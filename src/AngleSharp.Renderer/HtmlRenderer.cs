@@ -101,12 +101,13 @@ public sealed class HtmlRenderer
             return displayList;
         }
 
-        var textStyle = new RenderTextStyle(options.FontSize, options.TextColor, options.FontFamily, options.LineHeightMultiplier);
+        var textStyle = new RenderTextStyle(options.FontSize, options.TextColor, options.FontFamily, options.LineHeightMultiplier, 400f, false, false, false, options.TextColor, global::AngleSharp.Renderer.Rendering.RenderTextDecorationStyle.Solid, TextAlign.Left, 0f, 0f, 0f);
         var cursorY = contentY;
         var previousBlockMarginBottom = 0f;
         var suppressNextBlockTopMargin = false;
         var activeFloatLeftOffset = 0f;
         var activeFloatBottom = 0f;
+        var textIndentConsumed = false;
 
         foreach (var child in OrderChildrenForPainting(root.Children))
         {
@@ -120,6 +121,7 @@ public sealed class HtmlRenderer
                 suppressNextBlockTopMargin: ref suppressNextBlockTopMargin,
                 activeFloatLeftOffset: ref activeFloatLeftOffset,
                 activeFloatBottom: ref activeFloatBottom,
+                textIndentConsumed: ref textIndentConsumed,
                 textStyle: textStyle,
                 options: options,
                 displayList: displayList,
@@ -144,6 +146,7 @@ public sealed class HtmlRenderer
         ref bool suppressNextBlockTopMargin,
         ref float activeFloatLeftOffset,
         ref float activeFloatBottom,
+        ref bool textIndentConsumed,
         RenderTextStyle textStyle,
         HtmlRenderOptions options,
         DisplayList displayList,
@@ -152,10 +155,10 @@ public sealed class HtmlRenderer
         switch (node)
         {
             case TextRenderNode textNode:
-                LayoutTextNode(textNode.Ref, containingX, containingWidth, ref cursorY, ref previousBlockMarginBottom, ref suppressNextBlockTopMargin, ref activeFloatLeftOffset, ref activeFloatBottom, textStyle, options, displayList, maxY);
+                LayoutTextNode(textNode.Ref, containingX, containingWidth, ref cursorY, ref previousBlockMarginBottom, ref suppressNextBlockTopMargin, ref activeFloatLeftOffset, ref activeFloatBottom, ref textIndentConsumed, textStyle, options, displayList, maxY);
                 return;
             case ElementRenderNode element:
-                LayoutElement(element, containingX, containingY, containingWidth, ref cursorY, ref previousBlockMarginBottom, ref suppressNextBlockTopMargin, ref activeFloatLeftOffset, ref activeFloatBottom, textStyle, options, displayList, maxY);
+                LayoutElement(element, containingX, containingY, containingWidth, ref cursorY, ref previousBlockMarginBottom, ref suppressNextBlockTopMargin, ref activeFloatLeftOffset, ref activeFloatBottom, ref textIndentConsumed, textStyle, options, displayList, maxY);
                 return;
             default:
                 return;
@@ -172,6 +175,7 @@ public sealed class HtmlRenderer
         ref bool suppressNextBlockTopMargin,
         ref float activeFloatLeftOffset,
         ref float activeFloatBottom,
+        ref bool textIndentConsumed,
         RenderTextStyle inheritedTextStyle,
         HtmlRenderOptions options,
         DisplayList displayList,
@@ -225,7 +229,8 @@ public sealed class HtmlRenderer
             var inlineText = NormalizeWhitespace(element.TextContent ?? string.Empty);
             if (inlineText.Length > 0)
             {
-                LayoutWrappedText(inlineText, flowContainingX, flowContainingWidth, ref cursorY, currentTextStyle, options, displayList, maxY);
+                    LayoutWrappedText(inlineText, flowContainingX, flowContainingWidth, ref cursorY, currentTextStyle, options, displayList, maxY, textIndentConsumed ? 0f : currentTextStyle.TextIndent);
+                    textIndentConsumed = true;
             }
 
             previousBlockMarginBottom = 0f;
@@ -333,28 +338,159 @@ public sealed class HtmlRenderer
         var childSuppressNextBlockTopMargin = collapseWithFirstChild && !float.Equals(effectiveMarginTop, marginTop);
         var childActiveFloatLeftOffset = 0f;
         var childActiveFloatBottom = 0f;
+        var childTextIndentConsumed = false;
+        var inlineLineActive = false;
+        var inlineLineTop = contentY;
+        var inlineLineHeight = currentTextStyle.FontSize * currentTextStyle.LineHeightMultiplier;
+        var inlineCursorX = flowContainingX + (textIndentConsumed ? 0f : currentTextStyle.TextIndent);
 
-        foreach (var child in OrderChildrenForPainting(node.Children))
+        var orderedChildren = OrderChildrenForPainting(node.Children).ToList();
+        var hasInlineRun = orderedChildren.Any(child =>
+            (child is ElementRenderNode childElement &&
+             !ShouldRenderAsBlock(childElement.ComputedStyle) &&
+             !IsInlineBlock(childElement.ComputedStyle)) ||
+            (child is ElementRenderNode childElementWithBr && string.Equals(childElementWithBr.Ref.LocalName, "br", StringComparison.OrdinalIgnoreCase)));
+
+        if (!hasInlineRun)
         {
-            LayoutNode(
-                node: child,
-                containingX: contentX,
-                containingY: contentY,
-                containingWidth: contentWidth,
-                cursorY: ref childCursorY,
-                previousBlockMarginBottom: ref childPreviousBlockMarginBottom,
-                suppressNextBlockTopMargin: ref childSuppressNextBlockTopMargin,
-                activeFloatLeftOffset: ref childActiveFloatLeftOffset,
-                activeFloatBottom: ref childActiveFloatBottom,
-                textStyle: currentTextStyle,
-                options: options,
-                displayList: displayList,
-                maxY: maxY);
-
-            if (childCursorY > maxY)
+            foreach (var child in orderedChildren)
             {
-                break;
+                if (child is TextRenderNode textNode)
+                {
+                    LayoutTextNode(
+                        textNode.Ref,
+                        contentX,
+                        contentWidth,
+                        ref childCursorY,
+                        ref childPreviousBlockMarginBottom,
+                        ref childSuppressNextBlockTopMargin,
+                        ref childActiveFloatLeftOffset,
+                        ref childActiveFloatBottom,
+                        ref textIndentConsumed,
+                        currentTextStyle,
+                        options,
+                        displayList,
+                        maxY);
+                }
+                else if (child is ElementRenderNode blockChild)
+                {
+                    LayoutNode(
+                        node: blockChild,
+                        containingX: contentX,
+                        containingY: contentY,
+                        containingWidth: contentWidth,
+                        cursorY: ref childCursorY,
+                        previousBlockMarginBottom: ref childPreviousBlockMarginBottom,
+                        suppressNextBlockTopMargin: ref childSuppressNextBlockTopMargin,
+                        activeFloatLeftOffset: ref childActiveFloatLeftOffset,
+                        activeFloatBottom: ref childActiveFloatBottom,
+                        textIndentConsumed: ref childTextIndentConsumed,
+                        textStyle: currentTextStyle,
+                        options: options,
+                        displayList: displayList,
+                        maxY: maxY);
+                }
+
+                if (childCursorY > maxY)
+                {
+                    break;
+                }
             }
+        }
+        else
+        {
+            foreach (var child in orderedChildren)
+            {
+                var childIsBlock = child is ElementRenderNode childElement && (ShouldRenderAsBlock(childElement.ComputedStyle) || IsInlineBlock(childElement.ComputedStyle));
+
+                if (childIsBlock)
+                {
+                    if (inlineLineActive)
+                    {
+                        childCursorY = Math.Max(childCursorY, inlineLineTop + inlineLineHeight);
+                        inlineLineActive = false;
+                        inlineCursorX = flowContainingX;
+                        textIndentConsumed = true;
+                    }
+
+                    LayoutNode(
+                        node: child,
+                        containingX: contentX,
+                        containingY: contentY,
+                        containingWidth: contentWidth,
+                        cursorY: ref childCursorY,
+                        previousBlockMarginBottom: ref childPreviousBlockMarginBottom,
+                        suppressNextBlockTopMargin: ref childSuppressNextBlockTopMargin,
+                        activeFloatLeftOffset: ref childActiveFloatLeftOffset,
+                        activeFloatBottom: ref childActiveFloatBottom,
+                        textIndentConsumed: ref childTextIndentConsumed,
+                        textStyle: currentTextStyle,
+                        options: options,
+                        displayList: displayList,
+                        maxY: maxY);
+                }
+                else
+                {
+                    inlineLineActive = true;
+
+                    if (child is TextRenderNode textNode)
+                    {
+                        var inlineText = NormalizeWhitespace(textNode.Ref.Data);
+
+                        if (inlineText.Length > 0)
+                        {
+                            LayoutInlineTextRun(
+                                displayList,
+                                inlineText,
+                                currentTextStyle,
+                                flowContainingX,
+                                flowContainingWidth,
+                                options.AverageCharacterWidthFactor,
+                                ref inlineCursorX,
+                                ref inlineLineTop,
+                                ref inlineLineHeight,
+                                ref textIndentConsumed);
+                        }
+                    }
+                    else if (child is ElementRenderNode inlineElement)
+                    {
+                        var childTagName = inlineElement.Ref.LocalName;
+
+                        if (string.Equals(childTagName, "br", StringComparison.OrdinalIgnoreCase))
+                        {
+                            childCursorY += inlineLineHeight;
+                            inlineLineTop = childCursorY;
+                            inlineCursorX = flowContainingX;
+                            textIndentConsumed = true;
+                        }
+                        else
+                        {
+                            var childTextStyle = ResolveTextStyle(CreateStyleMap(inlineElement.ComputedStyle), currentTextStyle);
+                            var inlineText = NormalizeWhitespace(inlineElement.Ref.TextContent ?? string.Empty);
+
+                            if (inlineText.Length > 0)
+                            {
+                                LayoutInlineTextRun(
+                                    displayList,
+                                    inlineText,
+                                    childTextStyle,
+                                    flowContainingX,
+                                    flowContainingWidth,
+                                    options.AverageCharacterWidthFactor,
+                                    ref inlineCursorX,
+                                    ref inlineLineTop,
+                                    ref inlineLineHeight,
+                                    ref textIndentConsumed);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if (inlineLineActive)
+        {
+            childCursorY = Math.Max(childCursorY, inlineLineTop + inlineLineHeight);
         }
 
         var autoContentHeight = Math.Max(0f, childCursorY - contentY);
@@ -409,6 +545,7 @@ public sealed class HtmlRenderer
         ref bool suppressNextBlockTopMargin,
         ref float activeFloatLeftOffset,
         ref float activeFloatBottom,
+        ref bool textIndentConsumed,
         RenderTextStyle textStyle,
         HtmlRenderOptions options,
         DisplayList displayList,
@@ -431,7 +568,8 @@ public sealed class HtmlRenderer
         }
 
         var localFloatLeftOffset = cursorY < activeFloatBottom ? activeFloatLeftOffset : 0f;
-        LayoutWrappedText(text, containingX + localFloatLeftOffset, containingWidth - localFloatLeftOffset, ref cursorY, textStyle, options, displayList, maxY);
+        LayoutWrappedText(text, containingX + localFloatLeftOffset, containingWidth - localFloatLeftOffset, ref cursorY, textStyle, options, displayList, maxY, textIndentConsumed ? 0f : textStyle.TextIndent);
+        textIndentConsumed = true;
     }
 
     private static void LayoutWrappedText(
@@ -442,13 +580,15 @@ public sealed class HtmlRenderer
         RenderTextStyle textStyle,
         HtmlRenderOptions options,
         DisplayList displayList,
-        float maxY)
+        float maxY,
+        float firstLineIndent)
     {
         var lineHeight = textStyle.FontSize * textStyle.LineHeightMultiplier;
-        var lines = WrapText(text, maxWidth, textStyle.FontSize, options.AverageCharacterWidthFactor);
+        var lines = WrapText(text, maxWidth, textStyle.FontSize, options.AverageCharacterWidthFactor, textStyle.LetterSpacing);
 
-        foreach (var line in lines)
+        for (var index = 0; index < lines.Count; index++)
         {
+            var line = lines[index];
             cursorY += lineHeight;
 
             if (cursorY > maxY)
@@ -456,7 +596,78 @@ public sealed class HtmlRenderer
                 return;
             }
 
-            displayList.DrawText(line, x, cursorY, textStyle.Color, textStyle.FontSize, textStyle.FontFamily);
+            var lineWidth = EstimateTextWidth(line, textStyle.FontSize, options.AverageCharacterWidthFactor, textStyle.LetterSpacing);
+            var lineMaxWidth = index == 0 ? Math.Max(0f, maxWidth - firstLineIndent) : maxWidth;
+            var lineX = x + (index == 0 ? firstLineIndent : 0f) + ResolveTextAlignmentOffset(textStyle.TextAlign, lineMaxWidth, lineWidth);
+            var baselineY = cursorY + textStyle.VerticalAlignOffset;
+
+            displayList.DrawText(
+                line,
+                lineX,
+                baselineY,
+                textStyle.Color,
+                textStyle.FontSize,
+                textStyle.FontFamily,
+                textStyle.FontWeight,
+                textStyle.IsItalic,
+                textStyle.Underline,
+                textStyle.StrikeThrough,
+                textStyle.DecorationColor,
+                textStyle.DecorationStyle,
+                textStyle.LetterSpacing);
+        }
+    }
+
+    private static void LayoutInlineTextRun(
+        DisplayList displayList,
+        string text,
+        RenderTextStyle textStyle,
+        float flowX,
+        float flowWidth,
+        float averageCharacterWidthFactor,
+        ref float inlineCursorX,
+        ref float inlineLineTop,
+        ref float inlineLineHeight,
+        ref bool textIndentConsumed)
+    {
+        var words = text.Split(' ', StringSplitOptions.RemoveEmptyEntries);
+        var rightEdge = flowX + flowWidth;
+        var spaceWidth = EstimateTextWidth(" ", textStyle.FontSize, averageCharacterWidthFactor, textStyle.LetterSpacing);
+
+        foreach (var word in words)
+        {
+            var wordWidth = EstimateTextWidth(word, textStyle.FontSize, averageCharacterWidthFactor, textStyle.LetterSpacing);
+
+            if (inlineCursorX > flowX && inlineCursorX + spaceWidth + wordWidth > rightEdge)
+            {
+                inlineLineTop += inlineLineHeight;
+                inlineCursorX = flowX;
+                textIndentConsumed = true;
+            }
+
+            if (inlineCursorX > flowX)
+            {
+                inlineCursorX += spaceWidth;
+            }
+
+            displayList.DrawText(
+                word,
+                inlineCursorX,
+                inlineLineTop + textStyle.VerticalAlignOffset,
+                textStyle.Color,
+                textStyle.FontSize,
+                textStyle.FontFamily,
+                textStyle.FontWeight,
+                textStyle.IsItalic,
+                textStyle.Underline,
+                textStyle.StrikeThrough,
+                textStyle.DecorationColor,
+                textStyle.DecorationStyle,
+                textStyle.LetterSpacing);
+
+            inlineCursorX += wordWidth;
+            inlineLineHeight = Math.Max(inlineLineHeight, textStyle.FontSize * textStyle.LineHeightMultiplier);
+            textIndentConsumed = true;
         }
     }
 
@@ -503,8 +714,136 @@ public sealed class HtmlRenderer
 
         var lineHeight = ParseLineHeight(styleMap, inherited.LineHeightMultiplier);
         var color = ParseColor(styleMap.TryGetValue("color", out var colorValue) ? colorValue : null, inherited.Color);
+        var fontWeight = ParseFontWeight(styleMap, inherited.FontWeight);
+        var isItalic = ParseFontStyle(styleMap, inherited.IsItalic);
+        var (underline, strikeThrough) = ParseTextDecoration(styleMap, inherited.Underline, inherited.StrikeThrough);
+        var decorationColor = ParseColor(styleMap.TryGetValue("text-decoration-color", out var decorationColorValue) ? decorationColorValue : null, color);
+        var decorationStyle = ParseTextDecorationStyle(styleMap, inherited.DecorationStyle);
+        var textAlign = ParseTextAlign(styleMap, inherited.TextAlign);
+        var letterSpacing = ParseLength(styleMap, "letter-spacing", inherited.FontSize, inherited.LetterSpacing, allowAuto: false);
+        var textIndent = ParseLength(styleMap, "text-indent", inherited.FontSize, 0f, allowAuto: false);
+        var verticalAlignOffset = ParseVerticalAlign(styleMap, fontSize);
 
-        return new RenderTextStyle(fontSize, color, fontFamily, lineHeight);
+        return new RenderTextStyle(fontSize, color, fontFamily, lineHeight, fontWeight, isItalic, underline, strikeThrough, decorationColor, decorationStyle, textAlign, letterSpacing, textIndent, verticalAlignOffset);
+    }
+
+    private static float ParseVerticalAlign(Dictionary<string, string> styleMap, float fontSize)
+    {
+        if (!styleMap.TryGetValue("vertical-align", out var value) || string.IsNullOrWhiteSpace(value))
+        {
+            return 0f;
+        }
+
+        var normalized = value.Trim().ToLowerInvariant();
+
+        return normalized switch
+        {
+            "super" => -fontSize * 1.5f,
+            "sub" => fontSize * 0.8f,
+            "middle" => -fontSize * 0.15f,
+            "text-top" => -fontSize * 0.25f,
+            "text-bottom" => fontSize * 0.1f,
+            _ when ParseLengthValue(normalized, float.NaN, allowAuto: false) is var offset && !float.IsNaN(offset) => offset,
+            _ => 0f,
+        };
+    }
+
+    private static global::AngleSharp.Renderer.Rendering.RenderTextDecorationStyle ParseTextDecorationStyle(Dictionary<string, string> styleMap, global::AngleSharp.Renderer.Rendering.RenderTextDecorationStyle defaultValue)
+    {
+        if (!styleMap.TryGetValue("text-decoration-style", out var value) || string.IsNullOrWhiteSpace(value))
+        {
+            return defaultValue;
+        }
+
+        var normalized = value.Trim().ToLowerInvariant();
+
+        return normalized switch
+        {
+            "dashed" => global::AngleSharp.Renderer.Rendering.RenderTextDecorationStyle.Dashed,
+            "dotted" => global::AngleSharp.Renderer.Rendering.RenderTextDecorationStyle.Dotted,
+            _ => global::AngleSharp.Renderer.Rendering.RenderTextDecorationStyle.Solid,
+        };
+    }
+
+    private static TextAlign ParseTextAlign(Dictionary<string, string> styleMap, TextAlign defaultValue)
+    {
+        if (!styleMap.TryGetValue("text-align", out var value) || string.IsNullOrWhiteSpace(value))
+        {
+            return defaultValue;
+        }
+
+        var normalized = value.Trim().ToLowerInvariant();
+
+        return normalized switch
+        {
+            "center" => TextAlign.Center,
+            "right" => TextAlign.Right,
+            "end" => TextAlign.Right,
+            "left" => TextAlign.Left,
+            "start" => TextAlign.Left,
+            _ => defaultValue,
+        };
+    }
+
+    private static float ParseFontWeight(Dictionary<string, string> styleMap, float defaultValue)
+    {
+        if (!styleMap.TryGetValue("font-weight", out var value) || string.IsNullOrWhiteSpace(value))
+        {
+            return defaultValue;
+        }
+
+        var normalized = value.Trim().ToLowerInvariant();
+
+        return normalized switch
+        {
+            "normal" => 400f,
+            "bold" => 700f,
+            _ when float.TryParse(normalized, NumberStyles.Float, CultureInfo.InvariantCulture, out var weight) => weight,
+            _ => defaultValue,
+        };
+    }
+
+    private static bool ParseFontStyle(Dictionary<string, string> styleMap, bool defaultValue)
+    {
+        if (!styleMap.TryGetValue("font-style", out var value) || string.IsNullOrWhiteSpace(value))
+        {
+            return defaultValue;
+        }
+
+        var normalized = value.Trim().ToLowerInvariant();
+        return normalized is "italic" or "oblique";
+    }
+
+    private static (bool Underline, bool StrikeThrough) ParseTextDecoration(Dictionary<string, string> styleMap, bool defaultUnderline, bool defaultStrikeThrough)
+    {
+        var underline = defaultUnderline;
+        var strikeThrough = defaultStrikeThrough;
+
+        if (styleMap.TryGetValue("text-decoration-line", out var lineValue) || styleMap.TryGetValue("text-decoration", out lineValue))
+        {
+            var tokens = lineValue.Split(' ', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+
+            foreach (var token in tokens)
+            {
+                var normalized = token.Trim().ToLowerInvariant();
+
+                if (normalized == "underline")
+                {
+                    underline = true;
+                }
+                else if (normalized is "line-through" or "strikethrough")
+                {
+                    strikeThrough = true;
+                }
+                else if (normalized == "none")
+                {
+                    underline = false;
+                    strikeThrough = false;
+                }
+            }
+        }
+
+        return (underline, strikeThrough);
     }
 
     private static float ParseLineHeight(Dictionary<string, string> styleMap, float defaultValue)
@@ -576,6 +915,16 @@ public sealed class HtmlRenderer
         AddIfPresent(map, "background-color", style.GetBackgroundColor());
         AddIfPresent(map, "font-size", style.GetFontSize());
         AddIfPresent(map, "font-family", style.GetFontFamily());
+        AddIfPresent(map, "font-weight", style.GetPropertyValue("font-weight"));
+        AddIfPresent(map, "font-style", style.GetPropertyValue("font-style"));
+        AddIfPresent(map, "text-decoration", style.GetPropertyValue("text-decoration"));
+        AddIfPresent(map, "text-decoration-line", style.GetPropertyValue("text-decoration-line"));
+        AddIfPresent(map, "text-decoration-color", style.GetPropertyValue("text-decoration-color"));
+        AddIfPresent(map, "text-decoration-style", style.GetPropertyValue("text-decoration-style"));
+        AddIfPresent(map, "text-align", style.GetPropertyValue("text-align"));
+        AddIfPresent(map, "text-indent", style.GetTextIndent());
+        AddIfPresent(map, "vertical-align", style.GetVerticalAlign());
+        AddIfPresent(map, "letter-spacing", style.GetPropertyValue("letter-spacing"));
         AddIfPresent(map, "line-height", style.GetLineHeight());
         AddIfPresent(map, "color", style.GetColor());
 
@@ -1172,7 +1521,7 @@ public sealed class HtmlRenderer
         return fallback;
     }
 
-    private static IReadOnlyList<string> WrapText(string text, float maxWidth, float fontSize, float averageCharacterWidthFactor)
+    private static IReadOnlyList<string> WrapText(string text, float maxWidth, float fontSize, float averageCharacterWidthFactor, float letterSpacing)
     {
         var words = text.Split(' ', StringSplitOptions.RemoveEmptyEntries);
 
@@ -1187,8 +1536,8 @@ public sealed class HtmlRenderer
 
         foreach (var word in words)
         {
-            var wordWidth = EstimateTextWidth(word, fontSize, averageCharacterWidthFactor);
-            var separatorWidth = current.Length == 0 ? 0f : EstimateTextWidth(" ", fontSize, averageCharacterWidthFactor);
+            var wordWidth = EstimateTextWidth(word, fontSize, averageCharacterWidthFactor, letterSpacing);
+            var separatorWidth = current.Length == 0 ? 0f : EstimateTextWidth(" ", fontSize, averageCharacterWidthFactor, letterSpacing);
 
             if (current.Length > 0 && currentWidth + separatorWidth + wordWidth > maxWidth)
             {
@@ -1215,12 +1564,14 @@ public sealed class HtmlRenderer
         return lines;
     }
 
-    private static float EstimateTextWidth(string text, float fontSize, float averageCharacterWidthFactor)
+    private static float EstimateTextWidth(string text, float fontSize, float averageCharacterWidthFactor, float letterSpacing)
     {
         var width = 0f;
+        var characterCount = 0;
 
         foreach (var c in text)
         {
+            characterCount++;
             width += c switch
             {
                 'i' or 'l' or '!' or '|' => fontSize * 0.35f,
@@ -1230,7 +1581,27 @@ public sealed class HtmlRenderer
             };
         }
 
+        if (characterCount > 1)
+        {
+            width += (characterCount - 1) * letterSpacing;
+        }
+
         return width;
+    }
+
+    private static float ResolveTextAlignmentOffset(TextAlign align, float availableWidth, float textWidth)
+    {
+        if (availableWidth <= textWidth)
+        {
+            return 0f;
+        }
+
+        return align switch
+        {
+            TextAlign.Center => (availableWidth - textWidth) / 2f,
+            TextAlign.Right => availableWidth - textWidth,
+            _ => 0f,
+        };
     }
 
     private static string NormalizeWhitespace(string value)
@@ -1263,7 +1634,28 @@ public sealed class HtmlRenderer
         return sb.ToString().Trim();
     }
 
-    private readonly record struct RenderTextStyle(float FontSize, RenderColor Color, string FontFamily, float LineHeightMultiplier);
+    private readonly record struct RenderTextStyle(
+        float FontSize,
+        RenderColor Color,
+        string FontFamily,
+        float LineHeightMultiplier,
+        float FontWeight,
+        bool IsItalic,
+        bool Underline,
+        bool StrikeThrough,
+        RenderColor DecorationColor,
+        global::AngleSharp.Renderer.Rendering.RenderTextDecorationStyle DecorationStyle,
+        TextAlign TextAlign,
+        float LetterSpacing,
+        float TextIndent,
+        float VerticalAlignOffset);
+
+    private enum TextAlign
+    {
+        Left,
+        Center,
+        Right,
+    }
 
     private readonly record struct EdgeSizes(float Top, float Right, float Bottom, float Left);
 

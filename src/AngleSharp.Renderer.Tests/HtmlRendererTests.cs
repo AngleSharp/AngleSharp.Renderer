@@ -25,6 +25,190 @@ public sealed class HtmlRendererTests
     }
 
     [Fact]
+    public async Task BuildDisplayList_PropagatesFontSizeStyleAndDecorationToTextCommands()
+    {
+        var document = await ParseAsync("""
+            <html><body>
+                <p>
+                    <span style="font-size:12px; font-weight:400; text-decoration:underline;">Small</span>
+                    <span style="font-size:24px; font-style:italic; font-weight:700; text-decoration:line-through;">Large</span>
+                </p>
+            </body></html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, new HtmlRenderOptions
+        {
+            Width = 360,
+            Height = 240,
+            FontSize = 16f,
+        });
+
+        var textCommands = displayList.Commands.OfType<DrawTextCommand>().ToArray();
+
+        Assert.Equal(2, textCommands.Length);
+        Assert.Equal("Small", textCommands[0].Text);
+        Assert.Equal(12f, textCommands[0].FontSize);
+        Assert.False(textCommands[0].IsBold);
+        Assert.False(textCommands[0].IsItalic);
+        Assert.True(textCommands[0].Underline);
+        Assert.False(textCommands[0].StrikeThrough);
+
+        Assert.Equal("Large", textCommands[1].Text);
+        Assert.Equal(24f, textCommands[1].FontSize);
+        Assert.True(textCommands[1].IsBold);
+        Assert.True(textCommands[1].IsItalic);
+        Assert.False(textCommands[1].Underline);
+        Assert.True(textCommands[1].StrikeThrough);
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_CentersWrappedTextAndPreservesLineHeight()
+    {
+        var document = await ParseAsync("""
+            <html><body>
+                <div style="width:120px; text-align:center; line-height:2; font-size:10px;">
+                    one two three four five six seven eight nine ten eleven twelve
+                </div>
+            </body></html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, new HtmlRenderOptions
+        {
+            Width = 220,
+            Height = 180,
+            FontSize = 10f,
+        });
+
+        var textCommands = displayList.Commands.OfType<DrawTextCommand>().ToArray();
+
+        Assert.True(textCommands.Length >= 2);
+        Assert.True(textCommands[0].X > 0f);
+        Assert.True(textCommands[1].Y - textCommands[0].Y >= 20f);
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_AppliesLetterSpacingToTextCommands()
+    {
+        var document = await ParseAsync("""
+            <html><body>
+                <p style="letter-spacing:2px;">Spacing</p>
+            </body></html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, new HtmlRenderOptions
+        {
+            Width = 200,
+            Height = 120,
+            FontSize = 16f,
+        });
+
+        var textCommand = displayList.Commands.OfType<DrawTextCommand>().Single();
+
+        Assert.Equal(2f, textCommand.LetterSpacing);
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_PropagatesTextDecorationColorAndStyle()
+    {
+        var document = await ParseAsync("""
+            <html><body>
+                <p style="text-decoration:underline; text-decoration-style:dashed; text-decoration-color:#ff0000;">
+                    Decorated text
+                </p>
+            </body></html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, new HtmlRenderOptions
+        {
+            Width = 240,
+            Height = 120,
+            FontSize = 16f,
+        });
+
+        var textCommand = displayList.Commands.OfType<DrawTextCommand>().Single();
+
+        Assert.True(textCommand.Underline);
+        Assert.Equal(new RenderColor(255, 0, 0), textCommand.DecorationColor);
+        Assert.Equal(RenderTextDecorationStyle.Dashed, textCommand.DecorationStyle);
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_IndentsFirstLineOfBlockText()
+    {
+        var document = await ParseAsync("""
+            <html><body>
+                <p style="text-indent:20px; font-size:16px; width:180px;">Indented block text that wraps to a second line.</p>
+            </body></html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, new HtmlRenderOptions
+        {
+            Width = 240,
+            Height = 160,
+            FontSize = 16f,
+        });
+
+        var textCommands = displayList.Commands.OfType<DrawTextCommand>().ToArray();
+
+        Assert.True(textCommands.Length >= 2);
+        Assert.True(textCommands[0].X >= 20f);
+        Assert.True(textCommands[1].X < textCommands[0].X);
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_ShiftsInlineTextWithVerticalAlign()
+    {
+        var document = await ParseAsync("""
+            <html><body>
+                <p>
+                    before <span style="vertical-align:super; font-size:12px;">sup</span> after
+                </p>
+            </body></html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, new HtmlRenderOptions
+        {
+            Width = 240,
+            Height = 160,
+            FontSize = 16f,
+        });
+
+        var textCommands = displayList.Commands.OfType<DrawTextCommand>().ToArray();
+
+        Assert.True(textCommands.Length >= 2);
+        var superCommand = textCommands.First(command => command.Text.Contains("sup", StringComparison.OrdinalIgnoreCase));
+
+        Assert.True(superCommand.Y < textCommands[0].Y);
+    }
+
+    [Fact]
+    public async Task RenderToPng_UsesFontFamilyFallbackList()
+    {
+        var document = await ParseAsync("""
+            <html><body>
+                <p style="font-family:'DefinitelyMissing', serif; font-size:18px;">Fallback font family</p>
+            </body></html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var image = renderer.RenderToPng(document, new HtmlRenderOptions
+        {
+            Width = 240,
+            Height = 120,
+            FontSize = 18f,
+        });
+
+        Assert.Equal("image/png", image.MimeType);
+        Assert.True(image.Data.Length > 8);
+    }
+
+    [Fact]
     public async Task RenderToPng_ReturnsPngPayload()
     {
         var document = await ParseAsync("<html><body><p>PNG smoke test output.</p></body></html>");

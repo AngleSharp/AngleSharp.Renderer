@@ -194,6 +194,154 @@ public sealed class VisualConformanceTests
           maxDifferentPixels: 0);
     }
 
+    [Fact]
+    public async Task RenderToPng_RendersMixedTextSizesStylesAndDecorations()
+    {
+        var document = await ParseAsync("""
+            <html>
+              <head>
+                <style>
+                  html, body { margin: 0; padding: 0; }
+                  body { font-family: sans-serif; }
+                </style>
+              </head>
+              <body>
+                <p>
+                  <span style="font-size:12px; font-weight:400; text-decoration:underline;">Small text</span>
+                  <span style="font-size:24px; font-style:italic; font-weight:700; text-decoration:line-through;"> Large text</span>
+                </p>
+              </body>
+            </html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var image = renderer.RenderToPng(document, new HtmlRenderOptions
+        {
+            Width = 260,
+            Height = 120,
+            Padding = 0f,
+            ParagraphSpacing = 0f,
+            FontSize = 16f,
+        });
+
+        VisualSnapshotVerifier.VerifyOrCreate(
+          snapshotName: "mixed-text-sizes-styles-decorations.png",
+          actualPng: image.Data,
+          perChannelTolerance: 3,
+          maxDifferentPixels: 0);
+    }
+
+    [Fact]
+    public async Task RenderToPng_RendersAlignedWrappedTextWithLineHeight()
+    {
+        var document = await ParseAsync("""
+            <html>
+              <head>
+                <style>
+                  html, body { margin: 0; padding: 0; }
+                  body { font-family: sans-serif; }
+                </style>
+              </head>
+              <body>
+                <div style="width:140px; text-align:center; line-height:2; font-size:12px; color:#0000ff;">
+                  one two three four five six seven eight nine ten eleven twelve thirteen fourteen
+                </div>
+              </body>
+            </html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var image = renderer.RenderToPng(document, new HtmlRenderOptions
+        {
+            Width = 220,
+            Height = 180,
+            Padding = 0f,
+            ParagraphSpacing = 0f,
+            FontSize = 12f,
+        });
+
+        VisualSnapshotVerifier.VerifyOrCreate(
+          snapshotName: "aligned-wrapped-text-with-line-height.png",
+          actualPng: image.Data,
+          perChannelTolerance: 3,
+          maxDifferentPixels: 0);
+    }
+
+    [Fact]
+    public async Task RenderToPng_RendersDecorationColorAndStyle()
+    {
+        var document = await ParseAsync("""
+            <html>
+              <head>
+                <style>
+                  html, body { margin: 0; padding: 0; }
+                  body { font-family: sans-serif; }
+                </style>
+              </head>
+              <body>
+                <p style="font-size:18px; text-decoration:underline; text-decoration-style:dashed; text-decoration-color:#ff0000; color:#000000;">
+                  Decoration test
+                </p>
+              </body>
+            </html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var image = renderer.RenderToPng(document, new HtmlRenderOptions
+        {
+            Width = 240,
+            Height = 100,
+            Padding = 0f,
+            ParagraphSpacing = 0f,
+            FontSize = 18f,
+        });
+
+        VisualSnapshotVerifier.VerifyOrCreate(
+          snapshotName: "decoration-color-and-style.png",
+          actualPng: image.Data,
+          perChannelTolerance: 3,
+          maxDifferentPixels: 0);
+    }
+
+    [Fact]
+    public async Task RenderToPng_RendersTextIndentAndVerticalAlign()
+    {
+        var document = await ParseAsync("""
+            <html>
+              <head>
+                <style>
+                  html, body { margin: 0; padding: 0; }
+                  body { font-family: sans-serif; }
+                </style>
+              </head>
+              <body>
+                <p style="text-indent:24px; width:180px; font-size:16px;">
+                  Indented text that wraps to a second line.
+                </p>
+                <p style="font-size:16px;">
+                  normal <span style="vertical-align:super; font-size:12px; color:#ff0000;">sup</span> text
+                </p>
+              </body>
+            </html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var image = renderer.RenderToPng(document, new HtmlRenderOptions
+        {
+            Width = 260,
+            Height = 160,
+            Padding = 0f,
+            ParagraphSpacing = 0f,
+            FontSize = 16f,
+        });
+
+        VisualSnapshotVerifier.VerifyOrCreate(
+          snapshotName: "text-indent-and-vertical-align.png",
+          actualPng: image.Data,
+          perChannelTolerance: 3,
+          maxDifferentPixels: 0);
+    }
+
     private static async Task<AngleSharp.Dom.IDocument> ParseAsync(string html)
     {
         var context = BrowsingContext.New(Configuration.Default.WithCss());

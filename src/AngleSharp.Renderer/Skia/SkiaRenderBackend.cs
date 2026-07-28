@@ -76,15 +76,133 @@ public sealed class SkiaRenderBackend : IRenderBackend
 
     private static void DrawText(SKCanvas canvas, DrawTextCommand command)
     {
+        var fontStyle = new SKFontStyle(
+            command.FontWeight >= 600f ? SKFontStyleWeight.Bold : SKFontStyleWeight.Normal,
+            SKFontStyleWidth.Normal,
+            command.IsItalic ? SKFontStyleSlant.Italic : SKFontStyleSlant.Upright);
+
         using var paint = new SKPaint
         {
             Color = ToSkColor(command.Color),
             IsAntialias = true,
             TextSize = command.FontSize,
-            Typeface = SKTypeface.FromFamilyName(command.FontFamily),
+            Typeface = CreateTypeface(command.FontFamily, fontStyle),
         };
 
-        canvas.DrawText(command.Text, command.X, command.Y, paint);
+        DrawTextWithLetterSpacing(canvas, paint, command.Text, command.X, command.Y, command.LetterSpacing);
+
+        if (command.Underline || command.StrikeThrough)
+        {
+            using var decorationPaint = new SKPaint
+            {
+                Color = ToSkColor(command.DecorationColor),
+                IsAntialias = true,
+                Style = SKPaintStyle.Stroke,
+                StrokeWidth = Math.Max(1f, command.FontSize / 14f),
+            };
+
+            var textWidth = MeasureTextWidth(paint, command.Text, command.LetterSpacing);
+
+            if (command.Underline)
+            {
+                var underlineY = command.Y + Math.Max(1f, command.FontSize * 0.12f);
+                DrawDecorationLine(canvas, decorationPaint, command.X, underlineY, textWidth, command.DecorationStyle);
+            }
+
+            if (command.StrikeThrough)
+            {
+                var strikeY = command.Y - (command.FontSize * 0.32f);
+                DrawDecorationLine(canvas, decorationPaint, command.X, strikeY, textWidth, command.DecorationStyle);
+            }
+        }
+    }
+
+    private static void DrawDecorationLine(SKCanvas canvas, SKPaint paint, float x, float y, float width, RenderTextDecorationStyle style)
+    {
+        switch (style)
+        {
+            case RenderTextDecorationStyle.Dashed:
+                DrawPatternedLine(canvas, paint, x, y, width, dashLength: 6f, gapLength: 4f);
+                break;
+            case RenderTextDecorationStyle.Dotted:
+                DrawPatternedLine(canvas, paint, x, y, width, dashLength: 1f, gapLength: 4f);
+                break;
+            default:
+                canvas.DrawLine(x, y, x + width, y, paint);
+                break;
+        }
+    }
+
+    private static void DrawPatternedLine(SKCanvas canvas, SKPaint paint, float x, float y, float width, float dashLength, float gapLength)
+    {
+        var cursor = x;
+        var end = x + width;
+
+        while (cursor < end)
+        {
+            var segmentEnd = Math.Min(cursor + dashLength, end);
+            canvas.DrawLine(cursor, y, segmentEnd, y, paint);
+            cursor = segmentEnd + gapLength;
+        }
+    }
+
+    private static SKTypeface CreateTypeface(string fontFamily, SKFontStyle fontStyle)
+    {
+        var families = fontFamily.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+
+        foreach (var family in families)
+        {
+            var normalized = family.Trim('\'', '"', ' ');
+
+            if (string.IsNullOrWhiteSpace(normalized))
+            {
+                continue;
+            }
+
+            var typeface = SKTypeface.FromFamilyName(normalized, fontStyle);
+
+            if (typeface is not null)
+            {
+                return typeface;
+            }
+        }
+
+        return SKTypeface.FromFamilyName(fontFamily, fontStyle) ?? SKTypeface.Default;
+    }
+
+    private static void DrawTextWithLetterSpacing(SKCanvas canvas, SKPaint paint, string text, float x, float y, float letterSpacing)
+    {
+        if (letterSpacing <= 0f)
+        {
+            canvas.DrawText(text, x, y, paint);
+            return;
+        }
+
+        var cursorX = x;
+
+        foreach (var character in text)
+        {
+            var glyph = character.ToString();
+            canvas.DrawText(glyph, cursorX, y, paint);
+            cursorX += paint.MeasureText(glyph) + letterSpacing;
+        }
+    }
+
+    private static float MeasureTextWidth(SKPaint paint, string text, float letterSpacing)
+    {
+        if (letterSpacing <= 0f)
+        {
+            return paint.MeasureText(text);
+        }
+
+        var width = 0f;
+
+        foreach (var character in text)
+        {
+            width += paint.MeasureText(character.ToString()) + letterSpacing;
+        }
+
+        return width > 0f ? width - letterSpacing : 0f;
     }
 
     private static SKColor ToSkColor(RenderColor color) => new(color.R, color.G, color.B, color.A);

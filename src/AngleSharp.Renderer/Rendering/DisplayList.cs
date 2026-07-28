@@ -33,12 +33,25 @@ public sealed class DisplayList
     /// <summary>
     /// Adds a text draw command.
     /// </summary>
-    public void DrawText(string text, float x, float y, RenderColor color, float fontSize, string fontFamily)
+    public void DrawText(
+        string text,
+        float x,
+        float y,
+        RenderColor color,
+        float fontSize,
+        string fontFamily,
+        float fontWeight = 400f,
+        bool isItalic = false,
+        bool underline = false,
+        bool strikeThrough = false,
+        RenderColor? decorationColor = null,
+        RenderTextDecorationStyle decorationStyle = RenderTextDecorationStyle.Solid,
+        float letterSpacing = 0f)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(text);
         ArgumentException.ThrowIfNullOrWhiteSpace(fontFamily);
 
-        Add(new DrawTextCommand(text, x, y, color, fontSize, fontFamily));
+        Add(new DrawTextCommand(text, x, y, color, fontSize, fontFamily, fontWeight, isItalic, underline, strikeThrough, decorationColor ?? color, decorationStyle, letterSpacing));
     }
 }
 
@@ -61,4 +74,38 @@ public sealed record DrawTextCommand(
     float Y,
     RenderColor Color,
     float FontSize,
-    string FontFamily) : RenderCommand;
+    string FontFamily,
+    float FontWeight,
+    bool IsItalic,
+    bool Underline,
+    bool StrikeThrough,
+    RenderColor DecorationColor,
+    RenderTextDecorationStyle DecorationStyle,
+    float LetterSpacing) : RenderCommand
+{
+    /// <summary>
+    /// Indicates whether the command should be rendered with a bold typeface.
+    /// </summary>
+    public bool IsBold => FontWeight >= 600f;
+}
+
+/// <summary>
+/// Describes the decoration stroke style for text.
+/// </summary>
+public enum RenderTextDecorationStyle
+{
+    /// <summary>
+    /// Draw the decoration as a continuous line.
+    /// </summary>
+    Solid,
+
+    /// <summary>
+    /// Draw the decoration using dashes.
+    /// </summary>
+    Dashed,
+
+    /// <summary>
+    /// Draw the decoration using dots.
+    /// </summary>
+    Dotted,
+}
