@@ -159,6 +159,18 @@ public sealed class SkiaRenderBackend : IRenderBackend
                 continue;
             }
 
+            normalized = normalized.ToLowerInvariant();
+
+            normalized = normalized switch
+            {
+                "serif" => "DejaVu Serif",
+                "sans-serif" => "DejaVu Sans",
+                "monospace" => "DejaVu Sans Mono",
+                "cursive" => "DejaVu Sans",
+                "fantasy" => "DejaVu Serif",
+                _ => normalized,
+            };
+
             var typeface = SKTypeface.FromFamilyName(normalized, fontStyle);
 
             if (typeface is not null)

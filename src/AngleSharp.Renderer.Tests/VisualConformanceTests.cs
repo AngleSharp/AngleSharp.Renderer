@@ -342,6 +342,36 @@ public sealed class VisualConformanceTests
           maxDifferentPixels: 0);
     }
 
+      [Fact]
+      public async Task RenderToPng_RendersWebSafeFontFamiliesDifferently()
+      {
+          var document = await ParseAsync("""
+              <html>
+                <body>
+                  <p style="font-family:serif; font-size:26px;">Serif sample</p>
+                  <p style="font-family:sans-serif; font-size:26px;">Sans sample</p>
+                  <p style="font-family:monospace; font-size:26px;">Mono sample</p>
+                </body>
+              </html>
+              """);
+
+          var renderer = new HtmlRenderer();
+          var image = renderer.RenderToPng(document, new HtmlRenderOptions
+          {
+              Width = 320,
+              Height = 200,
+              Padding = 0f,
+              ParagraphSpacing = 4f,
+              FontSize = 16f,
+          });
+
+          VisualSnapshotVerifier.VerifyOrCreate(
+            snapshotName: "web-safe-font-families.png",
+            actualPng: image.Data,
+            perChannelTolerance: 3,
+            maxDifferentPixels: 0);
+      }
+
     private static async Task<AngleSharp.Dom.IDocument> ParseAsync(string html)
     {
         var context = BrowsingContext.New(Configuration.Default.WithCss());
