@@ -196,12 +196,13 @@ class Build : NukeBuild
         .DependsOn(CopyFiles)
         .Executes(() =>
         {
-            var nuspec = NugetDirectory / $"{TargetProjectName}.nuspec";
+            var nuspecFile = Path.Combine("bin", Version, "nuget", $"{TargetProjectName}.nuspec");
+            var outputDirectory = Path.Combine("bin", Version, "nuget");
 
             NuGetPack(_ => _
-                .SetTargetPath(nuspec)
+                .SetTargetPath(nuspecFile)
                 .SetVersion(Version)
-                .SetOutputDirectory(NugetDirectory)
+                .SetOutputDirectory(outputDirectory)
                 .SetSymbols(true)
                 .SetSymbolPackageFormat("snupkg")
                 .AddProperty("Configuration", Configuration)

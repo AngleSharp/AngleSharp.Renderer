@@ -60,4 +60,4 @@ This project is supported by the [.NET Foundation](https://dotnetfoundation.org)
 
 ## License
 
-AngleSharp.Css is released using the MIT license. For more information see the [license file](./LICENSE).
+AngleSharp.Renderer is released using the MIT license. For more information see the [license file](./LICENSE).
