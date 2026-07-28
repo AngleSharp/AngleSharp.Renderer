@@ -73,12 +73,14 @@ jobs:
         ANGLESHARP_SNAPSHOT_STRICT: 1
       run: ./build.sh -AngleSharpVersion 1.5.0
 
-    - name: Upload visual failure artifacts
-      if: failure()
+    - name: Upload visual assets
+      if: always()
       uses: actions/upload-artifact@v4
       with:
-        name: linux-visual-failure-assets
-        path: src/AngleSharp.Renderer.Tests/failure-assets/**
+        name: linux-visual-assets
+        path: |
+          src/AngleSharp.Renderer.Tests/verification-assets/**
+          src/AngleSharp.Renderer.Tests/failure-assets/**
         if-no-files-found: ignore
 
   windows:
@@ -103,10 +105,12 @@ jobs:
           .\build.ps1 -AngleSharpVersion 1.5.0
         }
 
-    - name: Upload visual failure artifacts
-      if: failure()
+    - name: Upload visual assets
+      if: always()
       uses: actions/upload-artifact@v4
       with:
-        name: windows-visual-failure-assets
-        path: src/AngleSharp.Renderer.Tests/failure-assets/**
+        name: windows-visual-assets
+        path: |
+          src/AngleSharp.Renderer.Tests/verification-assets/**
+          src/AngleSharp.Renderer.Tests/failure-assets/**
         if-no-files-found: ignore

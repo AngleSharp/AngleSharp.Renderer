@@ -32,7 +32,7 @@ public sealed class VisualConformanceTests
         VisualSnapshotVerifier.VerifyOrCreate(
           snapshotName: "paints-box-background-and-border.png",
           actualPng: image.Data,
-          perChannelTolerance: 2,
+          perChannelTolerance: 0,
           maxDifferentPixels: 0);
     }
 
@@ -62,7 +62,7 @@ public sealed class VisualConformanceTests
         VisualSnapshotVerifier.VerifyOrCreate(
           snapshotName: "centers-auto-margin-block.png",
           actualPng: image.Data,
-          perChannelTolerance: 2,
+          perChannelTolerance: 0,
           maxDifferentPixels: 0);
     }
 
@@ -93,7 +93,7 @@ public sealed class VisualConformanceTests
         VisualSnapshotVerifier.VerifyOrCreate(
           snapshotName: "shows-collapsed-vertical-margin-gap.png",
           actualPng: image.Data,
-          perChannelTolerance: 2,
+          perChannelTolerance: 0,
           maxDifferentPixels: 0);
     }
 
@@ -126,7 +126,7 @@ public sealed class VisualConformanceTests
         VisualSnapshotVerifier.VerifyOrCreate(
           snapshotName: "absolute-positioned-out-of-flow.png",
           actualPng: image.Data,
-          perChannelTolerance: 2,
+          perChannelTolerance: 0,
           maxDifferentPixels: 0);
     }
 
@@ -159,7 +159,7 @@ public sealed class VisualConformanceTests
         VisualSnapshotVerifier.VerifyOrCreate(
           snapshotName: "higher-z-index-over-lower-z-index.png",
           actualPng: image.Data,
-          perChannelTolerance: 2,
+          perChannelTolerance: 0,
           maxDifferentPixels: 0);
     }
 
@@ -191,7 +191,7 @@ public sealed class VisualConformanceTests
         VisualSnapshotVerifier.VerifyOrCreate(
           snapshotName: "negative-z-index-behind-in-flow.png",
           actualPng: image.Data,
-          perChannelTolerance: 2,
+          perChannelTolerance: 0,
           maxDifferentPixels: 0);
     }
 
@@ -228,7 +228,7 @@ public sealed class VisualConformanceTests
         VisualSnapshotVerifier.VerifyOrCreate(
           snapshotName: "mixed-text-sizes-styles-decorations.png",
           actualPng: image.Data,
-          perChannelTolerance: 3,
+          perChannelTolerance: 0,
           maxDifferentPixels: 0);
     }
 
@@ -264,7 +264,7 @@ public sealed class VisualConformanceTests
         VisualSnapshotVerifier.VerifyOrCreate(
           snapshotName: "aligned-wrapped-text-with-line-height.png",
           actualPng: image.Data,
-          perChannelTolerance: 3,
+          perChannelTolerance: 0,
           maxDifferentPixels: 0);
     }
 
@@ -300,7 +300,7 @@ public sealed class VisualConformanceTests
         VisualSnapshotVerifier.VerifyOrCreate(
           snapshotName: "decoration-color-and-style.png",
           actualPng: image.Data,
-          perChannelTolerance: 3,
+          perChannelTolerance: 0,
           maxDifferentPixels: 0);
     }
 
@@ -339,7 +339,7 @@ public sealed class VisualConformanceTests
         VisualSnapshotVerifier.VerifyOrCreate(
           snapshotName: "text-indent-and-vertical-align.png",
           actualPng: image.Data,
-          perChannelTolerance: 3,
+          perChannelTolerance: 0,
           maxDifferentPixels: 0);
     }
 
@@ -369,7 +369,7 @@ public sealed class VisualConformanceTests
           VisualSnapshotVerifier.VerifyOrCreate(
             snapshotName: "web-safe-font-families.png",
             actualPng: image.Data,
-            perChannelTolerance: 3,
+            perChannelTolerance: 0,
             maxDifferentPixels: 0);
       }
 

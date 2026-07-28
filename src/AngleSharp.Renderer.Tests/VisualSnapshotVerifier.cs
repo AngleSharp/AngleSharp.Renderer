@@ -21,9 +21,10 @@ internal static class VisualSnapshotVerifier
         Directory.CreateDirectory(verificationAssetsPath);
         Directory.CreateDirectory(failureAssetsPath);
 
-        var baselinePath = Path.Combine(verificationAssetsPath, snapshotName);
-        var failurePath = Path.Combine(failureAssetsPath, snapshotName);
-        var diffPath = Path.Combine(failureAssetsPath, Path.GetFileNameWithoutExtension(snapshotName) + ".diff.png");
+        var platformSnapshotName = GetPlatformSnapshotName(snapshotName);
+        var baselinePath = Path.Combine(verificationAssetsPath, platformSnapshotName);
+        var failurePath = Path.Combine(failureAssetsPath, platformSnapshotName);
+        var diffPath = Path.Combine(failureAssetsPath, Path.GetFileNameWithoutExtension(platformSnapshotName) + ".diff.png");
 
         if (!File.Exists(baselinePath))
         {
@@ -32,7 +33,7 @@ internal static class VisualSnapshotVerifier
                 File.WriteAllBytes(failurePath, actualPng);
 
                 throw new XunitException(
-                    $"Missing baseline snapshot '{snapshotName}' while strict mode is enabled ({StrictModeEnvironmentVariable}=1). " +
+                    $"Missing baseline snapshot '{platformSnapshotName}' while strict mode is enabled ({StrictModeEnvironmentVariable}=1). " +
                     $"Create baseline at: {baselinePath}. Actual output written to: {failurePath}.");
             }
 
@@ -62,12 +63,47 @@ internal static class VisualSnapshotVerifier
         File.WriteAllBytes(diffPath, comparison.DiffPng);
 
         throw new XunitException(
-            $"Visual snapshot mismatch for '{snapshotName}'. " +
+            $"Visual snapshot mismatch for '{platformSnapshotName}'. " +
             $"Expected size {comparison.ExpectedWidth}x{comparison.ExpectedHeight}, " +
             $"actual size {comparison.ActualWidth}x{comparison.ActualHeight}, " +
             $"different pixels: {comparison.DifferentPixels} (allowed: {maxDifferentPixels}), " +
             $"channel tolerance: {perChannelTolerance}. " +
             $"Baseline: {baselinePath}. Failure output: {failurePath}. Diff output: {diffPath}.");
+    }
+
+    private static string GetPlatformSnapshotName(string snapshotName)
+    {
+        var platformSuffix = GetPlatformSuffix();
+        var directory = Path.GetDirectoryName(snapshotName);
+        var fileNameWithoutExtension = Path.GetFileNameWithoutExtension(snapshotName);
+        var extension = Path.GetExtension(snapshotName);
+        var platformFileName = string.IsNullOrEmpty(extension)
+            ? $"{fileNameWithoutExtension}.{platformSuffix}"
+            : $"{fileNameWithoutExtension}.{platformSuffix}{extension}";
+
+        return string.IsNullOrEmpty(directory)
+            ? platformFileName
+            : Path.Combine(directory, platformFileName);
+    }
+
+    private static string GetPlatformSuffix()
+    {
+        if (OperatingSystem.IsWindows())
+        {
+            return "windows";
+        }
+
+        if (OperatingSystem.IsLinux())
+        {
+            return "linux";
+        }
+
+        if (OperatingSystem.IsMacOS())
+        {
+            return "macos";
+        }
+
+        return Environment.OSVersion.Platform.ToString().ToLowerInvariant();
     }
 
     private static bool IsStrictModeEnabled()
