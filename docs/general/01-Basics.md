@@ -6,22 +6,40 @@ section: "AngleSharp.Renderer"
 
 ## Requirements
 
-You need to have AngleSharp installed already. This can be done via NuGet:
+AngleSharp.Renderer builds on top of AngleSharp and AngleSharp.Css. Install the packages you need via NuGet:
 
 ```ps1
 Install-Package AngleSharp
-```
-
-## Getting AngleSharp.Renderer over NuGet
-
-The simplest way of integrating AngleSharp.Renderer to your project is by using NuGet. You can install AngleSharp.Renderer by opening the package manager console (PM) and typing in the following statement:
-
-```ps1
+Install-Package AngleSharp.Css
 Install-Package AngleSharp.Renderer
 ```
 
-You can also use the graphical library package manager ("Manage NuGet Packages for Solution"). Searching for "AngleSharp.Renderer" in the official NuGet online feed will find this library.
+## Rendering Pipeline
 
-## Setting up AngleSharp.Renderer
+The renderer works in three steps:
 
-(tbd)
+1. AngleSharp parses the HTML document.
+2. AngleSharp.Css provides computed styles and the render tree.
+3. AngleSharp.Renderer converts the tree into a display list and rasterizes it with Skia.
+
+```cs
+using AngleSharp;
+using AngleSharp.Renderer;
+
+var context = BrowsingContext.New(Configuration.Default.WithCss());
+var document = await context.OpenAsync(request => request.Content("<html><body>Hello</body></html>"));
+
+var renderer = new HtmlRenderer();
+var image = renderer.RenderToPng(document);
+```
+
+## Text And Fonts
+
+The renderer supports basic text styling such as font size, weight, italic, alignment, spacing, and decoration.
+Generic font families like `serif`, `sans-serif`, and `monospace` are mapped to installed local fonts so they render as visibly different faces.
+
+If you want predictable output in visual tests, specify an explicit font family and keep the host environment consistent.
+
+## Visual Testing
+
+The test suite uses PNG snapshots under `verification-assets/`. Missing baselines are created automatically unless strict mode is enabled with `ANGLESHARP_SNAPSHOT_STRICT=1`.
