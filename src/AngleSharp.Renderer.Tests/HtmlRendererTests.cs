@@ -1,0 +1,724 @@
+using AngleSharp;
+using AngleSharp.Css;
+using AngleSharp.Renderer.Rendering;
+
+namespace AngleSharp.Renderer.Tests;
+
+public sealed class HtmlRendererTests
+{
+    [Fact]
+    public async Task BuildDisplayList_IncludesBackgroundAndTextCommands()
+    {
+        var document = await ParseAsync("<html><body><h1>Title</h1><p>Hello renderer world from AngleSharp.</p></body></html>");
+        var renderer = new HtmlRenderer();
+
+        var displayList = renderer.BuildDisplayList(document, new HtmlRenderOptions
+        {
+            Width = 360,
+            Height = 240,
+            FontSize = 16f,
+        });
+
+        Assert.NotEmpty(displayList.Commands);
+        Assert.IsType<FillRectCommand>(displayList.Commands[0]);
+        Assert.Contains(displayList.Commands, command => command is DrawTextCommand);
+    }
+
+    [Fact]
+    public async Task RenderToPng_ReturnsPngPayload()
+    {
+        var document = await ParseAsync("<html><body><p>PNG smoke test output.</p></body></html>");
+        var renderer = new HtmlRenderer();
+
+        var image = renderer.RenderToPng(document, new HtmlRenderOptions
+        {
+            Width = 320,
+            Height = 180,
+        });
+
+        Assert.Equal("image/png", image.MimeType);
+        Assert.True(image.Data.Length > 8);
+        Assert.Equal(0x89, image.Data[0]);
+        Assert.Equal((byte)'P', image.Data[1]);
+        Assert.Equal((byte)'N', image.Data[2]);
+        Assert.Equal((byte)'G', image.Data[3]);
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_RendersBoxBackgroundFromPaddingAndMargins()
+    {
+        var document = await ParseAsync("""
+            <html><body>
+                <div style="margin:10px; padding:5px; width:100px; height:20px; background-color:#ff0000;"></div>
+            </body></html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, new HtmlRenderOptions
+        {
+            Width = 300,
+            Height = 200,
+            Padding = 0f,
+            ParagraphSpacing = 0f,
+        });
+
+        var backgrounds = displayList.Commands.OfType<FillRectCommand>().ToArray();
+        Assert.True(backgrounds.Length >= 2);
+
+        var boxBackground = backgrounds[1];
+        Assert.Equal(10f, boxBackground.Rect.X);
+        Assert.Equal(10f, boxBackground.Rect.Y);
+        Assert.Equal(110f, boxBackground.Rect.Width);
+        Assert.Equal(30f, boxBackground.Rect.Height);
+        Assert.Equal(new RenderColor(255, 0, 0), boxBackground.Color);
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_RendersPerSideBorderWidths()
+    {
+        var document = await ParseAsync("""
+            <html><body>
+                <div style="width:100px; height:20px; border-top-width:2px; border-right-width:3px; border-bottom-width:4px; border-left-width:5px; border-color:#0000ff;"></div>
+            </body></html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, new HtmlRenderOptions
+        {
+            Width = 300,
+            Height = 200,
+            Padding = 0f,
+            ParagraphSpacing = 0f,
+        });
+
+        var fills = displayList.Commands.OfType<FillRectCommand>().ToArray();
+        Assert.True(fills.Length >= 5);
+
+        var top = fills[1];
+        var right = fills[2];
+        var bottom = fills[3];
+        var left = fills[4];
+
+        Assert.Equal(2f, top.Rect.Height);
+        Assert.Equal(3f, right.Rect.Width);
+        Assert.Equal(4f, bottom.Rect.Height);
+        Assert.Equal(5f, left.Rect.Width);
+
+        Assert.Equal(new RenderColor(0, 0, 255), top.Color);
+        Assert.Equal(new RenderColor(0, 0, 255), right.Color);
+        Assert.Equal(new RenderColor(0, 0, 255), bottom.Color);
+        Assert.Equal(new RenderColor(0, 0, 255), left.Color);
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_ResolvesPercentageWidthAgainstContainingBlock()
+    {
+        var document = await ParseAsync("""
+            <html><body>
+                <div style="width:50%; height:10px; background-color:#00ff00;"></div>
+            </body></html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, new HtmlRenderOptions
+        {
+            Width = 300,
+            Height = 150,
+            Padding = 0f,
+            ParagraphSpacing = 0f,
+        });
+
+        var fills = displayList.Commands.OfType<FillRectCommand>().ToArray();
+        Assert.True(fills.Length >= 2);
+
+        var boxBackground = fills[1];
+        Assert.Equal(150f, boxBackground.Rect.Width);
+        Assert.Equal(10f, boxBackground.Rect.Height);
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_CentersBlockWithAutoHorizontalMargins()
+    {
+        var document = await ParseAsync("""
+            <html><body>
+                <div style="width:100px; height:10px; margin-left:auto; margin-right:auto; background-color:#00ff00;"></div>
+            </body></html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, new HtmlRenderOptions
+        {
+            Width = 300,
+            Height = 150,
+            Padding = 0f,
+            ParagraphSpacing = 0f,
+        });
+
+        var fills = displayList.Commands.OfType<FillRectCommand>().ToArray();
+        Assert.True(fills.Length >= 2);
+
+        var boxBackground = fills[1];
+        Assert.Equal(100f, boxBackground.Rect.X);
+        Assert.Equal(100f, boxBackground.Rect.Width);
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_CollapsesAdjacentVerticalMargins()
+    {
+        var document = await ParseAsync("""
+            <html><body>
+                <div style="height:10px; margin-bottom:20px; background-color:#ff0000;"></div>
+                <div style="height:10px; margin-top:10px; background-color:#0000ff;"></div>
+            </body></html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, new HtmlRenderOptions
+        {
+            Width = 300,
+            Height = 200,
+            Padding = 0f,
+            ParagraphSpacing = 0f,
+        });
+
+        var fills = displayList.Commands.OfType<FillRectCommand>().ToArray();
+        Assert.True(fills.Length >= 3);
+
+        var firstBox = fills[1];
+        var secondBox = fills[2];
+
+        Assert.Equal(0f, firstBox.Rect.Y);
+        Assert.Equal(30f, secondBox.Rect.Y);
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_CollapsesParentAndFirstChildTopMargins()
+    {
+        var document = await ParseAsync("""
+            <html><body>
+                <div style="margin-top:10px; background-color:#eeeeee;">
+                    <div style="margin-top:20px; height:10px; background-color:#ff0000;"></div>
+                </div>
+            </body></html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, new HtmlRenderOptions
+        {
+            Width = 320,
+            Height = 240,
+            Padding = 0f,
+            ParagraphSpacing = 0f,
+        });
+
+        var fills = displayList.Commands.OfType<FillRectCommand>().ToArray();
+        Assert.True(fills.Length >= 3);
+
+        var parentBackground = fills.Single(f => f.Color.Equals(new RenderColor(0xee, 0xee, 0xee)));
+        var childBackground = fills.Single(f => f.Color.Equals(new RenderColor(255, 0, 0)));
+
+        Assert.Equal(20f, parentBackground.Rect.Y);
+        Assert.Equal(20f, childBackground.Rect.Y);
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_DoesNotCollapseParentAndFirstChildTopMarginsWhenParentHasPadding()
+    {
+        var document = await ParseAsync("""
+            <html><body>
+                <div style="margin-top:10px; padding-top:1px; background-color:#eeeeee;">
+                    <div style="margin-top:20px; height:10px; background-color:#ff0000;"></div>
+                </div>
+            </body></html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, new HtmlRenderOptions
+        {
+            Width = 320,
+            Height = 240,
+            Padding = 0f,
+            ParagraphSpacing = 0f,
+        });
+
+        var fills = displayList.Commands.OfType<FillRectCommand>().ToArray();
+        Assert.True(fills.Length >= 3);
+
+        var parentBackground = fills.Single(f => f.Color.Equals(new RenderColor(0xee, 0xee, 0xee)));
+        var childBackground = fills.Single(f => f.Color.Equals(new RenderColor(255, 0, 0)));
+
+        Assert.Equal(10f, parentBackground.Rect.Y);
+        Assert.Equal(31f, childBackground.Rect.Y);
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_CollapsesParentAndLastChildBottomMargins()
+    {
+        var document = await ParseAsync("""
+            <html><body>
+                <div style="margin-bottom:10px; background-color:#eeeeee;">
+                    <div style="height:10px; margin-bottom:20px; background-color:#ff0000;"></div>
+                </div>
+                <div style="height:10px; background-color:#0000ff;"></div>
+            </body></html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, new HtmlRenderOptions
+        {
+            Width = 320,
+            Height = 260,
+            Padding = 0f,
+            ParagraphSpacing = 0f,
+        });
+
+        var fills = displayList.Commands.OfType<FillRectCommand>().ToArray();
+        var nextSibling = fills.Single(f => f.Color.Equals(new RenderColor(0, 0, 255)));
+
+        Assert.Equal(30f, nextSibling.Rect.Y);
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_DoesNotPaintBorderWhenStyleIsNone()
+    {
+        var document = await ParseAsync("""
+            <html><body>
+                <div style="width:100px; height:20px; border:5px none #ff0000; background-color:#00ff00;"></div>
+            </body></html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, new HtmlRenderOptions
+        {
+            Width = 300,
+            Height = 200,
+            Padding = 0f,
+            ParagraphSpacing = 0f,
+        });
+
+        var fills = displayList.Commands.OfType<FillRectCommand>().ToArray();
+        var redBorderFills = fills.Where(f => f.Color.Equals(new RenderColor(255, 0, 0))).ToArray();
+        Assert.Empty(redBorderFills);
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_DoesNotPaintDisplayNoneElement()
+    {
+        var document = await ParseAsync("""
+            <html><body>
+                <div style="display:none; width:50px; height:20px; background-color:#ff0000;"></div>
+            </body></html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, new HtmlRenderOptions
+        {
+            Width = 200,
+            Height = 120,
+            Padding = 0f,
+            ParagraphSpacing = 0f,
+        });
+
+        var fills = displayList.Commands.OfType<FillRectCommand>().ToArray();
+        Assert.Single(fills);
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_DoesNotPaintVisibilityHiddenElement()
+    {
+        var document = await ParseAsync("""
+            <html><body>
+                <div style="visibility:hidden; width:50px; height:20px; background-color:#ff0000;"></div>
+            </body></html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, new HtmlRenderOptions
+        {
+            Width = 200,
+            Height = 120,
+            Padding = 0f,
+            ParagraphSpacing = 0f,
+        });
+
+        var fills = displayList.Commands.OfType<FillRectCommand>().ToArray();
+        Assert.Single(fills);
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_RendersInlineBlockBox()
+    {
+        var document = await ParseAsync("""
+            <html><body>
+                <span style="display:inline-block; width:40px; height:12px; background-color:#ff0000;"></span>
+            </body></html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, new HtmlRenderOptions
+        {
+            Width = 200,
+            Height = 120,
+            Padding = 0f,
+            ParagraphSpacing = 0f,
+        });
+
+        var redFill = displayList.Commands
+            .OfType<FillRectCommand>()
+            .SingleOrDefault(f => f.Color.Equals(new RenderColor(255, 0, 0)));
+
+        Assert.NotNull(redFill);
+        Assert.Equal(40f, redFill.Rect.Width);
+        Assert.Equal(12f, redFill.Rect.Height);
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_RespectsDisplayBlock()
+    {
+        var document = await ParseAsync("""
+            <html><body>
+                <div style="display:block; width:60px; height:10px; background-color:#00ff00;"></div>
+            </body></html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, new HtmlRenderOptions
+        {
+            Width = 200,
+            Height = 120,
+            Padding = 0f,
+            ParagraphSpacing = 0f,
+        });
+
+        var greenFill = displayList.Commands
+            .OfType<FillRectCommand>()
+            .Single(f => f.Color.Equals(new RenderColor(0, 255, 0)));
+
+        Assert.Equal(60f, greenFill.Rect.Width);
+        Assert.Equal(10f, greenFill.Rect.Height);
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_TreatsInvalidDisplayFixedAsDefaultBlock()
+    {
+        var document = await ParseAsync("""
+            <html><body>
+                <div style="display:fixed; height:10px; background-color:#ff0000;"></div>
+            </body></html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, new HtmlRenderOptions
+        {
+            Width = 180,
+            Height = 80,
+            Padding = 0f,
+            ParagraphSpacing = 0f,
+        });
+
+        var redFill = displayList.Commands
+            .OfType<FillRectCommand>()
+            .Single(f => f.Color.Equals(new RenderColor(255, 0, 0)));
+
+        Assert.Equal(180f, redFill.Rect.Width);
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_TreatsInvalidDisplayRelativeAsDefaultBlock()
+    {
+        var document = await ParseAsync("""
+            <html><body>
+                <div style="display:relative; height:10px; background-color:#0000ff;"></div>
+            </body></html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, new HtmlRenderOptions
+        {
+            Width = 180,
+            Height = 80,
+            Padding = 0f,
+            ParagraphSpacing = 0f,
+        });
+
+        var blueFill = displayList.Commands
+            .OfType<FillRectCommand>()
+            .Single(f => f.Color.Equals(new RenderColor(0, 0, 255)));
+
+        Assert.Equal(180f, blueFill.Rect.Width);
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_FloatsLeftAndWrapsFollowingBlock()
+    {
+        var document = await ParseAsync("""
+            <html><body>
+                <div style="float:left; width:50px; height:20px; background-color:#ff0000;"></div>
+                <div style="width:40px; height:10px; background-color:#0000ff;"></div>
+            </body></html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, new HtmlRenderOptions
+        {
+            Width = 180,
+            Height = 100,
+            Padding = 0f,
+            ParagraphSpacing = 0f,
+        });
+
+        var fills = displayList.Commands.OfType<FillRectCommand>().ToArray();
+        var floatBox = fills.Single(f => f.Color.Equals(new RenderColor(255, 0, 0)));
+        var normalBox = fills.Single(f => f.Color.Equals(new RenderColor(0, 0, 255)));
+
+        Assert.Equal(0f, floatBox.Rect.X);
+        Assert.Equal(0f, floatBox.Rect.Y);
+        Assert.Equal(50f, floatBox.Rect.Width);
+        Assert.Equal(20f, floatBox.Rect.Height);
+
+        Assert.Equal(50f, normalBox.Rect.X);
+        Assert.Equal(0f, normalBox.Rect.Y);
+        Assert.Equal(40f, normalBox.Rect.Width);
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_AppliesRelativePositionOffsetWithoutChangingFlow()
+    {
+        var document = await ParseAsync("""
+            <html><body>
+                <div style="position:relative; left:20px; top:5px; width:40px; height:10px; background-color:#ff0000;"></div>
+                <div style="width:40px; height:10px; background-color:#0000ff;"></div>
+            </body></html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, new HtmlRenderOptions
+        {
+            Width = 200,
+            Height = 120,
+            Padding = 0f,
+            ParagraphSpacing = 0f,
+        });
+
+        var fills = displayList.Commands.OfType<FillRectCommand>().ToArray();
+        var relativeBox = fills.Single(f => f.Color.Equals(new RenderColor(255, 0, 0)));
+        var nextBlock = fills.Single(f => f.Color.Equals(new RenderColor(0, 0, 255)));
+
+        Assert.Equal(20f, relativeBox.Rect.X);
+        Assert.Equal(5f, relativeBox.Rect.Y);
+        Assert.Equal(10f, nextBlock.Rect.Y);
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_RendersFixedPositionRelativeToViewportAndExcludesFlow()
+    {
+        var document = await ParseAsync("""
+            <html><body>
+                <div style="position:fixed; left:15px; top:8px; width:30px; height:10px; background-color:#ff0000;"></div>
+                <div style="width:30px; height:10px; background-color:#0000ff;"></div>
+            </body></html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, new HtmlRenderOptions
+        {
+            Width = 200,
+            Height = 120,
+            Padding = 0f,
+            ParagraphSpacing = 0f,
+        });
+
+        var fills = displayList.Commands.OfType<FillRectCommand>().ToArray();
+        var fixedBox = fills.Single(f => f.Color.Equals(new RenderColor(255, 0, 0)));
+        var normalBox = fills.Single(f => f.Color.Equals(new RenderColor(0, 0, 255)));
+
+        Assert.Equal(15f, fixedBox.Rect.X);
+        Assert.Equal(8f, fixedBox.Rect.Y);
+        Assert.Equal(0f, normalBox.Rect.Y);
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_DistinguishesPaddingFromMargin()
+    {
+        var document = await ParseAsync("""
+            <html><body>
+                <div style="margin-left:10px; margin-top:4px; padding-left:5px; padding-right:7px; width:20px; height:10px; background-color:#ff0000;"></div>
+            </body></html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, new HtmlRenderOptions
+        {
+            Width = 220,
+            Height = 120,
+            Padding = 0f,
+            ParagraphSpacing = 0f,
+        });
+
+        var redFill = displayList.Commands
+            .OfType<FillRectCommand>()
+            .Single(f => f.Color.Equals(new RenderColor(255, 0, 0)));
+
+        Assert.Equal(10f, redFill.Rect.X);
+        Assert.Equal(4f, redFill.Rect.Y);
+        Assert.Equal(32f, redFill.Rect.Width);
+        Assert.Equal(10f, redFill.Rect.Height);
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_PaintsOutlineOutsideBorderWithoutChangingFlow()
+    {
+        var document = await ParseAsync("""
+            <html><body>
+                <div style="width:40px; height:10px; background-color:#ff0000; outline:3px solid #0000ff;"></div>
+                <div style="width:40px; height:10px; background-color:#00ff00;"></div>
+            </body></html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, new HtmlRenderOptions
+        {
+            Width = 200,
+            Height = 120,
+            Padding = 0f,
+            ParagraphSpacing = 0f,
+        });
+
+        var fills = displayList.Commands.OfType<FillRectCommand>().ToArray();
+        var greenBox = fills.Single(f => f.Color.Equals(new RenderColor(0, 255, 0)));
+        var outlineTop = fills.SingleOrDefault(f =>
+            f.Color.Equals(new RenderColor(0, 0, 255)) &&
+            f.Rect.X == -3f &&
+            f.Rect.Y == -3f &&
+            f.Rect.Width == 46f &&
+            f.Rect.Height == 3f);
+
+        Assert.NotNull(outlineTop);
+        Assert.Equal(10f, greenBox.Rect.Y);
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_RendersAbsolutePositionRelativeToContainingBlockAndExcludesFlow()
+    {
+        var document = await ParseAsync("""
+            <html><body>
+                <div style="position:relative; width:100px; height:20px; background-color:#eeeeee;">
+                    <div style="position:absolute; left:12px; top:6px; width:30px; height:10px; background-color:#ff0000;"></div>
+                </div>
+                <div style="width:40px; height:10px; background-color:#0000ff;"></div>
+            </body></html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, new HtmlRenderOptions
+        {
+            Width = 240,
+            Height = 140,
+            Padding = 0f,
+            ParagraphSpacing = 0f,
+        });
+
+        var fills = displayList.Commands.OfType<FillRectCommand>().ToArray();
+        var absoluteBox = fills.Single(f => f.Color.Equals(new RenderColor(255, 0, 0)));
+        var nextFlowBox = fills.Single(f => f.Color.Equals(new RenderColor(0, 0, 255)));
+
+        Assert.Equal(12f, absoluteBox.Rect.X);
+        Assert.Equal(6f, absoluteBox.Rect.Y);
+        Assert.Equal(20f, nextFlowBox.Rect.Y);
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_PaintsHigherZIndexAfterLowerForPositionedOverlaps()
+    {
+        var document = await ParseAsync("""
+            <html><body>
+                <div style="position:relative; width:120px; height:40px;">
+                    <div style="position:absolute; left:10px; top:5px; width:30px; height:20px; background-color:#ff0000; z-index:1;"></div>
+                    <div style="position:absolute; left:10px; top:5px; width:30px; height:20px; background-color:#0000ff; z-index:2;"></div>
+                </div>
+            </body></html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, new HtmlRenderOptions
+        {
+            Width = 220,
+            Height = 120,
+            Padding = 0f,
+            ParagraphSpacing = 0f,
+        });
+
+        var fills = displayList.Commands.OfType<FillRectCommand>().ToArray();
+        var redIndex = Array.FindIndex(fills, f => f.Color.Equals(new RenderColor(255, 0, 0)));
+        var blueIndex = Array.FindIndex(fills, f => f.Color.Equals(new RenderColor(0, 0, 255)));
+
+        Assert.True(redIndex >= 0);
+        Assert.True(blueIndex >= 0);
+        Assert.True(blueIndex > redIndex);
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_PaintsNegativeZIndexBeforeInFlowBackground()
+    {
+        var document = await ParseAsync("""
+            <html><body>
+                <div style="position:relative; width:120px; height:30px; background-color:#00ff00;">
+                    <div style="position:absolute; left:0; top:0; width:30px; height:10px; background-color:#ff0000; z-index:-1;"></div>
+                </div>
+            </body></html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, new HtmlRenderOptions
+        {
+            Width = 220,
+            Height = 120,
+            Padding = 0f,
+            ParagraphSpacing = 0f,
+        });
+
+        var fills = displayList.Commands.OfType<FillRectCommand>().ToArray();
+        var greenIndex = Array.FindIndex(fills, f => f.Color.Equals(new RenderColor(0, 255, 0)));
+        var redIndex = Array.FindIndex(fills, f => f.Color.Equals(new RenderColor(255, 0, 0)));
+
+        Assert.True(greenIndex >= 0);
+        Assert.True(redIndex >= 0);
+        Assert.True(redIndex < greenIndex);
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_UsesZIndexOverSourceOrderForPositionedSiblings()
+    {
+        var document = await ParseAsync("""
+            <html><body>
+                <div style="position:relative; width:120px; height:40px;">
+                    <div style="position:absolute; left:10px; top:5px; width:30px; height:20px; background-color:#0000ff; z-index:2;"></div>
+                    <div style="position:absolute; left:10px; top:5px; width:30px; height:20px; background-color:#ff0000; z-index:1;"></div>
+                </div>
+            </body></html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, new HtmlRenderOptions
+        {
+            Width = 220,
+            Height = 120,
+            Padding = 0f,
+            ParagraphSpacing = 0f,
+        });
+
+        var fills = displayList.Commands.OfType<FillRectCommand>().ToArray();
+        var redIndex = Array.FindIndex(fills, f => f.Color.Equals(new RenderColor(255, 0, 0)));
+        var blueIndex = Array.FindIndex(fills, f => f.Color.Equals(new RenderColor(0, 0, 255)));
+
+        Assert.True(redIndex >= 0);
+        Assert.True(blueIndex >= 0);
+        Assert.True(blueIndex > redIndex);
+    }
+
+    private static async Task<AngleSharp.Dom.IDocument> ParseAsync(string html)
+    {
+        var context = BrowsingContext.New(Configuration.Default.WithCss());
+        return await context.OpenAsync(request => request.Content(html));
+    }
+}

@@ -1,6 +1,10 @@
 using System.Globalization;
+using System.Linq;
 using System.Text;
 
+using AngleSharp.Css;
+using AngleSharp.Css.Dom;
+using AngleSharp.Css.RenderTree;
 using AngleSharp.Dom;
 using AngleSharp.Renderer.Rendering;
 using AngleSharp.Renderer.Skia;
@@ -12,35 +16,6 @@ namespace AngleSharp.Renderer;
 /// </summary>
 public sealed class HtmlRenderer
 {
-    private static readonly HashSet<string> BlockElements =
-    [
-        "article", "aside", "blockquote", "div", "dl", "dt", "dd", "fieldset", "figcaption", "figure",
-        "footer", "form", "h1", "h2", "h3", "h4", "h5", "h6", "header", "hr", "li", "main", "nav",
-        "ol", "p", "pre", "section", "table", "ul",
-    ];
-
-    private static readonly Dictionary<string, RenderColor> NamedColors = new(StringComparer.OrdinalIgnoreCase)
-    {
-        ["transparent"] = RenderColor.Transparent,
-        ["black"] = new RenderColor(0, 0, 0),
-        ["white"] = new RenderColor(255, 255, 255),
-        ["red"] = new RenderColor(255, 0, 0),
-        ["green"] = new RenderColor(0, 128, 0),
-        ["blue"] = new RenderColor(0, 0, 255),
-        ["yellow"] = new RenderColor(255, 255, 0),
-        ["gray"] = new RenderColor(128, 128, 128),
-        ["grey"] = new RenderColor(128, 128, 128),
-        ["silver"] = new RenderColor(192, 192, 192),
-        ["maroon"] = new RenderColor(128, 0, 0),
-        ["purple"] = new RenderColor(128, 0, 128),
-        ["fuchsia"] = new RenderColor(255, 0, 255),
-        ["lime"] = new RenderColor(0, 255, 0),
-        ["olive"] = new RenderColor(128, 128, 0),
-        ["navy"] = new RenderColor(0, 0, 128),
-        ["teal"] = new RenderColor(0, 128, 128),
-        ["aqua"] = new RenderColor(0, 255, 255),
-    };
-
     private readonly IRenderBackend _backend;
 
     /// <summary>
@@ -98,11 +73,24 @@ public sealed class HtmlRenderer
         var displayList = new DisplayList();
         displayList.FillRect(new RenderRect(0f, 0f, viewport.Width, viewport.Height), options.BackgroundColor);
 
-        var root = document.Body ?? document.DocumentElement;
-        if (root is null)
+        var window = document.DefaultView;
+        if (window is null)
         {
             return displayList;
         }
+
+        var renderDevice = new DefaultRenderDevice
+        {
+            ViewPortWidth = viewport.Width,
+            ViewPortHeight = viewport.Height,
+            DeviceWidth = viewport.Width,
+            DeviceHeight = viewport.Height,
+            FontSize = options.FontSize,
+        };
+
+        var renderTree = window.Render(renderDevice);
+        var body = document.Body;
+        var root = body is null ? renderTree : renderTree.Find(body) ?? renderTree;
 
         var contentX = options.Padding;
         var contentY = options.Padding;
@@ -115,8 +103,12 @@ public sealed class HtmlRenderer
 
         var textStyle = new RenderTextStyle(options.FontSize, options.TextColor, options.FontFamily, options.LineHeightMultiplier);
         var cursorY = contentY;
+        var previousBlockMarginBottom = 0f;
+        var suppressNextBlockTopMargin = false;
+        var activeFloatLeftOffset = 0f;
+        var activeFloatBottom = 0f;
 
-        foreach (var child in root.ChildNodes)
+        foreach (var child in OrderChildrenForPainting(root.Children))
         {
             LayoutNode(
                 node: child,
@@ -124,6 +116,10 @@ public sealed class HtmlRenderer
                 containingY: contentY,
                 containingWidth: contentWidth,
                 cursorY: ref cursorY,
+                previousBlockMarginBottom: ref previousBlockMarginBottom,
+                suppressNextBlockTopMargin: ref suppressNextBlockTopMargin,
+                activeFloatLeftOffset: ref activeFloatLeftOffset,
+                activeFloatBottom: ref activeFloatBottom,
                 textStyle: textStyle,
                 options: options,
                 displayList: displayList,
@@ -139,11 +135,15 @@ public sealed class HtmlRenderer
     }
 
     private static void LayoutNode(
-        INode node,
+        IRenderNode node,
         float containingX,
         float containingY,
         float containingWidth,
         ref float cursorY,
+        ref float previousBlockMarginBottom,
+        ref bool suppressNextBlockTopMargin,
+        ref float activeFloatLeftOffset,
+        ref float activeFloatBottom,
         RenderTextStyle textStyle,
         HtmlRenderOptions options,
         DisplayList displayList,
@@ -151,11 +151,11 @@ public sealed class HtmlRenderer
     {
         switch (node)
         {
-            case IText textNode:
-                LayoutTextNode(textNode, containingX, containingWidth, ref cursorY, textStyle, options, displayList, maxY);
+            case TextRenderNode textNode:
+                LayoutTextNode(textNode.Ref, containingX, containingWidth, ref cursorY, ref previousBlockMarginBottom, ref suppressNextBlockTopMargin, ref activeFloatLeftOffset, ref activeFloatBottom, textStyle, options, displayList, maxY);
                 return;
-            case IElement element:
-                LayoutElement(element, containingX, containingY, containingWidth, ref cursorY, textStyle, options, displayList, maxY);
+            case ElementRenderNode element:
+                LayoutElement(element, containingX, containingY, containingWidth, ref cursorY, ref previousBlockMarginBottom, ref suppressNextBlockTopMargin, ref activeFloatLeftOffset, ref activeFloatBottom, textStyle, options, displayList, maxY);
                 return;
             default:
                 return;
@@ -163,17 +163,25 @@ public sealed class HtmlRenderer
     }
 
     private static void LayoutElement(
-        IElement element,
+        ElementRenderNode node,
         float containingX,
         float containingY,
         float containingWidth,
         ref float cursorY,
+        ref float previousBlockMarginBottom,
+        ref bool suppressNextBlockTopMargin,
+        ref float activeFloatLeftOffset,
+        ref float activeFloatBottom,
         RenderTextStyle inheritedTextStyle,
         HtmlRenderOptions options,
         DisplayList displayList,
         float maxY)
     {
-        if (IsHidden(element))
+        var element = node.Ref;
+        var computedStyle = node.ComputedStyle;
+        var styleMap = CreateStyleMap(node.ComputedStyle);
+
+        if (!node.IsVisible())
         {
             return;
         }
@@ -192,57 +200,141 @@ public sealed class HtmlRenderer
             return;
         }
 
-        var styleMap = ParseStyleMap(element.GetAttribute("style"));
+        var renderAsBlock = ShouldRenderAsBlock(computedStyle);
+        var isInlineBlock = IsInlineBlock(computedStyle);
+        var currentTextStyle = ResolveTextStyle(styleMap, inheritedTextStyle);
 
-        if (styleMap.TryGetValue("display", out var explicitDisplay) &&
-            string.Equals(explicitDisplay.Trim(), "none", StringComparison.OrdinalIgnoreCase))
+        if (cursorY >= activeFloatBottom)
         {
-            return;
+            activeFloatLeftOffset = 0f;
+            activeFloatBottom = 0f;
         }
 
-        var renderAsBlock = ShouldRenderAsBlock(tagName, styleMap);
-        var currentTextStyle = ResolveTextStyle(tagName, styleMap, inheritedTextStyle);
+        var localFloatLeftOffset = cursorY < activeFloatBottom ? activeFloatLeftOffset : 0f;
+        var flowContainingX = containingX + localFloatLeftOffset;
+        var flowContainingWidth = Math.Max(0f, containingWidth - localFloatLeftOffset);
 
         if (!renderAsBlock)
         {
+            if (isInlineBlock)
+            {
+                renderAsBlock = true;
+            }
+            else
+            {
             var inlineText = NormalizeWhitespace(element.TextContent ?? string.Empty);
             if (inlineText.Length > 0)
             {
-                LayoutWrappedText(inlineText, containingX, containingWidth, ref cursorY, currentTextStyle, options, displayList, maxY);
+                LayoutWrappedText(inlineText, flowContainingX, flowContainingWidth, ref cursorY, currentTextStyle, options, displayList, maxY);
             }
 
+            previousBlockMarginBottom = 0f;
+            suppressNextBlockTopMargin = false;
+
+            return;
+            }
+        }
+
+        if (flowContainingWidth <= 0f)
+        {
             return;
         }
 
         var box = ResolveBoxStyle(styleMap);
-        var marginTop = box.Margin.Top;
-        var marginRight = box.Margin.Right;
-        var marginBottom = box.Margin.Bottom;
-        var marginLeft = box.Margin.Left;
+        var marginTop = ParseLength(styleMap, "margin-top", flowContainingWidth, box.Margin.Top, allowAuto: false);
+        var marginBottom = ParseLength(styleMap, "margin-bottom", flowContainingWidth, box.Margin.Bottom, allowAuto: false);
+        var marginLeft = ParseLength(styleMap, "margin-left", flowContainingWidth, box.Margin.Left, allowAuto: true);
+        var marginRight = ParseLength(styleMap, "margin-right", flowContainingWidth, box.Margin.Right, allowAuto: true);
+
+        if (suppressNextBlockTopMargin)
+        {
+            marginTop = 0f;
+            suppressNextBlockTopMargin = false;
+        }
 
         var borderTop = box.BorderWidth.Top;
         var borderRight = box.BorderWidth.Right;
         var borderBottom = box.BorderWidth.Bottom;
         var borderLeft = box.BorderWidth.Left;
 
-        var paddingTop = box.Padding.Top;
-        var paddingRight = box.Padding.Right;
-        var paddingBottom = box.Padding.Bottom;
-        var paddingLeft = box.Padding.Left;
+        var paddingTop = ParseLength(styleMap, "padding-top", flowContainingWidth, box.Padding.Top, allowAuto: false);
+        var paddingRight = ParseLength(styleMap, "padding-right", flowContainingWidth, box.Padding.Right, allowAuto: false);
+        var paddingBottom = ParseLength(styleMap, "padding-bottom", flowContainingWidth, box.Padding.Bottom, allowAuto: false);
+        var paddingLeft = ParseLength(styleMap, "padding-left", flowContainingWidth, box.Padding.Left, allowAuto: false);
 
-        var specifiedContentWidth = ParseLength(styleMap, "width", containingWidth, float.NaN);
-        var availableWidth = containingWidth - marginLeft - marginRight - borderLeft - borderRight - paddingLeft - paddingRight;
-        var contentWidth = float.IsNaN(specifiedContentWidth) ? availableWidth : specifiedContentWidth;
-        contentWidth = Math.Max(0f, contentWidth);
+        var position = GetPosition(styleMap);
+        var isAbsolute = string.Equals(position, "absolute", StringComparison.OrdinalIgnoreCase);
+        var isFixed = string.Equals(position, "fixed", StringComparison.OrdinalIgnoreCase);
+        var isRelative = string.Equals(position, "relative", StringComparison.OrdinalIgnoreCase);
+        var isFloatLeft = string.Equals(GetFloat(styleMap), "left", StringComparison.OrdinalIgnoreCase);
 
-        var borderBoxX = containingX + marginLeft;
-        var borderBoxY = cursorY + marginTop;
+        if (isAbsolute || isFixed)
+        {
+            marginTop = 0f;
+            marginBottom = 0f;
+            marginLeft = 0f;
+            marginRight = 0f;
+        }
+
+        var collapseWithFirstChild = borderTop <= 0f && paddingTop <= 0f;
+        var effectiveMarginTop = marginTop;
+
+        if (collapseWithFirstChild &&
+            TryGetFirstCollapsibleChildTopMargin(node, flowContainingWidth, out var firstChildTopMargin))
+        {
+            effectiveMarginTop = CollapseMargins(marginTop, firstChildTopMargin);
+        }
+
+        var specifiedContentWidth = ParseLength(styleMap, "width", flowContainingWidth, float.NaN, allowAuto: true);
+        ResolveHorizontalMetrics(
+            flowContainingWidth,
+            specifiedContentWidth,
+            borderLeft,
+            borderRight,
+            paddingLeft,
+            paddingRight,
+            ref marginLeft,
+            ref marginRight,
+            out var contentWidth);
+
+        var collapsedMarginTop = (isAbsolute || isFixed) ? 0f : CollapseMargins(previousBlockMarginBottom, effectiveMarginTop);
+
+        var flowBorderBoxX = flowContainingX + marginLeft;
+        var flowBorderBoxY = cursorY + collapsedMarginTop;
+
+        var leftOffset = ParseLength(styleMap, "left", flowContainingWidth, 0f, allowAuto: true);
+        var topOffset = ParseLength(styleMap, "top", flowContainingWidth, 0f, allowAuto: true);
+
+        if (float.IsNaN(leftOffset))
+        {
+            leftOffset = 0f;
+        }
+
+        if (float.IsNaN(topOffset))
+        {
+            topOffset = 0f;
+        }
+
+        var borderBoxX = isFixed
+            ? options.Padding + leftOffset
+            : isAbsolute
+                ? containingX + leftOffset
+                : flowBorderBoxX + (isRelative ? leftOffset : 0f);
+        var borderBoxY = isFixed
+            ? options.Padding + topOffset
+            : isAbsolute
+                ? containingY + topOffset
+                : flowBorderBoxY + (isRelative ? topOffset : 0f);
         var contentX = borderBoxX + borderLeft + paddingLeft;
         var contentY = borderBoxY + borderTop + paddingTop;
 
         var childCursorY = contentY;
+        var childPreviousBlockMarginBottom = 0f;
+        var childSuppressNextBlockTopMargin = collapseWithFirstChild && !float.Equals(effectiveMarginTop, marginTop);
+        var childActiveFloatLeftOffset = 0f;
+        var childActiveFloatBottom = 0f;
 
-        foreach (var child in element.ChildNodes)
+        foreach (var child in OrderChildrenForPainting(node.Children))
         {
             LayoutNode(
                 node: child,
@@ -250,6 +342,10 @@ public sealed class HtmlRenderer
                 containingY: contentY,
                 containingWidth: contentWidth,
                 cursorY: ref childCursorY,
+                previousBlockMarginBottom: ref childPreviousBlockMarginBottom,
+                suppressNextBlockTopMargin: ref childSuppressNextBlockTopMargin,
+                activeFloatLeftOffset: ref childActiveFloatLeftOffset,
+                activeFloatBottom: ref childActiveFloatBottom,
                 textStyle: currentTextStyle,
                 options: options,
                 displayList: displayList,
@@ -262,16 +358,46 @@ public sealed class HtmlRenderer
         }
 
         var autoContentHeight = Math.Max(0f, childCursorY - contentY);
-        var specifiedContentHeight = ParseLength(styleMap, "height", containingWidth, float.NaN);
+        var specifiedContentHeight = ParseLength(styleMap, "height", flowContainingWidth, float.NaN, allowAuto: true);
         var contentHeight = float.IsNaN(specifiedContentHeight) ? autoContentHeight : Math.Max(specifiedContentHeight, autoContentHeight);
 
         var borderBoxWidth = borderLeft + paddingLeft + contentWidth + paddingRight + borderRight;
         var borderBoxHeight = borderTop + paddingTop + contentHeight + paddingBottom + borderBottom;
 
+        var canCollapseWithLastChild = borderBottom <= 0f &&
+                                      paddingBottom <= 0f &&
+                                      float.IsNaN(specifiedContentHeight);
+
+        var effectiveMarginBottom = marginBottom;
+
+        if (canCollapseWithLastChild)
+        {
+            effectiveMarginBottom = CollapseMargins(marginBottom, childPreviousBlockMarginBottom);
+        }
+
         PaintBackground(displayList, box.BackgroundColor, borderBoxX, borderBoxY, borderBoxWidth, borderBoxHeight);
         PaintBorder(displayList, box.BorderColor, borderBoxX, borderBoxY, borderBoxWidth, borderBoxHeight, box.BorderWidth);
+        PaintOutline(displayList, styleMap, borderBoxX, borderBoxY, borderBoxWidth, borderBoxHeight);
 
-        cursorY += marginTop + borderBoxHeight + marginBottom + options.ParagraphSpacing;
+        if (isFloatLeft)
+        {
+            var floatRightEdge = (flowBorderBoxX + borderBoxWidth) - containingX;
+            activeFloatLeftOffset = Math.Max(activeFloatLeftOffset, floatRightEdge);
+            activeFloatBottom = Math.Max(activeFloatBottom, flowBorderBoxY + borderBoxHeight + effectiveMarginBottom);
+            previousBlockMarginBottom = 0f;
+            suppressNextBlockTopMargin = false;
+            return;
+        }
+
+        if (isAbsolute || isFixed)
+        {
+            previousBlockMarginBottom = 0f;
+            suppressNextBlockTopMargin = false;
+            return;
+        }
+
+        cursorY = flowBorderBoxY + borderBoxHeight;
+        previousBlockMarginBottom = effectiveMarginBottom + options.ParagraphSpacing;
     }
 
     private static void LayoutTextNode(
@@ -279,6 +405,10 @@ public sealed class HtmlRenderer
         float containingX,
         float containingWidth,
         ref float cursorY,
+        ref float previousBlockMarginBottom,
+        ref bool suppressNextBlockTopMargin,
+        ref float activeFloatLeftOffset,
+        ref float activeFloatBottom,
         RenderTextStyle textStyle,
         HtmlRenderOptions options,
         DisplayList displayList,
@@ -291,7 +421,17 @@ public sealed class HtmlRenderer
             return;
         }
 
-        LayoutWrappedText(text, containingX, containingWidth, ref cursorY, textStyle, options, displayList, maxY);
+        previousBlockMarginBottom = 0f;
+        suppressNextBlockTopMargin = false;
+
+        if (cursorY >= activeFloatBottom)
+        {
+            activeFloatLeftOffset = 0f;
+            activeFloatBottom = 0f;
+        }
+
+        var localFloatLeftOffset = cursorY < activeFloatBottom ? activeFloatLeftOffset : 0f;
+        LayoutWrappedText(text, containingX + localFloatLeftOffset, containingWidth - localFloatLeftOffset, ref cursorY, textStyle, options, displayList, maxY);
     }
 
     private static void LayoutWrappedText(
@@ -320,40 +460,43 @@ public sealed class HtmlRenderer
         }
     }
 
-    private static bool ShouldRenderAsBlock(string tagName, Dictionary<string, string> styleMap)
+    private static bool ShouldRenderAsBlock(ICssStyleDeclaration computedStyle)
     {
-        if (styleMap.TryGetValue("display", out var display))
+        var display = computedStyle.GetDisplay();
+
+        if (!string.IsNullOrWhiteSpace(display))
         {
             var normalized = display.Trim().ToLowerInvariant();
+
+            if (normalized.Length == 0)
+            {
+                return true;
+            }
+
             return normalized switch
             {
+                "none" => false,
                 "inline" => false,
+                "inline-flex" => false,
+                "inline-grid" => false,
+                "inline-table" => false,
+                "contents" => false,
                 _ => true,
             };
         }
 
-        return IsBlockElement(tagName);
+        return true;
     }
 
-    private static bool IsBlockElement(string tagName) => BlockElements.Contains(tagName);
-
-    private static bool IsHidden(IElement element)
+    private static bool IsInlineBlock(ICssStyleDeclaration computedStyle)
     {
-        var style = element.GetAttribute("style");
-        if (string.IsNullOrWhiteSpace(style))
-        {
-            return false;
-        }
-
-        var normalized = style.Replace(" ", string.Empty, StringComparison.Ordinal).ToLowerInvariant();
-        return normalized.Contains("display:none", StringComparison.Ordinal) ||
-               normalized.Contains("visibility:hidden", StringComparison.Ordinal);
+        var display = computedStyle.GetDisplay();
+        return string.Equals(display?.Trim(), "inline-block", StringComparison.OrdinalIgnoreCase);
     }
 
-    private static RenderTextStyle ResolveTextStyle(string tagName, Dictionary<string, string> styleMap, RenderTextStyle inherited)
+    private static RenderTextStyle ResolveTextStyle(Dictionary<string, string> styleMap, RenderTextStyle inherited)
     {
-        var scale = GetScaleMultiplier(tagName);
-        var fontSize = ParseLength(styleMap, "font-size", inherited.FontSize, inherited.FontSize * scale);
+        var fontSize = ParseLength(styleMap, "font-size", inherited.FontSize, inherited.FontSize, allowAuto: false);
         var fontFamily = styleMap.TryGetValue("font-family", out var family) && !string.IsNullOrWhiteSpace(family)
             ? family.Trim('\'', '"', ' ')
             : inherited.FontFamily;
@@ -362,21 +505,6 @@ public sealed class HtmlRenderer
         var color = ParseColor(styleMap.TryGetValue("color", out var colorValue) ? colorValue : null, inherited.Color);
 
         return new RenderTextStyle(fontSize, color, fontFamily, lineHeight);
-    }
-
-    private static float GetScaleMultiplier(string tagName)
-    {
-        return tagName.ToLowerInvariant() switch
-        {
-            "h1" => 2.0f,
-            "h2" => 1.7f,
-            "h3" => 1.5f,
-            "h4" => 1.25f,
-            "h5" => 1.1f,
-            "h6" => 1.0f,
-            "small" => 0.85f,
-            _ => 1f,
-        };
     }
 
     private static float ParseLineHeight(Dictionary<string, string> styleMap, float defaultValue)
@@ -402,149 +530,326 @@ public sealed class HtmlRenderer
         return defaultValue;
     }
 
-    private static Dictionary<string, string> ParseStyleMap(string? style)
+    private static Dictionary<string, string> CreateStyleMap(ICssStyleDeclaration style)
     {
         var map = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
 
-        if (string.IsNullOrWhiteSpace(style))
-        {
-            return map;
-        }
+        AddIfPresent(map, "display", style.GetDisplay());
+        AddIfPresent(map, "visibility", style.GetVisibility());
+        AddIfPresent(map, "width", style.GetWidth());
+        AddIfPresent(map, "height", style.GetHeight());
+        AddIfPresent(map, "position", style.GetPropertyValue("position"));
+        AddIfPresent(map, "left", style.GetPropertyValue("left"));
+        AddIfPresent(map, "top", style.GetPropertyValue("top"));
+        AddIfPresent(map, "float", style.GetPropertyValue("float"));
+        AddIfPresent(map, "z-index", style.GetPropertyValue("z-index"));
 
-        var declarations = style.Split(';', StringSplitOptions.RemoveEmptyEntries);
+        AddIfPresent(map, "margin-top", style.GetMarginTop());
+        AddIfPresent(map, "margin-right", style.GetMarginRight());
+        AddIfPresent(map, "margin-bottom", style.GetMarginBottom());
+        AddIfPresent(map, "margin-left", style.GetMarginLeft());
 
-        foreach (var declaration in declarations)
-        {
-            var separator = declaration.IndexOf(':');
-            if (separator < 0)
-            {
-                continue;
-            }
+        AddIfPresent(map, "padding-top", style.GetPaddingTop());
+        AddIfPresent(map, "padding-right", style.GetPaddingRight());
+        AddIfPresent(map, "padding-bottom", style.GetPaddingBottom());
+        AddIfPresent(map, "padding-left", style.GetPaddingLeft());
 
-            var property = declaration[..separator].Trim().ToLowerInvariant();
-            var value = declaration[(separator + 1)..].Trim();
+        AddIfPresent(map, "border-top-width", style.GetBorderTopWidth());
+        AddIfPresent(map, "border-right-width", style.GetBorderRightWidth());
+        AddIfPresent(map, "border-bottom-width", style.GetBorderBottomWidth());
+        AddIfPresent(map, "border-left-width", style.GetBorderLeftWidth());
 
-            if (property.Length == 0 || value.Length == 0)
-            {
-                continue;
-            }
+        AddIfPresent(map, "border-top-style", style.GetBorderTopStyle());
+        AddIfPresent(map, "border-right-style", style.GetBorderRightStyle());
+        AddIfPresent(map, "border-bottom-style", style.GetBorderBottomStyle());
+        AddIfPresent(map, "border-left-style", style.GetBorderLeftStyle());
 
-            map[property] = value;
-        }
+        AddIfPresent(map, "border-top-color", style.GetBorderTopColor());
+        AddIfPresent(map, "border-right-color", style.GetBorderRightColor());
+        AddIfPresent(map, "border-bottom-color", style.GetBorderBottomColor());
+        AddIfPresent(map, "border-left-color", style.GetBorderLeftColor());
+
+        AddIfPresent(map, "outline-width", style.GetPropertyValue("outline-width"));
+        AddIfPresent(map, "outline-style", style.GetPropertyValue("outline-style"));
+        AddIfPresent(map, "outline-color", style.GetPropertyValue("outline-color"));
+
+        AddIfPresent(map, "background-color", style.GetBackgroundColor());
+        AddIfPresent(map, "font-size", style.GetFontSize());
+        AddIfPresent(map, "font-family", style.GetFontFamily());
+        AddIfPresent(map, "line-height", style.GetLineHeight());
+        AddIfPresent(map, "color", style.GetColor());
 
         return map;
     }
 
+    private static void AddIfPresent(Dictionary<string, string> map, string property, string? value)
+    {
+        if (!string.IsNullOrWhiteSpace(value))
+        {
+            map[property] = value;
+        }
+    }
+
+    private static bool TryGetFirstCollapsibleChildTopMargin(ElementRenderNode node, float containingWidth, out float marginTop)
+    {
+        foreach (var child in node.Children)
+        {
+            if (child is TextRenderNode textNode)
+            {
+                if (NormalizeWhitespace(textNode.Ref.Data).Length > 0)
+                {
+                    marginTop = 0f;
+                    return false;
+                }
+
+                continue;
+            }
+
+            if (child is not ElementRenderNode childElement)
+            {
+                continue;
+            }
+
+            if (!childElement.IsVisible())
+            {
+                continue;
+            }
+
+            var tagName = childElement.Ref.LocalName;
+
+            if (string.Equals(tagName, "script", StringComparison.OrdinalIgnoreCase) ||
+                string.Equals(tagName, "style", StringComparison.OrdinalIgnoreCase))
+            {
+                continue;
+            }
+
+            if (!ShouldRenderAsBlock(childElement.ComputedStyle))
+            {
+                marginTop = 0f;
+                return false;
+            }
+
+            var childStyle = CreateStyleMap(childElement.ComputedStyle);
+            marginTop = ParseLength(childStyle, "margin-top", containingWidth, 0f, allowAuto: false);
+            return true;
+        }
+
+        marginTop = 0f;
+        return false;
+    }
+
+    private static IEnumerable<IRenderNode> OrderChildrenForPainting(IEnumerable<IRenderNode> children)
+    {
+        var negatives = new List<(IRenderNode Node, int Z, int Index)>();
+        var flow = new List<(IRenderNode Node, int Index)>();
+        var nonNegatives = new List<(IRenderNode Node, int Z, int Index)>();
+
+        var index = 0;
+
+        foreach (var child in children)
+        {
+            if (child is ElementRenderNode elementChild)
+            {
+                var childStyleMap = CreateStyleMap(elementChild.ComputedStyle);
+
+                if (IsOutOfFlowPositioned(childStyleMap))
+                {
+                    var z = ParseZIndex(childStyleMap);
+
+                    if (z < 0)
+                    {
+                        negatives.Add((child, z, index));
+                    }
+                    else
+                    {
+                        nonNegatives.Add((child, z, index));
+                    }
+
+                    index++;
+                    continue;
+                }
+            }
+
+            flow.Add((child, index));
+            index++;
+        }
+
+        foreach (var entry in negatives.OrderBy(m => m.Z).ThenBy(m => m.Index))
+        {
+            yield return entry.Node;
+        }
+
+        foreach (var entry in flow.OrderBy(m => m.Index))
+        {
+            yield return entry.Node;
+        }
+
+        foreach (var entry in nonNegatives.OrderBy(m => m.Z).ThenBy(m => m.Index))
+        {
+            yield return entry.Node;
+        }
+    }
+
+    private static bool IsOutOfFlowPositioned(Dictionary<string, string> styleMap)
+    {
+        var position = GetPosition(styleMap);
+        return string.Equals(position, "absolute", StringComparison.OrdinalIgnoreCase) ||
+               string.Equals(position, "fixed", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static int ParseZIndex(Dictionary<string, string> styleMap)
+    {
+        if (!styleMap.TryGetValue("z-index", out var value) || string.IsNullOrWhiteSpace(value))
+        {
+            return 0;
+        }
+
+        var normalized = value.Trim().ToLowerInvariant();
+
+        if (string.Equals(normalized, "auto", StringComparison.Ordinal))
+        {
+            return 0;
+        }
+
+        return int.TryParse(normalized, NumberStyles.Integer, CultureInfo.InvariantCulture, out var z)
+            ? z
+            : 0;
+    }
+
     private static BoxStyle ResolveBoxStyle(Dictionary<string, string> styleMap)
     {
-        var margin = ResolveEdgeSizes(styleMap, "margin", defaultValue: 0f);
-        var padding = ResolveEdgeSizes(styleMap, "padding", defaultValue: 0f);
-        var borderWidth = ResolveEdgeSizes(styleMap, "border-width", defaultValue: 0f);
+        var margin = new EdgeSizes(
+            Top: ParseLength(styleMap, "margin-top", 0f, 0f, allowAuto: false),
+            Right: ParseLength(styleMap, "margin-right", 0f, 0f, allowAuto: true),
+            Bottom: ParseLength(styleMap, "margin-bottom", 0f, 0f, allowAuto: false),
+            Left: ParseLength(styleMap, "margin-left", 0f, 0f, allowAuto: true));
 
-        if (styleMap.TryGetValue("border", out var borderShorthand))
-        {
-            borderWidth = ResolveBorderWidthFromShorthand(borderShorthand, borderWidth);
-        }
+        var padding = new EdgeSizes(
+            Top: ParseLength(styleMap, "padding-top", 0f, 0f, allowAuto: false),
+            Right: ParseLength(styleMap, "padding-right", 0f, 0f, allowAuto: false),
+            Bottom: ParseLength(styleMap, "padding-bottom", 0f, 0f, allowAuto: false),
+            Left: ParseLength(styleMap, "padding-left", 0f, 0f, allowAuto: false));
 
-        borderWidth = borderWidth with
-        {
-            Top = ParseLength(styleMap, "border-top-width", 0f, borderWidth.Top),
-            Right = ParseLength(styleMap, "border-right-width", 0f, borderWidth.Right),
-            Bottom = ParseLength(styleMap, "border-bottom-width", 0f, borderWidth.Bottom),
-            Left = ParseLength(styleMap, "border-left-width", 0f, borderWidth.Left),
-        };
+        var borderWidth = new EdgeSizes(
+            Top: ParseLength(styleMap, "border-top-width", 0f, 0f, allowAuto: false),
+            Right: ParseLength(styleMap, "border-right-width", 0f, 0f, allowAuto: false),
+            Bottom: ParseLength(styleMap, "border-bottom-width", 0f, 0f, allowAuto: false),
+            Left: ParseLength(styleMap, "border-left-width", 0f, 0f, allowAuto: false));
+
+        var borderStyle = ResolveBorderStyles(styleMap);
+
+        borderWidth = ApplyBorderStyleToWidths(borderWidth, borderStyle);
 
         var backgroundColor = ParseColor(styleMap.TryGetValue("background-color", out var background) ? background : null, RenderColor.Transparent);
-        var borderColor = ParseColor(styleMap.TryGetValue("border-color", out var borderColorValue) ? borderColorValue : null, RenderColor.Black);
-
-        if (styleMap.TryGetValue("border", out var borderValue))
-        {
-            var colorFromBorder = ParseBorderColorFromShorthand(borderValue);
-            if (colorFromBorder is not null)
-            {
-                borderColor = colorFromBorder.Value;
-            }
-        }
+        var borderColor = ParseColor(
+            styleMap.TryGetValue("border-top-color", out var topColor) ? topColor :
+            styleMap.TryGetValue("border-right-color", out var rightColor) ? rightColor :
+            styleMap.TryGetValue("border-bottom-color", out var bottomColor) ? bottomColor :
+            styleMap.TryGetValue("border-left-color", out var leftColor) ? leftColor :
+            null,
+            RenderColor.Black);
 
         return new BoxStyle(margin, padding, borderWidth, backgroundColor, borderColor);
     }
 
-    private static EdgeSizes ResolveEdgeSizes(Dictionary<string, string> styleMap, string propertyName, float defaultValue)
+    private static EdgeBorderStyle ResolveBorderStyles(Dictionary<string, string> styleMap)
     {
-        var edges = new EdgeSizes(defaultValue, defaultValue, defaultValue, defaultValue);
+        var top = styleMap.TryGetValue("border-top-style", out var topStyle)
+            ? ParseBorderStyleToken(topStyle)
+            : BorderStyleKind.Solid;
+        var right = styleMap.TryGetValue("border-right-style", out var rightStyle)
+            ? ParseBorderStyleToken(rightStyle)
+            : BorderStyleKind.Solid;
+        var bottom = styleMap.TryGetValue("border-bottom-style", out var bottomStyle)
+            ? ParseBorderStyleToken(bottomStyle)
+            : BorderStyleKind.Solid;
+        var left = styleMap.TryGetValue("border-left-style", out var leftStyle)
+            ? ParseBorderStyleToken(leftStyle)
+            : BorderStyleKind.Solid;
 
-        if (!styleMap.TryGetValue(propertyName, out var value))
+        return new EdgeBorderStyle(top, right, bottom, left);
+    }
+
+    private static BorderStyleKind ParseBorderStyleToken(string? token)
+    {
+        if (string.IsNullOrWhiteSpace(token))
         {
-            return edges;
+            return BorderStyleKind.Solid;
         }
 
-        var parts = value.Split(' ', StringSplitOptions.RemoveEmptyEntries);
+        var normalized = token.Trim().ToLowerInvariant();
 
-        if (parts.Length == 0)
+        return normalized switch
         {
-            return edges;
-        }
-
-        var values = new float[parts.Length];
-
-        for (var i = 0; i < parts.Length; i++)
-        {
-            values[i] = ParseLengthValue(parts[i], defaultValue);
-        }
-
-        return parts.Length switch
-        {
-            1 => new EdgeSizes(values[0], values[0], values[0], values[0]),
-            2 => new EdgeSizes(values[0], values[1], values[0], values[1]),
-            3 => new EdgeSizes(values[0], values[1], values[2], values[1]),
-            _ => new EdgeSizes(values[0], values[1], values[2], values[3]),
+            "none" => BorderStyleKind.None,
+            "hidden" => BorderStyleKind.Hidden,
+            _ => BorderStyleKind.Solid,
         };
     }
 
-    private static EdgeSizes ResolveBorderWidthFromShorthand(string value, EdgeSizes existing)
+    private static EdgeSizes ApplyBorderStyleToWidths(EdgeSizes widths, EdgeBorderStyle styles)
     {
-        var tokens = value.Split(' ', StringSplitOptions.RemoveEmptyEntries);
-
-        foreach (var token in tokens)
+        return widths with
         {
-            if (TryParsePixelValue(token, out var parsed))
-            {
-                return new EdgeSizes(parsed, parsed, parsed, parsed);
-            }
-
-            if (string.Equals(token, "thin", StringComparison.OrdinalIgnoreCase))
-            {
-                return new EdgeSizes(1f, 1f, 1f, 1f);
-            }
-
-            if (string.Equals(token, "medium", StringComparison.OrdinalIgnoreCase))
-            {
-                return new EdgeSizes(3f, 3f, 3f, 3f);
-            }
-
-            if (string.Equals(token, "thick", StringComparison.OrdinalIgnoreCase))
-            {
-                return new EdgeSizes(5f, 5f, 5f, 5f);
-            }
-        }
-
-        return existing;
+            Top = IsPaintedBorderStyle(styles.Top) ? widths.Top : 0f,
+            Right = IsPaintedBorderStyle(styles.Right) ? widths.Right : 0f,
+            Bottom = IsPaintedBorderStyle(styles.Bottom) ? widths.Bottom : 0f,
+            Left = IsPaintedBorderStyle(styles.Left) ? widths.Left : 0f,
+        };
     }
 
-    private static RenderColor? ParseBorderColorFromShorthand(string value)
-    {
-        var tokens = value.Split(' ', StringSplitOptions.RemoveEmptyEntries);
+    private static bool IsPaintedBorderStyle(BorderStyleKind style) => style != BorderStyleKind.None && style != BorderStyleKind.Hidden;
 
-        foreach (var token in tokens)
+    
+
+    private static string GetPosition(Dictionary<string, string> styleMap)
+    {
+        return styleMap.TryGetValue("position", out var position)
+            ? position.Trim().ToLowerInvariant()
+            : string.Empty;
+    }
+
+    private static string GetFloat(Dictionary<string, string> styleMap)
+    {
+        return styleMap.TryGetValue("float", out var value)
+            ? value.Trim().ToLowerInvariant()
+            : string.Empty;
+    }
+
+    private static void PaintOutline(DisplayList displayList, Dictionary<string, string> styleMap, float x, float y, float width, float height)
+    {
+        if (!styleMap.TryGetValue("outline-width", out var outlineWidthRaw) ||
+            !styleMap.TryGetValue("outline-style", out var outlineStyleRaw))
         {
-            var color = ParseColor(token, RenderColor.Transparent);
-            if (color.A > 0)
-            {
-                return color;
-            }
+            return;
         }
 
-        return null;
+        var style = ParseBorderStyleToken(outlineStyleRaw);
+
+        if (!IsPaintedBorderStyle(style))
+        {
+            return;
+        }
+
+        var outlineWidth = ParseLengthValue(outlineWidthRaw, 0f, allowAuto: false);
+
+        if (outlineWidth <= 0f)
+        {
+            return;
+        }
+
+        var color = ParseColor(
+            styleMap.TryGetValue("outline-color", out var outlineColor) ? outlineColor : null,
+            RenderColor.Black);
+
+        PaintBorder(
+            displayList,
+            color,
+            x - outlineWidth,
+            y - outlineWidth,
+            width + (2f * outlineWidth),
+            height + (2f * outlineWidth),
+            new EdgeSizes(outlineWidth, outlineWidth, outlineWidth, outlineWidth));
     }
 
     private static void PaintBackground(DisplayList displayList, RenderColor color, float x, float y, float width, float height)
@@ -585,7 +890,87 @@ public sealed class HtmlRenderer
         }
     }
 
-    private static float ParseLength(Dictionary<string, string> styleMap, string propertyName, float relativeTo, float defaultValue)
+    private static float CollapseMargins(float previousMarginBottom, float currentMarginTop)
+    {
+        var positivePart = Math.Max(0f, previousMarginBottom) + Math.Max(0f, currentMarginTop);
+        var negativePart = Math.Min(0f, previousMarginBottom) + Math.Min(0f, currentMarginTop);
+
+        if (positivePart > 0f && negativePart < 0f)
+        {
+            return positivePart + negativePart;
+        }
+
+        if (positivePart > 0f)
+        {
+            return Math.Max(previousMarginBottom, currentMarginTop);
+        }
+
+        return Math.Min(previousMarginBottom, currentMarginTop);
+    }
+
+    private static void ResolveHorizontalMetrics(
+        float containingWidth,
+        float specifiedContentWidth,
+        float borderLeft,
+        float borderRight,
+        float paddingLeft,
+        float paddingRight,
+        ref float marginLeft,
+        ref float marginRight,
+        out float contentWidth)
+    {
+        var hasAutoWidth = float.IsNaN(specifiedContentWidth);
+        var hasAutoLeft = float.IsNaN(marginLeft);
+        var hasAutoRight = float.IsNaN(marginRight);
+
+        var usedMarginLeft = hasAutoLeft ? 0f : marginLeft;
+        var usedMarginRight = hasAutoRight ? 0f : marginRight;
+        var horizontalExtras = borderLeft + borderRight + paddingLeft + paddingRight;
+
+        if (hasAutoWidth)
+        {
+            contentWidth = containingWidth - horizontalExtras - usedMarginLeft - usedMarginRight;
+
+            if (contentWidth < 0f)
+            {
+                contentWidth = 0f;
+            }
+
+            marginLeft = usedMarginLeft;
+            marginRight = usedMarginRight;
+            return;
+        }
+
+        contentWidth = Math.Max(0f, specifiedContentWidth);
+        var underflow = containingWidth - horizontalExtras - contentWidth - usedMarginLeft - usedMarginRight;
+
+        if (hasAutoLeft && hasAutoRight)
+        {
+            var half = underflow / 2f;
+            marginLeft = half;
+            marginRight = half;
+            return;
+        }
+
+        if (hasAutoLeft)
+        {
+            marginLeft = underflow;
+            marginRight = usedMarginRight;
+            return;
+        }
+
+        if (hasAutoRight)
+        {
+            marginLeft = usedMarginLeft;
+            marginRight = underflow;
+            return;
+        }
+
+        marginLeft = usedMarginLeft;
+        marginRight = usedMarginRight + underflow;
+    }
+
+    private static float ParseLength(Dictionary<string, string> styleMap, string propertyName, float relativeTo, float defaultValue, bool allowAuto)
     {
         if (!styleMap.TryGetValue(propertyName, out var value) || string.IsNullOrWhiteSpace(value))
         {
@@ -594,7 +979,7 @@ public sealed class HtmlRenderer
 
         var parsed = value.Trim().ToLowerInvariant();
 
-        if (parsed == "auto")
+        if (allowAuto && parsed == "auto")
         {
             return float.NaN;
         }
@@ -605,11 +990,16 @@ public sealed class HtmlRenderer
             return (pct / 100f) * relativeTo;
         }
 
-        return ParseLengthValue(parsed, defaultValue);
+        return ParseLengthValue(parsed, defaultValue, allowAuto: false);
     }
 
-    private static float ParseLengthValue(string value, float defaultValue)
+    private static float ParseLengthValue(string value, float defaultValue, bool allowAuto = true)
     {
+        if (allowAuto && string.Equals(value.Trim(), "auto", StringComparison.OrdinalIgnoreCase))
+        {
+            return float.NaN;
+        }
+
         if (TryParsePixelValue(value, out var pixels))
         {
             return pixels;
@@ -650,26 +1040,109 @@ public sealed class HtmlRenderer
             return ParseHexColor(color, fallback);
         }
 
-        if (color.StartsWith("rgb(", StringComparison.Ordinal) && color.EndsWith(')'))
+        if ((color.StartsWith("rgb(", StringComparison.Ordinal) || color.StartsWith("rgba(", StringComparison.Ordinal)) && color.EndsWith(')'))
         {
-            var content = color[4..^1];
-            var parts = content.Split(',', StringSplitOptions.RemoveEmptyEntries);
+            var start = color.IndexOf('(');
+            var content = color[(start + 1)..^1].Trim();
 
-            if (parts.Length == 3 &&
-                byte.TryParse(parts[0].Trim(), out var r) &&
-                byte.TryParse(parts[1].Trim(), out var g) &&
-                byte.TryParse(parts[2].Trim(), out var b))
+            if (content.Contains(',', StringComparison.Ordinal))
             {
-                return new RenderColor(r, g, b);
+                var commaParts = content.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+
+                if (commaParts.Length >= 3 &&
+                    TryParseColorChannel(commaParts[0], out var r) &&
+                    TryParseColorChannel(commaParts[1], out var g) &&
+                    TryParseColorChannel(commaParts[2], out var b))
+                {
+                    var alpha = byte.MaxValue;
+
+                    if (commaParts.Length >= 4 && TryParseAlphaChannel(commaParts[3], out var a))
+                    {
+                        alpha = a;
+                    }
+
+                    return new RenderColor(r, g, b, alpha);
+                }
+            }
+            else
+            {
+                var slashParts = content.Split('/', StringSplitOptions.TrimEntries);
+                var rgbParts = slashParts[0].Split(' ', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+
+                if (rgbParts.Length >= 3 &&
+                    TryParseColorChannel(rgbParts[0], out var r) &&
+                    TryParseColorChannel(rgbParts[1], out var g) &&
+                    TryParseColorChannel(rgbParts[2], out var b))
+                {
+                    var alpha = byte.MaxValue;
+
+                    if (slashParts.Length > 1 && TryParseAlphaChannel(slashParts[1], out var a))
+                    {
+                        alpha = a;
+                    }
+
+                    return new RenderColor(r, g, b, alpha);
+                }
             }
         }
 
-        if (NamedColors.TryGetValue(color, out var namedColor))
+        if (string.Equals(color, "transparent", StringComparison.OrdinalIgnoreCase))
         {
-            return namedColor;
+            return RenderColor.Transparent;
         }
 
         return fallback;
+    }
+
+    private static bool TryParseColorChannel(string raw, out byte value)
+    {
+        var token = raw.Trim();
+
+        if (token.EndsWith("%", StringComparison.Ordinal) &&
+            float.TryParse(token[..^1], NumberStyles.Float, CultureInfo.InvariantCulture, out var percent))
+        {
+            percent = Math.Clamp(percent, 0f, 100f);
+            value = (byte)Math.Round((percent / 100f) * 255f);
+            return true;
+        }
+
+        if (float.TryParse(token, NumberStyles.Float, CultureInfo.InvariantCulture, out var channel))
+        {
+            channel = Math.Clamp(channel, 0f, 255f);
+            value = (byte)Math.Round(channel);
+            return true;
+        }
+
+        value = 0;
+        return false;
+    }
+
+    private static bool TryParseAlphaChannel(string raw, out byte alpha)
+    {
+        var token = raw.Trim();
+
+        if (token.EndsWith("%", StringComparison.Ordinal) &&
+            float.TryParse(token[..^1], NumberStyles.Float, CultureInfo.InvariantCulture, out var percent))
+        {
+            percent = Math.Clamp(percent, 0f, 100f);
+            alpha = (byte)Math.Round((percent / 100f) * 255f);
+            return true;
+        }
+
+        if (float.TryParse(token, NumberStyles.Float, CultureInfo.InvariantCulture, out var a))
+        {
+            if (a <= 1f)
+            {
+                a *= 255f;
+            }
+
+            a = Math.Clamp(a, 0f, 255f);
+            alpha = (byte)Math.Round(a);
+            return true;
+        }
+
+        alpha = byte.MaxValue;
+        return false;
     }
 
     private static RenderColor ParseHexColor(string color, RenderColor fallback)
@@ -793,6 +1266,15 @@ public sealed class HtmlRenderer
     private readonly record struct RenderTextStyle(float FontSize, RenderColor Color, string FontFamily, float LineHeightMultiplier);
 
     private readonly record struct EdgeSizes(float Top, float Right, float Bottom, float Left);
+
+    private enum BorderStyleKind
+    {
+        Solid,
+        None,
+        Hidden,
+    }
+
+    private readonly record struct EdgeBorderStyle(BorderStyleKind Top, BorderStyleKind Right, BorderStyleKind Bottom, BorderStyleKind Left);
 
     private readonly record struct BoxStyle(
         EdgeSizes Margin,
