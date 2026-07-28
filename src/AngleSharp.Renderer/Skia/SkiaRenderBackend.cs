@@ -105,6 +105,9 @@ public sealed class SkiaRenderBackend : IRenderBackend
         {
             Color = ToSkColor(command.Color),
             IsAntialias = true,
+            SubpixelText = false,
+            LcdRenderText = false,
+            HintingLevel = SKPaintHinting.Normal,
             TextSize = command.FontSize,
             Typeface = CreateTypeface(command.FontFamily, fontStyle),
             TextSkewX = command.IsItalic ? -0.25f : 0f,
