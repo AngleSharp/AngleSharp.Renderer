@@ -37,6 +37,9 @@ class Build : NukeBuild
     [Nuke.Common.Parameter("AngleSharp package version override (e.g. 1.0.0 for compatibility checks)")]
     readonly string AngleSharpVersion;
 
+    [Nuke.Common.Parameter("Skip visual snapshot tests (or set ANGLESHARP_SKIP_VISUAL_TESTS=1)")]
+    readonly bool SkipVisualTests;
+
     [Solution]
     readonly Solution Solution;
 
@@ -156,6 +159,10 @@ class Build : NukeBuild
         .DependsOn(Compile)
         .Executes(() =>
         {
+            var skipVisualTests = SkipVisualTests ||
+                string.Equals(Environment.GetEnvironmentVariable("ANGLESHARP_SKIP_VISUAL_TESTS"), "1", StringComparison.OrdinalIgnoreCase) ||
+                string.Equals(Environment.GetEnvironmentVariable("ANGLESHARP_SKIP_VISUAL_TESTS"), "true", StringComparison.OrdinalIgnoreCase);
+
             DotNetTest(s =>
             {
                 var settings = s
@@ -163,6 +170,11 @@ class Build : NukeBuild
                     .SetConfiguration(Configuration)
                     .EnableNoRestore()
                     .EnableNoBuild();
+
+                if (skipVisualTests)
+                {
+                    settings = settings.SetFilter("Category!=Visual");
+                }
 
                 if (!String.IsNullOrEmpty(AngleSharpVersion))
                 {

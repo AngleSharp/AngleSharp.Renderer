@@ -3,6 +3,7 @@ using AngleSharp.Css;
 
 namespace AngleSharp.Renderer.Tests;
 
+[Trait("Category", "Visual")]
 public sealed class VisualConformanceTests
 {
     [Fact]

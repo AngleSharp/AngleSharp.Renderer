@@ -49,6 +49,15 @@ jobs:
 
     steps:
     - uses: actions/checkout@v5
+
+    - name: Install deterministic fonts for snapshots
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y fonts-dejavu-core fontconfig
+        fc-cache -f
+        fc-match serif
+        fc-match sans-serif
+        fc-match monospace
     
     - name: Setup dotnet
       uses: actions/setup-dotnet@v5
@@ -57,6 +66,8 @@ jobs:
           10.0.x
 
     - name: Build
+      env:
+        ANGLESHARP_SNAPSHOT_STRICT: 1
       run: ./build.sh -AngleSharpVersion 1.5.0
 
   windows:
@@ -72,6 +83,8 @@ jobs:
           10.0.x
 
     - name: Build
+      env:
+        ANGLESHARP_SKIP_VISUAL_TESTS: 1
       run: |
         if ($env:GITHUB_REF -eq "refs/heads/main") {
           .\build.ps1 -Target Publish -AngleSharpVersion 1.5.0

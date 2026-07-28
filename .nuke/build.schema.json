@@ -126,6 +126,10 @@
           "type": "string",
           "description": "ReleaseNotesFilePath - To determine the SemanticVersion"
         },
+        "SkipVisualTests": {
+          "type": "boolean",
+          "description": "Skip visual snapshot tests (or set ANGLESHARP_SKIP_VISUAL_TESTS=1)"
+        },
         "Solution": {
           "type": "string",
           "description": "Path to a solution file that is automatically loaded"
