@@ -25,6 +25,10 @@
     <PackageReference Include="SkiaSharp.NativeAssets.Linux.NoDependencies" Version="2.88.9" />
   </ItemGroup>
 
+  <ItemGroup>
+    <EmbeddedResource Include="Resources/Fonts/*.ttf" />
+  </ItemGroup>
+
   <PropertyGroup Condition=" '$(OS)' == 'Windows_NT' ">
     <DelaySign>false</DelaySign>
   </PropertyGroup>

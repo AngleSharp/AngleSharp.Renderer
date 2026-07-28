@@ -61,9 +61,7 @@ Tests are split between structural assertions and visual conformance checks.
 - Visual tests live in `src/AngleSharp.Renderer.Tests/VisualConformanceTests.cs` and compare PNG output against baselines in `verification-assets/`.
 - Failed visual comparisons write the actual image and a diff image into `failure-assets/`.
 - Missing baselines are auto-created unless `ANGLESHARP_SNAPSHOT_STRICT=1` or `true` is set.
-- CI policy is OS-specific to reduce rendering drift:
-	- Linux runs visual tests with deterministic font installation and `ANGLESHARP_SNAPSHOT_STRICT=1`.
-	- Windows skips visual tests by setting `ANGLESHARP_SKIP_VISUAL_TESTS=1`, and NUKE applies test filter `Category!=Visual`.
+- CI runs visual tests on both Linux and Windows. To reduce drift, the renderer uses bundled deterministic font files for generic font-family resolution.
 
 When changing renderer behavior, update or add tests first, then run the focused test file or the full test project.
 

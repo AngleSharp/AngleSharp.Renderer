@@ -94,8 +94,6 @@ jobs:
           10.0.x
 
     - name: Build
-      env:
-        ANGLESHARP_SKIP_VISUAL_TESTS: 1
       run: |
         if ($env:GITHUB_REF -eq "refs/heads/main") {
           .\build.ps1 -Target Publish -AngleSharpVersion 1.5.0
