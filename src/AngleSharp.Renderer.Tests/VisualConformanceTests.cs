@@ -1,7 +1,7 @@
-using AngleSharp;
-using AngleSharp.Css;
-
 namespace AngleSharp.Renderer.Tests;
+
+using AngleSharp;
+using AngleSharp.Html.Dom;
 
 [Trait("Category", "Visual")]
 public sealed class VisualConformanceTests
@@ -204,6 +204,92 @@ public sealed class VisualConformanceTests
           actualPng: image.Data,
           perChannelTolerance: 0,
           maxDifferentPixels: 0);
+    }
+
+    [Fact]
+    public async Task RenderToPng_RendersCanvasRectanglesAndClearRect()
+    {
+        var image = await RenderCanvasSnapshotAsync("""
+            <html>
+              <body>
+                <canvas width="120" height="100"></canvas>
+              </body>
+            </html>
+            """, context =>
+        {
+            context.SetFillStyle("#ff0000");
+            context.FillRect(10f, 10f, 70f, 40f);
+            context.SetFillStyle("#00ff00");
+            context.FillRect(40f, 30f, 45f, 30f);
+            context.ClearRect(25f, 20f, 45f, 25f);
+        });
+
+        VisualSnapshotVerifier.VerifyOrCreate(
+            snapshotName: "renders-canvas-rectangles-and-clear-rect.png",
+            actualPng: image,
+            perChannelTolerance: 0,
+            maxDifferentPixels: 0);
+    }
+
+    [Fact]
+    public async Task RenderToPng_RendersCanvasPathAndText()
+    {
+        var image = await RenderCanvasSnapshotAsync("""
+            <html>
+              <body>
+                <canvas width="140" height="120"></canvas>
+              </body>
+            </html>
+            """, context =>
+        {
+            context.SetFillStyle("#00ff00");
+            context.SetStrokeStyle("#0000ff");
+            context.SetLineWidth(2f);
+            context.SetFont("20px sans-serif");
+            context.BeginPath();
+            context.MoveTo(10f, 10f);
+            context.LineTo(110f, 10f);
+            context.LineTo(110f, 90f);
+            context.ClosePath();
+            context.Fill();
+            context.Stroke();
+            context.FillText("Canvas", 14f, 72f);
+        });
+
+        VisualSnapshotVerifier.VerifyOrCreate(
+            snapshotName: "renders-canvas-path-and-text.png",
+            actualPng: image,
+            perChannelTolerance: 0,
+            maxDifferentPixels: 0);
+    }
+
+    [Fact]
+    public async Task RenderToPng_RendersCanvasTranslationAndState()
+    {
+        var image = await RenderCanvasSnapshotAsync("""
+            <html>
+              <body>
+                <canvas width="140" height="120"></canvas>
+              </body>
+            </html>
+            """, context =>
+        {
+            context.SetFillStyle("#ff0000");
+            context.FillRect(10f, 10f, 30f, 30f);
+            context.Save();
+            context.Translate(20f, 0f);
+            context.SetFillStyle("#0000ff");
+            context.FillRect(10f, 10f, 30f, 30f);
+            context.Restore();
+            context.SetFillStyle("#00ff00");
+            context.FillRect(50f, 50f, 30f, 30f);
+        });
+
+        VisualSnapshotVerifier.VerifyOrCreate(
+            snapshotName: "renders-canvas-translation-and-state.png",
+            actualPng: image,
+            perChannelTolerance: 0,
+            maxDifferentPixels: 0);
     }
 
     [Fact]
@@ -481,6 +567,21 @@ public sealed class VisualConformanceTests
             perChannelTolerance: 0,
             maxDifferentPixels: 0);
       }
+
+    private static async Task<byte[]> RenderCanvasSnapshotAsync(string html, Action<Canvas2DRenderingContext> draw)
+    {
+        var context = BrowsingContext.New(Configuration.Default.WithCss().WithRendering());
+        var document = await context.OpenAsync(request => request.Content(html));
+        var canvas = document.QuerySelector("canvas") as IHtmlCanvasElement;
+
+        Assert.NotNull(canvas);
+
+        var renderingContext = canvas!.GetContext("2d");
+        var canvasContext = Assert.IsType<Canvas2DRenderingContext>(renderingContext);
+        draw(canvasContext);
+
+        return canvasContext.ToImage("image/png");
+    }
 
     private static async Task<AngleSharp.Dom.IDocument> ParseAsync(string html)
     {
