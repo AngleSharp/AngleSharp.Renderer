@@ -98,6 +98,115 @@ public sealed class VisualConformanceTests
     }
 
     [Fact]
+    public async Task RenderToPng_RendersSimpleTableLayout()
+    {
+        var document = await ParseAsync("""
+            <html>
+              <head>
+                <style>html, body { margin: 0; padding: 0; } table { border-collapse: collapse; } td { padding: 4px; border: 1px solid black; background-color: #f0f0f0; }</style>
+              </head>
+              <body>
+                <table style="width:120px;">
+                  <tr><td>A</td><td>B</td></tr>
+                  <tr><td>C</td><td>D</td></tr>
+                </table>
+              </body>
+            </html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var image = renderer.RenderToPng(document, new HtmlRenderOptions
+        {
+            Width = 180,
+            Height = 120,
+            Padding = 0f,
+            ParagraphSpacing = 0f,
+        });
+
+        VisualSnapshotVerifier.VerifyOrCreate(
+          snapshotName: "renders-simple-table-layout.png",
+          actualPng: image.Data,
+          perChannelTolerance: 0,
+          maxDifferentPixels: 0);
+    }
+
+    [Fact]
+    public async Task RenderToPng_RendersTableCellBordersAndWidths()
+    {
+        var document = await ParseAsync("""
+            <html>
+              <head>
+                <style>html, body { margin: 0; padding: 0; } table { border-collapse: collapse; width: 160px; } td { padding: 6px; border: 2px solid #333; background-color: #dceeff; }</style>
+              </head>
+              <body>
+                <table>
+                  <tr>
+                    <td style="width:70px;">Left</td>
+                    <td style="width:70px;">Right</td>
+                  </tr>
+                </table>
+              </body>
+            </html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var image = renderer.RenderToPng(document, new HtmlRenderOptions
+        {
+            Width = 220,
+            Height = 120,
+            Padding = 0f,
+            ParagraphSpacing = 0f,
+        });
+
+        VisualSnapshotVerifier.VerifyOrCreate(
+          snapshotName: "renders-table-cell-borders-and-widths.png",
+          actualPng: image.Data,
+          perChannelTolerance: 0,
+          maxDifferentPixels: 0);
+    }
+
+    [Fact]
+    public async Task RenderToPng_RendersTableWithColspanAndRowspan()
+    {
+        var document = await ParseAsync("""
+            <html>
+              <head>
+                <style>html, body { margin: 0; padding: 0; } table { border-collapse: collapse; width: 180px; } td { padding: 6px; border: 1px solid #222; background-color: #eef7ff; }</style>
+              </head>
+              <body>
+                <table>
+                  <tr>
+                    <td colspan="2">Header</td>
+                  </tr>
+                  <tr>
+                    <td rowspan="2">Left</td>
+                    <td>Right</td>
+                  </tr>
+                  <tr>
+                    <td>Bottom</td>
+                  </tr>
+                </table>
+              </body>
+            </html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var image = renderer.RenderToPng(document, new HtmlRenderOptions
+        {
+            Width = 220,
+            Height = 140,
+            Padding = 0f,
+            ParagraphSpacing = 0f,
+        });
+
+        VisualSnapshotVerifier.VerifyOrCreate(
+          snapshotName: "renders-table-with-colspan-and-rowspan.png",
+          actualPng: image.Data,
+          perChannelTolerance: 0,
+          maxDifferentPixels: 0);
+    }
+
+    [Fact]
     public async Task RenderToPng_PaintsAbsolutePositionedElementOutOfFlow()
     {
         var document = await ParseAsync("""

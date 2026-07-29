@@ -204,6 +204,14 @@ public sealed class HtmlRenderer
             return;
         }
 
+        var display = GetDisplay(styleMap);
+
+        if (string.Equals(display, "table", StringComparison.OrdinalIgnoreCase))
+        {
+            LayoutTable(node, containingX, containingY, containingWidth, ref cursorY, ref previousBlockMarginBottom, ref suppressNextBlockTopMargin, ref activeFloatLeftOffset, ref activeFloatBottom, ref textIndentConsumed, inheritedTextStyle, options, displayList, maxY);
+            return;
+        }
+
         var renderAsBlock = ShouldRenderAsBlock(computedStyle);
         var isInlineBlock = IsInlineBlock(computedStyle);
         var currentTextStyle = ResolveTextStyle(styleMap, inheritedTextStyle);
@@ -536,6 +544,355 @@ public sealed class HtmlRenderer
         previousBlockMarginBottom = effectiveMarginBottom + options.ParagraphSpacing;
     }
 
+    private static IEnumerable<ElementRenderNode> CollectTableRows(ElementRenderNode tableNode)
+    {
+        foreach (var child in tableNode.Children)
+        {
+            if (child is ElementRenderNode childElement)
+            {
+                if (string.Equals(childElement.Ref.LocalName, "tr", StringComparison.OrdinalIgnoreCase))
+                {
+                    yield return childElement;
+                }
+
+                foreach (var descendant in CollectTableRows(childElement))
+                {
+                    yield return descendant;
+                }
+            }
+        }
+    }
+
+    private static void LayoutTable(
+        ElementRenderNode tableNode,
+        float containingX,
+        float containingY,
+        float containingWidth,
+        ref float cursorY,
+        ref float previousBlockMarginBottom,
+        ref bool suppressNextBlockTopMargin,
+        ref float activeFloatLeftOffset,
+        ref float activeFloatBottom,
+        ref bool textIndentConsumed,
+        RenderTextStyle inheritedTextStyle,
+        HtmlRenderOptions options,
+        DisplayList displayList,
+        float maxY)
+    {
+        var tableStyle = CreateStyleMap(tableNode.ComputedStyle);
+        var specifiedWidth = ParseLength(tableStyle, "width", containingWidth, float.NaN, allowAuto: true);
+        var availableWidth = float.IsNaN(specifiedWidth) ? containingWidth : specifiedWidth;
+        var borderCollapse = string.Equals(tableStyle.TryGetValue("border-collapse", out var borderCollapseValue) ? borderCollapseValue : null, "collapse", StringComparison.OrdinalIgnoreCase);
+
+        var rows = CollectTableRows(tableNode).ToList();
+        var colgroup = tableNode.Children
+            .Where(child => child is ElementRenderNode { Ref.LocalName: var localName } && string.Equals(localName, "colgroup", StringComparison.OrdinalIgnoreCase))
+            .Cast<ElementRenderNode>()
+            .FirstOrDefault();
+        var columnSpecs = new List<(int ColumnIndex, float Width)>();
+
+        if (colgroup is not null)
+        {
+            var columnNodes = colgroup.Children
+                .Where(child => child is ElementRenderNode { Ref.LocalName: var localName } && string.Equals(localName, "col", StringComparison.OrdinalIgnoreCase))
+                .Cast<ElementRenderNode>()
+                .ToList();
+
+            for (var index = 0; index < columnNodes.Count; index++)
+            {
+                var columnStyle = CreateStyleMap(columnNodes[index].ComputedStyle);
+                var specifiedColumnWidth = ParseLength(columnStyle, "width", availableWidth, float.NaN, allowAuto: true);
+                if (!float.IsNaN(specifiedColumnWidth))
+                {
+                    columnSpecs.Add((index, specifiedColumnWidth));
+                }
+            }
+        }
+
+        if (rows.Count == 0)
+        {
+            cursorY += inheritedTextStyle.FontSize * inheritedTextStyle.LineHeightMultiplier;
+            return;
+        }
+
+        var rowCellLists = rows
+            .Select(row => row.Children
+                .Where(child => child is ElementRenderNode cellNode && (string.Equals(cellNode.Ref.LocalName, "td", StringComparison.OrdinalIgnoreCase) || string.Equals(cellNode.Ref.LocalName, "th", StringComparison.OrdinalIgnoreCase)))
+                .Cast<ElementRenderNode>()
+                .ToList())
+            .ToList();
+
+        var tableCells = new List<(int RowIndex, int ColumnIndex, int ColumnSpan, int RowSpan, ElementRenderNode CellNode, Dictionary<string, string> CellStyle, RenderTextStyle CellTextStyle, string Text, float PaddingLeft, float PaddingRight, float PaddingTop, float PaddingBottom, float BorderLeftWidth, float BorderRightWidth, float BorderTopWidth, float BorderBottomWidth, RenderColor BackgroundColor)>();
+        var rowSpanOccupancy = new List<int>();
+        var columnCount = 0;
+
+        for (var rowIndex = 0; rowIndex < rowCellLists.Count; rowIndex++)
+        {
+            var cells = rowCellLists[rowIndex];
+            var currentRowOccupied = new List<int>();
+            var nextRowSpanOccupancy = new List<int>();
+            var currentColumnIndex = 0;
+
+            foreach (var cellNode in cells)
+            {
+                while (true)
+                {
+                    while (currentColumnIndex >= currentRowOccupied.Count)
+                    {
+                        currentRowOccupied.Add(0);
+                    }
+
+                    while (currentColumnIndex >= rowSpanOccupancy.Count)
+                    {
+                        rowSpanOccupancy.Add(0);
+                    }
+
+                    if (rowSpanOccupancy[currentColumnIndex] == 0 && currentRowOccupied[currentColumnIndex] == 0)
+                    {
+                        break;
+                    }
+
+                    currentColumnIndex++;
+                }
+
+                var cellStyle = CreateStyleMap(cellNode.ComputedStyle);
+                var cellTextStyle = ResolveTextStyle(cellStyle, inheritedTextStyle);
+                var text = NormalizeWhitespace(cellNode.Ref.TextContent ?? string.Empty);
+                var colspan = 1;
+                var rowspan = 1;
+
+                if (int.TryParse(cellNode.Ref.GetAttribute("colspan"), NumberStyles.Integer, CultureInfo.InvariantCulture, out var parsedColspan) && parsedColspan > 0)
+                {
+                    colspan = parsedColspan;
+                }
+
+                if (int.TryParse(cellNode.Ref.GetAttribute("rowspan"), NumberStyles.Integer, CultureInfo.InvariantCulture, out var parsedRowspan) && parsedRowspan > 0)
+                {
+                    rowspan = parsedRowspan;
+                }
+
+                for (var spanOffset = 0; spanOffset < colspan; spanOffset++)
+                {
+                    while (currentColumnIndex + spanOffset >= currentRowOccupied.Count)
+                    {
+                        currentRowOccupied.Add(0);
+                    }
+
+                    currentRowOccupied[currentColumnIndex + spanOffset] = 1;
+                }
+
+                for (var spanOffset = 0; spanOffset < colspan; spanOffset++)
+                {
+                    while (currentColumnIndex + spanOffset >= nextRowSpanOccupancy.Count)
+                    {
+                        nextRowSpanOccupancy.Add(0);
+                    }
+
+                    nextRowSpanOccupancy[currentColumnIndex + spanOffset] = Math.Max(nextRowSpanOccupancy[currentColumnIndex + spanOffset], Math.Max(0, rowspan - 1));
+                }
+
+                tableCells.Add((rowIndex, currentColumnIndex, colspan, rowspan, cellNode, cellStyle, cellTextStyle, text,
+                    ParseLength(cellStyle, "padding-left", containingWidth, 4f, allowAuto: false),
+                    ParseLength(cellStyle, "padding-right", containingWidth, 4f, allowAuto: false),
+                    ParseLength(cellStyle, "padding-top", containingWidth, 4f, allowAuto: false),
+                    ParseLength(cellStyle, "padding-bottom", containingWidth, 4f, allowAuto: false),
+                    ParseLength(cellStyle, "border-left-width", containingWidth, 1f, allowAuto: false),
+                    ParseLength(cellStyle, "border-right-width", containingWidth, 1f, allowAuto: false),
+                    ParseLength(cellStyle, "border-top-width", containingWidth, 1f, allowAuto: false),
+                    ParseLength(cellStyle, "border-bottom-width", containingWidth, 1f, allowAuto: false),
+                    ParseColor(cellStyle.TryGetValue("background-color", out var backgroundColor) ? backgroundColor : null, RenderColor.Transparent)));
+
+                columnCount = Math.Max(columnCount, currentColumnIndex + colspan);
+                currentColumnIndex += colspan;
+            }
+
+            foreach (var index in Enumerable.Range(0, rowSpanOccupancy.Count))
+            {
+                if (rowSpanOccupancy[index] > 0)
+                {
+                    nextRowSpanOccupancy[index] = Math.Max(nextRowSpanOccupancy[index], rowSpanOccupancy[index] - 1);
+                }
+            }
+
+            rowSpanOccupancy = nextRowSpanOccupancy;
+        }
+
+        if (columnCount <= 0)
+        {
+            cursorY += inheritedTextStyle.FontSize * inheritedTextStyle.LineHeightMultiplier;
+            return;
+        }
+
+        var columnMinWidths = new float[columnCount];
+        foreach (var placement in tableCells)
+        {
+            var specifiedCellWidth = ParseLength(placement.CellStyle, "width", availableWidth, float.NaN, allowAuto: true);
+            var paddingLeft = placement.PaddingLeft;
+            var paddingRight = placement.PaddingRight;
+            var borderLeftWidth = placement.BorderLeftWidth;
+            var borderRightWidth = placement.BorderRightWidth;
+            var textWidth = placement.Text.Length > 0 ? EstimateTextWidth(placement.Text, placement.CellTextStyle.FontSize, options.AverageCharacterWidthFactor, placement.CellTextStyle.LetterSpacing) : 0f;
+            var minCellWidth = textWidth + paddingLeft + paddingRight + borderLeftWidth + borderRightWidth + 8f;
+            var widthPerColumn = float.IsNaN(specifiedCellWidth) ? minCellWidth / Math.Max(1, placement.ColumnSpan) : specifiedCellWidth / Math.Max(1, placement.ColumnSpan);
+
+            for (var spanOffset = 0; spanOffset < placement.ColumnSpan; spanOffset++)
+            {
+                var columnIndex = placement.ColumnIndex + spanOffset;
+                columnMinWidths[columnIndex] = Math.Max(columnMinWidths[columnIndex], widthPerColumn);
+            }
+        }
+
+        foreach (var (columnIndex, columnWidth) in columnSpecs)
+        {
+            if (columnIndex < columnMinWidths.Length)
+            {
+                columnMinWidths[columnIndex] = Math.Max(columnMinWidths[columnIndex], columnWidth);
+            }
+        }
+
+        var totalMinWidth = columnMinWidths.Sum();
+        var tableWidth = Math.Max(availableWidth, totalMinWidth);
+        var columnWidths = new float[columnCount];
+
+        if (availableWidth > totalMinWidth)
+        {
+            var extraWidth = availableWidth - totalMinWidth;
+            var extraPerColumn = extraWidth / Math.Max(1, columnCount);
+            for (var columnIndex = 0; columnIndex < columnCount; columnIndex++)
+            {
+                columnWidths[columnIndex] = columnMinWidths[columnIndex] + extraPerColumn;
+            }
+        }
+        else if (availableWidth > 0f && totalMinWidth > availableWidth)
+        {
+            var scale = availableWidth / totalMinWidth;
+            for (var columnIndex = 0; columnIndex < columnCount; columnIndex++)
+            {
+                columnWidths[columnIndex] = columnMinWidths[columnIndex] * scale;
+            }
+        }
+        else
+        {
+            columnWidths = columnMinWidths.ToArray();
+        }
+
+        var tableX = containingX;
+        var tableY = cursorY;
+        var rowTopOffsets = new float[rowCellLists.Count];
+        var rowHeights = new float[rowCellLists.Count];
+
+        foreach (var placement in tableCells)
+        {
+            var contentWidth = Math.Max(0f, columnWidths.Skip(placement.ColumnIndex).Take(placement.ColumnSpan).Sum() - placement.PaddingLeft - placement.PaddingRight - placement.BorderLeftWidth - placement.BorderRightWidth);
+            var contentHeight = 0f;
+            var text = placement.Text;
+
+            if (contentWidth > 0f && text.Length > 0)
+            {
+                var wrappedLines = WrapText(text, contentWidth, placement.CellTextStyle.FontSize, options.AverageCharacterWidthFactor, placement.CellTextStyle.LetterSpacing);
+                var lineHeight = placement.CellTextStyle.FontSize * placement.CellTextStyle.LineHeightMultiplier;
+                contentHeight = wrappedLines.Count * lineHeight;
+            }
+
+            var effectiveHeight = Math.Max(20f, contentHeight + placement.PaddingTop + placement.PaddingBottom + placement.BorderTopWidth + placement.BorderBottomWidth);
+            for (var rowIndex = placement.RowIndex; rowIndex < placement.RowIndex + placement.RowSpan; rowIndex++)
+            {
+                rowHeights[rowIndex] = Math.Max(rowHeights[rowIndex], effectiveHeight);
+            }
+        }
+
+        var currentRowTop = 0f;
+        for (var rowIndex = 0; rowIndex < rowCellLists.Count; rowIndex++)
+        {
+            rowTopOffsets[rowIndex] = currentRowTop;
+            currentRowTop += rowHeights[rowIndex];
+        }
+
+        var columnLefts = new float[columnCount];
+        var currentColumnLeft = 0f;
+        for (var columnIndex = 0; columnIndex < columnCount; columnIndex++)
+        {
+            columnLefts[columnIndex] = currentColumnLeft;
+            currentColumnLeft += columnWidths[columnIndex];
+        }
+
+        var tableHeight = currentRowTop;
+        foreach (var placement in tableCells)
+        {
+            var contentWidth = Math.Max(0f, columnWidths.Skip(placement.ColumnIndex).Take(placement.ColumnSpan).Sum() - placement.PaddingLeft - placement.PaddingRight - placement.BorderLeftWidth - placement.BorderRightWidth);
+            var cellX = tableX + columnLefts[placement.ColumnIndex];
+            var cellY = tableY + rowTopOffsets[placement.RowIndex];
+            var cellWidth = columnWidths.Skip(placement.ColumnIndex).Take(placement.ColumnSpan).Sum();
+            var cellHeight = 0f;
+            for (var rowIndex = placement.RowIndex; rowIndex < placement.RowIndex + placement.RowSpan; rowIndex++)
+            {
+                cellHeight += rowHeights[rowIndex];
+            }
+
+            var contentHeight = 0f;
+            if (contentWidth > 0f && placement.Text.Length > 0)
+            {
+                var wrappedLines = WrapText(placement.Text, contentWidth, placement.CellTextStyle.FontSize, options.AverageCharacterWidthFactor, placement.CellTextStyle.LetterSpacing);
+                var lineHeight = placement.CellTextStyle.FontSize * placement.CellTextStyle.LineHeightMultiplier;
+                contentHeight = wrappedLines.Count * lineHeight;
+            }
+
+            var effectiveHeight = Math.Max(20f, contentHeight + placement.PaddingTop + placement.PaddingBottom + placement.BorderTopWidth + placement.BorderBottomWidth);
+            displayList.FillRect(new RenderRect(cellX, cellY, cellWidth, effectiveHeight), placement.BackgroundColor);
+
+            if (!borderCollapse)
+            {
+                displayList.FillRect(new RenderRect(cellX, cellY, cellWidth, placement.BorderTopWidth), RenderColor.Black);
+                displayList.FillRect(new RenderRect(cellX + cellWidth - placement.BorderRightWidth, cellY, placement.BorderRightWidth, effectiveHeight), RenderColor.Black);
+                displayList.FillRect(new RenderRect(cellX, cellY + effectiveHeight - placement.BorderBottomWidth, cellWidth, placement.BorderBottomWidth), RenderColor.Black);
+                displayList.FillRect(new RenderRect(cellX, cellY, placement.BorderLeftWidth, effectiveHeight), RenderColor.Black);
+            }
+
+            if (contentWidth > 0f && placement.Text.Length > 0)
+            {
+                var wrappedLines = WrapText(placement.Text, contentWidth, placement.CellTextStyle.FontSize, options.AverageCharacterWidthFactor, placement.CellTextStyle.LetterSpacing);
+                var lineHeight = placement.CellTextStyle.FontSize * placement.CellTextStyle.LineHeightMultiplier;
+                var lineX = cellX + placement.PaddingLeft + placement.BorderLeftWidth;
+                var lineY = cellY + placement.PaddingTop + placement.BorderTopWidth + lineHeight;
+
+                for (var lineIndex = 0; lineIndex < wrappedLines.Count; lineIndex++)
+                {
+                    var line = wrappedLines[lineIndex];
+                    displayList.DrawText(line, lineX, lineY + (lineIndex * lineHeight), placement.CellTextStyle.Color, placement.CellTextStyle.FontSize, placement.CellTextStyle.FontFamily, placement.CellTextStyle.FontWeight, placement.CellTextStyle.IsItalic, placement.CellTextStyle.Underline, placement.CellTextStyle.StrikeThrough, placement.CellTextStyle.DecorationColor, placement.CellTextStyle.DecorationStyle, placement.CellTextStyle.LetterSpacing);
+                }
+            }
+        }
+
+        if (borderCollapse)
+        {
+            var collapsedBorderWidth = 1f;
+
+            displayList.FillRect(new RenderRect(tableX, tableY, tableWidth, collapsedBorderWidth), RenderColor.Black);
+            displayList.FillRect(new RenderRect(tableX, tableY + tableHeight - collapsedBorderWidth, tableWidth, collapsedBorderWidth), RenderColor.Black);
+            displayList.FillRect(new RenderRect(tableX, tableY, collapsedBorderWidth, tableHeight), RenderColor.Black);
+            displayList.FillRect(new RenderRect(tableX + tableWidth - collapsedBorderWidth, tableY, collapsedBorderWidth, tableHeight), RenderColor.Black);
+
+            var currentVerticalX = tableX;
+            for (var columnIndex = 1; columnIndex < columnCount; columnIndex++)
+            {
+                currentVerticalX += columnWidths[columnIndex - 1];
+                displayList.FillRect(new RenderRect(currentVerticalX, tableY, collapsedBorderWidth, tableHeight), RenderColor.Black);
+            }
+
+            var currentHorizontalY = tableY;
+            for (var rowIndex = 1; rowIndex < rowCellLists.Count; rowIndex++)
+            {
+                currentHorizontalY += rowHeights[rowIndex - 1];
+                displayList.FillRect(new RenderRect(tableX, currentHorizontalY, tableWidth, collapsedBorderWidth), RenderColor.Black);
+            }
+        }
+
+        displayList.FillRect(new RenderRect(tableX, tableY, tableWidth, tableHeight), RenderColor.Transparent);
+        cursorY = tableY + tableHeight + 4f;
+        previousBlockMarginBottom = 0f;
+        suppressNextBlockTopMargin = false;
+    }
+
     private static void LayoutTextNode(
         IText textNode,
         float containingX,
@@ -669,6 +1026,11 @@ public sealed class HtmlRenderer
             inlineLineHeight = Math.Max(inlineLineHeight, textStyle.FontSize * textStyle.LineHeightMultiplier);
             textIndentConsumed = true;
         }
+    }
+
+    private static string? GetDisplay(Dictionary<string, string> styleMap)
+    {
+        return styleMap.TryGetValue("display", out var display) ? display : null;
     }
 
     private static bool ShouldRenderAsBlock(ICssStyleDeclaration computedStyle)
@@ -897,6 +1259,7 @@ public sealed class HtmlRenderer
         AddIfPresent(map, "border-right-width", style.GetBorderRightWidth());
         AddIfPresent(map, "border-bottom-width", style.GetBorderBottomWidth());
         AddIfPresent(map, "border-left-width", style.GetBorderLeftWidth());
+        AddIfPresent(map, "border-collapse", style.GetPropertyValue("border-collapse"));
 
         AddIfPresent(map, "border-top-style", style.GetBorderTopStyle());
         AddIfPresent(map, "border-right-style", style.GetBorderRightStyle());
