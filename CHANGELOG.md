@@ -1,6 +1,6 @@
 # 0.2.0
 
-Released on ?.
+Released on Friday, July 31 2026.
 
 - Added more drawing modes such as tables, floats, ...
 - Added `WithRendering` extension to register rendering service
