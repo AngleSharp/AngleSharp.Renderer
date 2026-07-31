@@ -20,7 +20,7 @@ Use the test project directly when iterating on renderer behavior:
 dotnet test src/AngleSharp.Renderer.Tests/AngleSharp.Renderer.Tests.csproj
 ```
 
-The repo also includes build scripts that drive the NUKE bootstrapper:
+The repo also includes build scripts that drive the Fallout bootstrapper:
 
 ```bash
 ./build.sh
