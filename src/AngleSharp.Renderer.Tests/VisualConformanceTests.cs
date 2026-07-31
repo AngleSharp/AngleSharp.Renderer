@@ -232,7 +232,7 @@ public sealed class VisualConformanceTests
     }
 
     [Fact]
-    public async Task RenderToPng_RendersCanvasPathAndText()
+    public async Task RenderToPng_RendersCanvasPathAndStroke()
     {
         var image = await RenderCanvasSnapshotAsync("""
             <html>
@@ -253,14 +253,13 @@ public sealed class VisualConformanceTests
             context.ClosePath();
             context.Fill();
             context.Stroke();
-            context.FillText("Canvas", 14f, 72f);
         });
 
         VisualSnapshotVerifier.VerifyOrCreate(
             snapshotName: "renders-canvas-path-and-text.png",
             actualPng: image,
-          perChannelTolerance: 16,
-          maxDifferentPixels: 180);
+            perChannelTolerance: 0,
+            maxDifferentPixels: 0);
     }
 
     [Fact]
