@@ -89,6 +89,97 @@ public sealed class HtmlRendererTests
     }
 
     [Fact]
+    public async Task BuildDisplayList_AppliesColspanToCellGeometry()
+    {
+        var document = await ParseAsync("""
+            <html><body>
+                <table style="width:160px;">
+                    <tr>
+                        <td colspan="2" style="background-color:#ff0000;">Header</td>
+                    </tr>
+                    <tr>
+                        <td style="background-color:#00ff00;">A</td>
+                        <td style="background-color:#0000ff;">B</td>
+                    </tr>
+                </table>
+            </body></html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, new HtmlRenderOptions
+        {
+            Width = 240,
+            Height = 160,
+            FontSize = 16f,
+        });
+
+        var headerBackground = displayList.Commands
+            .OfType<FillRectCommand>()
+            .FirstOrDefault(command => command.Rect.Width > 100f);
+
+        Assert.NotNull(headerBackground);
+        Assert.True(headerBackground!.Rect.Width > 100f);
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_CollapsesAdjacentCellBordersWhenRequested()
+    {
+        var document = await ParseAsync("""
+            <html><body>
+                <table style="border-collapse:collapse;">
+                    <tr><td style="border:1px solid black;">A</td><td style="border:1px solid black;">B</td></tr>
+                    <tr><td style="border:1px solid black;">C</td><td style="border:1px solid black;">D</td></tr>
+                </table>
+            </body></html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, new HtmlRenderOptions
+        {
+            Width = 240,
+            Height = 160,
+            FontSize = 16f,
+        });
+
+        var borderCommands = displayList.Commands
+            .OfType<FillRectCommand>()
+            .Count(command => command.Color == RenderColor.Black);
+
+        Assert.True(borderCommands < 10, $"Expected collapsed borders to reduce border commands, but found {borderCommands}.");
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_UsesColumnWidthsFromColgroup()
+    {
+        var document = await ParseAsync("""
+            <html><body>
+                <table style="width:180px;">
+                    <colgroup>
+                        <col style="width:120px;" />
+                    </colgroup>
+                    <tr>
+                        <td style="background-color:#ff0000;"></td>
+                    </tr>
+                </table>
+            </body></html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, new HtmlRenderOptions
+        {
+            Width = 240,
+            Height = 160,
+            FontSize = 16f,
+        });
+
+        var fills = displayList.Commands.OfType<FillRectCommand>().ToArray();
+        var cellBackground = fills.FirstOrDefault(command => command.Color == new RenderColor(255, 0, 0));
+
+        Assert.NotNull(cellBackground);
+        Assert.True(cellBackground!.Rect.Width >= 100f, $"Expected the colgroup width to expand the cell geometry, but got {cellBackground.Rect.Width}.");
+    }
+
+    [Fact]
     public async Task BuildDisplayList_AppliesLetterSpacingToTextCommands()
     {
         var document = await ParseAsync("""

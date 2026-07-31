@@ -17,6 +17,7 @@ The project now contains a first draft implementation with:
 - A backend-agnostic rendering core and display-list model
 - A SkiaSharp backend that renders PNG output
 - A basic DOM-driven text layout pass (block flow, heading scaling, word wrapping)
+- Basic support for HTML canvas via a bitmap-backed 2D rendering context
 
 This is an initial vertical slice and not a full browser-grade layout engine yet.
 
@@ -26,7 +27,7 @@ This is an initial vertical slice and not a full browser-grade layout engine yet
 using AngleSharp;
 using AngleSharp.Renderer;
 
-var context = BrowsingContext.New(Configuration.Default);
+var context = BrowsingContext.New(Configuration.Default.WithCss().WithRendering());
 var document = await context.OpenAsync(req => req.Content(@"
 <html>
 	<body>
@@ -45,6 +46,8 @@ var image = renderer.RenderToPng(document, new HtmlRenderOptions
 await File.WriteAllBytesAsync("render.png", image.Data);
 ```
 
+Registering the rendering service with `WithRendering()` is also what enables support for `<canvas>` elements and their 2D drawing context. The renderer currently provides a lightweight bitmap-backed implementation for common drawing operations such as rectangles, paths, text, clear operations, and simple state management.
+
 ## Design Direction
 
 The current architecture is intentionally split into two layers:
@@ -60,4 +63,4 @@ This project is supported by the [.NET Foundation](https://dotnetfoundation.org)
 
 ## License
 
-AngleSharp.Css is released using the MIT license. For more information see the [license file](./LICENSE).
+AngleSharp.Renderer is released using the MIT license. For more information see the [license file](./LICENSE).

@@ -2,7 +2,7 @@
   <PropertyGroup>
     <Description>Adds rendering functionality to the core AngleSharp library.</Description>
     <Product>AngleSharp.Renderer</Product>
-    <Version>0.1.0</Version>
+    <Version>0.2.0</Version>
     <Nullable>enable</Nullable>
     <LangVersion>latest</LangVersion>
     <SignAssembly>true</SignAssembly>
