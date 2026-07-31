@@ -5,13 +5,22 @@
     <TargetFrameworks>net8.0;net10.0</TargetFrameworks>
     <GenerateDocumentationFile>true</GenerateDocumentationFile>
     <Nullable>enable</Nullable>
+  </PropertyGroup>
+
+  <PropertyGroup Label="Packaging">
+    <PackageProjectUrl>https://anglesharp.github.io</PackageProjectUrl>
+    <PackageLicenseExpression>MIT</PackageLicenseExpression>
+    <PackageIcon>logo.png</PackageIcon>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
+    <PackageTags>html;html5;css;css3;dom;rendering;canvas;library;anglesharp;angle</PackageTags>
+    <PackageReleaseNotes>https://github.com/AngleSharp/AngleSharp.Renderer/blob/main/CHANGELOG.md</PackageReleaseNotes>
     <RepositoryUrl>https://github.com/AngleSharp/AngleSharp.Renderer</RepositoryUrl>
     <RepositoryType>git</RepositoryType>
     <PublishRepositoryUrl>true</PublishRepositoryUrl>
     <EmbedUntrackedSources>true</EmbedUntrackedSources>
     <IncludeSymbols>true</IncludeSymbols>
     <SymbolPackageFormat>snupkg</SymbolPackageFormat>
-    <AngleSharpVersion>1.*</AngleSharpVersion>
+    <AngleSharpVersion Condition=" '$(AngleSharpVersion)' == '' ">1.5.0</AngleSharpVersion>
   </PropertyGroup>
 
   <ItemGroup>
@@ -19,14 +28,25 @@
   </ItemGroup>
 
   <ItemGroup>
-    <PackageReference Include="AngleSharp" Version="$(AngleSharpVersion)" />
-    <PackageReference Include="AngleSharp.Css" Version="1.0.0" />
+    <PackageReference Include="AngleSharp" Version="[$(AngleSharpVersion),2.0.0)" />
+    <PackageReference Include="AngleSharp.Css" Version="[1.0.0,2.0.0)" />
     <PackageReference Include="SkiaSharp" Version="2.88.9" />
     <PackageReference Include="SkiaSharp.NativeAssets.Linux.NoDependencies" Version="2.88.9" />
   </ItemGroup>
 
   <ItemGroup>
     <EmbeddedResource Include="Resources/Fonts/*.ttf" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <None Include="$(MSBuildThisFileDirectory)..\..\logo.png" Pack="true" PackagePath="\" Visible="false" />
+    <None Include="$(MSBuildThisFileDirectory)..\..\README.md" Pack="true" PackagePath="\" Visible="false" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <AssemblyAttribute Include="System.Runtime.InteropServices.ComVisibleAttribute">
+      <_Parameter1>false</_Parameter1>
+    </AssemblyAttribute>
   </ItemGroup>
 
   <PropertyGroup Condition=" '$(OS)' == 'Windows_NT' ">
