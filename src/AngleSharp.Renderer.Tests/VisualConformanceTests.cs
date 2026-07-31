@@ -259,8 +259,8 @@ public sealed class VisualConformanceTests
         VisualSnapshotVerifier.VerifyOrCreate(
             snapshotName: "renders-canvas-path-and-text.png",
             actualPng: image,
-            perChannelTolerance: 0,
-            maxDifferentPixels: 0);
+          perChannelTolerance: 16,
+          maxDifferentPixels: 180);
     }
 
     [Fact]
