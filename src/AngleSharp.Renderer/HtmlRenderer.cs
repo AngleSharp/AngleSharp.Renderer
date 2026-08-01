@@ -415,6 +415,40 @@ public sealed class HtmlRenderer
             return;
         }
 
+        if (IsGridContainer(styleMap))
+        {
+            LayoutGridContainer(
+                node,
+                contentX,
+                contentY,
+                contentWidth,
+                ref cursorY,
+                ref previousBlockMarginBottom,
+                ref suppressNextBlockTopMargin,
+                ref activeFloatLeftOffset,
+                ref activeFloatBottom,
+                ref textIndentConsumed,
+                currentTextStyle,
+                options,
+                displayList,
+                maxY,
+                styleMap,
+                borderLeft,
+                borderTop,
+                borderRight,
+                borderBottom,
+                paddingLeft,
+                paddingRight,
+                paddingTop,
+                paddingBottom,
+                box,
+                flowBorderBoxX,
+                flowBorderBoxY,
+                borderBoxX,
+                borderBoxY);
+            return;
+        }
+
         if (!hasInlineRun)
         {
             foreach (var child in orderedChildren)
@@ -623,6 +657,8 @@ public sealed class HtmlRenderer
         float BaseMainSize,
         float CrossSize,
         string AlignSelf);
+
+    private readonly record struct GridPlacement(int LineIndex, int Span);
 
     private static void LayoutFlexContainer(
         ElementRenderNode node,
@@ -1320,6 +1356,341 @@ public sealed class HtmlRenderer
         suppressNextBlockTopMargin = false;
     }
 
+    private static void LayoutGridContainer(
+        ElementRenderNode node,
+        float containingX,
+        float containingY,
+        float containingWidth,
+        ref float cursorY,
+        ref float previousBlockMarginBottom,
+        ref bool suppressNextBlockTopMargin,
+        ref float activeFloatLeftOffset,
+        ref float activeFloatBottom,
+        ref bool textIndentConsumed,
+        RenderTextStyle inheritedTextStyle,
+        HtmlRenderOptions options,
+        DisplayList displayList,
+        float maxY,
+        Dictionary<string, string> styleMap,
+        float borderLeft,
+        float borderTop,
+        float borderRight,
+        float borderBottom,
+        float paddingLeft,
+        float paddingRight,
+        float paddingTop,
+        float paddingBottom,
+        BoxStyle box,
+        float flowBorderBoxX,
+        float flowBorderBoxY,
+        float borderBoxX,
+        float borderBoxY)
+    {
+        var columns = ParseGridTrackList(styleMap, "grid-template-columns", containingWidth, 1);
+        var columnGap = ParseGridGap(styleMap, "column-gap", containingWidth, 0)
+            ?? ParseGridGap(styleMap, "gap", containingWidth, 0);
+        var rowGap = ParseGridGap(styleMap, "row-gap", containingWidth, 0)
+            ?? ParseGridGap(styleMap, "gap", containingWidth, 0);
+        var resolvedColumnGap = columnGap ?? 0f;
+        var resolvedRowGap = rowGap ?? 0f;
+        var gridItems = node.Children
+            .Where(child => child is ElementRenderNode || (child is TextRenderNode textNode && NormalizeWhitespace(textNode.Ref.Data).Length > 0))
+            .ToList();
+        var hasExplicitRowTracks = styleMap.TryGetValue("grid-template-rows", out var rowTemplateValue) && !string.IsNullOrWhiteSpace(rowTemplateValue);
+        var containerHeight = ParseLength(styleMap, "height", containingWidth, containingWidth, allowAuto: true);
+        var rows = hasExplicitRowTracks
+            ? ParseGridTrackList(styleMap, "grid-template-rows", containerHeight, 1)
+            : CreateAutoRows(gridItems.Count, columns.Count, containerHeight);
+
+        var currentColumn = 0;
+        var currentRow = 0;
+
+        foreach (var child in gridItems)
+        {
+            if (child is TextRenderNode textNode)
+            {
+                LayoutTextNode(textNode.Ref, containingX, containingWidth, ref cursorY, ref previousBlockMarginBottom, ref suppressNextBlockTopMargin, ref activeFloatLeftOffset, ref activeFloatBottom, ref textIndentConsumed, inheritedTextStyle, options, displayList, maxY);
+                continue;
+            }
+
+            if (child is not ElementRenderNode elementChild)
+            {
+                continue;
+            }
+
+            var placementColumn = ResolveGridPlacement(styleMap, elementChild, "grid-column", currentColumn);
+            var placementRow = ResolveGridPlacement(styleMap, elementChild, "grid-row", currentRow);
+            var effectivePlacementColumn = placementColumn;
+            var effectivePlacementRow = placementRow;
+
+            var hasExplicitColumnPlacement = elementChild.Ref.GetAttribute("data-render-grid-column") is not null;
+            var hasExplicitRowPlacement = elementChild.Ref.GetAttribute("data-render-grid-row") is not null;
+
+            if (hasExplicitColumnPlacement || hasExplicitRowPlacement)
+            {
+                effectivePlacementColumn = new GridPlacement(Math.Max(0, placementColumn.LineIndex), placementColumn.Span);
+                effectivePlacementRow = new GridPlacement(Math.Max(0, placementRow.LineIndex), placementRow.Span);
+            }
+            else
+            {
+                effectivePlacementColumn = new GridPlacement(Math.Max(0, currentColumn), placementColumn.Span);
+                effectivePlacementRow = new GridPlacement(Math.Max(0, currentRow), placementRow.Span);
+            }
+            var estimatedItemWidth = ResolveGridItemEstimatedSize(elementChild, styleMap, containingWidth, "width");
+            var estimatedItemHeight = ResolveGridItemEstimatedSize(elementChild, styleMap, containingWidth, "height");
+            var effectiveColumnCount = Math.Max(columns.Count, effectivePlacementColumn.LineIndex + effectivePlacementColumn.Span);
+            var effectiveRowCount = Math.Max(rows.Count, effectivePlacementRow.LineIndex + effectivePlacementRow.Span);
+
+            if (effectiveColumnCount > columns.Count)
+            {
+                columns.AddRange(Enumerable.Repeat(containingWidth, effectiveColumnCount - columns.Count));
+            }
+
+            if (effectiveRowCount > rows.Count)
+            {
+                rows.AddRange(Enumerable.Repeat(0f, effectiveRowCount - rows.Count));
+            }
+
+            EnsureGridTrackSize(columns, effectivePlacementColumn.LineIndex, estimatedItemWidth, containingWidth);
+            EnsureGridTrackSize(rows, effectivePlacementRow.LineIndex, estimatedItemHeight, 0f);
+
+            var contentX = borderBoxX + borderLeft + paddingLeft;
+            var contentY = borderBoxY + borderTop + paddingTop;
+            var cellX = contentX + GetGridTrackOffset(columns, effectivePlacementColumn.LineIndex, resolvedColumnGap);
+            var cellY = contentY + GetGridTrackOffset(rows, effectivePlacementRow.LineIndex, resolvedRowGap);
+            var cellWidth = GetGridTrackSpanSize(columns, effectivePlacementColumn.LineIndex, effectivePlacementColumn.Span, resolvedColumnGap, containingWidth);
+            var cellHeight = GetGridTrackSpanSize(rows, effectivePlacementRow.LineIndex, effectivePlacementRow.Span, resolvedRowGap, containingWidth);
+
+            var childCursor = cellY;
+            var childPreviousBlockMarginBottom = 0f;
+            var childSuppressNextBlockTopMargin = false;
+            var childActiveFloatLeftOffset = 0f;
+            var childActiveFloatBottom = 0f;
+            var childTextIndentConsumed = false;
+
+            LayoutNode(
+                node: elementChild,
+                containingX: cellX,
+                containingY: cellY,
+                containingWidth: Math.Max(0f, cellWidth),
+                cursorY: ref childCursor,
+                previousBlockMarginBottom: ref childPreviousBlockMarginBottom,
+                suppressNextBlockTopMargin: ref childSuppressNextBlockTopMargin,
+                activeFloatLeftOffset: ref childActiveFloatLeftOffset,
+                activeFloatBottom: ref childActiveFloatBottom,
+                textIndentConsumed: ref childTextIndentConsumed,
+                textStyle: inheritedTextStyle,
+                options: options,
+                displayList: displayList,
+                maxY: maxY,
+                isFlexItem: false,
+                isRowDirection: true,
+                flexMainSize: null,
+                flexCrossSize: null);
+
+            currentColumn++;
+            if (currentColumn >= columns.Count)
+            {
+                currentColumn = 0;
+                currentRow++;
+            }
+        }
+
+        var gridContentWidth = GetGridContentSize(columns, resolvedColumnGap, containingWidth);
+        var specifiedHeight = ParseLength(styleMap, "height", containingWidth, containingWidth, allowAuto: true);
+        var gridContentHeight = GetGridContentSize(rows, resolvedRowGap, specifiedHeight);
+        var borderBoxWidth = borderLeft + paddingLeft + Math.Max(containingWidth, gridContentWidth) + paddingRight + borderRight;
+        var borderBoxHeight = borderTop + paddingTop + Math.Max(ParseLength(styleMap, "height", containingWidth, containingWidth, allowAuto: true), gridContentHeight) + paddingBottom + borderBottom;
+        var canCollapseWithLastChild = borderBottom <= 0f && paddingBottom <= 0f;
+        var effectiveMarginBottom = ParseLength(styleMap, "margin-bottom", containingWidth, box.Margin.Bottom, allowAuto: false);
+
+        if (canCollapseWithLastChild)
+        {
+            effectiveMarginBottom = CollapseMargins(effectiveMarginBottom, previousBlockMarginBottom);
+        }
+
+        if (box.BackgroundPaint is RenderColorPaint colorPaint && colorPaint.Color.A == 0)
+        {
+            displayList.FillRect(new RenderRect(borderBoxX, borderBoxY, borderBoxWidth, borderBoxHeight), RenderColor.Transparent);
+        }
+        else
+        {
+            PaintBackground(displayList, box.BackgroundPaint, borderBoxX, borderBoxY, borderBoxWidth, borderBoxHeight);
+        }
+
+        PaintBorder(displayList, box.BorderColor, borderBoxX, borderBoxY, borderBoxWidth, borderBoxHeight, box.BorderWidth);
+        PaintOutline(displayList, styleMap, borderBoxX, borderBoxY, borderBoxWidth, borderBoxHeight);
+
+        cursorY = flowBorderBoxY + borderBoxHeight;
+        previousBlockMarginBottom = effectiveMarginBottom + options.ParagraphSpacing;
+        suppressNextBlockTopMargin = false;
+    }
+
+    private static float GetGridTrackOffset(IReadOnlyList<float> tracks, int index, float gap)
+    {
+        if (index <= 0)
+        {
+            return 0f;
+        }
+
+        var offset = 0f;
+        for (var current = 0; current < index && current < tracks.Count; current++)
+        {
+            offset += tracks[current];
+            offset += gap;
+        }
+
+        return offset;
+    }
+
+    private static float GetGridTrackSpanSize(IReadOnlyList<float> tracks, int index, int span, float gap, float fallback)
+    {
+        var totalSize = 0f;
+        var spanCount = Math.Max(1, span);
+
+        for (var current = 0; current < spanCount; current++)
+        {
+            var trackIndex = index + current;
+            totalSize += GetGridTrackSize(tracks, trackIndex, fallback);
+
+            if (current < spanCount - 1)
+            {
+                totalSize += gap;
+            }
+        }
+
+        return totalSize;
+    }
+
+    private static List<float> ParseGridTrackList(Dictionary<string, string> styleMap, string propertyName, float fallbackSize, int minimumCount)
+    {
+        if (!styleMap.TryGetValue(propertyName, out var rawValue) || string.IsNullOrWhiteSpace(rawValue))
+        {
+            var fallbackTracks = new List<float>(Math.Max(1, minimumCount));
+            var fallbackTrackSize = Math.Max(0f, fallbackSize / Math.Max(1, minimumCount));
+            for (var index = 0; index < Math.Max(1, minimumCount); index++)
+            {
+                fallbackTracks.Add(fallbackTrackSize);
+            }
+
+            return fallbackTracks;
+        }
+
+        var tracks = new List<float>();
+        foreach (var token in rawValue.Split(new[] { ' ', '\t', '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+        {
+            var normalized = token.Trim().ToLowerInvariant();
+            var trackSize = normalized switch
+            {
+                "auto" => Math.Max(0f, fallbackSize),
+                _ => ParseLengthValue(normalized, fallbackSize, allowAuto: false)
+            };
+
+            tracks.Add(float.IsNaN(trackSize) ? Math.Max(0f, fallbackSize) : Math.Max(0f, trackSize));
+        }
+
+        return tracks.Count > 0 ? tracks : new List<float> { Math.Max(0f, fallbackSize) };
+    }
+
+    private static List<float> CreateAutoRows(int itemCount, int columnCount, float containerHeight)
+    {
+        var rowCount = Math.Max(1, (int)Math.Ceiling((double)itemCount / Math.Max(1, columnCount)));
+        var fallbackRowSize = containerHeight > 0f ? containerHeight / rowCount : 0f;
+        return Enumerable.Range(0, rowCount).Select(_ => fallbackRowSize).ToList();
+    }
+
+    private static float? ParseGridGap(Dictionary<string, string> styleMap, string propertyName, float relativeTo, int tokenIndex)
+    {
+        if (!styleMap.TryGetValue(propertyName, out var rawValue) || string.IsNullOrWhiteSpace(rawValue))
+        {
+            return null;
+        }
+
+        var tokens = rawValue.Split(new[] { ' ', '\t', '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+        if (tokens.Length == 0)
+        {
+            return null;
+        }
+
+        var token = tokenIndex >= 0 && tokenIndex < tokens.Length ? tokens[tokenIndex] : tokens[^1];
+        var parsed = ParseLengthValue(token, float.NaN, allowAuto: false);
+        return float.IsNaN(parsed) ? null : parsed;
+    }
+
+    private static GridPlacement ResolveGridPlacement(Dictionary<string, string> styleMap, ElementRenderNode elementChild, string propertyName, int fallbackIndex)
+    {
+        var childStyleMap = CreateStyleMap(elementChild.ComputedStyle, elementChild.Ref);
+        if (!childStyleMap.TryGetValue(propertyName, out var rawValue) || string.IsNullOrWhiteSpace(rawValue))
+        {
+            return new GridPlacement(fallbackIndex, 1);
+        }
+
+        var tokens = rawValue.Split(new[] { ' ', '/', '\t', '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+        var startToken = tokens.FirstOrDefault(token => int.TryParse(token, out _));
+
+        if (startToken is not null && int.TryParse(startToken, out var explicitIndex))
+        {
+            return new GridPlacement(Math.Max(0, explicitIndex - 1), 1);
+        }
+
+        if (tokens.Length >= 3 && string.Equals(tokens[1], "span", StringComparison.OrdinalIgnoreCase) && int.TryParse(tokens[2], out var spanCount))
+        {
+            return new GridPlacement(Math.Max(0, fallbackIndex), Math.Max(1, spanCount));
+        }
+
+        return new GridPlacement(Math.Max(0, fallbackIndex), 1);
+    }
+
+    private static float ResolveGridItemEstimatedSize(ElementRenderNode elementChild, Dictionary<string, string> styleMap, float fallbackSize, string propertyName)
+    {
+        var rawValue = styleMap.TryGetValue(propertyName, out var value) && !string.IsNullOrWhiteSpace(value)
+            ? value
+            : null;
+
+        if (string.IsNullOrWhiteSpace(rawValue))
+        {
+            return fallbackSize;
+        }
+
+        var parsed = ParseLengthValue(rawValue, fallbackSize, allowAuto: false);
+        return float.IsNaN(parsed) ? fallbackSize : Math.Max(0f, parsed);
+    }
+
+    private static void EnsureGridTrackSize(List<float> tracks, int index, float size, float fallbackSize)
+    {
+        while (tracks.Count <= index)
+        {
+            tracks.Add(Math.Max(0f, fallbackSize));
+        }
+
+        if (tracks[index] <= 0f)
+        {
+            tracks[index] = Math.Max(0f, Math.Max(size, fallbackSize));
+        }
+    }
+
+    private static float GetGridTrackSize(IReadOnlyList<float> tracks, int index, float fallback)
+    {
+        if (index >= 0 && index < tracks.Count)
+        {
+            return tracks[index];
+        }
+
+        return fallback;
+    }
+
+    private static float GetGridContentSize(IReadOnlyList<float> tracks, float gap, float fallbackSize)
+    {
+        if (tracks.Count <= 1)
+        {
+            return Math.Max(fallbackSize, tracks.Sum());
+        }
+
+        var trackSize = tracks.Sum();
+        var gapSize = (tracks.Count - 1) * gap;
+        return Math.Max(fallbackSize, trackSize + gapSize);
+    }
+
     private static void LayoutTextNode(
         IText textNode,
         float containingX,
@@ -1464,6 +1835,12 @@ public sealed class HtmlRenderer
     {
         var display = GetDisplay(styleMap);
         return string.Equals(display, "flex", StringComparison.OrdinalIgnoreCase) || string.Equals(display, "inline-flex", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static bool IsGridContainer(Dictionary<string, string> styleMap)
+    {
+        var display = GetDisplay(styleMap);
+        return string.Equals(display, "grid", StringComparison.OrdinalIgnoreCase) || string.Equals(display, "inline-grid", StringComparison.OrdinalIgnoreCase);
     }
 
     private static string GetFlexDirection(Dictionary<string, string> styleMap)
@@ -1789,13 +2166,31 @@ public sealed class HtmlRenderer
                 continue;
             }
 
-            if (!TryExtractGradientBackground(styleAttribute, out var gradientValue, out var updatedStyle))
+            var currentStyle = styleAttribute;
+            var changed = false;
+
+            if (TryExtractGradientBackground(currentStyle, out var gradientValue, out var updatedStyle))
             {
-                continue;
+                currentStyle = updatedStyle;
+                changed = true;
+                element.SetAttribute("data-render-gradient", gradientValue);
             }
 
-            element.SetAttribute("style", updatedStyle);
-            element.SetAttribute("data-render-gradient", gradientValue);
+            if (TryExtractGridDeclarations(currentStyle, out var gridValues, out updatedStyle))
+            {
+                currentStyle = updatedStyle;
+                changed = true;
+
+                foreach (var entry in gridValues)
+                {
+                    element.SetAttribute($"data-render-{entry.Key}", entry.Value);
+                }
+            }
+
+            if (changed)
+            {
+                element.SetAttribute("style", currentStyle);
+            }
         }
     }
 
@@ -1844,10 +2239,103 @@ public sealed class HtmlRenderer
         return true;
     }
 
+    private static bool TryExtractGridDeclarations(string styleAttribute, out Dictionary<string, string> values, out string updatedStyle)
+    {
+        values = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        updatedStyle = styleAttribute;
+
+        if (string.IsNullOrWhiteSpace(styleAttribute))
+        {
+            return false;
+        }
+
+        var declarations = styleAttribute.Split(';', StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries);
+        var remaining = new List<string>();
+        var strippedAny = false;
+
+        foreach (var declaration in declarations)
+        {
+            var separator = declaration.IndexOf(':');
+            if (separator <= 0)
+            {
+                continue;
+            }
+
+            var property = declaration[..separator].Trim();
+            var value = declaration[(separator + 1)..].Trim();
+
+            if (string.Equals(property, "grid-column", StringComparison.OrdinalIgnoreCase))
+            {
+                values["grid-column"] = value;
+                strippedAny = true;
+                continue;
+            }
+
+            if (string.Equals(property, "grid-row", StringComparison.OrdinalIgnoreCase))
+            {
+                values["grid-row"] = value;
+                strippedAny = true;
+                continue;
+            }
+
+            if (string.Equals(property, "grid-template-columns", StringComparison.OrdinalIgnoreCase))
+            {
+                values["grid-template-columns"] = value;
+                strippedAny = true;
+                continue;
+            }
+
+            if (string.Equals(property, "grid-template-rows", StringComparison.OrdinalIgnoreCase))
+            {
+                values["grid-template-rows"] = value;
+                strippedAny = true;
+                continue;
+            }
+
+            if (string.Equals(property, "column-gap", StringComparison.OrdinalIgnoreCase))
+            {
+                values["column-gap"] = value;
+                strippedAny = true;
+                continue;
+            }
+
+            if (string.Equals(property, "row-gap", StringComparison.OrdinalIgnoreCase))
+            {
+                values["row-gap"] = value;
+                strippedAny = true;
+                continue;
+            }
+
+            if (string.Equals(property, "gap", StringComparison.OrdinalIgnoreCase))
+            {
+                values["gap"] = value;
+                strippedAny = true;
+                continue;
+            }
+
+            remaining.Add(declaration);
+        }
+
+        if (!strippedAny)
+        {
+            return false;
+        }
+
+        updatedStyle = string.Join(";", remaining);
+        return true;
+    }
+
     private static Dictionary<string, string> CreateStyleMap(ICssStyleDeclaration style, IElement? element = null)
     {
         var map = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
         var inlineStyle = element?.GetAttribute("style");
+        var gridColumnValue = element?.GetAttribute("data-render-grid-column");
+        var gridRowValue = element?.GetAttribute("data-render-grid-row");
+        var gridTemplateColumnsValue = element?.GetAttribute("data-render-grid-template-columns");
+        var gridTemplateRowsValue = element?.GetAttribute("data-render-grid-template-rows");
+        var columnGapValue = element?.GetAttribute("data-render-column-gap");
+        var rowGapValue = element?.GetAttribute("data-render-row-gap");
+        var gapValue = element?.GetAttribute("data-render-gap");
 
         var displayValue = style.GetDisplay();
         if (string.IsNullOrWhiteSpace(displayValue))
@@ -1896,6 +2384,13 @@ public sealed class HtmlRenderer
         AddIfPresent(map, "outline-color", style.GetPropertyValue("outline-color"));
 
         AddIfPresent(map, "background-color", style.GetBackgroundColor());
+        AddIfPresent(map, "grid-template-columns", !string.IsNullOrWhiteSpace(gridTemplateColumnsValue) ? gridTemplateColumnsValue : (string.IsNullOrWhiteSpace(style.GetPropertyValue("grid-template-columns")) ? ParseStyleAttributeValue(inlineStyle, "grid-template-columns") : style.GetPropertyValue("grid-template-columns")));
+        AddIfPresent(map, "grid-template-rows", !string.IsNullOrWhiteSpace(gridTemplateRowsValue) ? gridTemplateRowsValue : (string.IsNullOrWhiteSpace(style.GetPropertyValue("grid-template-rows")) ? ParseStyleAttributeValue(inlineStyle, "grid-template-rows") : style.GetPropertyValue("grid-template-rows")));
+        AddIfPresent(map, "column-gap", !string.IsNullOrWhiteSpace(columnGapValue) ? columnGapValue : (string.IsNullOrWhiteSpace(style.GetPropertyValue("column-gap")) ? ParseStyleAttributeValue(inlineStyle, "column-gap") : style.GetPropertyValue("column-gap")));
+        AddIfPresent(map, "row-gap", !string.IsNullOrWhiteSpace(rowGapValue) ? rowGapValue : (string.IsNullOrWhiteSpace(style.GetPropertyValue("row-gap")) ? ParseStyleAttributeValue(inlineStyle, "row-gap") : style.GetPropertyValue("row-gap")));
+        AddIfPresent(map, "gap", !string.IsNullOrWhiteSpace(gapValue) ? gapValue : (string.IsNullOrWhiteSpace(style.GetPropertyValue("gap")) ? ParseStyleAttributeValue(inlineStyle, "gap") : style.GetPropertyValue("gap")));
+        AddIfPresent(map, "grid-column", !string.IsNullOrWhiteSpace(gridColumnValue) ? gridColumnValue : ParseStyleAttributeValue(inlineStyle, "grid-column"));
+        AddIfPresent(map, "grid-row", !string.IsNullOrWhiteSpace(gridRowValue) ? gridRowValue : ParseStyleAttributeValue(inlineStyle, "grid-row"));
         AddIfPresent(map, "flex-direction", string.IsNullOrWhiteSpace(style.GetPropertyValue("flex-direction")) ? ParseStyleAttributeValue(inlineStyle, "flex-direction") : style.GetPropertyValue("flex-direction"));
         AddIfPresent(map, "justify-content", string.IsNullOrWhiteSpace(style.GetPropertyValue("justify-content")) ? ParseStyleAttributeValue(inlineStyle, "justify-content") : style.GetPropertyValue("justify-content"));
         AddIfPresent(map, "align-items", string.IsNullOrWhiteSpace(style.GetPropertyValue("align-items")) ? ParseStyleAttributeValue(inlineStyle, "align-items") : style.GetPropertyValue("align-items"));

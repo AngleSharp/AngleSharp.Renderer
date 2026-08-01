@@ -5,6 +5,7 @@ Released on Monday, August 3 2026.
 - Added support for gradients
 - Added rendering images
 - Added flexbox layout mode
+- Added grid layout mode
 
 # 0.2.0
 

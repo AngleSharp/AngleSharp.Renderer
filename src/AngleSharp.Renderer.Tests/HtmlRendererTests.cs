@@ -618,6 +618,177 @@ public sealed class HtmlRendererTests
     }
 
     [Fact]
+    public async Task BuildDisplayList_LaysOutGridItemsInRowsAndColumns()
+    {
+        var document = await ParseAsync("""
+            <html><body>
+                <div style="display:grid; grid-template-columns:50px 50px; grid-template-rows:20px 20px; width:100px; height:40px;">
+                    <div style="width:20px; height:10px; background-color:#ff0000;"></div>
+                    <div style="width:20px; height:10px; background-color:#0000ff;"></div>
+                    <div style="width:20px; height:10px; background-color:#00ff00;"></div>
+                    <div style="width:20px; height:10px; background-color:#ffff00;"></div>
+                </div>
+            </body></html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, new HtmlRenderOptions
+        {
+            Width = 200,
+            Height = 120,
+            FontSize = 16f,
+        });
+
+        var childBackgrounds = displayList.Commands
+            .OfType<FillRectCommand>()
+            .Where(command => command.Rect.Width == 20f && command.Rect.Height == 10f)
+            .OrderBy(command => command.Rect.Y)
+            .ThenBy(command => command.Rect.X)
+            .ToArray();
+
+        Assert.Equal(4, childBackgrounds.Length);
+        Assert.Equal(16f, childBackgrounds[0].Rect.X);
+        Assert.Equal(16f, childBackgrounds[0].Rect.Y);
+        Assert.Equal(66f, childBackgrounds[1].Rect.X);
+        Assert.Equal(16f, childBackgrounds[1].Rect.Y);
+        Assert.Equal(16f, childBackgrounds[2].Rect.X);
+        Assert.Equal(36f, childBackgrounds[2].Rect.Y);
+        Assert.Equal(66f, childBackgrounds[3].Rect.X);
+        Assert.Equal(36f, childBackgrounds[3].Rect.Y);
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_AppliesGridGapsToTrackPlacement()
+    {
+        var document = await ParseAsync("""
+            <html><body>
+                <div style="display:grid; grid-template-columns:50px 50px; grid-template-rows:20px 20px; gap:10px 20px; width:120px; height:60px;">
+                    <div style="width:20px; height:10px; background-color:#ff0000;"></div>
+                    <div style="width:20px; height:10px; background-color:#0000ff;"></div>
+                    <div style="width:20px; height:10px; background-color:#00ff00;"></div>
+                    <div style="width:20px; height:10px; background-color:#ffff00;"></div>
+                </div>
+            </body></html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, new HtmlRenderOptions
+        {
+            Width = 200,
+            Height = 120,
+            FontSize = 16f,
+        });
+
+        var childBackgrounds = displayList.Commands
+            .OfType<FillRectCommand>()
+            .Where(command => command.Rect.Width == 20f && command.Rect.Height == 10f)
+            .OrderBy(command => command.Rect.Y)
+            .ThenBy(command => command.Rect.X)
+            .ToArray();
+
+        Assert.Equal(4, childBackgrounds.Length);
+        Assert.Equal(16f, childBackgrounds[0].Rect.X);
+        Assert.Equal(16f, childBackgrounds[0].Rect.Y);
+        Assert.Equal(76f, childBackgrounds[1].Rect.X);
+        Assert.Equal(16f, childBackgrounds[1].Rect.Y);
+        Assert.Equal(16f, childBackgrounds[2].Rect.X);
+        Assert.Equal(46f, childBackgrounds[2].Rect.Y);
+        Assert.Equal(76f, childBackgrounds[3].Rect.X);
+        Assert.Equal(46f, childBackgrounds[3].Rect.Y);
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_AppliesExplicitGridItemPlacement()
+    {
+        var document = await ParseAsync("""
+            <html><body>
+                <div style="display:grid; grid-template-columns:50px 50px; grid-template-rows:20px 20px; width:100px; height:40px;">
+                    <div style="width:20px; height:10px; background-color:#ff0000; grid-column:2; grid-row:2;"></div>
+                </div>
+            </body></html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, new HtmlRenderOptions
+        {
+            Width = 200,
+            Height = 120,
+            FontSize = 16f,
+        });
+
+        var childBackground = displayList.Commands
+            .OfType<FillRectCommand>()
+            .Single(command => command.Rect.Width == 20f && command.Rect.Height == 10f);
+
+        Assert.Equal(66f, childBackground.Rect.X);
+        Assert.Equal(36f, childBackground.Rect.Y);
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_AppliesSpanBasedGridItemPlacement()
+    {
+        var document = await ParseAsync("""
+            <html><body>
+                <div style="display:grid; grid-template-columns:50px 50px; grid-template-rows:20px 20px; width:100px; height:40px;">
+                    <div style="width:20px; height:10px; background-color:#ff0000; grid-column:1 / span 2;"></div>
+                </div>
+            </body></html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, new HtmlRenderOptions
+        {
+            Width = 200,
+            Height = 120,
+            FontSize = 16f,
+        });
+
+        var childBackground = displayList.Commands
+            .OfType<FillRectCommand>()
+            .Single(command => command.Rect.Width == 20f && command.Rect.Height == 10f);
+
+        Assert.Equal(16f, childBackground.Rect.X);
+        Assert.Equal(16f, childBackground.Rect.Y);
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_AppliesAutoPlacementAcrossImplicitTracks()
+    {
+        var document = await ParseAsync("""
+            <html><body>
+                <div style="display:grid; grid-template-columns:50px 50px; width:100px; height:40px;">
+                    <div style="width:20px; height:10px; background-color:#ff0000;"></div>
+                    <div style="width:20px; height:10px; background-color:#0000ff;"></div>
+                    <div style="width:20px; height:10px; background-color:#00ff00;"></div>
+                </div>
+            </body></html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, new HtmlRenderOptions
+        {
+            Width = 200,
+            Height = 120,
+            FontSize = 16f,
+        });
+
+        var childBackgrounds = displayList.Commands
+            .OfType<FillRectCommand>()
+            .Where(command => command.Rect.Width == 20f && command.Rect.Height == 10f)
+            .OrderBy(command => command.Rect.Y)
+            .ThenBy(command => command.Rect.X)
+            .ToArray();
+
+        Assert.Equal(3, childBackgrounds.Length);
+        Assert.Equal(16f, childBackgrounds[0].Rect.X);
+        Assert.Equal(16f, childBackgrounds[0].Rect.Y);
+        Assert.Equal(66f, childBackgrounds[1].Rect.X);
+        Assert.Equal(16f, childBackgrounds[1].Rect.Y);
+        Assert.Equal(16f, childBackgrounds[2].Rect.X);
+        Assert.Equal(36f, childBackgrounds[2].Rect.Y);
+    }
+
+    [Fact]
     public async Task BuildDisplayList_AppliesLetterSpacingToTextCommands()
     {
         var document = await ParseAsync("""
