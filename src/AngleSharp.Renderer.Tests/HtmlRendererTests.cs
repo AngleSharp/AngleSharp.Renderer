@@ -25,6 +25,29 @@ public sealed class HtmlRendererTests
     }
 
     [Fact]
+    public async Task BuildDisplayList_PaintsImageElementsFromCurrentDownload()
+    {
+        var document = await ParseAsync("""
+            <html><body>
+                <img src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAACklEQVR4nGMAAQABAA4A4cQTmwAAAABJRU5ErkJggg==" style="width:40px; height:20px;" />
+            </body></html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, new HtmlRenderOptions
+        {
+            Width = 240,
+            Height = 160,
+            FontSize = 16f,
+        });
+
+        var imageCommand = Assert.Single(displayList.Commands.OfType<DrawImageCommand>());
+        Assert.Equal(40f, imageCommand.Rect.Width);
+        Assert.Equal(20f, imageCommand.Rect.Height);
+        Assert.NotEmpty(imageCommand.Image.Data);
+    }
+
+    [Fact]
     public async Task BuildDisplayList_ParsesLinearGradientBackgrounds()
     {
         var document = await ParseAsync("""

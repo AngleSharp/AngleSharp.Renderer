@@ -40,6 +40,15 @@ public sealed class DisplayList
     }
 
     /// <summary>
+    /// Adds an image draw command.
+    /// </summary>
+    public void DrawImage(RenderRect rect, RenderedImage image)
+    {
+        ArgumentNullException.ThrowIfNull(image);
+        Add(new DrawImageCommand(rect, image));
+    }
+
+    /// <summary>
     /// Adds a text draw command.
     /// </summary>
     public void DrawText(

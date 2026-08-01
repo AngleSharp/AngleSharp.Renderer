@@ -1,4 +1,5 @@
 using System.Globalization;
+using System.IO;
 using System.Linq;
 using System.Text;
 
@@ -6,8 +7,11 @@ using AngleSharp.Css;
 using AngleSharp.Css.Dom;
 using AngleSharp.Css.RenderTree;
 using AngleSharp.Dom;
+using AngleSharp.Io;
 using AngleSharp.Renderer.Rendering;
 using AngleSharp.Renderer.Skia;
+
+using SkiaSharp;
 
 namespace AngleSharp.Renderer;
 
@@ -214,7 +218,7 @@ public sealed class HtmlRenderer
             return;
         }
 
-        var renderAsBlock = ShouldRenderAsBlock(computedStyle);
+        var renderAsBlock = ShouldRenderAsBlock(computedStyle) || string.Equals(tagName, "img", StringComparison.OrdinalIgnoreCase);
         var isInlineBlock = IsInlineBlock(computedStyle);
         var currentTextStyle = ResolveTextStyle(styleMap, inheritedTextStyle);
 
@@ -524,6 +528,12 @@ public sealed class HtmlRenderer
         PaintBackground(displayList, box.BackgroundPaint, borderBoxX, borderBoxY, borderBoxWidth, borderBoxHeight);
         PaintBorder(displayList, box.BorderColor, borderBoxX, borderBoxY, borderBoxWidth, borderBoxHeight, box.BorderWidth);
         PaintOutline(displayList, styleMap, borderBoxX, borderBoxY, borderBoxWidth, borderBoxHeight);
+
+        if (string.Equals(tagName, "img", StringComparison.OrdinalIgnoreCase) &&
+            TryResolveImage(node, styleMap, flowContainingWidth, borderBoxX + borderLeft + paddingLeft, borderBoxY + borderTop + paddingTop, out var image, out var imageRect))
+        {
+            displayList.DrawImage(imageRect, image!);
+        }
 
         if (isFloatLeft)
         {
@@ -1646,6 +1656,142 @@ public sealed class HtmlRenderer
             width + (2f * outlineWidth),
             height + (2f * outlineWidth),
             new EdgeSizes(outlineWidth, outlineWidth, outlineWidth, outlineWidth));
+    }
+
+    private static bool TryResolveImage(ElementRenderNode node, Dictionary<string, string> styleMap, float containingWidth, float x, float y, out RenderedImage? image, out RenderRect rect)
+    {
+        image = null;
+        rect = default;
+
+        if (!string.Equals(node.Ref.LocalName, "img", StringComparison.OrdinalIgnoreCase))
+        {
+            return false;
+        }
+
+        var source = node.Ref.GetAttribute("src");
+        byte[]? bytes = null;
+        string? mimeType = null;
+
+        if (node.Ref is ILoadableElement loadableElement && loadableElement.CurrentDownload is { Task: not null } download)
+        {
+            IResponse? response;
+
+            try
+            {
+                response = download.Task.GetAwaiter().GetResult();
+            }
+            catch
+            {
+                response = null;
+            }
+
+            if (response?.Content is not null)
+            {
+                using var sourceStream = response.Content;
+                using var memoryStream = new MemoryStream();
+                sourceStream.CopyTo(memoryStream);
+                bytes = memoryStream.ToArray();
+                mimeType = response.Headers?.TryGetValue("Content-Type", out var contentType) == true && !string.IsNullOrWhiteSpace(contentType)
+                    ? contentType
+                    : "image/unknown";
+            }
+        }
+
+        if (bytes is null && TryParseDataUri(source, out var dataUriBytes, out var dataUriMimeType))
+        {
+            bytes = dataUriBytes;
+            mimeType = dataUriMimeType;
+        }
+
+        if (bytes is null || bytes.Length == 0)
+        {
+            return false;
+        }
+
+        using var skImage = SKImage.FromEncodedData(bytes);
+        if (skImage is null)
+        {
+            return false;
+        }
+
+        var width = ParseLength(styleMap, "width", containingWidth, float.NaN, allowAuto: true);
+        var height = ParseLength(styleMap, "height", containingWidth, float.NaN, allowAuto: true);
+
+        var naturalWidth = skImage.Width;
+        var naturalHeight = skImage.Height;
+
+        if (float.IsNaN(width) && float.IsNaN(height))
+        {
+            width = naturalWidth;
+            height = naturalHeight;
+        }
+        else if (float.IsNaN(width) && !float.IsNaN(height) && naturalWidth > 0f)
+        {
+            width = (height / naturalHeight) * naturalWidth;
+        }
+        else if (!float.IsNaN(width) && float.IsNaN(height) && naturalHeight > 0f)
+        {
+            height = (width / naturalWidth) * naturalHeight;
+        }
+
+        if (float.IsNaN(width) || float.IsNaN(height) || width <= 0f || height <= 0f)
+        {
+            width = naturalWidth;
+            height = naturalHeight;
+        }
+
+        image = new RenderedImage(bytes, (int)Math.Max(1, Math.Round(width)), (int)Math.Max(1, Math.Round(height)), mimeType ?? "image/unknown");
+        rect = new RenderRect(x, y, width, height);
+        return true;
+    }
+
+    private static bool TryParseDataUri(string? source, out byte[]? bytes, out string? mimeType)
+    {
+        bytes = null;
+        mimeType = null;
+
+        if (string.IsNullOrWhiteSpace(source) || !source.StartsWith("data:", StringComparison.OrdinalIgnoreCase))
+        {
+            return false;
+        }
+
+        var commaIndex = source.IndexOf(',');
+        if (commaIndex <= 5)
+        {
+            return false;
+        }
+
+        var header = source[5..commaIndex];
+        var isBase64 = header.EndsWith(";base64", StringComparison.OrdinalIgnoreCase);
+        var mediaType = isBase64 ? header[..^7] : header;
+        var payload = source[(commaIndex + 1)..];
+
+        if (string.IsNullOrEmpty(mediaType))
+        {
+            mimeType = "image/unknown";
+        }
+        else if (mediaType.StartsWith(";", StringComparison.Ordinal))
+        {
+            mimeType = "image/unknown";
+        }
+        else
+        {
+            mimeType = mediaType;
+        }
+
+        try
+        {
+            bytes = isBase64
+                ? Convert.FromBase64String(payload)
+                : Encoding.UTF8.GetBytes(Uri.UnescapeDataString(payload));
+        }
+        catch
+        {
+            bytes = null;
+            return false;
+        }
+
+        return bytes.Length > 0;
     }
 
     private static void PaintBackground(DisplayList displayList, RenderPaint paint, float x, float y, float width, float height)

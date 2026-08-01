@@ -2,7 +2,8 @@
 
 Released on Monday, August 3 2026.
 
-- Added support for gradients.
+- Added support for gradients
+- Added support for images
 
 # 0.2.0
 

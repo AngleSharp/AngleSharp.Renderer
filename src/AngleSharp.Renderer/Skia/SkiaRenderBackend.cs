@@ -66,6 +66,9 @@ public sealed class SkiaRenderBackend : IRenderBackend
             case FillRectCommand fill:
                 DrawFillRect(canvas, fill);
                 break;
+            case DrawImageCommand image:
+                DrawImage(canvas, image);
+                break;
             case DrawTextCommand text:
                 DrawText(canvas, text);
                 break;
@@ -159,6 +162,30 @@ public sealed class SkiaRenderBackend : IRenderBackend
             gradient.Stops.Select(stop => new SKColor(stop.Color.R, stop.Color.G, stop.Color.B, stop.Color.A)).ToArray(),
             gradient.Stops.Select(stop => stop.Position).ToArray(),
             SKShaderTileMode.Clamp);
+    }
+
+    private static void DrawImage(SKCanvas canvas, DrawImageCommand command)
+    {
+        if (command.Image.Data.Length == 0 || command.Rect.IsEmpty)
+        {
+            return;
+        }
+
+        using var data = SKData.CreateCopy(command.Image.Data);
+        using var image = SKImage.FromEncodedData(data);
+        if (image is null)
+        {
+            return;
+        }
+
+        var rect = new SKRect(
+            command.Rect.X,
+            command.Rect.Y,
+            command.Rect.X + command.Rect.Width,
+            command.Rect.Y + command.Rect.Height);
+
+        using var paint = new SKPaint { IsAntialias = true, FilterQuality = SKFilterQuality.High };
+        canvas.DrawImage(image, rect, paint);
     }
 
     private static void DrawText(SKCanvas canvas, DrawTextCommand command)
