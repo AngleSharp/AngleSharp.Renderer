@@ -25,6 +25,94 @@ public sealed class HtmlRendererTests
     }
 
     [Fact]
+    public async Task BuildDisplayList_ParsesLinearGradientBackgrounds()
+    {
+        var document = await ParseAsync("""
+            <html><body>
+                <div style="width:100px; height:50px; background-image:linear-gradient(#ff0000, #0000ff);"></div>
+            </body></html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, new HtmlRenderOptions
+        {
+            Width = 240,
+            Height = 160,
+            FontSize = 16f,
+        });
+
+        var gradientBackground = displayList.Commands
+            .OfType<FillRectCommand>()
+            .Single(command => command.Paint is RenderGradientPaint);
+
+        var gradient = Assert.IsType<RenderGradientPaint>(gradientBackground.Paint).Gradient;
+
+        Assert.Equal(RenderGradientKind.Linear, gradient.Kind);
+        Assert.Equal(2, gradient.Stops.Count);
+        Assert.Equal(new RenderColor(255, 0, 0), gradient.Stops[0].Color);
+        Assert.Equal(new RenderColor(0, 0, 255), gradient.Stops[1].Color);
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_ParsesRadialGradientBackgrounds()
+    {
+        var document = await ParseAsync("""
+            <html><body>
+                <div style="width:100px; height:50px; background-image:radial-gradient(circle, #ff0000 0%, #0000ff 100%);"></div>
+            </body></html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, new HtmlRenderOptions
+        {
+            Width = 240,
+            Height = 160,
+            FontSize = 16f,
+        });
+
+        var gradientBackground = displayList.Commands
+            .OfType<FillRectCommand>()
+            .Single(command => command.Paint is RenderGradientPaint);
+
+        var gradient = Assert.IsType<RenderGradientPaint>(gradientBackground.Paint).Gradient;
+
+        Assert.Equal(RenderGradientKind.Radial, gradient.Kind);
+        Assert.Equal(2, gradient.Stops.Count);
+        Assert.Equal(new RenderColor(255, 0, 0), gradient.Stops[0].Color);
+        Assert.Equal(new RenderColor(0, 0, 255), gradient.Stops[1].Color);
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_ParsesConicGradientBackgrounds()
+    {
+        var document = await ParseAsync("""
+            <html><body>
+                <div style="width:100px; height:50px; background-image:conic-gradient(from 45deg, #ff0000, #00ff00, #0000ff);"></div>
+            </body></html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, new HtmlRenderOptions
+        {
+            Width = 240,
+            Height = 160,
+            FontSize = 16f,
+        });
+
+        var gradientBackground = displayList.Commands
+            .OfType<FillRectCommand>()
+            .Single(command => command.Paint is RenderGradientPaint);
+
+        var gradient = Assert.IsType<RenderGradientPaint>(gradientBackground.Paint).Gradient;
+
+        Assert.Equal(RenderGradientKind.Conic, gradient.Kind);
+        Assert.Equal(3, gradient.Stops.Count);
+        Assert.Equal(new RenderColor(255, 0, 0), gradient.Stops[0].Color);
+        Assert.Equal(new RenderColor(0, 255, 0), gradient.Stops[1].Color);
+        Assert.Equal(new RenderColor(0, 0, 255), gradient.Stops[2].Color);
+    }
+
+    [Fact]
     public async Task BuildDisplayList_PropagatesFontSizeStyleAndDecorationToTextCommands()
     {
         var document = await ParseAsync("""

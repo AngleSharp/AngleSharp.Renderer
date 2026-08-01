@@ -79,6 +79,8 @@ public sealed class HtmlRenderer
             return displayList;
         }
 
+        PrepareDocumentForRendering(document);
+
         var renderDevice = new DefaultRenderDevice
         {
             ViewPortWidth = viewport.Width,
@@ -183,7 +185,7 @@ public sealed class HtmlRenderer
     {
         var element = node.Ref;
         var computedStyle = node.ComputedStyle;
-        var styleMap = CreateStyleMap(node.ComputedStyle);
+        var styleMap = CreateStyleMap(node.ComputedStyle, node.Ref);
 
         if (!node.IsVisible())
         {
@@ -519,7 +521,7 @@ public sealed class HtmlRenderer
             effectiveMarginBottom = CollapseMargins(marginBottom, childPreviousBlockMarginBottom);
         }
 
-        PaintBackground(displayList, box.BackgroundColor, borderBoxX, borderBoxY, borderBoxWidth, borderBoxHeight);
+        PaintBackground(displayList, box.BackgroundPaint, borderBoxX, borderBoxY, borderBoxWidth, borderBoxHeight);
         PaintBorder(displayList, box.BorderColor, borderBoxX, borderBoxY, borderBoxWidth, borderBoxHeight, box.BorderWidth);
         PaintOutline(displayList, styleMap, borderBoxX, borderBoxY, borderBoxWidth, borderBoxHeight);
 
@@ -1231,7 +1233,75 @@ public sealed class HtmlRenderer
         return defaultValue;
     }
 
-    private static Dictionary<string, string> CreateStyleMap(ICssStyleDeclaration style)
+    private static void PrepareDocumentForRendering(IDocument document)
+    {
+        ArgumentNullException.ThrowIfNull(document);
+
+        foreach (var element in document.All.OfType<IElement>())
+        {
+            var styleAttribute = element.GetAttribute("style");
+
+            if (string.IsNullOrWhiteSpace(styleAttribute))
+            {
+                continue;
+            }
+
+            if (!TryExtractGradientBackground(styleAttribute, out var gradientValue, out var updatedStyle))
+            {
+                continue;
+            }
+
+            element.SetAttribute("style", updatedStyle);
+            element.SetAttribute("data-render-gradient", gradientValue);
+        }
+    }
+
+    private static bool TryExtractGradientBackground(string styleAttribute, out string gradientValue, out string updatedStyle)
+    {
+        gradientValue = string.Empty;
+        updatedStyle = styleAttribute;
+
+        if (!styleAttribute.Contains("background-image", StringComparison.OrdinalIgnoreCase))
+        {
+            return false;
+        }
+
+        var declarations = styleAttribute.Split(';', StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries);
+        var remaining = new List<string>();
+
+        foreach (var declaration in declarations)
+        {
+            var separator = declaration.IndexOf(':');
+            if (separator <= 0)
+            {
+                continue;
+            }
+
+            var property = declaration[..separator].Trim();
+            var value = declaration[(separator + 1)..].Trim();
+
+            if (string.Equals(property, "background-image", StringComparison.OrdinalIgnoreCase) &&
+                (value.StartsWith("linear-gradient", StringComparison.OrdinalIgnoreCase) ||
+                 value.StartsWith("radial-gradient", StringComparison.OrdinalIgnoreCase) ||
+                 value.StartsWith("conic-gradient", StringComparison.OrdinalIgnoreCase)))
+            {
+                gradientValue = value;
+                continue;
+            }
+
+            remaining.Add(declaration);
+        }
+
+        if (string.IsNullOrWhiteSpace(gradientValue))
+        {
+            return false;
+        }
+
+        updatedStyle = string.Join(";", remaining);
+        return true;
+    }
+
+    private static Dictionary<string, string> CreateStyleMap(ICssStyleDeclaration style, IElement? element = null)
     {
         var map = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
 
@@ -1276,6 +1346,19 @@ public sealed class HtmlRenderer
         AddIfPresent(map, "outline-color", style.GetPropertyValue("outline-color"));
 
         AddIfPresent(map, "background-color", style.GetBackgroundColor());
+
+        var backgroundImageValue = element is not null
+            ? element.GetAttribute("data-render-gradient")
+            : null;
+
+        if (!string.IsNullOrWhiteSpace(backgroundImageValue))
+        {
+            AddIfPresent(map, "background-image", backgroundImageValue);
+        }
+        else
+        {
+            AddIfPresent(map, "background-image", style.GetPropertyValue("background-image"));
+        }
         AddIfPresent(map, "font-size", style.GetFontSize());
         AddIfPresent(map, "font-family", style.GetFontFamily());
         AddIfPresent(map, "font-weight", style.GetPropertyValue("font-weight"));
@@ -1341,7 +1424,7 @@ public sealed class HtmlRenderer
                 return false;
             }
 
-            var childStyle = CreateStyleMap(childElement.ComputedStyle);
+            var childStyle = CreateStyleMap(childElement.ComputedStyle, childElement.Ref);
             marginTop = ParseLength(childStyle, "margin-top", containingWidth, 0f, allowAuto: false);
             return true;
         }
@@ -1362,7 +1445,7 @@ public sealed class HtmlRenderer
         {
             if (child is ElementRenderNode elementChild)
             {
-                var childStyleMap = CreateStyleMap(elementChild.ComputedStyle);
+                var childStyleMap = CreateStyleMap(elementChild.ComputedStyle, elementChild.Ref);
 
                 if (IsOutOfFlowPositioned(childStyleMap))
                 {
@@ -1453,6 +1536,7 @@ public sealed class HtmlRenderer
         borderWidth = ApplyBorderStyleToWidths(borderWidth, borderStyle);
 
         var backgroundColor = ParseColor(styleMap.TryGetValue("background-color", out var background) ? background : null, RenderColor.Transparent);
+        var backgroundPaint = ParseBackgroundPaint(styleMap, backgroundColor);
         var borderColor = ParseColor(
             styleMap.TryGetValue("border-top-color", out var topColor) ? topColor :
             styleMap.TryGetValue("border-right-color", out var rightColor) ? rightColor :
@@ -1461,7 +1545,7 @@ public sealed class HtmlRenderer
             null,
             RenderColor.Black);
 
-        return new BoxStyle(margin, padding, borderWidth, backgroundColor, borderColor);
+        return new BoxStyle(margin, padding, borderWidth, backgroundPaint, borderColor);
     }
 
     private static EdgeBorderStyle ResolveBorderStyles(Dictionary<string, string> styleMap)
@@ -1564,14 +1648,28 @@ public sealed class HtmlRenderer
             new EdgeSizes(outlineWidth, outlineWidth, outlineWidth, outlineWidth));
     }
 
-    private static void PaintBackground(DisplayList displayList, RenderColor color, float x, float y, float width, float height)
+    private static void PaintBackground(DisplayList displayList, RenderPaint paint, float x, float y, float width, float height)
     {
-        if (color.A == 0 || width <= 0f || height <= 0f)
+        if (width <= 0f || height <= 0f)
         {
             return;
         }
 
-        displayList.FillRect(new RenderRect(x, y, width, height), color);
+        if (paint is RenderColorPaint colorPaint)
+        {
+            if (colorPaint.Color.A == 0)
+            {
+                return;
+            }
+
+            displayList.FillRect(new RenderRect(x, y, width, height), colorPaint.Color);
+            return;
+        }
+
+        if (paint is RenderGradientPaint)
+        {
+            displayList.FillRect(new RenderRect(x, y, width, height), paint);
+        }
     }
 
     private static void PaintBorder(DisplayList displayList, RenderColor color, float x, float y, float width, float height, EdgeSizes border)
@@ -1736,6 +1834,269 @@ public sealed class HtmlRenderer
 
         pixels = 0f;
         return false;
+    }
+
+    private static RenderPaint ParseBackgroundPaint(Dictionary<string, string> styleMap, RenderColor fallbackColor)
+    {
+        if (!styleMap.TryGetValue("background-image", out var backgroundImage) || string.IsNullOrWhiteSpace(backgroundImage))
+        {
+            return new RenderColorPaint(fallbackColor);
+        }
+
+        return ParseGradientPaint(backgroundImage, fallbackColor);
+    }
+
+    private static RenderPaint ParseGradientPaint(string rawValue, RenderColor fallbackColor)
+    {
+        var value = rawValue.Trim();
+
+        if (value.StartsWith("linear-gradient", StringComparison.OrdinalIgnoreCase))
+        {
+            return new RenderGradientPaint(ParseLinearGradient(value, fallbackColor));
+        }
+
+        if (value.StartsWith("radial-gradient", StringComparison.OrdinalIgnoreCase))
+        {
+            return new RenderGradientPaint(ParseRadialGradient(value, fallbackColor));
+        }
+
+        if (value.StartsWith("conic-gradient", StringComparison.OrdinalIgnoreCase))
+        {
+            return new RenderGradientPaint(ParseConicGradient(value, fallbackColor));
+        }
+
+        return new RenderColorPaint(fallbackColor);
+    }
+
+    private static RenderGradient ParseLinearGradient(string rawValue, RenderColor fallbackColor)
+    {
+        var inner = ExtractGradientInnerExpression(rawValue, "linear-gradient");
+        var parts = SplitGradientArguments(inner);
+        var startIndex = 0;
+        var angleDegrees = 90f;
+
+        if (parts.Length > 0)
+        {
+            var first = parts[0].Trim();
+
+            if (TryParseDirection(first, out var parsedAngle))
+            {
+                angleDegrees = parsedAngle;
+                startIndex = 1;
+            }
+        }
+
+        var stops = ParseGradientStops(parts.Skip(startIndex).ToArray(), fallbackColor);
+        return new RenderGradient(RenderGradientKind.Linear, stops, AngleDegrees: angleDegrees);
+    }
+
+    private static RenderGradient ParseRadialGradient(string rawValue, RenderColor fallbackColor)
+    {
+        var inner = ExtractGradientInnerExpression(rawValue, "radial-gradient");
+        var parts = SplitGradientArguments(inner);
+        var startIndex = 0;
+
+        if (parts.Length > 0)
+        {
+            var first = parts[0].Trim();
+            if (first.StartsWith("circle", StringComparison.OrdinalIgnoreCase) || first.StartsWith("ellipse", StringComparison.OrdinalIgnoreCase))
+            {
+                startIndex = 1;
+            }
+        }
+
+        var stops = ParseGradientStops(parts.Skip(startIndex).ToArray(), fallbackColor);
+        return new RenderGradient(RenderGradientKind.Radial, stops);
+    }
+
+    private static RenderGradient ParseConicGradient(string rawValue, RenderColor fallbackColor)
+    {
+        var inner = ExtractGradientInnerExpression(rawValue, "conic-gradient");
+        var parts = SplitGradientArguments(inner);
+        var startIndex = 0;
+        var angleDegrees = 0f;
+
+        if (parts.Length > 0)
+        {
+            var first = parts[0].Trim();
+            if (first.StartsWith("from", StringComparison.OrdinalIgnoreCase))
+            {
+                angleDegrees = ParseAngle(first[4..].Trim());
+                startIndex = 1;
+            }
+        }
+
+        var stops = ParseGradientStops(parts.Skip(startIndex).ToArray(), fallbackColor);
+        return new RenderGradient(RenderGradientKind.Conic, stops, AngleDegrees: angleDegrees);
+    }
+
+    private static string ExtractGradientInnerExpression(string rawValue, string functionName)
+    {
+        if (!rawValue.StartsWith(functionName, StringComparison.OrdinalIgnoreCase))
+        {
+            return string.Empty;
+        }
+
+        var opening = rawValue.IndexOf('(');
+        var closing = rawValue.LastIndexOf(')');
+
+        if (opening < 0 || closing <= opening)
+        {
+            return string.Empty;
+        }
+
+        return rawValue[(opening + 1)..closing].Trim();
+    }
+
+    private static string[] SplitGradientArguments(string value)
+    {
+        if (string.IsNullOrWhiteSpace(value))
+        {
+            return [];
+        }
+
+        var parts = new List<string>();
+        var current = new StringBuilder();
+        var depth = 0;
+
+        foreach (var character in value)
+        {
+            if (character == '(')
+            {
+                depth++;
+            }
+            else if (character == ')')
+            {
+                depth = Math.Max(0, depth - 1);
+            }
+            else if (character == ',' && depth == 0)
+            {
+                var part = current.ToString().Trim();
+                if (part.Length > 0)
+                {
+                    parts.Add(part);
+                }
+
+                current.Clear();
+                continue;
+            }
+
+            current.Append(character);
+        }
+
+        var last = current.ToString().Trim();
+        if (last.Length > 0)
+        {
+            parts.Add(last);
+        }
+
+        return parts.ToArray();
+    }
+
+    private static IReadOnlyList<RenderGradientStop> ParseGradientStops(string[] parts, RenderColor fallbackColor)
+    {
+        if (parts.Length == 0)
+        {
+            return [new RenderGradientStop(0f, fallbackColor)];
+        }
+
+        var stops = new List<RenderGradientStop>(parts.Length);
+
+        for (var index = 0; index < parts.Length; index++)
+        {
+            var part = parts[index].Trim();
+            if (part.Length == 0)
+            {
+                continue;
+            }
+
+            var separatorIndex = part.IndexOfAny([ ' ', '\t', '\n', '\r' ]);
+            var colorToken = separatorIndex >= 0 ? part[..separatorIndex].Trim() : part;
+            var positionToken = separatorIndex >= 0 ? part[(separatorIndex + 1)..].Trim() : string.Empty;
+
+            var color = ParseColor(colorToken, fallbackColor);
+            var position = string.IsNullOrWhiteSpace(positionToken)
+                ? (parts.Length == 1 ? 0f : (index / (float)Math.Max(1, parts.Length - 1)))
+                : ParseStopPosition(positionToken);
+
+            stops.Add(new RenderGradientStop(position, color));
+        }
+
+        return stops;
+    }
+
+    private static float ParseStopPosition(string rawPosition)
+    {
+        var value = rawPosition.Trim();
+        if (string.IsNullOrWhiteSpace(value))
+        {
+            return 0f;
+        }
+
+        if (value.EndsWith("%", StringComparison.Ordinal) &&
+            float.TryParse(value[..^1], NumberStyles.Float, CultureInfo.InvariantCulture, out var percent))
+        {
+            return Math.Clamp(percent / 100f, 0f, 1f);
+        }
+
+        if (float.TryParse(value, NumberStyles.Float, CultureInfo.InvariantCulture, out var numeric))
+        {
+            return Math.Clamp(numeric, 0f, 1f);
+        }
+
+        return 0f;
+    }
+
+    private static bool TryParseDirection(string value, out float angleDegrees)
+    {
+        angleDegrees = 90f;
+        var normalized = value.Trim().ToLowerInvariant();
+
+        if (normalized.StartsWith("to ", StringComparison.Ordinal))
+        {
+            var direction = normalized[3..].Trim();
+            angleDegrees = direction switch
+            {
+                "top" => 270f,
+                "right" => 0f,
+                "bottom" => 90f,
+                "left" => 180f,
+                "top right" or "right top" => 315f,
+                "top left" or "left top" => 225f,
+                "bottom right" or "right bottom" => 45f,
+                "bottom left" or "left bottom" => 135f,
+                _ => 90f,
+            };
+            return true;
+        }
+
+        return TryParseAngle(normalized, out angleDegrees);
+    }
+
+    private static bool TryParseAngle(string value, out float angleDegrees)
+    {
+        angleDegrees = 90f;
+
+        if (value.EndsWith("deg", StringComparison.Ordinal) &&
+            float.TryParse(value[..^3].Trim(), NumberStyles.Float, CultureInfo.InvariantCulture, out var degrees))
+        {
+            angleDegrees = degrees;
+            return true;
+        }
+
+        if (value.EndsWith("rad", StringComparison.Ordinal) &&
+            float.TryParse(value[..^3].Trim(), NumberStyles.Float, CultureInfo.InvariantCulture, out var radians))
+        {
+            angleDegrees = radians * 180f / (float)Math.PI;
+            return true;
+        }
+
+        return false;
+    }
+
+    private static float ParseAngle(string value)
+    {
+        return TryParseAngle(value, out var angle) ? angle : 0f;
     }
 
     private static RenderColor ParseColor(string? rawColor, RenderColor fallback)
@@ -2035,6 +2396,6 @@ public sealed class HtmlRenderer
         EdgeSizes Margin,
         EdgeSizes Padding,
         EdgeSizes BorderWidth,
-        RenderColor BackgroundColor,
+        RenderPaint BackgroundPaint,
         RenderColor BorderColor);
 }

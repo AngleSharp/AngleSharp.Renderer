@@ -1,4 +1,5 @@
 using AngleSharp.Renderer.Rendering;
+using System.Linq;
 using System.Reflection;
 using System.Threading;
 
@@ -78,12 +79,7 @@ public sealed class SkiaRenderBackend : IRenderBackend
             return;
         }
 
-        using var paint = new SKPaint
-        {
-            Color = ToSkColor(command.Color),
-            IsAntialias = true,
-            Style = SKPaintStyle.Fill,
-        };
+        using var paint = CreateFillPaint(command.Paint, command.Rect);
 
         var rect = new SKRect(
             command.Rect.X,
@@ -92,6 +88,77 @@ public sealed class SkiaRenderBackend : IRenderBackend
             command.Rect.Y + command.Rect.Height);
 
         canvas.DrawRect(rect, paint);
+    }
+
+    private static SKPaint CreateFillPaint(RenderPaint paint, RenderRect rect)
+    {
+        return paint switch
+        {
+            RenderColorPaint colorPaint => new SKPaint
+            {
+                Color = ToSkColor(colorPaint.Color),
+                IsAntialias = true,
+                Style = SKPaintStyle.Fill,
+            },
+            RenderGradientPaint gradientPaint => CreateGradientPaint(gradientPaint.Gradient, rect),
+            _ => throw new NotSupportedException($"Unsupported paint type: {paint.GetType().Name}"),
+        };
+    }
+
+    private static SKPaint CreateGradientPaint(RenderGradient gradient, RenderRect rect)
+    {
+        var paint = new SKPaint
+        {
+            IsAntialias = true,
+            Style = SKPaintStyle.Fill,
+        };
+
+        var colors = gradient.Stops.Select(stop => new SKColor(stop.Color.R, stop.Color.G, stop.Color.B, stop.Color.A)).ToArray();
+        var positions = gradient.Stops.Select(stop => stop.Position).ToArray();
+
+        var centerX = rect.X + (rect.Width / 2f);
+        var centerY = rect.Y + (rect.Height / 2f);
+        var radius = (float)Math.Max(rect.Width, rect.Height) / 2f;
+
+        paint.Shader = gradient.Kind switch
+        {
+            RenderGradientKind.Linear => CreateLinearGradientShader(gradient, rect),
+            RenderGradientKind.Radial => SKShader.CreateRadialGradient(
+                new SKPoint(centerX, centerY),
+                radius,
+                colors,
+                positions,
+                SKShaderTileMode.Clamp),
+            RenderGradientKind.Conic => SKShader.CreateSweepGradient(
+                new SKPoint(centerX, centerY),
+                colors,
+                positions),
+            _ => throw new NotSupportedException($"Unsupported gradient kind: {gradient.Kind}"),
+        };
+
+        return paint;
+    }
+
+    private static SKShader CreateLinearGradientShader(RenderGradient gradient, RenderRect rect)
+    {
+        var centerX = rect.X + (rect.Width / 2f);
+        var centerY = rect.Y + (rect.Height / 2f);
+        var diagonal = Math.Sqrt((rect.Width * rect.Width) + (rect.Height * rect.Height));
+        var halfDiagonal = (float)diagonal / 2f;
+        var radians = (gradient.AngleDegrees % 360f + 360f) % 360f;
+        var angle = radians * (Math.PI / 180d);
+        var dx = (float)Math.Cos(angle);
+        var dy = (float)Math.Sin(angle);
+
+        var start = new SKPoint(centerX - (dx * halfDiagonal), centerY - (dy * halfDiagonal));
+        var end = new SKPoint(centerX + (dx * halfDiagonal), centerY + (dy * halfDiagonal));
+
+        return SKShader.CreateLinearGradient(
+            start,
+            end,
+            gradient.Stops.Select(stop => new SKColor(stop.Color.R, stop.Color.G, stop.Color.B, stop.Color.A)).ToArray(),
+            gradient.Stops.Select(stop => stop.Position).ToArray(),
+            SKShaderTileMode.Clamp);
     }
 
     private static void DrawText(SKCanvas canvas, DrawTextCommand command)

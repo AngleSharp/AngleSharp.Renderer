@@ -28,7 +28,16 @@ public sealed class DisplayList
     /// <summary>
     /// Adds a filled rectangle command.
     /// </summary>
-    public void FillRect(RenderRect rect, RenderColor color) => Add(new FillRectCommand(rect, color));
+    public void FillRect(RenderRect rect, RenderColor color) => Add(new FillRectCommand(rect, new RenderColorPaint(color)));
+
+    /// <summary>
+    /// Adds a filled rectangle command using a custom paint.
+    /// </summary>
+    public void FillRect(RenderRect rect, RenderPaint paint)
+    {
+        ArgumentNullException.ThrowIfNull(paint);
+        Add(new FillRectCommand(rect, paint));
+    }
 
     /// <summary>
     /// Adds a text draw command.
@@ -63,7 +72,13 @@ public abstract record RenderCommand;
 /// <summary>
 /// Draws a filled rectangle.
 /// </summary>
-public sealed record FillRectCommand(RenderRect Rect, RenderColor Color) : RenderCommand;
+public sealed record FillRectCommand(RenderRect Rect, RenderPaint Paint) : RenderCommand
+{
+    /// <summary>
+    /// Gets the solid color for this command when it uses a simple color paint.
+    /// </summary>
+    public RenderColor Color => Paint is RenderColorPaint colorPaint ? colorPaint.Color : RenderColor.Transparent;
+}
 
 /// <summary>
 /// Draws a single line of text at a baseline position.
