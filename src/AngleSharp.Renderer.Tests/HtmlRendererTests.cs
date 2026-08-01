@@ -291,6 +291,333 @@ public sealed class HtmlRendererTests
     }
 
     [Fact]
+    public async Task BuildDisplayList_LaysOutFlexItemsInCenteredRow()
+    {
+        var document = await ParseAsync("""
+            <html><body>
+                <div style="display:flex; width:100px; height:40px; justify-content:center; align-items:center;">
+                    <div style="width:20px; height:10px; background-color:#ff0000;"></div>
+                    <div style="width:20px; height:10px; background-color:#0000ff;"></div>
+                </div>
+            </body></html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, new HtmlRenderOptions
+        {
+            Width = 200,
+            Height = 120,
+            FontSize = 16f,
+        });
+
+        var containerBackground = displayList.Commands
+            .OfType<FillRectCommand>()
+            .First(command => command.Rect.Width == 100f && command.Rect.Height == 40f);
+
+        var childBackgrounds = displayList.Commands
+            .OfType<FillRectCommand>()
+            .Where(command => command.Rect.Width == 20f && command.Rect.Height == 10f)
+            .OrderBy(command => command.Rect.X)
+            .ToArray();
+
+        Assert.Equal(2, childBackgrounds.Length);
+        Assert.Equal(containerBackground.Rect.X + 30f, childBackgrounds[0].Rect.X);
+        Assert.Equal(containerBackground.Rect.Y + 15f, childBackgrounds[0].Rect.Y);
+        Assert.Equal(containerBackground.Rect.X + 50f, childBackgrounds[1].Rect.X);
+        Assert.Equal(containerBackground.Rect.Y + 15f, childBackgrounds[1].Rect.Y);
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_LaysOutFlexItemsInColumnDirection()
+    {
+        var document = await ParseAsync("""
+            <html><body>
+                <div style="display:flex; flex-direction:column; width:100px; height:60px; align-items:center;">
+                    <div style="width:20px; height:10px; background-color:#ff0000;"></div>
+                    <div style="width:20px; height:10px; background-color:#0000ff;"></div>
+                </div>
+            </body></html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, new HtmlRenderOptions
+        {
+            Width = 200,
+            Height = 140,
+            FontSize = 16f,
+        });
+
+        var containerBackground = displayList.Commands
+            .OfType<FillRectCommand>()
+            .First(command => command.Rect.Width == 100f && command.Rect.Height == 60f);
+
+        var childBackgrounds = displayList.Commands
+            .OfType<FillRectCommand>()
+            .Where(command => command.Rect.Width == 20f && command.Rect.Height == 10f)
+            .OrderBy(command => command.Rect.Y)
+            .ToArray();
+
+        Assert.Equal(2, childBackgrounds.Length);
+        Assert.Equal(containerBackground.Rect.X + 40f, childBackgrounds[0].Rect.X);
+        Assert.Equal(containerBackground.Rect.Y, childBackgrounds[0].Rect.Y);
+        Assert.Equal(containerBackground.Rect.X + 40f, childBackgrounds[1].Rect.X);
+        Assert.Equal(containerBackground.Rect.Y + 10f, childBackgrounds[1].Rect.Y);
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_AppliesFlexGrowToItems()
+    {
+        var document = await ParseAsync("""
+            <html><body>
+                <div style="display:flex; width:100px; height:40px;">
+                    <div style="flex-grow:1; width:20px; height:10px; background-color:#ff0000;"></div>
+                    <div style="flex-grow:1; width:20px; height:10px; background-color:#0000ff;"></div>
+                </div>
+            </body></html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, new HtmlRenderOptions
+        {
+            Width = 200,
+            Height = 120,
+            FontSize = 16f,
+        });
+
+        var childBackgrounds = displayList.Commands
+            .OfType<FillRectCommand>()
+            .Where(command => command.Rect.Width == 50f && command.Rect.Height == 10f)
+            .OrderBy(command => command.Rect.X)
+            .ToArray();
+
+        Assert.Equal(2, childBackgrounds.Length);
+        Assert.Equal(childBackgrounds[0].Rect.X, childBackgrounds[0].Rect.X);
+        Assert.Equal(childBackgrounds[0].Rect.X + 50f, childBackgrounds[1].Rect.X);
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_WrapsItemsToNewLinesWhenNeeded()
+    {
+        var document = await ParseAsync("""
+            <html><body>
+                <div style="display:flex; flex-wrap:wrap; width:70px; height:40px;">
+                    <div style="width:40px; height:10px; background-color:#ff0000;"></div>
+                    <div style="width:40px; height:10px; background-color:#0000ff;"></div>
+                </div>
+            </body></html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, new HtmlRenderOptions
+        {
+            Width = 200,
+            Height = 120,
+            FontSize = 16f,
+        });
+
+        var childBackgrounds = displayList.Commands
+            .OfType<FillRectCommand>()
+            .Where(command => command.Rect.Width == 40f && command.Rect.Height == 10f)
+            .OrderBy(command => command.Rect.Y)
+            .ThenBy(command => command.Rect.X)
+            .ToArray();
+
+        Assert.Equal(2, childBackgrounds.Length);
+        Assert.True(childBackgrounds[1].Rect.Y > childBackgrounds[0].Rect.Y);
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_UsesAlignSelfForIndividualItems()
+    {
+        var document = await ParseAsync("""
+            <html><body>
+                <div style="display:flex; width:100px; height:40px; align-items:center;">
+                    <div style="align-self:flex-start; width:20px; height:10px; background-color:#ff0000;"></div>
+                    <div style="width:20px; height:10px; background-color:#0000ff;"></div>
+                </div>
+            </body></html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, new HtmlRenderOptions
+        {
+            Width = 200,
+            Height = 120,
+            FontSize = 16f,
+        });
+
+        var childBackgrounds = displayList.Commands
+            .OfType<FillRectCommand>()
+            .Where(command => command.Rect.Width == 20f && command.Rect.Height == 10f)
+            .OrderBy(command => command.Rect.X)
+            .ToArray();
+
+        Assert.Equal(2, childBackgrounds.Length);
+        Assert.True(childBackgrounds[0].Rect.Y < childBackgrounds[1].Rect.Y);
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_UsesFlexEndJustification()
+    {
+        var document = await ParseAsync("""
+            <html><body>
+                <div style="display:flex; justify-content:flex-end; width:100px; height:40px;">
+                    <div style="width:20px; height:10px; background-color:#ff0000;"></div>
+                    <div style="width:20px; height:10px; background-color:#0000ff;"></div>
+                </div>
+            </body></html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, new HtmlRenderOptions
+        {
+            Width = 200,
+            Height = 120,
+            FontSize = 16f,
+        });
+
+        var childBackgrounds = displayList.Commands
+            .OfType<FillRectCommand>()
+            .Where(command => command.Rect.Width == 20f && command.Rect.Height == 10f)
+            .OrderBy(command => command.Rect.X)
+            .ToArray();
+
+        Assert.Equal(2, childBackgrounds.Length);
+        Assert.Equal(76f, childBackgrounds[0].Rect.X);
+        Assert.Equal(96f, childBackgrounds[1].Rect.X);
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_UsesSpaceBetweenJustification()
+    {
+        var document = await ParseAsync("""
+            <html><body>
+                <div style="display:flex; justify-content:space-between; width:100px; height:40px;">
+                    <div style="width:20px; height:10px; background-color:#ff0000;"></div>
+                    <div style="width:20px; height:10px; background-color:#0000ff;"></div>
+                </div>
+            </body></html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, new HtmlRenderOptions
+        {
+            Width = 200,
+            Height = 120,
+            FontSize = 16f,
+        });
+
+        var childBackgrounds = displayList.Commands
+            .OfType<FillRectCommand>()
+            .Where(command => command.Rect.Width == 20f && command.Rect.Height == 10f)
+            .OrderBy(command => command.Rect.X)
+            .ToArray();
+
+        Assert.Equal(2, childBackgrounds.Length);
+        Assert.Equal(31f, childBackgrounds[0].Rect.X);
+        Assert.Equal(81f, childBackgrounds[1].Rect.X);
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_UsesRowReverseDirection()
+    {
+        var document = await ParseAsync("""
+            <html><body>
+                <div style="display:flex; flex-direction:row-reverse; width:100px; height:40px;">
+                    <div style="width:20px; height:10px; background-color:#ff0000;"></div>
+                    <div style="width:20px; height:10px; background-color:#0000ff;"></div>
+                </div>
+            </body></html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, new HtmlRenderOptions
+        {
+            Width = 200,
+            Height = 120,
+            FontSize = 16f,
+        });
+
+        var containerBackground = displayList.Commands
+            .OfType<FillRectCommand>()
+            .First(command => command.Rect.Width == 100f && command.Rect.Height == 40f);
+
+        var childBackgrounds = displayList.Commands
+            .OfType<FillRectCommand>()
+            .Where(command => command.Rect.Width == 20f && command.Rect.Height == 10f)
+            .OrderBy(command => command.Rect.X)
+            .ToArray();
+
+        Assert.Equal(2, childBackgrounds.Length);
+        Assert.Equal(containerBackground.Rect.X + 60f, childBackgrounds[0].Rect.X);
+        Assert.Equal(containerBackground.Rect.X + 80f, childBackgrounds[1].Rect.X);
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_UsesColumnReverseDirection()
+    {
+        var document = await ParseAsync("""
+            <html><body>
+                <div style="display:flex; flex-direction:column-reverse; width:100px; height:60px;">
+                    <div style="width:20px; height:10px; background-color:#ff0000;"></div>
+                    <div style="width:20px; height:10px; background-color:#0000ff;"></div>
+                </div>
+            </body></html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, new HtmlRenderOptions
+        {
+            Width = 200,
+            Height = 140,
+            FontSize = 16f,
+        });
+
+        var containerBackground = displayList.Commands
+            .OfType<FillRectCommand>()
+            .First(command => command.Rect.Width == 100f && command.Rect.Height == 60f);
+
+        var childBackgrounds = displayList.Commands
+            .OfType<FillRectCommand>()
+            .Where(command => command.Rect.Width == 20f && command.Rect.Height == 10f)
+            .OrderBy(command => command.Rect.Y)
+            .ToArray();
+
+        Assert.Equal(2, childBackgrounds.Length);
+        Assert.Equal(containerBackground.Rect.Y + 40f, childBackgrounds[0].Rect.Y);
+        Assert.Equal(containerBackground.Rect.Y + 50f, childBackgrounds[1].Rect.Y);
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_UsesFlexBasisForMainSize()
+    {
+        var document = await ParseAsync("""
+            <html><body>
+                <div style="display:flex; width:100px; height:40px;">
+                    <div style="flex-basis:40px; width:20px; height:10px; background-color:#ff0000;"></div>
+                    <div style="width:20px; height:10px; background-color:#0000ff;"></div>
+                </div>
+            </body></html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, new HtmlRenderOptions
+        {
+            Width = 200,
+            Height = 120,
+            FontSize = 16f,
+        });
+
+        var childBackgrounds = displayList.Commands
+            .OfType<FillRectCommand>()
+            .Where(command => command.Rect.Width == 40f && command.Rect.Height == 10f)
+            .OrderBy(command => command.Rect.X)
+            .ToArray();
+
+        Assert.Single(childBackgrounds);
+    }
+
+    [Fact]
     public async Task BuildDisplayList_AppliesLetterSpacingToTextCommands()
     {
         var document = await ParseAsync("""
