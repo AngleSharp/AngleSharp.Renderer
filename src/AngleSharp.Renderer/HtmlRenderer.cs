@@ -3,6 +3,7 @@ using System.IO;
 using System.Linq;
 using System.Runtime.CompilerServices;
 using System.Text;
+using System.Threading;
 
 using AngleSharp.Css;
 using AngleSharp.Css.Dom;
@@ -23,6 +24,7 @@ public sealed class HtmlRenderer
 {
     // Per-document cache keeps image payloads stable across repeated renders of the same DOM instance.
     private static readonly ConditionalWeakTable<IDocument, DocumentImageCache> s_imageCacheByDocument = new();
+    private static readonly AsyncLocal<LayoutCapture?> s_layoutCapture = new();
 
     private readonly IRenderBackend _backend;
 
@@ -32,6 +34,92 @@ public sealed class HtmlRenderer
     }
 
     private sealed record CachedImageResource(byte[] Bytes, string MimeType, int NaturalWidth, int NaturalHeight);
+
+    internal readonly record struct ElementLayoutMetrics(
+        float BorderBoxX,
+        float BorderBoxY,
+        float BorderBoxWidth,
+        float BorderBoxHeight,
+        float BorderLeft,
+        float BorderRight,
+        float BorderTop,
+        float BorderBottom,
+        float PaddingLeft,
+        float PaddingRight,
+        float PaddingTop,
+        float PaddingBottom);
+
+    private sealed class LayoutCapture
+    {
+        private readonly Dictionary<IElement, ElementLayoutMetrics> _metricsByElement = new(ReferenceEqualityComparer.Instance);
+
+        public void Record(IElement element, ElementLayoutMetrics metrics)
+        {
+            _metricsByElement[element] = metrics;
+        }
+
+        public IReadOnlyDictionary<IElement, ElementLayoutMetrics> Snapshot()
+        {
+            return _metricsByElement;
+        }
+    }
+
+    internal static IReadOnlyDictionary<IElement, ElementLayoutMetrics> CaptureLayoutMetrics(IDocument document, HtmlRenderOptions? options = null)
+    {
+        ArgumentNullException.ThrowIfNull(document);
+
+        var effectiveOptions = options ?? new HtmlRenderOptions();
+        var viewport = new RenderViewport(effectiveOptions.Width, effectiveOptions.Height);
+        var capture = new LayoutCapture();
+        var previous = s_layoutCapture.Value;
+        s_layoutCapture.Value = capture;
+
+        try
+        {
+            _ = BuildDisplayList(document, viewport, effectiveOptions);
+            return capture.Snapshot();
+        }
+        finally
+        {
+            s_layoutCapture.Value = previous;
+        }
+    }
+
+    private static void RecordLayoutMetrics(
+        IElement element,
+        float borderBoxX,
+        float borderBoxY,
+        float borderBoxWidth,
+        float borderBoxHeight,
+        float borderLeft,
+        float borderRight,
+        float borderTop,
+        float borderBottom,
+        float paddingLeft,
+        float paddingRight,
+        float paddingTop,
+        float paddingBottom)
+    {
+        var capture = s_layoutCapture.Value;
+        if (capture is null)
+        {
+            return;
+        }
+
+        capture.Record(element, new ElementLayoutMetrics(
+            borderBoxX,
+            borderBoxY,
+            borderBoxWidth,
+            borderBoxHeight,
+            borderLeft,
+            borderRight,
+            borderTop,
+            borderBottom,
+            paddingLeft,
+            paddingRight,
+            paddingTop,
+            paddingBottom));
+    }
 
     /// <summary>
     /// Creates a new renderer with a default Skia backend.
@@ -628,6 +716,21 @@ public sealed class HtmlRenderer
             effectiveMarginBottom = CollapseMargins(marginBottom, childPreviousBlockMarginBottom);
         }
 
+        RecordLayoutMetrics(
+            node.Ref,
+            borderBoxX,
+            borderBoxY,
+            borderBoxWidth,
+            borderBoxHeight,
+            borderLeft,
+            borderRight,
+            borderTop,
+            borderBottom,
+            paddingLeft,
+            paddingRight,
+            paddingTop,
+            paddingBottom);
+
         PaintBackground(displayList, box.BackgroundPaint, borderBoxX, borderBoxY, borderBoxWidth, borderBoxHeight);
         PaintBorder(displayList, box.BorderColor, borderBoxX, borderBoxY, borderBoxWidth, borderBoxHeight, box.BorderWidth);
         PaintOutline(displayList, styleMap, borderBoxX, borderBoxY, borderBoxWidth, borderBoxHeight);
@@ -977,6 +1080,21 @@ public sealed class HtmlRenderer
             PaintBackground(displayList, box.BackgroundPaint, borderBoxX, borderBoxY, borderBoxWidth, borderBoxHeight);
         }
 
+        RecordLayoutMetrics(
+            node.Ref,
+            borderBoxX,
+            borderBoxY,
+            borderBoxWidth,
+            borderBoxHeight,
+            borderLeft,
+            borderRight,
+            borderTop,
+            borderBottom,
+            paddingLeft,
+            paddingRight,
+            paddingTop,
+            paddingBottom);
+
         PaintBorder(displayList, box.BorderColor, borderBoxX, borderBoxY, borderBoxWidth, borderBoxHeight, box.BorderWidth);
         PaintOutline(displayList, styleMap, borderBoxX, borderBoxY, borderBoxWidth, borderBoxHeight);
 
@@ -1312,6 +1430,21 @@ public sealed class HtmlRenderer
             }
 
             var effectiveHeight = Math.Max(20f, contentHeight + placement.PaddingTop + placement.PaddingBottom + placement.BorderTopWidth + placement.BorderBottomWidth);
+            RecordLayoutMetrics(
+                placement.CellNode.Ref,
+                cellX,
+                cellY,
+                cellWidth,
+                effectiveHeight,
+                placement.BorderLeftWidth,
+                placement.BorderRightWidth,
+                placement.BorderTopWidth,
+                placement.BorderBottomWidth,
+                placement.PaddingLeft,
+                placement.PaddingRight,
+                placement.PaddingTop,
+                placement.PaddingBottom);
+
             displayList.FillRect(new RenderRect(cellX, cellY, cellWidth, effectiveHeight), placement.BackgroundColor);
 
             if (!borderCollapse)
@@ -1360,6 +1493,21 @@ public sealed class HtmlRenderer
                 displayList.FillRect(new RenderRect(tableX, currentHorizontalY, tableWidth, collapsedBorderWidth), RenderColor.Black);
             }
         }
+
+        RecordLayoutMetrics(
+            tableNode.Ref,
+            tableX,
+            tableY,
+            tableWidth,
+            tableHeight,
+            borderLeft: 0f,
+            borderRight: 0f,
+            borderTop: 0f,
+            borderBottom: 0f,
+            paddingLeft: 0f,
+            paddingRight: 0f,
+            paddingTop: 0f,
+            paddingBottom: 0f);
 
         displayList.FillRect(new RenderRect(tableX, tableY, tableWidth, tableHeight), RenderColor.Transparent);
         cursorY = tableY + tableHeight + 4f;
@@ -1528,6 +1676,21 @@ public sealed class HtmlRenderer
         {
             PaintBackground(displayList, box.BackgroundPaint, borderBoxX, borderBoxY, borderBoxWidth, borderBoxHeight);
         }
+
+        RecordLayoutMetrics(
+            node.Ref,
+            borderBoxX,
+            borderBoxY,
+            borderBoxWidth,
+            borderBoxHeight,
+            borderLeft,
+            borderRight,
+            borderTop,
+            borderBottom,
+            paddingLeft,
+            paddingRight,
+            paddingTop,
+            paddingBottom);
 
         PaintBorder(displayList, box.BorderColor, borderBoxX, borderBoxY, borderBoxWidth, borderBoxHeight, box.BorderWidth);
         PaintOutline(displayList, styleMap, borderBoxX, borderBoxY, borderBoxWidth, borderBoxHeight);
