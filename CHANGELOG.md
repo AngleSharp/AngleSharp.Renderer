@@ -2,6 +2,7 @@
 
 Released on Monday, August 3 2026.
 
+- Improved public API with `GetDomHarness`
 - Added support for gradients
 - Added rendering images
 - Added flexbox layout mode
