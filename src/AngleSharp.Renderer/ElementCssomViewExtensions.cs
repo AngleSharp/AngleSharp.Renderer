@@ -179,6 +179,38 @@ public static class ElementCssomViewExtensions
     }
 
     /// <summary>
+    /// Sets scroll positions from options.
+    /// </summary>
+    [DomName("scrollTo")]
+    public static void ScrollTo(this IElement element, ScrollToOptions options)
+    {
+        ArgumentNullException.ThrowIfNull(element);
+        ArgumentNullException.ThrowIfNull(options);
+
+        var targetX = options.Left ?? GetScrollLeft(element);
+        var targetY = options.Top ?? GetScrollTop(element);
+        ScrollTo(element, targetX, targetY);
+    }
+
+    /// <summary>
+    /// Scroll alias for setting absolute coordinates.
+    /// </summary>
+    [DomName("scroll")]
+    public static void Scroll(this IElement element, double x, double y)
+    {
+        ScrollTo(element, x, y);
+    }
+
+    /// <summary>
+    /// Scroll alias for setting absolute coordinates from options.
+    /// </summary>
+    [DomName("scroll")]
+    public static void Scroll(this IElement element, ScrollToOptions options)
+    {
+        ScrollTo(element, options);
+    }
+
+    /// <summary>
     /// Adjusts scroll positions by the supplied deltas.
     /// </summary>
     [DomName("scrollBy")]
@@ -187,6 +219,53 @@ public static class ElementCssomViewExtensions
         ArgumentNullException.ThrowIfNull(element);
 
         ScrollTo(element, GetScrollLeft(element) + x, GetScrollTop(element) + y);
+    }
+
+    /// <summary>
+    /// Adjusts scroll positions by the supplied option deltas.
+    /// </summary>
+    [DomName("scrollBy")]
+    public static void ScrollBy(this IElement element, ScrollToOptions options)
+    {
+        ArgumentNullException.ThrowIfNull(element);
+        ArgumentNullException.ThrowIfNull(options);
+
+        var deltaX = options.Left ?? 0d;
+        var deltaY = options.Top ?? 0d;
+        ScrollBy(element, deltaX, deltaY);
+    }
+
+    /// <summary>
+    /// Scrolls ancestor containers to reveal the element.
+    /// </summary>
+    [DomName("scrollIntoView")]
+    public static void ScrollIntoView(this IElement element)
+    {
+        ScrollIntoView(element, true);
+    }
+
+    /// <summary>
+    /// Scrolls ancestor containers to reveal the element using legacy align-to-top behavior.
+    /// </summary>
+    [DomName("scrollIntoView")]
+    public static void ScrollIntoView(this IElement element, bool alignToTop)
+    {
+        ArgumentNullException.ThrowIfNull(element);
+
+        var block = alignToTop ? ScrollLogicalPosition.Start : ScrollLogicalPosition.End;
+        ScrollElementIntoView(element, block, ScrollLogicalPosition.Nearest);
+    }
+
+    /// <summary>
+    /// Scrolls ancestor containers to reveal the element using options.
+    /// </summary>
+    [DomName("scrollIntoView")]
+    public static void ScrollIntoView(this IElement element, ScrollIntoViewOptions options)
+    {
+        ArgumentNullException.ThrowIfNull(element);
+        ArgumentNullException.ThrowIfNull(options);
+
+        ScrollElementIntoView(element, options.Block, options.Inline);
     }
 
     /// <summary>
@@ -398,5 +477,89 @@ public static class ElementCssomViewExtensions
         }
 
         return string.Equals(position.Trim(), "static", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static void ScrollElementIntoView(IElement element, ScrollLogicalPosition block, ScrollLogicalPosition inline)
+    {
+        var metricsMap = GetMetricsMap(element);
+        if (metricsMap is null || !metricsMap.TryGetValue(element, out var elementMetrics))
+        {
+            return;
+        }
+
+        var ancestor = element.ParentElement;
+
+        while (ancestor is not null)
+        {
+            if (!metricsMap.TryGetValue(ancestor, out var ancestorMetrics) || !IsScrollable(ancestor, ancestorMetrics))
+            {
+                ancestor = ancestor.ParentElement;
+                continue;
+            }
+
+            var clientWidth = Math.Max(0d, ancestorMetrics.BorderBoxWidth - ancestorMetrics.BorderLeft - ancestorMetrics.BorderRight);
+            var clientHeight = Math.Max(0d, ancestorMetrics.BorderBoxHeight - ancestorMetrics.BorderTop - ancestorMetrics.BorderBottom);
+            var paddingLeft = ancestorMetrics.BorderBoxX + ancestorMetrics.BorderLeft;
+            var paddingTop = ancestorMetrics.BorderBoxY + ancestorMetrics.BorderTop;
+            var elementLeft = elementMetrics.BorderBoxX - paddingLeft;
+            var elementTop = elementMetrics.BorderBoxY - paddingTop;
+            var elementRight = elementLeft + elementMetrics.BorderBoxWidth;
+            var elementBottom = elementTop + elementMetrics.BorderBoxHeight;
+
+            var currentLeft = ancestor.GetScrollLeft();
+            var currentTop = ancestor.GetScrollTop();
+            var targetLeft = ResolveScrollOffset(currentLeft, elementLeft, elementRight, clientWidth, inline);
+            var targetTop = ResolveScrollOffset(currentTop, elementTop, elementBottom, clientHeight, block);
+
+            ancestor.SetScrollLeft(targetLeft);
+            ancestor.SetScrollTop(targetTop);
+            ancestor = ancestor.ParentElement;
+        }
+    }
+
+    private static double ResolveScrollOffset(double current, double start, double end, double viewportSize, ScrollLogicalPosition position)
+    {
+        if (viewportSize <= 0d)
+        {
+            return current;
+        }
+
+        return position switch
+        {
+            ScrollLogicalPosition.Start => start,
+            ScrollLogicalPosition.End => end - viewportSize,
+            ScrollLogicalPosition.Center => start - ((viewportSize - (end - start)) / 2d),
+            _ => ResolveNearest(current, start, end, viewportSize),
+        };
+    }
+
+    private static double ResolveNearest(double current, double start, double end, double viewportSize)
+    {
+        var viewportEnd = current + viewportSize;
+        var size = end - start;
+
+        if (size > viewportSize)
+        {
+            return start;
+        }
+
+        if (start < current)
+        {
+            return start;
+        }
+
+        if (end > viewportEnd)
+        {
+            return end - viewportSize;
+        }
+
+        return current;
+    }
+
+    private static bool IsScrollable(IElement element, HtmlRenderer.ElementLayoutMetrics metrics)
+    {
+        var clientWidth = Math.Max(0d, metrics.BorderBoxWidth - metrics.BorderLeft - metrics.BorderRight);
+        var clientHeight = Math.Max(0d, metrics.BorderBoxHeight - metrics.BorderTop - metrics.BorderBottom);
+        return element.GetScrollWidth() > clientWidth || element.GetScrollHeight() > clientHeight;
     }
 }

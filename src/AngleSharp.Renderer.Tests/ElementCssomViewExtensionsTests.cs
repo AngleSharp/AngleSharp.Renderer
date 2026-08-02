@@ -173,6 +173,79 @@ public sealed class ElementCssomViewExtensionsTests
         viewport.ScrollBy(maxLeft + 20, maxTop + 20);
         Assert.Equal(maxLeft, viewport.GetScrollLeft());
         Assert.Equal(maxTop, viewport.GetScrollTop());
+
+        viewport.Scroll(new ScrollToOptions { Left = 5, Top = 7 });
+        Assert.Equal(5d, viewport.GetScrollLeft());
+        Assert.Equal(7d, viewport.GetScrollTop());
+
+        viewport.ScrollBy(new ScrollToOptions { Left = 3, Top = 4 });
+        Assert.Equal(8d, viewport.GetScrollLeft());
+        Assert.Equal(11d, viewport.GetScrollTop());
+
+        viewport.Scroll(2, 3);
+        Assert.Equal(2d, viewport.GetScrollLeft());
+        Assert.Equal(3d, viewport.GetScrollTop());
+    }
+
+    [Fact]
+    public async Task ScrollIntoView_ScrollsScrollableAncestor()
+    {
+        var document = await ParseAsync("""
+            <html>
+              <head><style>html, body { margin: 0; padding: 0; }</style></head>
+              <body>
+                <div id="viewport" style="position:relative; width:40px; height:20px; border:1px solid black;">
+                  <div id="target" style="position:absolute; left:80px; top:60px; width:30px; height:40px;"></div>
+                </div>
+              </body>
+            </html>
+            """);
+
+        var viewport = document.QuerySelector("#viewport");
+        var target = document.QuerySelector("#target");
+
+        Assert.NotNull(viewport);
+        Assert.NotNull(target);
+
+        target!.ScrollIntoView();
+
+        Assert.True(viewport!.GetScrollLeft() > 0d);
+        Assert.True(viewport.GetScrollTop() > 0d);
+    }
+
+    [Fact]
+    public async Task ScrollIntoView_RespectsBooleanAndOptionsVariants()
+    {
+        var document = await ParseAsync("""
+            <html>
+              <head><style>html, body { margin: 0; padding: 0; }</style></head>
+              <body>
+                <div id="viewport" style="position:relative; width:40px; height:20px; border:1px solid black;">
+                  <div id="target" style="position:absolute; left:80px; top:60px; width:30px; height:40px;"></div>
+                </div>
+              </body>
+            </html>
+            """);
+
+        var viewport = document.QuerySelector("#viewport");
+        var target = document.QuerySelector("#target");
+
+        Assert.NotNull(viewport);
+        Assert.NotNull(target);
+
+        target!.ScrollIntoView(false);
+        var bottomAlignedTop = viewport!.GetScrollTop();
+
+        viewport.ScrollTo(0, 0);
+        target.ScrollIntoView(new ScrollIntoViewOptions
+        {
+          Block = ScrollLogicalPosition.Center,
+          Inline = ScrollLogicalPosition.Center,
+        });
+
+        Assert.True(bottomAlignedTop >= viewport.GetScrollTop());
+        Assert.True(viewport.GetScrollLeft() > 0d);
+        Assert.True(viewport.GetScrollTop() > 0d);
     }
 
     [Fact]
