@@ -254,6 +254,45 @@ public sealed class ElementCssomViewExtensionsTests
         Assert.Equal(130, image.Height);
     }
 
+    [Fact]
+    public async Task CaretPositionFromPoint_ReturnsCaretInTextNode()
+    {
+        var document = await ParseAsync("""
+            <html>
+              <head><style>html, body { margin: 0; padding: 0; }</style></head>
+              <body>
+                <p id="text" style="font-size:20px; margin:0;">hello</p>
+              </body>
+            </html>
+            """);
+
+        var caret = document.CaretPositionFromPoint(22d, 10d);
+
+        Assert.NotNull(caret);
+        Assert.IsAssignableFrom<IText>(caret!.OffsetNode);
+        Assert.InRange(caret.Offset, 1, 3);
+
+        var rect = caret.GetClientRect();
+        Assert.True(rect.Height > 0d);
+    }
+
+    [Fact]
+    public async Task CaretPositionFromPoint_ReturnsNull_OutsideRenderedContent()
+    {
+        var document = await ParseAsync("""
+            <html>
+              <head><style>html, body { margin: 0; padding: 0; }</style></head>
+              <body>
+                <p>hello</p>
+              </body>
+            </html>
+            """);
+
+        var caret = document.CaretPositionFromPoint(-100d, -100d);
+
+        Assert.Null(caret);
+    }
+
     private static async Task<IDocument> ParseAsync(string html)
     {
       var context = BrowsingContext.New(CreateConfiguration(240, 160));
