@@ -1,6 +1,7 @@
 using System.Globalization;
 using System.IO;
 using System.Linq;
+using System.Runtime.CompilerServices;
 using System.Text;
 
 using AngleSharp.Css;
@@ -20,7 +21,17 @@ namespace AngleSharp.Renderer;
 /// </summary>
 public sealed class HtmlRenderer
 {
+    // Per-document cache keeps image payloads stable across repeated renders of the same DOM instance.
+    private static readonly ConditionalWeakTable<IDocument, DocumentImageCache> s_imageCacheByDocument = new();
+
     private readonly IRenderBackend _backend;
+
+    private sealed class DocumentImageCache
+    {
+        public Dictionary<string, CachedImageResource?> Resources { get; } = new(StringComparer.Ordinal);
+    }
+
+    private sealed record CachedImageResource(byte[] Bytes, string MimeType, int NaturalWidth, int NaturalHeight);
 
     /// <summary>
     /// Creates a new renderer with a default Skia backend.
@@ -2739,10 +2750,102 @@ public sealed class HtmlRenderer
         }
 
         var source = node.Ref.GetAttribute("src");
+        if (!TryGetOrLoadImageResource(node.Ref, source, out var imageResource) || imageResource is null)
+        {
+            return false;
+        }
+
+        var width = ParseLength(styleMap, "width", containingWidth, float.NaN, allowAuto: true);
+        var height = ParseLength(styleMap, "height", containingWidth, float.NaN, allowAuto: true);
+
+        var naturalWidth = imageResource.NaturalWidth;
+        var naturalHeight = imageResource.NaturalHeight;
+
+        if (float.IsNaN(width) && float.IsNaN(height))
+        {
+            width = naturalWidth;
+            height = naturalHeight;
+        }
+        else if (float.IsNaN(width) && !float.IsNaN(height) && naturalWidth > 0f)
+        {
+            width = (height / naturalHeight) * naturalWidth;
+        }
+        else if (!float.IsNaN(width) && float.IsNaN(height) && naturalHeight > 0f)
+        {
+            height = (width / naturalWidth) * naturalHeight;
+        }
+
+        if (float.IsNaN(width) || float.IsNaN(height) || width <= 0f || height <= 0f)
+        {
+            width = naturalWidth;
+            height = naturalHeight;
+        }
+
+        image = new RenderedImage(imageResource.Bytes, (int)Math.Max(1, Math.Round(width)), (int)Math.Max(1, Math.Round(height)), imageResource.MimeType);
+        rect = new RenderRect(x, y, width, height);
+        return true;
+    }
+
+    private static bool TryGetOrLoadImageResource(IElement element, string? source, out CachedImageResource? imageResource)
+    {
+        imageResource = null;
+        if (string.IsNullOrWhiteSpace(source))
+        {
+            return false;
+        }
+
+        var cacheKey = source.Trim();
+        var cache = GetImageCache(element);
+
+        if (cache is not null)
+        {
+            lock (cache.Resources)
+            {
+                if (cache.Resources.TryGetValue(cacheKey, out imageResource))
+                {
+                    return imageResource is not null;
+                }
+            }
+        }
+
+        if (!TryLoadImageResource(element, source, out imageResource))
+        {
+            if (cache is not null)
+            {
+                lock (cache.Resources)
+                {
+                    cache.Resources[cacheKey] = null;
+                }
+            }
+
+            return false;
+        }
+
+        if (cache is not null)
+        {
+            lock (cache.Resources)
+            {
+                cache.Resources[cacheKey] = imageResource;
+            }
+        }
+
+        return true;
+    }
+
+    private static DocumentImageCache? GetImageCache(IElement element)
+    {
+        var owner = element.Owner;
+        return owner is null ? null : s_imageCacheByDocument.GetValue(owner, static _ => new DocumentImageCache());
+    }
+
+    private static bool TryLoadImageResource(IElement element, string? source, out CachedImageResource? imageResource)
+    {
+        imageResource = null;
+
         byte[]? bytes = null;
         string? mimeType = null;
 
-        if (node.Ref is ILoadableElement loadableElement && loadableElement.CurrentDownload is { Task: not null } download)
+        if (element is ILoadableElement loadableElement && loadableElement.CurrentDownload is { Task: not null } download)
         {
             IResponse? response;
 
@@ -2784,34 +2887,10 @@ public sealed class HtmlRenderer
             return false;
         }
 
-        var width = ParseLength(styleMap, "width", containingWidth, float.NaN, allowAuto: true);
-        var height = ParseLength(styleMap, "height", containingWidth, float.NaN, allowAuto: true);
-
         var naturalWidth = skImage.Width;
         var naturalHeight = skImage.Height;
 
-        if (float.IsNaN(width) && float.IsNaN(height))
-        {
-            width = naturalWidth;
-            height = naturalHeight;
-        }
-        else if (float.IsNaN(width) && !float.IsNaN(height) && naturalWidth > 0f)
-        {
-            width = (height / naturalHeight) * naturalWidth;
-        }
-        else if (!float.IsNaN(width) && float.IsNaN(height) && naturalHeight > 0f)
-        {
-            height = (width / naturalWidth) * naturalHeight;
-        }
-
-        if (float.IsNaN(width) || float.IsNaN(height) || width <= 0f || height <= 0f)
-        {
-            width = naturalWidth;
-            height = naturalHeight;
-        }
-
-        image = new RenderedImage(bytes, (int)Math.Max(1, Math.Round(width)), (int)Math.Max(1, Math.Round(height)), mimeType ?? "image/unknown");
-        rect = new RenderRect(x, y, width, height);
+        imageResource = new CachedImageResource(bytes, mimeType ?? "image/unknown", naturalWidth, naturalHeight);
         return true;
     }
 

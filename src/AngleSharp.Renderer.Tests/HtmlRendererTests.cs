@@ -1,6 +1,11 @@
 using AngleSharp;
 using AngleSharp.Css;
+using AngleSharp.Dom;
+using AngleSharp.Io;
 using AngleSharp.Renderer.Rendering;
+
+using System.Net;
+using System.Threading;
 
 namespace AngleSharp.Renderer.Tests;
 
@@ -45,6 +50,45 @@ public sealed class HtmlRendererTests
         Assert.Equal(40f, imageCommand.Rect.Width);
         Assert.Equal(20f, imageCommand.Rect.Height);
         Assert.NotEmpty(imageCommand.Image.Data);
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_CachesHttpImagePayloadPerDocument()
+    {
+        var requester = new SingleResponseImageRequester(Convert.FromBase64String("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAACklEQVR4nGMAAQABAA4A4cQTmwAAAABJRU5ErkJggg=="));
+        var configuration = Configuration.Default
+            .WithCss()
+            .With(requester)
+            .WithDefaultLoader(new LoaderOptions
+            {
+                IsResourceLoadingEnabled = true,
+            });
+
+        var document = await ParseAsync("""
+            <html><body>
+                <img src="http://assets.test/image.png" style="width:40px; height:20px;" />
+            </body></html>
+            """, configuration, "http://example.test/");
+
+        var renderer = new HtmlRenderer();
+
+        var first = renderer.BuildDisplayList(document, new HtmlRenderOptions
+        {
+            Width = 240,
+            Height = 160,
+            FontSize = 16f,
+        });
+
+        var second = renderer.BuildDisplayList(document, new HtmlRenderOptions
+        {
+            Width = 240,
+            Height = 160,
+            FontSize = 16f,
+        });
+
+        Assert.Single(first.Commands.OfType<DrawImageCommand>());
+        Assert.Single(second.Commands.OfType<DrawImageCommand>());
+        Assert.Equal(1, requester.ContentReadSessionCount);
     }
 
     [Fact]
@@ -1600,9 +1644,87 @@ public sealed class HtmlRendererTests
         Assert.True(blueIndex > redIndex);
     }
 
-    private static async Task<AngleSharp.Dom.IDocument> ParseAsync(string html)
+    private static async Task<AngleSharp.Dom.IDocument> ParseAsync(string html, IConfiguration? configuration = null, string? address = null)
     {
-        var context = BrowsingContext.New(Configuration.Default.WithCss());
-        return await context.OpenAsync(request => request.Content(html));
+        var context = BrowsingContext.New(configuration ?? Configuration.Default.WithCss());
+
+        return await context.OpenAsync(request =>
+        {
+            if (!string.IsNullOrWhiteSpace(address))
+            {
+                request.Address(address);
+            }
+
+            request.Content(html);
+        });
+    }
+
+    private sealed class SingleResponseImageRequester : BaseRequester
+    {
+        private readonly ReadTrackingMemoryStream _stream;
+
+        public SingleResponseImageRequester(byte[] imageData)
+        {
+            _stream = new ReadTrackingMemoryStream(imageData);
+        }
+
+        public int ContentReadSessionCount => _stream.ReadSessionCount;
+
+        public override bool SupportsProtocol(string protocol)
+        {
+            return string.Equals(protocol, "http", StringComparison.OrdinalIgnoreCase) ||
+                   string.Equals(protocol, "https", StringComparison.OrdinalIgnoreCase);
+        }
+
+        protected override Task<IResponse?> PerformRequestAsync(Request request, CancellationToken cancel)
+        {
+            var response = new DefaultResponse
+            {
+                Address = request.Address,
+                StatusCode = HttpStatusCode.OK,
+                Headers = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+                {
+                    ["Content-Type"] = "image/png",
+                },
+                Content = _stream,
+            };
+
+            return Task.FromResult<IResponse?>(response);
+        }
+
+        private sealed class ReadTrackingMemoryStream : MemoryStream
+        {
+            public ReadTrackingMemoryStream(byte[] buffer)
+                : base(buffer)
+            {
+            }
+
+            public int ReadSessionCount { get; private set; }
+
+            public override int Read(byte[] buffer, int offset, int count)
+            {
+                if (Position == 0)
+                {
+                    ReadSessionCount++;
+                }
+
+                return base.Read(buffer, offset, count);
+            }
+
+            public override int Read(Span<byte> buffer)
+            {
+                if (Position == 0)
+                {
+                    ReadSessionCount++;
+                }
+
+                return base.Read(buffer);
+            }
+
+            protected override void Dispose(bool disposing)
+            {
+                // Keep the backing stream alive for deterministic test behavior.
+            }
+        }
     }
 }
