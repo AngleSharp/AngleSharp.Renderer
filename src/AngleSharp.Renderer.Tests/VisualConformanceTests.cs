@@ -1,6 +1,7 @@
 namespace AngleSharp.Renderer.Tests;
 
 using AngleSharp;
+using AngleSharp.Css;
 using AngleSharp.Html.Dom;
 
 [Trait("Category", "Visual")]
@@ -21,12 +22,10 @@ public sealed class VisualConformanceTests
             """);
 
         var renderer = new HtmlRenderer();
-        var image = renderer.RenderToPng(document, new HtmlRenderOptions
+        var image = renderer.RenderToPng(document, new DefaultRenderDevice
         {
-            Width = 120,
-            Height = 120,
-            Padding = 0f,
-            ParagraphSpacing = 0f,
+            ViewPortWidth = 120,
+            ViewPortHeight = 120,
         });
 
         VisualSnapshotVerifier.VerifyOrCreate(
@@ -51,12 +50,10 @@ public sealed class VisualConformanceTests
             """);
 
         var renderer = new HtmlRenderer();
-        var image = renderer.RenderToPng(document, new HtmlRenderOptions
+        var image = renderer.RenderToPng(document, new DefaultRenderDevice
         {
-            Width = 120,
-            Height = 80,
-            Padding = 0f,
-            ParagraphSpacing = 0f,
+            ViewPortWidth = 120,
+            ViewPortHeight = 80,
         });
 
         VisualSnapshotVerifier.VerifyOrCreate(
@@ -82,12 +79,10 @@ public sealed class VisualConformanceTests
             """);
 
         var renderer = new HtmlRenderer();
-        var image = renderer.RenderToPng(document, new HtmlRenderOptions
+        var image = renderer.RenderToPng(document, new DefaultRenderDevice
         {
-            Width = 120,
-            Height = 120,
-            Padding = 0f,
-            ParagraphSpacing = 0f,
+            ViewPortWidth = 120,
+            ViewPortHeight = 120,
         });
 
         VisualSnapshotVerifier.VerifyOrCreate(
@@ -115,12 +110,10 @@ public sealed class VisualConformanceTests
             """);
 
         var renderer = new HtmlRenderer();
-        var image = renderer.RenderToPng(document, new HtmlRenderOptions
+        var image = renderer.RenderToPng(document, new DefaultRenderDevice
         {
-            Width = 180,
-            Height = 120,
-            Padding = 0f,
-            ParagraphSpacing = 0f,
+            ViewPortWidth = 180,
+            ViewPortHeight = 120,
         });
 
         VisualSnapshotVerifier.VerifyOrCreate(
@@ -150,12 +143,10 @@ public sealed class VisualConformanceTests
             """);
 
         var renderer = new HtmlRenderer();
-        var image = renderer.RenderToPng(document, new HtmlRenderOptions
+        var image = renderer.RenderToPng(document, new DefaultRenderDevice
         {
-            Width = 220,
-            Height = 120,
-            Padding = 0f,
-            ParagraphSpacing = 0f,
+            ViewPortWidth = 220,
+            ViewPortHeight = 120,
         });
 
         VisualSnapshotVerifier.VerifyOrCreate(
@@ -191,12 +182,10 @@ public sealed class VisualConformanceTests
             """);
 
         var renderer = new HtmlRenderer();
-        var image = renderer.RenderToPng(document, new HtmlRenderOptions
+        var image = renderer.RenderToPng(document, new DefaultRenderDevice
         {
-            Width = 220,
-            Height = 140,
-            Padding = 0f,
-            ParagraphSpacing = 0f,
+            ViewPortWidth = 220,
+            ViewPortHeight = 140,
         });
 
         VisualSnapshotVerifier.VerifyOrCreate(
@@ -309,12 +298,10 @@ public sealed class VisualConformanceTests
             """);
 
         var renderer = new HtmlRenderer();
-        var image = renderer.RenderToPng(document, new HtmlRenderOptions
+        var image = renderer.RenderToPng(document, new DefaultRenderDevice
         {
-            Width = 160,
-            Height = 100,
-            Padding = 0f,
-            ParagraphSpacing = 0f,
+            ViewPortWidth = 160,
+            ViewPortHeight = 100,
         });
 
         VisualSnapshotVerifier.VerifyOrCreate(
@@ -342,12 +329,10 @@ public sealed class VisualConformanceTests
             """);
 
         var renderer = new HtmlRenderer();
-        var image = renderer.RenderToPng(document, new HtmlRenderOptions
+        var image = renderer.RenderToPng(document, new DefaultRenderDevice
         {
-            Width = 160,
-            Height = 100,
-            Padding = 0f,
-            ParagraphSpacing = 0f,
+            ViewPortWidth = 160,
+            ViewPortHeight = 100,
         });
 
         VisualSnapshotVerifier.VerifyOrCreate(
@@ -374,12 +359,10 @@ public sealed class VisualConformanceTests
             """);
 
         var renderer = new HtmlRenderer();
-        var image = renderer.RenderToPng(document, new HtmlRenderOptions
+        var image = renderer.RenderToPng(document, new DefaultRenderDevice
         {
-            Width = 160,
-            Height = 100,
-            Padding = 0f,
-            ParagraphSpacing = 0f,
+            ViewPortWidth = 160,
+            ViewPortHeight = 100,
         });
 
         VisualSnapshotVerifier.VerifyOrCreate(
@@ -410,12 +393,10 @@ public sealed class VisualConformanceTests
             """);
 
         var renderer = new HtmlRenderer();
-        var image = renderer.RenderToPng(document, new HtmlRenderOptions
+        var image = renderer.RenderToPng(document, new DefaultRenderDevice
         {
-            Width = 260,
-            Height = 120,
-            Padding = 0f,
-            ParagraphSpacing = 0f,
+            ViewPortWidth = 260,
+            ViewPortHeight = 120,
             FontSize = 16f,
         });
 
@@ -446,12 +427,10 @@ public sealed class VisualConformanceTests
             """);
 
         var renderer = new HtmlRenderer();
-        var image = renderer.RenderToPng(document, new HtmlRenderOptions
+        var image = renderer.RenderToPng(document, new DefaultRenderDevice
         {
-            Width = 220,
-            Height = 180,
-            Padding = 0f,
-            ParagraphSpacing = 0f,
+            ViewPortWidth = 220,
+            ViewPortHeight = 180,
             FontSize = 12f,
         });
 
@@ -482,12 +461,10 @@ public sealed class VisualConformanceTests
             """);
 
         var renderer = new HtmlRenderer();
-        var image = renderer.RenderToPng(document, new HtmlRenderOptions
+        var image = renderer.RenderToPng(document, new DefaultRenderDevice
         {
-            Width = 240,
-            Height = 100,
-            Padding = 0f,
-            ParagraphSpacing = 0f,
+            ViewPortWidth = 240,
+            ViewPortHeight = 100,
             FontSize = 18f,
         });
 
@@ -521,12 +498,10 @@ public sealed class VisualConformanceTests
             """);
 
         var renderer = new HtmlRenderer();
-        var image = renderer.RenderToPng(document, new HtmlRenderOptions
+        var image = renderer.RenderToPng(document, new DefaultRenderDevice
         {
-            Width = 260,
-            Height = 160,
-            Padding = 0f,
-            ParagraphSpacing = 0f,
+            ViewPortWidth = 260,
+            ViewPortHeight = 160,
             FontSize = 16f,
         });
 
@@ -551,12 +526,10 @@ public sealed class VisualConformanceTests
               """);
 
           var renderer = new HtmlRenderer();
-          var image = renderer.RenderToPng(document, new HtmlRenderOptions
+          var image = renderer.RenderToPng(document, new DefaultRenderDevice
           {
-              Width = 320,
-              Height = 200,
-              Padding = 0f,
-              ParagraphSpacing = 4f,
+              ViewPortWidth = 320,
+              ViewPortHeight = 200,
               FontSize = 16f,
           });
 

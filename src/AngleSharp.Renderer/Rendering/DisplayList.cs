@@ -1,7 +1,6 @@
-using System.Collections.Generic;
-using System.Collections.ObjectModel;
-
 namespace AngleSharp.Renderer.Rendering;
+
+using System.Collections.ObjectModel;
 
 /// <summary>
 /// Represents an ordered sequence of draw commands.

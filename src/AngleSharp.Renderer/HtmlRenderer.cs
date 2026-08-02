@@ -1,3 +1,5 @@
+namespace AngleSharp.Renderer;
+
 using System.Globalization;
 using System.IO;
 using System.Linq;
@@ -14,8 +16,6 @@ using AngleSharp.Renderer.Rendering;
 using AngleSharp.Renderer.Skia;
 
 using SkiaSharp;
-
-namespace AngleSharp.Renderer;
 
 /// <summary>
 /// Renders HTML documents into image output.
@@ -49,6 +49,18 @@ public sealed class HtmlRenderer
         float PaddingTop,
         float PaddingBottom);
 
+    private readonly record struct LayoutContext(
+        int Width,
+        int Height,
+        RenderColor BackgroundColor,
+        RenderColor TextColor,
+        float Padding,
+        string FontFamily,
+        float FontSize,
+        float LineHeightMultiplier,
+        float ParagraphSpacing,
+        float AverageCharacterWidthFactor);
+
     private sealed class LayoutCapture
     {
         private readonly Dictionary<IElement, ElementLayoutMetrics> _metricsByElement = new(ReferenceEqualityComparer.Instance);
@@ -64,19 +76,20 @@ public sealed class HtmlRenderer
         }
     }
 
-    internal static IReadOnlyDictionary<IElement, ElementLayoutMetrics> CaptureLayoutMetrics(IDocument document, HtmlRenderOptions? options = null)
+    internal static IReadOnlyDictionary<IElement, ElementLayoutMetrics> CaptureLayoutMetrics(IDocument document, IRenderDevice renderDevice)
     {
         ArgumentNullException.ThrowIfNull(document);
+        ArgumentNullException.ThrowIfNull(renderDevice);
 
-        var effectiveOptions = options ?? new HtmlRenderOptions();
-        var viewport = new RenderViewport(effectiveOptions.Width, effectiveOptions.Height);
+        var context = CreateLayoutContext(document, renderDevice);
+        var viewport = new RenderViewport(context.Width, context.Height);
         var capture = new LayoutCapture();
         var previous = s_layoutCapture.Value;
         s_layoutCapture.Value = capture;
 
         try
         {
-            _ = BuildDisplayList(document, viewport, effectiveOptions);
+            _ = BuildDisplayList(document, viewport, context, renderDevice);
             return capture.Snapshot();
         }
         finally
@@ -139,19 +152,68 @@ public sealed class HtmlRenderer
         _backend = backend;
     }
 
+    private static LayoutContext CreateLayoutContext(IDocument document, IRenderDevice renderDevice)
+    {
+        var width = Math.Max(1, (int)Math.Round(Convert.ToDouble(renderDevice.ViewPortWidth)));
+        var height = Math.Max(1, (int)Math.Round(Convert.ToDouble(renderDevice.ViewPortHeight)));
+        var defaultFontSize = Math.Max(1f, (float)renderDevice.FontSize);
+        var defaultFontFamily = "sans-serif";
+        var defaultLineHeight = 1.35f;
+        var defaultTextColor = RenderColor.Black;
+        var defaultBackgroundColor = RenderColor.White;
+
+        var rootElement = document.Body ?? document.DocumentElement;
+        if (rootElement is not null)
+        {
+            var styleMap = CreateStyleMap(rootElement.ComputeCurrentStyle(), rootElement);
+            defaultFontSize = ParseLength(styleMap, "font-size", defaultFontSize, defaultFontSize, allowAuto: false);
+            defaultFontFamily = styleMap.TryGetValue("font-family", out var family) && !string.IsNullOrWhiteSpace(family)
+                ? family.Trim('\'', '"', ' ')
+                : defaultFontFamily;
+            defaultLineHeight = ParseLineHeight(styleMap, defaultLineHeight);
+            defaultTextColor = ParseColor(styleMap.TryGetValue("color", out var colorValue) ? colorValue : null, defaultTextColor);
+            defaultBackgroundColor = ParseColor(styleMap.TryGetValue("background-color", out var backgroundValue) ? backgroundValue : null, defaultBackgroundColor);
+        }
+
+        return new LayoutContext(
+            Width: width,
+            Height: height,
+            BackgroundColor: defaultBackgroundColor,
+            TextColor: defaultTextColor,
+            Padding: 0f,
+            FontFamily: defaultFontFamily,
+            FontSize: defaultFontSize,
+            LineHeightMultiplier: defaultLineHeight,
+            ParagraphSpacing: 0f,
+            AverageCharacterWidthFactor: 0.55f);
+    }
+
     /// <summary>
     /// Renders the given document to a PNG image.
     /// </summary>
     /// <param name="document">The source document.</param>
-    /// <param name="options">Optional rendering settings.</param>
     /// <returns>The rendered PNG image.</returns>
-    public RenderedImage RenderToPng(IDocument document, HtmlRenderOptions? options = null)
+    public RenderedImage RenderToPng(IDocument document)
     {
         ArgumentNullException.ThrowIfNull(document);
+        var renderDevice = document.Context.GetService<IRenderDevice>();
+        return RenderToPng(document, renderDevice!);
+    }
 
-        var effectiveOptions = options ?? new HtmlRenderOptions();
-        var viewport = new RenderViewport(effectiveOptions.Width, effectiveOptions.Height);
-        var displayList = BuildDisplayList(document, viewport, effectiveOptions);
+    /// <summary>
+    /// Renders the given document to a PNG image.
+    /// </summary>
+    /// <param name="document">The source document.</param>
+    /// <param name="renderDevice">The render device used for viewport and typography defaults.</param>
+    /// <returns>The rendered PNG image.</returns>
+    public RenderedImage RenderToPng(IDocument document, IRenderDevice renderDevice)
+    {
+        ArgumentNullException.ThrowIfNull(document);
+        ArgumentNullException.ThrowIfNull(renderDevice);
+
+        var context = CreateLayoutContext(document, renderDevice);
+        var viewport = new RenderViewport(context.Width, context.Height);
+        var displayList = BuildDisplayList(document, viewport, context, renderDevice);
 
         return _backend.RenderToPng(displayList, viewport);
     }
@@ -160,21 +222,34 @@ public sealed class HtmlRenderer
     /// Builds a display list from the given document.
     /// </summary>
     /// <param name="document">The source document.</param>
-    /// <param name="options">Optional rendering settings.</param>
     /// <returns>The generated display list.</returns>
-    public DisplayList BuildDisplayList(IDocument document, HtmlRenderOptions? options = null)
+    public DisplayList BuildDisplayList(IDocument document)
     {
         ArgumentNullException.ThrowIfNull(document);
-
-        var effectiveOptions = options ?? new HtmlRenderOptions();
-        var viewport = new RenderViewport(effectiveOptions.Width, effectiveOptions.Height);
-        return BuildDisplayList(document, viewport, effectiveOptions);
+        var renderDevice = document.Context.GetService<IRenderDevice>();
+        return BuildDisplayList(document, renderDevice!);
     }
 
-    private static DisplayList BuildDisplayList(IDocument document, RenderViewport viewport, HtmlRenderOptions options)
+    /// <summary>
+    /// Builds a display list from the given document.
+    /// </summary>
+    /// <param name="document">The source document.</param>
+    /// <param name="renderDevice">The render device used for viewport and typography defaults.</param>
+    /// <returns>The generated display list.</returns>
+    public DisplayList BuildDisplayList(IDocument document, IRenderDevice renderDevice)
+    {
+        ArgumentNullException.ThrowIfNull(document);
+        ArgumentNullException.ThrowIfNull(renderDevice);
+
+        var context = CreateLayoutContext(document, renderDevice);
+        var viewport = new RenderViewport(context.Width, context.Height);
+        return BuildDisplayList(document, viewport, context, renderDevice);
+    }
+
+    private static DisplayList BuildDisplayList(IDocument document, RenderViewport viewport, LayoutContext context, IRenderDevice renderDevice)
     {
         var displayList = new DisplayList();
-        displayList.FillRect(new RenderRect(0f, 0f, viewport.Width, viewport.Height), options.BackgroundColor);
+        displayList.FillRect(new RenderRect(0f, 0f, viewport.Width, viewport.Height), context.BackgroundColor);
 
         var window = document.DefaultView;
         if (window is null)
@@ -184,29 +259,20 @@ public sealed class HtmlRenderer
 
         PrepareDocumentForRendering(document);
 
-        var renderDevice = new DefaultRenderDevice
-        {
-            ViewPortWidth = viewport.Width,
-            ViewPortHeight = viewport.Height,
-            DeviceWidth = viewport.Width,
-            DeviceHeight = viewport.Height,
-            FontSize = options.FontSize,
-        };
-
         var renderTree = window.Render(renderDevice);
         var body = document.Body;
         var root = body is null ? renderTree : renderTree.Find(body) ?? renderTree;
 
-        var contentX = options.Padding;
-        var contentY = options.Padding;
-        var contentWidth = viewport.Width - (2f * options.Padding);
+        var contentX = context.Padding;
+        var contentY = context.Padding;
+        var contentWidth = viewport.Width - (2f * context.Padding);
 
         if (contentWidth <= 0f)
         {
             return displayList;
         }
 
-        var textStyle = new RenderTextStyle(options.FontSize, options.TextColor, options.FontFamily, options.LineHeightMultiplier, 400f, false, false, false, options.TextColor, global::AngleSharp.Renderer.Rendering.RenderTextDecorationStyle.Solid, TextAlign.Left, 0f, 0f, 0f);
+        var textStyle = new RenderTextStyle(context.FontSize, context.TextColor, context.FontFamily, context.LineHeightMultiplier, 400f, false, false, false, context.TextColor, global::AngleSharp.Renderer.Rendering.RenderTextDecorationStyle.Solid, TextAlign.Left, 0f, 0f, 0f);
         var cursorY = contentY;
         var previousBlockMarginBottom = 0f;
         var suppressNextBlockTopMargin = false;
@@ -228,11 +294,11 @@ public sealed class HtmlRenderer
                 activeFloatBottom: ref activeFloatBottom,
                 textIndentConsumed: ref textIndentConsumed,
                 textStyle: textStyle,
-                options: options,
+                context: context,
                 displayList: displayList,
-                maxY: viewport.Height - options.Padding);
+                maxY: viewport.Height - context.Padding);
 
-            if (cursorY > viewport.Height - options.Padding)
+            if (cursorY > viewport.Height - context.Padding)
             {
                 break;
             }
@@ -253,7 +319,7 @@ public sealed class HtmlRenderer
         ref float activeFloatBottom,
         ref bool textIndentConsumed,
         RenderTextStyle textStyle,
-        HtmlRenderOptions options,
+        LayoutContext context,
         DisplayList displayList,
         float maxY,
         bool isFlexItem = false,
@@ -264,10 +330,10 @@ public sealed class HtmlRenderer
         switch (node)
         {
             case TextRenderNode textNode:
-                LayoutTextNode(textNode.Ref, containingX, containingWidth, ref cursorY, ref previousBlockMarginBottom, ref suppressNextBlockTopMargin, ref activeFloatLeftOffset, ref activeFloatBottom, ref textIndentConsumed, textStyle, options, displayList, maxY);
+                LayoutTextNode(textNode.Ref, containingX, containingWidth, ref cursorY, ref previousBlockMarginBottom, ref suppressNextBlockTopMargin, ref activeFloatLeftOffset, ref activeFloatBottom, ref textIndentConsumed, textStyle, context, displayList, maxY);
                 return;
             case ElementRenderNode element:
-                LayoutElement(element, containingX, containingY, containingWidth, ref cursorY, ref previousBlockMarginBottom, ref suppressNextBlockTopMargin, ref activeFloatLeftOffset, ref activeFloatBottom, ref textIndentConsumed, textStyle, options, displayList, maxY, isFlexItem, isRowDirection, flexMainSize, flexCrossSize);
+                LayoutElement(element, containingX, containingY, containingWidth, ref cursorY, ref previousBlockMarginBottom, ref suppressNextBlockTopMargin, ref activeFloatLeftOffset, ref activeFloatBottom, ref textIndentConsumed, textStyle, context, displayList, maxY, isFlexItem, isRowDirection, flexMainSize, flexCrossSize);
                 return;
             default:
                 return;
@@ -286,7 +352,7 @@ public sealed class HtmlRenderer
         ref float activeFloatBottom,
         ref bool textIndentConsumed,
         RenderTextStyle inheritedTextStyle,
-        HtmlRenderOptions options,
+        LayoutContext context,
         DisplayList displayList,
         float maxY,
         bool isFlexItem = false,
@@ -321,7 +387,7 @@ public sealed class HtmlRenderer
 
         if (string.Equals(display, "table", StringComparison.OrdinalIgnoreCase))
         {
-            LayoutTable(node, containingX, containingY, containingWidth, ref cursorY, ref previousBlockMarginBottom, ref suppressNextBlockTopMargin, ref activeFloatLeftOffset, ref activeFloatBottom, ref textIndentConsumed, inheritedTextStyle, options, displayList, maxY);
+            LayoutTable(node, containingX, containingY, containingWidth, ref cursorY, ref previousBlockMarginBottom, ref suppressNextBlockTopMargin, ref activeFloatLeftOffset, ref activeFloatBottom, ref textIndentConsumed, inheritedTextStyle, context, displayList, maxY);
             return;
         }
 
@@ -350,7 +416,7 @@ public sealed class HtmlRenderer
             var inlineText = NormalizeWhitespace(element.TextContent ?? string.Empty);
             if (inlineText.Length > 0)
             {
-                    LayoutWrappedText(inlineText, flowContainingX, flowContainingWidth, ref cursorY, currentTextStyle, options, displayList, maxY, textIndentConsumed ? 0f : currentTextStyle.TextIndent);
+                    LayoutWrappedText(inlineText, flowContainingX, flowContainingWidth, ref cursorY, currentTextStyle, context, displayList, maxY, textIndentConsumed ? 0f : currentTextStyle.TextIndent);
                     textIndentConsumed = true;
             }
 
@@ -450,12 +516,12 @@ public sealed class HtmlRenderer
         }
 
         var borderBoxX = isFixed
-            ? options.Padding + leftOffset
+            ? context.Padding + leftOffset
             : isAbsolute
                 ? containingX + leftOffset
                 : flowBorderBoxX + (isRelative ? leftOffset : 0f);
         var borderBoxY = isFixed
-            ? options.Padding + topOffset
+            ? context.Padding + topOffset
             : isAbsolute
                 ? containingY + topOffset
                 : flowBorderBoxY + (isRelative ? topOffset : 0f);
@@ -494,7 +560,7 @@ public sealed class HtmlRenderer
                 ref activeFloatBottom,
                 ref textIndentConsumed,
                 currentTextStyle,
-                options,
+                context,
                 displayList,
                 maxY,
                 styleMap,
@@ -528,7 +594,7 @@ public sealed class HtmlRenderer
                 ref activeFloatBottom,
                 ref textIndentConsumed,
                 currentTextStyle,
-                options,
+                context,
                 displayList,
                 maxY,
                 styleMap,
@@ -565,7 +631,7 @@ public sealed class HtmlRenderer
                         ref childActiveFloatBottom,
                         ref textIndentConsumed,
                         currentTextStyle,
-                        options,
+                        context,
                         displayList,
                         maxY);
                 }
@@ -583,7 +649,7 @@ public sealed class HtmlRenderer
                         activeFloatBottom: ref childActiveFloatBottom,
                         textIndentConsumed: ref childTextIndentConsumed,
                         textStyle: currentTextStyle,
-                        options: options,
+                        context: context,
                         displayList: displayList,
                         maxY: maxY);
                 }
@@ -622,7 +688,7 @@ public sealed class HtmlRenderer
                         activeFloatBottom: ref childActiveFloatBottom,
                         textIndentConsumed: ref childTextIndentConsumed,
                         textStyle: currentTextStyle,
-                        options: options,
+                        context: context,
                         displayList: displayList,
                         maxY: maxY);
                 }
@@ -642,7 +708,7 @@ public sealed class HtmlRenderer
                                 currentTextStyle,
                                 flowContainingX,
                                 flowContainingWidth,
-                                options.AverageCharacterWidthFactor,
+                                context.AverageCharacterWidthFactor,
                                 ref inlineCursorX,
                                 ref inlineLineTop,
                                 ref inlineLineHeight,
@@ -673,7 +739,7 @@ public sealed class HtmlRenderer
                                     childTextStyle,
                                     flowContainingX,
                                     flowContainingWidth,
-                                    options.AverageCharacterWidthFactor,
+                                    context.AverageCharacterWidthFactor,
                                     ref inlineCursorX,
                                     ref inlineLineTop,
                                     ref inlineLineHeight,
@@ -759,7 +825,7 @@ public sealed class HtmlRenderer
         }
 
         cursorY = flowBorderBoxY + borderBoxHeight;
-        previousBlockMarginBottom = effectiveMarginBottom + options.ParagraphSpacing;
+        previousBlockMarginBottom = effectiveMarginBottom + context.ParagraphSpacing;
     }
 
     private readonly record struct FlexItemLayoutInfo(
@@ -786,7 +852,7 @@ public sealed class HtmlRenderer
         ref float activeFloatBottom,
         ref bool textIndentConsumed,
         RenderTextStyle inheritedTextStyle,
-        HtmlRenderOptions options,
+        LayoutContext context,
         DisplayList displayList,
         float maxY,
         Dictionary<string, string> styleMap,
@@ -1016,7 +1082,7 @@ public sealed class HtmlRenderer
 
                 if (item.Node is TextRenderNode textNode)
                 {
-                    LayoutTextNode(textNode.Ref, childX, containingWidth, ref childCursorY, ref childPreviousBlockMarginBottom, ref childSuppressNextBlockTopMargin, ref childActiveFloatLeftOffset, ref childActiveFloatBottom, ref childTextIndentConsumed, inheritedTextStyle, options, displayList, maxY);
+                    LayoutTextNode(textNode.Ref, childX, containingWidth, ref childCursorY, ref childPreviousBlockMarginBottom, ref childSuppressNextBlockTopMargin, ref childActiveFloatLeftOffset, ref childActiveFloatBottom, ref childTextIndentConsumed, inheritedTextStyle, context, displayList, maxY);
                 }
                 else if (item.Node is ElementRenderNode elementChild)
                 {
@@ -1042,7 +1108,7 @@ public sealed class HtmlRenderer
                         activeFloatBottom: ref childActiveFloatBottomOffset,
                         textIndentConsumed: ref childTextIndent,
                         textStyle: inheritedTextStyle,
-                        options: options,
+                        context: context,
                         displayList: displayList,
                         maxY: maxY,
                         isFlexItem: true,
@@ -1105,7 +1171,7 @@ public sealed class HtmlRenderer
         }
 
         cursorY = flowBorderBoxY + borderBoxHeight;
-        previousBlockMarginBottom = effectiveMarginBottom + options.ParagraphSpacing;
+        previousBlockMarginBottom = effectiveMarginBottom + context.ParagraphSpacing;
         suppressNextBlockTopMargin = false;
     }
 
@@ -1167,7 +1233,7 @@ public sealed class HtmlRenderer
         ref float activeFloatBottom,
         ref bool textIndentConsumed,
         RenderTextStyle inheritedTextStyle,
-        HtmlRenderOptions options,
+        LayoutContext context,
         DisplayList displayList,
         float maxY)
     {
@@ -1323,7 +1389,7 @@ public sealed class HtmlRenderer
             var paddingRight = placement.PaddingRight;
             var borderLeftWidth = placement.BorderLeftWidth;
             var borderRightWidth = placement.BorderRightWidth;
-            var textWidth = placement.Text.Length > 0 ? EstimateTextWidth(placement.Text, placement.CellTextStyle.FontSize, options.AverageCharacterWidthFactor, placement.CellTextStyle.LetterSpacing) : 0f;
+            var textWidth = placement.Text.Length > 0 ? EstimateTextWidth(placement.Text, placement.CellTextStyle.FontSize, context.AverageCharacterWidthFactor, placement.CellTextStyle.LetterSpacing) : 0f;
             var minCellWidth = textWidth + paddingLeft + paddingRight + borderLeftWidth + borderRightWidth + 8f;
             var widthPerColumn = float.IsNaN(specifiedCellWidth) ? minCellWidth / Math.Max(1, placement.ColumnSpan) : specifiedCellWidth / Math.Max(1, placement.ColumnSpan);
 
@@ -1381,7 +1447,7 @@ public sealed class HtmlRenderer
 
             if (contentWidth > 0f && text.Length > 0)
             {
-                var wrappedLines = WrapText(text, contentWidth, placement.CellTextStyle.FontSize, options.AverageCharacterWidthFactor, placement.CellTextStyle.LetterSpacing);
+                var wrappedLines = WrapText(text, contentWidth, placement.CellTextStyle.FontSize, context.AverageCharacterWidthFactor, placement.CellTextStyle.LetterSpacing);
                 var lineHeight = placement.CellTextStyle.FontSize * placement.CellTextStyle.LineHeightMultiplier;
                 contentHeight = wrappedLines.Count * lineHeight;
             }
@@ -1424,7 +1490,7 @@ public sealed class HtmlRenderer
             var contentHeight = 0f;
             if (contentWidth > 0f && placement.Text.Length > 0)
             {
-                var wrappedLines = WrapText(placement.Text, contentWidth, placement.CellTextStyle.FontSize, options.AverageCharacterWidthFactor, placement.CellTextStyle.LetterSpacing);
+                var wrappedLines = WrapText(placement.Text, contentWidth, placement.CellTextStyle.FontSize, context.AverageCharacterWidthFactor, placement.CellTextStyle.LetterSpacing);
                 var lineHeight = placement.CellTextStyle.FontSize * placement.CellTextStyle.LineHeightMultiplier;
                 contentHeight = wrappedLines.Count * lineHeight;
             }
@@ -1457,7 +1523,7 @@ public sealed class HtmlRenderer
 
             if (contentWidth > 0f && placement.Text.Length > 0)
             {
-                var wrappedLines = WrapText(placement.Text, contentWidth, placement.CellTextStyle.FontSize, options.AverageCharacterWidthFactor, placement.CellTextStyle.LetterSpacing);
+                var wrappedLines = WrapText(placement.Text, contentWidth, placement.CellTextStyle.FontSize, context.AverageCharacterWidthFactor, placement.CellTextStyle.LetterSpacing);
                 var lineHeight = placement.CellTextStyle.FontSize * placement.CellTextStyle.LineHeightMultiplier;
                 var lineX = cellX + placement.PaddingLeft + placement.BorderLeftWidth;
                 var lineY = cellY + placement.PaddingTop + placement.BorderTopWidth + lineHeight;
@@ -1527,7 +1593,7 @@ public sealed class HtmlRenderer
         ref float activeFloatBottom,
         ref bool textIndentConsumed,
         RenderTextStyle inheritedTextStyle,
-        HtmlRenderOptions options,
+        LayoutContext context,
         DisplayList displayList,
         float maxY,
         Dictionary<string, string> styleMap,
@@ -1568,7 +1634,7 @@ public sealed class HtmlRenderer
         {
             if (child is TextRenderNode textNode)
             {
-                LayoutTextNode(textNode.Ref, containingX, containingWidth, ref cursorY, ref previousBlockMarginBottom, ref suppressNextBlockTopMargin, ref activeFloatLeftOffset, ref activeFloatBottom, ref textIndentConsumed, inheritedTextStyle, options, displayList, maxY);
+                LayoutTextNode(textNode.Ref, containingX, containingWidth, ref cursorY, ref previousBlockMarginBottom, ref suppressNextBlockTopMargin, ref activeFloatLeftOffset, ref activeFloatBottom, ref textIndentConsumed, inheritedTextStyle, context, displayList, maxY);
                 continue;
             }
 
@@ -1639,7 +1705,7 @@ public sealed class HtmlRenderer
                 activeFloatBottom: ref childActiveFloatBottom,
                 textIndentConsumed: ref childTextIndentConsumed,
                 textStyle: inheritedTextStyle,
-                options: options,
+                context: context,
                 displayList: displayList,
                 maxY: maxY,
                 isFlexItem: false,
@@ -1696,7 +1762,7 @@ public sealed class HtmlRenderer
         PaintOutline(displayList, styleMap, borderBoxX, borderBoxY, borderBoxWidth, borderBoxHeight);
 
         cursorY = flowBorderBoxY + borderBoxHeight;
-        previousBlockMarginBottom = effectiveMarginBottom + options.ParagraphSpacing;
+        previousBlockMarginBottom = effectiveMarginBottom + context.ParagraphSpacing;
         suppressNextBlockTopMargin = false;
     }
 
@@ -1876,7 +1942,7 @@ public sealed class HtmlRenderer
         ref float activeFloatBottom,
         ref bool textIndentConsumed,
         RenderTextStyle textStyle,
-        HtmlRenderOptions options,
+        LayoutContext context,
         DisplayList displayList,
         float maxY)
     {
@@ -1897,7 +1963,7 @@ public sealed class HtmlRenderer
         }
 
         var localFloatLeftOffset = cursorY < activeFloatBottom ? activeFloatLeftOffset : 0f;
-        LayoutWrappedText(text, containingX + localFloatLeftOffset, containingWidth - localFloatLeftOffset, ref cursorY, textStyle, options, displayList, maxY, textIndentConsumed ? 0f : textStyle.TextIndent);
+        LayoutWrappedText(text, containingX + localFloatLeftOffset, containingWidth - localFloatLeftOffset, ref cursorY, textStyle, context, displayList, maxY, textIndentConsumed ? 0f : textStyle.TextIndent);
         textIndentConsumed = true;
     }
 
@@ -1907,13 +1973,13 @@ public sealed class HtmlRenderer
         float maxWidth,
         ref float cursorY,
         RenderTextStyle textStyle,
-        HtmlRenderOptions options,
+        LayoutContext context,
         DisplayList displayList,
         float maxY,
         float firstLineIndent)
     {
         var lineHeight = textStyle.FontSize * textStyle.LineHeightMultiplier;
-        var lines = WrapText(text, maxWidth, textStyle.FontSize, options.AverageCharacterWidthFactor, textStyle.LetterSpacing);
+        var lines = WrapText(text, maxWidth, textStyle.FontSize, context.AverageCharacterWidthFactor, textStyle.LetterSpacing);
 
         for (var index = 0; index < lines.Count; index++)
         {
@@ -1925,7 +1991,7 @@ public sealed class HtmlRenderer
                 return;
             }
 
-            var lineWidth = EstimateTextWidth(line, textStyle.FontSize, options.AverageCharacterWidthFactor, textStyle.LetterSpacing);
+            var lineWidth = EstimateTextWidth(line, textStyle.FontSize, context.AverageCharacterWidthFactor, textStyle.LetterSpacing);
             var lineMaxWidth = index == 0 ? Math.Max(0f, maxWidth - firstLineIndent) : maxWidth;
             var lineX = x + (index == 0 ? firstLineIndent : 0f) + ResolveTextAlignmentOffset(textStyle.TextAlign, lineMaxWidth, lineWidth);
             var baselineY = cursorY + textStyle.VerticalAlignOffset;
