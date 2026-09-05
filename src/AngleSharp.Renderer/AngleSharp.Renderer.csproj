@@ -20,7 +20,8 @@
     <EmbedUntrackedSources>true</EmbedUntrackedSources>
     <IncludeSymbols>true</IncludeSymbols>
     <SymbolPackageFormat>snupkg</SymbolPackageFormat>
-    <AngleSharpVersion Condition=" '$(AngleSharpVersion)' == '' ">1.7.0</AngleSharpVersion>
+    <AngleSharpVersion Condition=" '$(AngleSharpVersion)' == '' ">1.8.0</AngleSharpVersion>
+    <AngleSharpCssVersion Condition=" '$(AngleSharpCssVersion)' == '' ">1.1.0</AngleSharpCssVersion>
   </PropertyGroup>
 
   <ItemGroup>
@@ -29,7 +30,7 @@
 
   <ItemGroup>
     <PackageReference Include="AngleSharp" Version="[$(AngleSharpVersion),2.0.0)" />
-    <PackageReference Include="AngleSharp.Css" Version="[1.0.0,2.0.0)" />
+    <PackageReference Include="AngleSharp.Css" Version="[$(AngleSharpCssVersion),2.0.0)" />
     <PackageReference Include="SkiaSharp" Version="2.88.9" />
     <PackageReference Include="SkiaSharp.NativeAssets.Linux.NoDependencies" Version="2.88.9" />
   </ItemGroup>
