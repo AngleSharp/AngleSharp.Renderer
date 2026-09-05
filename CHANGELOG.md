@@ -3,6 +3,7 @@
 Released on Monday, September 7 2026.
 
 - Improved public API with `GetDomHarness`
+- Fixed HTML table rendering (vertical alignment, span, ...)
 - Added support for gradients
 - Added rendering images
 - Added flexbox layout mode
