@@ -15,6 +15,11 @@ public sealed class DisplayList
     public ReadOnlyCollection<RenderCommand> Commands => _commands.AsReadOnly();
 
     /// <summary>
+    /// Gets or sets the <c>@font-face</c> declarations the text commands resolve against.
+    /// </summary>
+    public FontFaceSet Fonts { get; set; } = FontFaceSet.Empty;
+
+    /// <summary>
     /// Adds a command to the list.
     /// </summary>
     /// <param name="command">The command to add.</param>

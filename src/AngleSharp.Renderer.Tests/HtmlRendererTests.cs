@@ -279,9 +279,23 @@ public sealed class HtmlRendererTests
     [Fact]
     public async Task BuildDisplayList_CollapsesAdjacentCellBordersWhenRequested()
     {
-        var document = await ParseAsync("""
+        var collapsed = await CountCellBorderCommandsAsync("collapse");
+        var separate = await CountCellBorderCommandsAsync("separate");
+
+        Assert.True(collapsed.Total < separate.Total,
+            $"Expected collapsing to draw fewer borders than separate ones, got {collapsed.Total} against {separate.Total}.");
+
+        // The point of collapsing is that neighbours share an edge, so the rule between the two
+        // columns has to be painted exactly once.
+        Assert.Equal(1, collapsed.InteriorVerticalRules);
+        Assert.Equal(2, separate.InteriorVerticalRules);
+    }
+
+    private static async Task<(int Total, int InteriorVerticalRules)> CountCellBorderCommandsAsync(string borderCollapse)
+    {
+        var document = await ParseAsync($$"""
             <html><body>
-                <table style="border-collapse:collapse;">
+                <table style="border-collapse:{{borderCollapse}}; width:200px;">
                     <tr><td style="border:1px solid black;">A</td><td style="border:1px solid black;">B</td></tr>
                     <tr><td style="border:1px solid black;">C</td><td style="border:1px solid black;">D</td></tr>
                 </table>
@@ -296,11 +310,23 @@ public sealed class HtmlRendererTests
             FontSize = 16f,
         });
 
-        var borderCommands = displayList.Commands
+        var borders = displayList.Commands
             .OfType<FillRectCommand>()
-            .Count(command => command.Color == RenderColor.Black);
+            .Where(command => command.Color == RenderColor.Black)
+            .ToArray();
 
-        Assert.True(borderCommands < 10, $"Expected collapsed borders to reduce border commands, but found {borderCommands}.");
+        // Vertical rules that sit strictly inside the table, counted on the first row only.
+        var tableLeft = borders.Min(command => command.Rect.X);
+        var tableRight = borders.Max(command => command.Rect.X + command.Rect.Width);
+        var firstRowY = borders.Min(command => command.Rect.Y);
+
+        var interior = borders
+            .Where(command => command.Rect.Width <= 2f)
+            .Where(command => command.Rect.X > tableLeft + 0.5f && command.Rect.X + command.Rect.Width < tableRight - 0.5f)
+            .Where(command => command.Rect.Y <= firstRowY + 1f)
+            .Count();
+
+        return (borders.Length, interior);
     }
 
     [Fact]

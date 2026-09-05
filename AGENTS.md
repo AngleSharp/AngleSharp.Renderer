@@ -36,9 +36,20 @@ The renderer is intentionally split into a small number of layers:
 
 - `HtmlRenderer` builds a display list from the AngleSharp render tree and computed styles.
 - `DisplayList` is the backend-agnostic command model.
-- `SkiaRenderBackend` turns the display list into a PNG using SkiaSharp.
+- `SkiaRenderBackend` turns the display list into a PNG using SkiaSharp, and implements `ITextMeasurer` so layout measures with the very typefaces it paints with. Both paths resolve fonts through `SkiaTextShaping`, which exists to keep them from drifting apart.
+- Font resolution lives in `SkiaTextShaping.CreateTypeface` and walks the CSS family list in order: generic families map to the bundled fonts, named families resolve only when actually installed, and an exhausted list falls back to the bundled sans-serif. Do not resolve named families with `SKTypeface.FromFamilyName` - it substitutes the host's default for an unknown family instead of returning null, which swallows the rest of the fallback list and makes output depend on the machine. Availability goes through a case-insensitive index of the installed families, because Skia's own lookup is case sensitive on Linux but not on Windows.
+- `ITextMeasurer` is the seam between layout and rasterization. Line breaking, text alignment and table column widths all go through it; a renderer built with a custom measurer lays out against that measurer. Never reintroduce a font-independent width heuristic here - it silently decouples layout from what is drawn.
 - `HtmlRenderOptions` holds viewport and text defaults.
 - `AngleSharp.Css` provides the render tree and computed-style data used by the renderer.
+
+Font handling resolves each entry of a `font-family` list in order, and the first usable one wins:
+
+1. Generic families (`serif`, `sans-serif`, `monospace`, plus `cursive`, `fantasy`, `system-ui` and the `ui-*` aliases) always come from the fonts bundled in `Resources/Fonts`. They are keywords, so an `@font-face` rule cannot take them over, and they are what keeps snapshots reproducible.
+2. `@font-face` declarations, collected per document by `FontFaceLoader` and carried on `DisplayList.Fonts`. Sources are tried in declaration order; `local()` resolves against the installed fonts and `url()` against `data:` URIs, or the network when - and only when - the browsing context has an  `IDocumentLoader` configured, mirroring how images are handled. WOFF and WOFF2 are rejected up front because Skia cannot decode them.
+3. Installed families, which depend on the host and are therefore not safe to assert in snapshots.
+4. The bundled sans-serif, as the last resort.
+
+Table spans: a cell covers the columns and rows it spans, and a spanning cell's height is shared across the rows it covers rather than imposed on each of them. With `border-collapse: collapse` each cell paints only its top and left edge and the table adds the frame, so shared edges are drawn once and no rule is painted across a spanning cell. Cell content honours `vertical-align` (`top`, `middle`, `bottom`), defaulting to the `middle` that AngleSharp.Css resolves for cells; `baseline` is treated as `top`, since baselines are not aligned across a row. Note that on a cell `vertical-align` positions the content box, which is a different meaning from the inline shift `ParseVerticalAlign` applies to `super`, `sub` and friends.
 
 Current behavior includes block layout, margins, padding, borders, floats, inline-block, relative/fixed/absolute positioning, z-index ordering, outlines, text styling, text alignment, line-height, letter-spacing, text-indent, vertical-align, and generic font-family handling.
 
@@ -93,7 +104,5 @@ other two.
 - The docs live under `docs/general/` and `docs/tutorials/`; they are the best place to document user-facing renderer behavior.
 - `AGENTS.md` should remain the primary agent note for this repo.
 - The repository already carries a snapshot-based workflow, so visual changes usually require updating the baseline PNGs together with the code change.
-- The Linux Skia setup uses `SkiaSharp.NativeAssets.Linux.NoDependencies`, which is built without
-  fontconfig. Installing system fonts on a Linux runner therefore has no effect on rendering; only
-  the bundled fonts and Skia's own fallback matter.
+- The Linux Skia setup uses `SkiaSharp.NativeAssets.Linux.NoDependencies`. It is built without fontconfig, but it is *not* fontless: it scans `/usr/share/fonts/` directly, so whatever that directory holds is what `SKTypeface.FromFamilyName` can resolve. Generic families never reach that path (they come from the bundled fonts), but named families do, which makes them depend on the runner image. CI deliberately does not install extra fonts - determinism for named families has to come from the renderer's fallback, not from curating the runner.
 - Keep an eye on `failure-assets/` after test runs; they are useful diagnostics, not source of truth.

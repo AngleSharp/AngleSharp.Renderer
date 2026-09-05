@@ -25,8 +25,12 @@ public sealed class HtmlRenderer
     // Per-document cache keeps image payloads stable across repeated renders of the same DOM instance.
     private static readonly ConditionalWeakTable<IDocument, DocumentImageCache> s_imageCacheByDocument = new();
     private static readonly AsyncLocal<LayoutCapture?> s_layoutCapture = new();
+    private static readonly ITextMeasurer s_defaultTextMeasurer = new SkiaTextMeasurer();
+
+    private const float CollapsedBorderWidth = 1f;
 
     private readonly IRenderBackend _backend;
+    private readonly ITextMeasurer _textMeasurer;
 
     private sealed class DocumentImageCache
     {
@@ -59,7 +63,8 @@ public sealed class HtmlRenderer
         float FontSize,
         float LineHeightMultiplier,
         float ParagraphSpacing,
-        float AverageCharacterWidthFactor);
+        ITextMeasurer TextMeasurer,
+        FontFaceSet Fonts);
 
     private sealed class LayoutCapture
     {
@@ -81,7 +86,7 @@ public sealed class HtmlRenderer
         ArgumentNullException.ThrowIfNull(document);
         ArgumentNullException.ThrowIfNull(renderDevice);
 
-        var context = CreateLayoutContext(document, renderDevice);
+        var context = CreateLayoutContext(document, renderDevice, s_defaultTextMeasurer);
         var viewport = new RenderViewport(context.Width, context.Height);
         var capture = new LayoutCapture();
         var previous = s_layoutCapture.Value;
@@ -143,16 +148,29 @@ public sealed class HtmlRenderer
     }
 
     /// <summary>
-    /// Creates a new renderer with a specific backend.
+    /// Creates a new renderer with a specific backend. A backend that measures text itself is
+    /// used for layout as well, so that layout and rasterization agree on advance widths.
     /// </summary>
     /// <param name="backend">The backend used for rasterization.</param>
     public HtmlRenderer(IRenderBackend backend)
+        : this(backend, (backend as ITextMeasurer) ?? s_defaultTextMeasurer)
     {
-        ArgumentNullException.ThrowIfNull(backend);
-        _backend = backend;
     }
 
-    private static LayoutContext CreateLayoutContext(IDocument document, IRenderDevice renderDevice)
+    /// <summary>
+    /// Creates a new renderer with a specific backend and text measurer.
+    /// </summary>
+    /// <param name="backend">The backend used for rasterization.</param>
+    /// <param name="textMeasurer">The measurer used to compute advance widths during layout.</param>
+    public HtmlRenderer(IRenderBackend backend, ITextMeasurer textMeasurer)
+    {
+        ArgumentNullException.ThrowIfNull(backend);
+        ArgumentNullException.ThrowIfNull(textMeasurer);
+        _backend = backend;
+        _textMeasurer = textMeasurer;
+    }
+
+    private static LayoutContext CreateLayoutContext(IDocument document, IRenderDevice renderDevice, ITextMeasurer textMeasurer)
     {
         var width = Math.Max(1, (int)Math.Round(Convert.ToDouble(renderDevice.ViewPortWidth)));
         var height = Math.Max(1, (int)Math.Round(Convert.ToDouble(renderDevice.ViewPortHeight)));
@@ -185,7 +203,8 @@ public sealed class HtmlRenderer
             FontSize: defaultFontSize,
             LineHeightMultiplier: defaultLineHeight,
             ParagraphSpacing: 0f,
-            AverageCharacterWidthFactor: 0.55f);
+            TextMeasurer: textMeasurer,
+            Fonts: FontFaceLoader.Load(document));
     }
 
     /// <summary>
@@ -211,7 +230,7 @@ public sealed class HtmlRenderer
         ArgumentNullException.ThrowIfNull(document);
         ArgumentNullException.ThrowIfNull(renderDevice);
 
-        var context = CreateLayoutContext(document, renderDevice);
+        var context = CreateLayoutContext(document, renderDevice, _textMeasurer);
         var viewport = new RenderViewport(context.Width, context.Height);
         var displayList = BuildDisplayList(document, viewport, context, renderDevice);
 
@@ -241,14 +260,14 @@ public sealed class HtmlRenderer
         ArgumentNullException.ThrowIfNull(document);
         ArgumentNullException.ThrowIfNull(renderDevice);
 
-        var context = CreateLayoutContext(document, renderDevice);
+        var context = CreateLayoutContext(document, renderDevice, _textMeasurer);
         var viewport = new RenderViewport(context.Width, context.Height);
         return BuildDisplayList(document, viewport, context, renderDevice);
     }
 
     private static DisplayList BuildDisplayList(IDocument document, RenderViewport viewport, LayoutContext context, IRenderDevice renderDevice)
     {
-        var displayList = new DisplayList();
+        var displayList = new DisplayList { Fonts = context.Fonts };
         displayList.FillRect(new RenderRect(0f, 0f, viewport.Width, viewport.Height), context.BackgroundColor);
 
         var window = document.DefaultView;
@@ -708,7 +727,7 @@ public sealed class HtmlRenderer
                                 currentTextStyle,
                                 flowContainingX,
                                 flowContainingWidth,
-                                context.AverageCharacterWidthFactor,
+                                context,
                                 ref inlineCursorX,
                                 ref inlineLineTop,
                                 ref inlineLineHeight,
@@ -739,7 +758,7 @@ public sealed class HtmlRenderer
                                     childTextStyle,
                                     flowContainingX,
                                     flowContainingWidth,
-                                    context.AverageCharacterWidthFactor,
+                                    context,
                                     ref inlineCursorX,
                                     ref inlineLineTop,
                                     ref inlineLineHeight,
@@ -1280,7 +1299,7 @@ public sealed class HtmlRenderer
                 .ToList())
             .ToList();
 
-        var tableCells = new List<(int RowIndex, int ColumnIndex, int ColumnSpan, int RowSpan, ElementRenderNode CellNode, Dictionary<string, string> CellStyle, RenderTextStyle CellTextStyle, string Text, float PaddingLeft, float PaddingRight, float PaddingTop, float PaddingBottom, float BorderLeftWidth, float BorderRightWidth, float BorderTopWidth, float BorderBottomWidth, RenderColor BackgroundColor)>();
+        var tableCells = new List<TableCellPlacement>();
         var rowSpanOccupancy = new List<int>();
         var columnCount = 0;
 
@@ -1349,7 +1368,7 @@ public sealed class HtmlRenderer
                     nextRowSpanOccupancy[currentColumnIndex + spanOffset] = Math.Max(nextRowSpanOccupancy[currentColumnIndex + spanOffset], Math.Max(0, rowspan - 1));
                 }
 
-                tableCells.Add((rowIndex, currentColumnIndex, colspan, rowspan, cellNode, cellStyle, cellTextStyle, text,
+                tableCells.Add(new TableCellPlacement(rowIndex, currentColumnIndex, colspan, rowspan, cellNode, cellStyle, cellTextStyle, text,
                     ParseLength(cellStyle, "padding-left", containingWidth, 4f, allowAuto: false),
                     ParseLength(cellStyle, "padding-right", containingWidth, 4f, allowAuto: false),
                     ParseLength(cellStyle, "padding-top", containingWidth, 4f, allowAuto: false),
@@ -1358,7 +1377,8 @@ public sealed class HtmlRenderer
                     ParseLength(cellStyle, "border-right-width", containingWidth, 1f, allowAuto: false),
                     ParseLength(cellStyle, "border-top-width", containingWidth, 1f, allowAuto: false),
                     ParseLength(cellStyle, "border-bottom-width", containingWidth, 1f, allowAuto: false),
-                    ParseColor(cellStyle.TryGetValue("background-color", out var backgroundColor) ? backgroundColor : null, RenderColor.Transparent)));
+                    ParseColor(cellStyle.TryGetValue("background-color", out var backgroundColor) ? backgroundColor : null, RenderColor.Transparent),
+                    ParseCellVerticalAlign(cellStyle)));
 
                 columnCount = Math.Max(columnCount, currentColumnIndex + colspan);
                 currentColumnIndex += colspan;
@@ -1368,6 +1388,12 @@ public sealed class HtmlRenderer
             {
                 if (rowSpanOccupancy[index] > 0)
                 {
+                    // A row with fewer cells than the span reaches over leaves the new list short.
+                    while (index >= nextRowSpanOccupancy.Count)
+                    {
+                        nextRowSpanOccupancy.Add(0);
+                    }
+
                     nextRowSpanOccupancy[index] = Math.Max(nextRowSpanOccupancy[index], rowSpanOccupancy[index] - 1);
                 }
             }
@@ -1389,7 +1415,7 @@ public sealed class HtmlRenderer
             var paddingRight = placement.PaddingRight;
             var borderLeftWidth = placement.BorderLeftWidth;
             var borderRightWidth = placement.BorderRightWidth;
-            var textWidth = placement.Text.Length > 0 ? EstimateTextWidth(placement.Text, placement.CellTextStyle.FontSize, context.AverageCharacterWidthFactor, placement.CellTextStyle.LetterSpacing) : 0f;
+            var textWidth = placement.Text.Length > 0 ? MeasureTextWidth(context, placement.Text, placement.CellTextStyle) : 0f;
             var minCellWidth = textWidth + paddingLeft + paddingRight + borderLeftWidth + borderRightWidth + 8f;
             var widthPerColumn = float.IsNaN(specifiedCellWidth) ? minCellWidth / Math.Max(1, placement.ColumnSpan) : specifiedCellWidth / Math.Max(1, placement.ColumnSpan);
 
@@ -1439,23 +1465,33 @@ public sealed class HtmlRenderer
         var rowTopOffsets = new float[rowCellLists.Count];
         var rowHeights = new float[rowCellLists.Count];
 
-        foreach (var placement in tableCells)
+        // Cells confined to a single row establish the row heights on their own.
+        foreach (var placement in tableCells.Where(placement => placement.RowSpan <= 1))
         {
-            var contentWidth = Math.Max(0f, columnWidths.Skip(placement.ColumnIndex).Take(placement.ColumnSpan).Sum() - placement.PaddingLeft - placement.PaddingRight - placement.BorderLeftWidth - placement.BorderRightWidth);
-            var contentHeight = 0f;
-            var text = placement.Text;
+            rowHeights[placement.RowIndex] = Math.Max(rowHeights[placement.RowIndex], MeasureCellHeight(context, placement, columnWidths));
+        }
 
-            if (contentWidth > 0f && text.Length > 0)
-            {
-                var wrappedLines = WrapText(text, contentWidth, placement.CellTextStyle.FontSize, context.AverageCharacterWidthFactor, placement.CellTextStyle.LetterSpacing);
-                var lineHeight = placement.CellTextStyle.FontSize * placement.CellTextStyle.LineHeightMultiplier;
-                contentHeight = wrappedLines.Count * lineHeight;
-            }
+        for (var rowIndex = 0; rowIndex < rowHeights.Length; rowIndex++)
+        {
+            rowHeights[rowIndex] = Math.Max(rowHeights[rowIndex], 20f);
+        }
 
-            var effectiveHeight = Math.Max(20f, contentHeight + placement.PaddingTop + placement.PaddingBottom + placement.BorderTopWidth + placement.BorderBottomWidth);
-            for (var rowIndex = placement.RowIndex; rowIndex < placement.RowIndex + placement.RowSpan; rowIndex++)
+        // A spanning cell only has to fit across the rows it covers taken together, so it grows
+        // them by whatever is still missing rather than imposing its full height on each one.
+        foreach (var placement in tableCells.Where(placement => placement.RowSpan > 1))
+        {
+            var spannedRows = Enumerable.Range(placement.RowIndex, placement.RowSpan).ToArray();
+            var available = spannedRows.Sum(rowIndex => rowHeights[rowIndex]);
+            var required = MeasureCellHeight(context, placement, columnWidths);
+
+            if (required > available)
             {
-                rowHeights[rowIndex] = Math.Max(rowHeights[rowIndex], effectiveHeight);
+                var deficitPerRow = (required - available) / placement.RowSpan;
+
+                foreach (var rowIndex in spannedRows)
+                {
+                    rowHeights[rowIndex] += deficitPerRow;
+                }
             }
         }
 
@@ -1487,21 +1523,12 @@ public sealed class HtmlRenderer
                 cellHeight += rowHeights[rowIndex];
             }
 
-            var contentHeight = 0f;
-            if (contentWidth > 0f && placement.Text.Length > 0)
-            {
-                var wrappedLines = WrapText(placement.Text, contentWidth, placement.CellTextStyle.FontSize, context.AverageCharacterWidthFactor, placement.CellTextStyle.LetterSpacing);
-                var lineHeight = placement.CellTextStyle.FontSize * placement.CellTextStyle.LineHeightMultiplier;
-                contentHeight = wrappedLines.Count * lineHeight;
-            }
-
-            var effectiveHeight = Math.Max(20f, contentHeight + placement.PaddingTop + placement.PaddingBottom + placement.BorderTopWidth + placement.BorderBottomWidth);
             RecordLayoutMetrics(
                 placement.CellNode.Ref,
                 cellX,
                 cellY,
                 cellWidth,
-                effectiveHeight,
+                cellHeight,
                 placement.BorderLeftWidth,
                 placement.BorderRightWidth,
                 placement.BorderTopWidth,
@@ -1511,22 +1538,44 @@ public sealed class HtmlRenderer
                 placement.PaddingTop,
                 placement.PaddingBottom);
 
-            displayList.FillRect(new RenderRect(cellX, cellY, cellWidth, effectiveHeight), placement.BackgroundColor);
+            displayList.FillRect(new RenderRect(cellX, cellY, cellWidth, cellHeight), placement.BackgroundColor);
 
-            if (!borderCollapse)
+            if (borderCollapse)
+            {
+                // Collapsed borders are shared, so each cell contributes only its top and left
+                // edge and the table frame closes the far sides. Drawing full outlines instead
+                // would lay two lines over every shared edge, and a grid spanning the whole table
+                // would cut straight through the cells that span rows or columns.
+                displayList.FillRect(new RenderRect(cellX, cellY, cellWidth, CollapsedBorderWidth), RenderColor.Black);
+                displayList.FillRect(new RenderRect(cellX, cellY, CollapsedBorderWidth, cellHeight), RenderColor.Black);
+            }
+            else
             {
                 displayList.FillRect(new RenderRect(cellX, cellY, cellWidth, placement.BorderTopWidth), RenderColor.Black);
-                displayList.FillRect(new RenderRect(cellX + cellWidth - placement.BorderRightWidth, cellY, placement.BorderRightWidth, effectiveHeight), RenderColor.Black);
-                displayList.FillRect(new RenderRect(cellX, cellY + effectiveHeight - placement.BorderBottomWidth, cellWidth, placement.BorderBottomWidth), RenderColor.Black);
-                displayList.FillRect(new RenderRect(cellX, cellY, placement.BorderLeftWidth, effectiveHeight), RenderColor.Black);
+                displayList.FillRect(new RenderRect(cellX + cellWidth - placement.BorderRightWidth, cellY, placement.BorderRightWidth, cellHeight), RenderColor.Black);
+                displayList.FillRect(new RenderRect(cellX, cellY + cellHeight - placement.BorderBottomWidth, cellWidth, placement.BorderBottomWidth), RenderColor.Black);
+                displayList.FillRect(new RenderRect(cellX, cellY, placement.BorderLeftWidth, cellHeight), RenderColor.Black);
             }
 
             if (contentWidth > 0f && placement.Text.Length > 0)
             {
-                var wrappedLines = WrapText(placement.Text, contentWidth, placement.CellTextStyle.FontSize, context.AverageCharacterWidthFactor, placement.CellTextStyle.LetterSpacing);
+                var wrappedLines = WrapText(context, placement.Text, contentWidth, placement.CellTextStyle);
                 var lineHeight = placement.CellTextStyle.FontSize * placement.CellTextStyle.LineHeightMultiplier;
                 var lineX = cellX + placement.PaddingLeft + placement.BorderLeftWidth;
-                var lineY = cellY + placement.PaddingTop + placement.BorderTopWidth + lineHeight;
+
+                // The content box can be taller than the text, most visibly in a cell that spans
+                // rows, so the block of lines is placed according to the cell's vertical-align.
+                var contentBoxHeight = cellHeight - placement.PaddingTop - placement.PaddingBottom
+                    - placement.BorderTopWidth - placement.BorderBottomWidth;
+                var slack = Math.Max(0f, contentBoxHeight - (wrappedLines.Count * lineHeight));
+                var verticalOffset = placement.VerticalAlign switch
+                {
+                    CellVerticalAlign.Middle => slack / 2f,
+                    CellVerticalAlign.Bottom => slack,
+                    _ => 0f,
+                };
+
+                var lineY = cellY + placement.PaddingTop + placement.BorderTopWidth + verticalOffset + lineHeight;
 
                 for (var lineIndex = 0; lineIndex < wrappedLines.Count; lineIndex++)
                 {
@@ -1538,26 +1587,12 @@ public sealed class HtmlRenderer
 
         if (borderCollapse)
         {
-            var collapsedBorderWidth = 1f;
-
-            displayList.FillRect(new RenderRect(tableX, tableY, tableWidth, collapsedBorderWidth), RenderColor.Black);
-            displayList.FillRect(new RenderRect(tableX, tableY + tableHeight - collapsedBorderWidth, tableWidth, collapsedBorderWidth), RenderColor.Black);
-            displayList.FillRect(new RenderRect(tableX, tableY, collapsedBorderWidth, tableHeight), RenderColor.Black);
-            displayList.FillRect(new RenderRect(tableX + tableWidth - collapsedBorderWidth, tableY, collapsedBorderWidth, tableHeight), RenderColor.Black);
-
-            var currentVerticalX = tableX;
-            for (var columnIndex = 1; columnIndex < columnCount; columnIndex++)
-            {
-                currentVerticalX += columnWidths[columnIndex - 1];
-                displayList.FillRect(new RenderRect(currentVerticalX, tableY, collapsedBorderWidth, tableHeight), RenderColor.Black);
-            }
-
-            var currentHorizontalY = tableY;
-            for (var rowIndex = 1; rowIndex < rowCellLists.Count; rowIndex++)
-            {
-                currentHorizontalY += rowHeights[rowIndex - 1];
-                displayList.FillRect(new RenderRect(tableX, currentHorizontalY, tableWidth, collapsedBorderWidth), RenderColor.Black);
-            }
+            // The interior lines come from the cell outlines above; only the frame is left, which
+            // also closes the edge of rows that hold fewer cells than the table has columns.
+            displayList.FillRect(new RenderRect(tableX, tableY, tableWidth, CollapsedBorderWidth), RenderColor.Black);
+            displayList.FillRect(new RenderRect(tableX, tableY + tableHeight - CollapsedBorderWidth, tableWidth, CollapsedBorderWidth), RenderColor.Black);
+            displayList.FillRect(new RenderRect(tableX, tableY, CollapsedBorderWidth, tableHeight), RenderColor.Black);
+            displayList.FillRect(new RenderRect(tableX + tableWidth - CollapsedBorderWidth, tableY, CollapsedBorderWidth, tableHeight), RenderColor.Black);
         }
 
         RecordLayoutMetrics(
@@ -1979,7 +2014,7 @@ public sealed class HtmlRenderer
         float firstLineIndent)
     {
         var lineHeight = textStyle.FontSize * textStyle.LineHeightMultiplier;
-        var lines = WrapText(text, maxWidth, textStyle.FontSize, context.AverageCharacterWidthFactor, textStyle.LetterSpacing);
+        var lines = WrapText(context, text, maxWidth, textStyle);
 
         for (var index = 0; index < lines.Count; index++)
         {
@@ -1991,7 +2026,7 @@ public sealed class HtmlRenderer
                 return;
             }
 
-            var lineWidth = EstimateTextWidth(line, textStyle.FontSize, context.AverageCharacterWidthFactor, textStyle.LetterSpacing);
+            var lineWidth = MeasureTextWidth(context, line, textStyle);
             var lineMaxWidth = index == 0 ? Math.Max(0f, maxWidth - firstLineIndent) : maxWidth;
             var lineX = x + (index == 0 ? firstLineIndent : 0f) + ResolveTextAlignmentOffset(textStyle.TextAlign, lineMaxWidth, lineWidth);
             var baselineY = cursorY + textStyle.VerticalAlignOffset;
@@ -2019,7 +2054,7 @@ public sealed class HtmlRenderer
         RenderTextStyle textStyle,
         float flowX,
         float flowWidth,
-        float averageCharacterWidthFactor,
+        LayoutContext context,
         ref float inlineCursorX,
         ref float inlineLineTop,
         ref float inlineLineHeight,
@@ -2027,11 +2062,11 @@ public sealed class HtmlRenderer
     {
         var words = text.Split(' ', StringSplitOptions.RemoveEmptyEntries);
         var rightEdge = flowX + flowWidth;
-        var spaceWidth = EstimateTextWidth(" ", textStyle.FontSize, averageCharacterWidthFactor, textStyle.LetterSpacing);
+        var spaceWidth = MeasureTextWidth(context, " ", textStyle);
 
         foreach (var word in words)
         {
-            var wordWidth = EstimateTextWidth(word, textStyle.FontSize, averageCharacterWidthFactor, textStyle.LetterSpacing);
+            var wordWidth = MeasureTextWidth(context, word, textStyle);
 
             if (inlineCursorX > flowX && inlineCursorX + spaceWidth + wordWidth > rightEdge)
             {
@@ -2249,6 +2284,27 @@ public sealed class HtmlRenderer
         var verticalAlignOffset = ParseVerticalAlign(styleMap, fontSize);
 
         return new RenderTextStyle(fontSize, color, fontFamily, lineHeight, fontWeight, isItalic, underline, strikeThrough, decorationColor, decorationStyle, textAlign, letterSpacing, textIndent, verticalAlignOffset);
+    }
+
+    /// <summary>
+    /// Reads the box-level meaning of <c>vertical-align</c>, which is what the property means on a
+    /// table cell. On inline content the same property shifts the text instead, which is what
+    /// <see cref="ParseVerticalAlign"/> handles.
+    /// </summary>
+    private static CellVerticalAlign ParseCellVerticalAlign(Dictionary<string, string> styleMap)
+    {
+        if (!styleMap.TryGetValue("vertical-align", out var value) || string.IsNullOrWhiteSpace(value))
+        {
+            return CellVerticalAlign.Middle;
+        }
+
+        return value.Trim().ToLowerInvariant() switch
+        {
+            "top" or "text-top" => CellVerticalAlign.Top,
+            "bottom" or "text-bottom" => CellVerticalAlign.Bottom,
+            "middle" => CellVerticalAlign.Middle,
+            _ => CellVerticalAlign.Top,
+        };
     }
 
     private static float ParseVerticalAlign(Dictionary<string, string> styleMap, float fontSize)
@@ -3769,7 +3825,28 @@ public sealed class HtmlRenderer
         return fallback;
     }
 
-    private static IReadOnlyList<string> WrapText(string text, float maxWidth, float fontSize, float averageCharacterWidthFactor, float letterSpacing)
+    /// <summary>
+    /// The height a cell needs for its own content, independent of the rows it spans.
+    /// </summary>
+    private static float MeasureCellHeight(
+        LayoutContext context,
+        TableCellPlacement placement,
+        float[] columnWidths)
+    {
+        var contentWidth = Math.Max(0f, columnWidths.Skip(placement.ColumnIndex).Take(placement.ColumnSpan).Sum()
+            - placement.PaddingLeft - placement.PaddingRight - placement.BorderLeftWidth - placement.BorderRightWidth);
+        var contentHeight = 0f;
+
+        if (contentWidth > 0f && placement.Text.Length > 0)
+        {
+            var wrappedLines = WrapText(context, placement.Text, contentWidth, placement.CellTextStyle);
+            contentHeight = wrappedLines.Count * placement.CellTextStyle.FontSize * placement.CellTextStyle.LineHeightMultiplier;
+        }
+
+        return Math.Max(20f, contentHeight + placement.PaddingTop + placement.PaddingBottom + placement.BorderTopWidth + placement.BorderBottomWidth);
+    }
+
+    private static IReadOnlyList<string> WrapText(LayoutContext context, string text, float maxWidth, RenderTextStyle textStyle)
     {
         var words = text.Split(' ', StringSplitOptions.RemoveEmptyEntries);
 
@@ -3784,8 +3861,8 @@ public sealed class HtmlRenderer
 
         foreach (var word in words)
         {
-            var wordWidth = EstimateTextWidth(word, fontSize, averageCharacterWidthFactor, letterSpacing);
-            var separatorWidth = current.Length == 0 ? 0f : EstimateTextWidth(" ", fontSize, averageCharacterWidthFactor, letterSpacing);
+            var wordWidth = MeasureTextWidth(context, word, textStyle);
+            var separatorWidth = current.Length == 0 ? 0f : MeasureTextWidth(context, " ", textStyle);
 
             if (current.Length > 0 && currentWidth + separatorWidth + wordWidth > maxWidth)
             {
@@ -3812,30 +3889,16 @@ public sealed class HtmlRenderer
         return lines;
     }
 
-    private static float EstimateTextWidth(string text, float fontSize, float averageCharacterWidthFactor, float letterSpacing)
-    {
-        var width = 0f;
-        var characterCount = 0;
+    private static RenderFont ToRenderFont(RenderTextStyle textStyle, FontFaceSet fonts) => new(
+        textStyle.FontFamily,
+        textStyle.FontSize,
+        textStyle.FontWeight,
+        textStyle.IsItalic,
+        textStyle.LetterSpacing,
+        fonts);
 
-        foreach (var c in text)
-        {
-            characterCount++;
-            width += c switch
-            {
-                'i' or 'l' or '!' or '|' => fontSize * 0.35f,
-                'm' or 'w' or 'M' or 'W' => fontSize * 0.9f,
-                ' ' => fontSize * 0.33f,
-                _ => fontSize * averageCharacterWidthFactor,
-            };
-        }
-
-        if (characterCount > 1)
-        {
-            width += (characterCount - 1) * letterSpacing;
-        }
-
-        return width;
-    }
+    private static float MeasureTextWidth(LayoutContext context, string text, RenderTextStyle textStyle) =>
+        context.TextMeasurer.MeasureWidth(text, ToRenderFont(textStyle, context.Fonts));
 
     private static float ResolveTextAlignmentOffset(TextAlign align, float availableWidth, float textWidth)
     {
@@ -3881,6 +3944,40 @@ public sealed class HtmlRenderer
 
         return sb.ToString().Trim();
     }
+
+    /// <summary>
+    /// Where a cell's content sits within the box the cell occupies.
+    /// </summary>
+    /// <remarks>
+    /// <c>baseline</c> is treated as <c>top</c>: aligning the first line boxes of every cell in a
+    /// row against a shared baseline is not implemented.
+    /// </remarks>
+    private enum CellVerticalAlign
+    {
+        Top,
+        Middle,
+        Bottom,
+    }
+
+    private readonly record struct TableCellPlacement(
+        int RowIndex,
+        int ColumnIndex,
+        int ColumnSpan,
+        int RowSpan,
+        ElementRenderNode CellNode,
+        Dictionary<string, string> CellStyle,
+        RenderTextStyle CellTextStyle,
+        string Text,
+        float PaddingLeft,
+        float PaddingRight,
+        float PaddingTop,
+        float PaddingBottom,
+        float BorderLeftWidth,
+        float BorderRightWidth,
+        float BorderTopWidth,
+        float BorderBottomWidth,
+        RenderColor BackgroundColor,
+        CellVerticalAlign VerticalAlign);
 
     private readonly record struct RenderTextStyle(
         float FontSize,

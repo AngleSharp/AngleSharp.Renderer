@@ -1,7 +1,5 @@
 using AngleSharp.Renderer.Rendering;
 using System.Linq;
-using System.Reflection;
-using System.Threading;
 
 using SkiaSharp;
 
@@ -10,25 +8,16 @@ namespace AngleSharp.Renderer.Skia;
 /// <summary>
 /// Uses SkiaSharp to render a display list.
 /// </summary>
-public sealed class SkiaRenderBackend : IRenderBackend
+/// <remarks>
+/// The backend also measures text, so a renderer using it lays out against the same advance
+/// widths it paints with.
+/// </remarks>
+public sealed class SkiaRenderBackend : IRenderBackend, ITextMeasurer
 {
-    private const string FontResourcePrefix = "AngleSharp.Renderer.Resources.Fonts.";
+    private readonly SkiaTextMeasurer _textMeasurer = new();
 
-    private static readonly Lazy<IReadOnlyDictionary<string, BundledFontFamily>> BundledFonts =
-        new(CreateBundledFonts, LazyThreadSafetyMode.ExecutionAndPublication);
-
-    private static readonly IReadOnlyDictionary<string, string> GenericFontMappings =
-        new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
-        {
-            ["serif"] = "serif",
-            ["sans-serif"] = "sans-serif",
-            ["monospace"] = "monospace",
-            ["cursive"] = "sans-serif",
-            ["fantasy"] = "serif",
-            ["dejavu serif"] = "serif",
-            ["dejavu sans"] = "sans-serif",
-            ["dejavu sans mono"] = "monospace",
-        };
+    /// <inheritdoc />
+    public float MeasureWidth(string text, RenderFont font) => _textMeasurer.MeasureWidth(text, font);
 
     /// <inheritdoc />
     public RenderedImage RenderToPng(DisplayList displayList, RenderViewport viewport)
@@ -49,7 +38,7 @@ public sealed class SkiaRenderBackend : IRenderBackend
 
         foreach (var command in displayList.Commands)
         {
-            DrawCommand(canvas, command);
+            DrawCommand(canvas, command, displayList.Fonts);
         }
 
         using var image = surface.Snapshot();
@@ -59,7 +48,7 @@ public sealed class SkiaRenderBackend : IRenderBackend
         return new RenderedImage(data.ToArray(), viewport.Width, viewport.Height, "image/png");
     }
 
-    private static void DrawCommand(SKCanvas canvas, RenderCommand command)
+    private static void DrawCommand(SKCanvas canvas, RenderCommand command, FontFaceSet fonts)
     {
         switch (command)
         {
@@ -70,7 +59,7 @@ public sealed class SkiaRenderBackend : IRenderBackend
                 DrawImage(canvas, image);
                 break;
             case DrawTextCommand text:
-                DrawText(canvas, text);
+                DrawText(canvas, text, fonts);
                 break;
         }
     }
@@ -188,24 +177,18 @@ public sealed class SkiaRenderBackend : IRenderBackend
         canvas.DrawImage(image, rect, paint);
     }
 
-    private static void DrawText(SKCanvas canvas, DrawTextCommand command)
+    private static void DrawText(SKCanvas canvas, DrawTextCommand command, FontFaceSet fonts)
     {
-        var fontStyle = new SKFontStyle(
-            command.FontWeight >= 600f ? SKFontStyleWeight.Bold : SKFontStyleWeight.Normal,
-            SKFontStyleWidth.Normal,
-            command.IsItalic ? SKFontStyleSlant.Italic : SKFontStyleSlant.Upright);
+        var font = new RenderFont(
+            command.FontFamily,
+            command.FontSize,
+            command.FontWeight,
+            command.IsItalic,
+            command.LetterSpacing,
+            fonts);
 
-        using var paint = new SKPaint
-        {
-            Color = ToSkColor(command.Color),
-            IsAntialias = true,
-            SubpixelText = false,
-            LcdRenderText = false,
-            HintingLevel = SKPaintHinting.Normal,
-            TextSize = command.FontSize,
-            Typeface = CreateTypeface(command.FontFamily, fontStyle),
-            TextSkewX = command.IsItalic ? -0.25f : 0f,
-        };
+        using var paint = SkiaTextShaping.CreateTextPaint(font);
+        paint.Color = ToSkColor(command.Color);
 
         DrawTextWithLetterSpacing(canvas, paint, command.Text, command.X, command.Y, command.LetterSpacing);
 
@@ -219,7 +202,7 @@ public sealed class SkiaRenderBackend : IRenderBackend
                 StrokeWidth = Math.Max(1f, command.FontSize / 14f),
             };
 
-            var textWidth = MeasureTextWidth(paint, command.Text, command.LetterSpacing);
+            var textWidth = SkiaTextShaping.MeasureTextWidth(paint, command.Text, command.LetterSpacing);
 
             if (command.Underline)
             {
@@ -264,74 +247,6 @@ public sealed class SkiaRenderBackend : IRenderBackend
         }
     }
 
-    private static SKTypeface CreateTypeface(string fontFamily, SKFontStyle fontStyle)
-    {
-        var isBold = fontStyle.Weight >= (int)SKFontStyleWeight.Bold;
-
-        var families = fontFamily.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
-
-        foreach (var family in families)
-        {
-            var normalized = family.Trim('\'', '"', ' ');
-
-            if (string.IsNullOrWhiteSpace(normalized))
-            {
-                continue;
-            }
-
-            if (GenericFontMappings.TryGetValue(normalized, out var bundledFamilyKey) &&
-                BundledFonts.Value.TryGetValue(bundledFamilyKey, out var bundledFamily))
-            {
-                return isBold ? bundledFamily.Bold : bundledFamily.Regular;
-            }
-
-            var typeface = SKTypeface.FromFamilyName(normalized, fontStyle);
-
-            if (typeface is not null)
-            {
-                return typeface;
-            }
-        }
-
-        if (BundledFonts.Value.TryGetValue("sans-serif", out var defaultFamily))
-        {
-            return isBold ? defaultFamily.Bold : defaultFamily.Regular;
-        }
-
-        return SKTypeface.FromFamilyName(fontFamily, fontStyle) ?? SKTypeface.Default;
-    }
-
-    private static IReadOnlyDictionary<string, BundledFontFamily> CreateBundledFonts()
-    {
-        var sansRegular = LoadBundledTypeface("DejaVuSans.ttf");
-        var sansBold = LoadBundledTypeface("DejaVuSans-Bold.ttf");
-        var serifRegular = LoadBundledTypeface("DejaVuSerif.ttf");
-        var serifBold = LoadBundledTypeface("DejaVuSerif-Bold.ttf");
-        var monoRegular = LoadBundledTypeface("DejaVuSansMono.ttf");
-        var monoBold = LoadBundledTypeface("DejaVuSansMono-Bold.ttf");
-
-        return new Dictionary<string, BundledFontFamily>(StringComparer.OrdinalIgnoreCase)
-        {
-            ["sans-serif"] = new BundledFontFamily(sansRegular, sansBold),
-            ["serif"] = new BundledFontFamily(serifRegular, serifBold),
-            ["monospace"] = new BundledFontFamily(monoRegular, monoBold),
-        };
-    }
-
-    private static SKTypeface LoadBundledTypeface(string fileName)
-    {
-        var assembly = typeof(SkiaRenderBackend).Assembly;
-        var resourceName = string.Concat(FontResourcePrefix, fileName);
-
-        using var stream = assembly.GetManifestResourceStream(resourceName)
-            ?? throw new InvalidOperationException($"Bundled font resource not found: {resourceName}");
-        using var data = SKData.Create(stream)
-            ?? throw new InvalidOperationException($"Unable to read bundled font resource: {resourceName}");
-
-        return SKTypeface.FromData(data)
-            ?? throw new InvalidOperationException($"Unable to load bundled font resource: {resourceName}");
-    }
-
     private static void DrawTextWithLetterSpacing(SKCanvas canvas, SKPaint paint, string text, float x, float y, float letterSpacing)
     {
         if (letterSpacing <= 0f)
@@ -350,24 +265,6 @@ public sealed class SkiaRenderBackend : IRenderBackend
         }
     }
 
-    private static float MeasureTextWidth(SKPaint paint, string text, float letterSpacing)
-    {
-        if (letterSpacing <= 0f)
-        {
-            return paint.MeasureText(text);
-        }
-
-        var width = 0f;
-
-        foreach (var character in text)
-        {
-            width += paint.MeasureText(character.ToString()) + letterSpacing;
-        }
-
-        return width > 0f ? width - letterSpacing : 0f;
-    }
-
     private static SKColor ToSkColor(RenderColor color) => new(color.R, color.G, color.B, color.A);
 
-    private readonly record struct BundledFontFamily(SKTypeface Regular, SKTypeface Bold);
 }
