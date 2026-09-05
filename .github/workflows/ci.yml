@@ -98,11 +98,11 @@ jobs:
     - name: Build
       run: |
         if ($env:GITHUB_REF -eq "refs/heads/main") {
-          .\build.ps1 -Target Publish -AngleSharpVersion 1.5.0
+          .\build.ps1 -Target Publish -AngleSharpVersion 1.8.0 -AngleSharpCssVersion 1.1.0
         } elseif ($env:GITHUB_REF -eq "refs/heads/devel") {
-          .\build.ps1 -Target PrePublish -AngleSharpVersion 1.5.0
+          .\build.ps1 -Target PrePublish -AngleSharpVersion 1.8.0 -AngleSharpCssVersion 1.1.0
         } else {
-          .\build.ps1 -AngleSharpVersion 1.5.0
+          .\build.ps1 -AngleSharpVersion 1.8.0 -AngleSharpCssVersion 1.1.0
         }
 
     - name: Upload visual assets
