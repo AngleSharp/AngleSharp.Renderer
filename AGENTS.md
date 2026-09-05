@@ -28,7 +28,7 @@ The repo also includes build scripts that drive the Fallout bootstrapper:
 ./build.cmd
 ```
 
-The main renderer project targets `net8.0` and `net10.0`. The test project targets `net8.0`.
+The main renderer project targets `net8.0` and `net10.0`; the test project targets both as well, so both runtimes are exercised.
 
 ## Architecture
 
@@ -60,15 +60,40 @@ Tests are split between structural assertions and visual conformance checks.
 - Structural tests live in `src/AngleSharp.Renderer.Tests/HtmlRendererTests.cs` and verify the display list directly.
 - Visual tests live in `src/AngleSharp.Renderer.Tests/VisualConformanceTests.cs` and compare PNG output against baselines in `verification-assets/`.
 - Failed visual comparisons write the actual image and a diff image into `failure-assets/`.
-- Missing baselines are auto-created unless `ANGLESHARP_SNAPSHOT_STRICT=1` or `true` is set.
-- CI runs visual tests on both Linux and Windows. To reduce drift, the renderer uses bundled deterministic font files for generic font-family resolution.
+- Missing baselines are auto-created unless `ANGLESHARP_SNAPSHOT_STRICT=1` or `true` is set. CI always sets it.
+- `ANGLESHARP_SNAPSHOT_UPDATE=1` overwrites the baselines for the current platform instead of comparing.
 
 When changing renderer behavior, update or add tests first, then run the focused test file or the full test project.
+
+### The Platform Matrix
+
+Baselines are per-platform (`<snapshot>.linux.png`, `<snapshot>.windows.png`, `<snapshot>.macos.png`).
+They cannot be shared: Skia rasterizes glyphs through FreeType on Linux, DirectWrite on Windows and
+CoreText on macOS, so the very same bundled font file yields different anti-aliasing. The bundled
+fonts remove *font selection* as a variable, not *font rasterization*.
+
+Because of that, a snapshot can only ever be checked by the platform it was recorded on, and the
+usual failure mode is a baseline that silently rots on the platforms the author does not have:
+
+- `SnapshotBaselineCoverageTests` fails on *every* platform as soon as a snapshot is missing a
+  platform variant, so an incomplete matrix surfaces locally instead of on a foreign CI leg.
+- `ci.yml` runs the whole test suite on Linux, Windows and macOS with strict mode on, and gates
+  packaging on all three. The runner images are pinned (`ubuntu-22.04`, `windows-2022`, `macos-14`);
+  bumping one is a rasterization change and requires regenerating the baselines.
+- `update-snapshots.yml` (`workflow_dispatch`) re-renders the baselines on all three platforms,
+  verifies the matrix is complete, and commits them back. This is the only supported way to
+  regenerate baselines you cannot produce locally. Note that the bot push does not retrigger CI.
+
+The regular flow for a renderer change is: change the code, run the tests locally to refresh your
+own platform's baselines, push, then dispatch **Update Snapshots** on the branch to fill in the
+other two.
 
 ## Repository Notes
 
 - The docs live under `docs/general/` and `docs/tutorials/`; they are the best place to document user-facing renderer behavior.
 - `AGENTS.md` should remain the primary agent note for this repo.
 - The repository already carries a snapshot-based workflow, so visual changes usually require updating the baseline PNGs together with the code change.
-- The Linux Skia setup uses native assets from the main project package references.
+- The Linux Skia setup uses `SkiaSharp.NativeAssets.Linux.NoDependencies`, which is built without
+  fontconfig. Installing system fonts on a Linux runner therefore has no effect on rendering; only
+  the bundled fonts and Skia's own fallback matter.
 - Keep an eye on `failure-assets/` after test runs; they are useful diagnostics, not source of truth.
