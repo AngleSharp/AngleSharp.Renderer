@@ -1,3 +1,9 @@
+# 0.4.0
+
+Released on Wednesday, September 9 2026.
+
+- ...
+
 # 0.3.0
 
 Released on Monday, September 7 2026.
