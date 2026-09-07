@@ -2154,6 +2154,111 @@ public sealed class VisualConformanceTests
         return renderer.RenderToPng(document, renderDevice);
     }
 
+    // A hand-built 2x2 RGB PNG (no palette, filter 0), one red pixel diagonal from one blue pixel -
+    // a tiny, unambiguous checkerboard tile that makes tiling/scaling/positioning visually obvious
+    // even at very small sizes, unlike a solid-color 1x1 pixel (which would look identical whether
+    // or not tiling/positioning code actually ran).
+    private const string CheckerboardTileDataUri =
+        "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAIAAAD91JpzAAAAE0lEQVR42mO4IycnZ3OHAYiBLAAgUgSdATw7NgAAAABJRU5ErkJggg==";
+
+    // A larger (20x20, four 10x10 quadrants) checkerboard PNG built the same way as
+    // CheckerboardTileDataUri, used specifically for the default-repeat tiling test below - tiling
+    // a 2x2 tile at 1:1 scale produces a genuinely correct but single-pixel-period checkerboard,
+    // which is indistinguishable from a rendering bug under any kind of downsampled visual
+    // inspection (verified: a raw per-pixel dump of that render confirmed it actually alternates
+    // correctly, but it is not a useful baseline for a human - or a diff image - to eyeball).
+    private const string CoarseCheckerboardTileDataUri =
+        "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABQAAAAUCAIAAAAC64paAAAAJUlEQVR42mO4IyeHB8nZ3MGDGEY1j2omqBm/NH6jRzWPaiaoGQCY+s0A5fuwxQAAAABJRU5ErkJggg==";
+
+    [Fact]
+    public async Task RenderToPng_TilesBackgroundImageAcrossBoxByDefault()
+    {
+        // No background-repeat/position/size given at all - the CSS initial values (`repeat repeat`,
+        // `0% 0%`, `auto`) tile the 20x20 tile at its own natural size across the whole box, so a
+        // 60x60 box shows a clean 3x3 grid of the tile's four quadrants.
+        var document = await ParseAsync($$"""
+            <html>
+              <head><style>html, body { margin: 0; padding: 0; }</style></head>
+              <body>
+                <div style="width:60px; height:60px; background-image: url({{CoarseCheckerboardTileDataUri}});"></div>
+              </body>
+            </html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var image = renderer.RenderToPng(document, new DefaultRenderDevice
+        {
+            ViewPortWidth = 60,
+            ViewPortHeight = 60,
+        });
+
+        VisualSnapshotVerifier.VerifyOrCreate(
+          snapshotName: "tiles-background-image-across-box-by-default.png",
+          actualPng: image.Data,
+          perChannelTolerance: 0,
+          maxDifferentPixels: 0);
+    }
+
+    [Fact]
+    public async Task RenderToPng_PositionsAndSizesNoRepeatBackgroundImage()
+    {
+        // An explicit background-size, background-repeat: no-repeat and background-position: right
+        // bottom together place a single, scaled-up copy of the tile in the box's bottom-right
+        // corner - the rest of the box shows the plain background-color underneath, since a
+        // non-repeating axis paints transparent (Decal), not a smeared/clamped edge color.
+        var document = await ParseAsync($$"""
+            <html>
+              <head><style>html, body { margin: 0; padding: 0; }</style></head>
+              <body>
+                <div style="width:60px; height:60px; background-color:#ffffff; background-image: url({{CheckerboardTileDataUri}}); background-repeat: no-repeat; background-size: 20px 20px; background-position: right bottom;"></div>
+              </body>
+            </html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var image = renderer.RenderToPng(document, new DefaultRenderDevice
+        {
+            ViewPortWidth = 60,
+            ViewPortHeight = 60,
+        });
+
+        VisualSnapshotVerifier.VerifyOrCreate(
+          snapshotName: "positions-and-sizes-no-repeat-background-image.png",
+          actualPng: image.Data,
+          perChannelTolerance: 0,
+          maxDifferentPixels: 0);
+    }
+
+    [Fact]
+    public async Task RenderToPng_ScalesBackgroundImageToCoverBox()
+    {
+        // background-size: cover scales the (square) tile up until it fills a non-square box
+        // entirely, cropping whichever axis overflows - here the box is wider than it is tall, so
+        // the tile is scaled to the box's width and its vertical overflow is cropped symmetrically
+        // (background-position: center, the CSS default for a single "center" keyword).
+        var document = await ParseAsync($$"""
+            <html>
+              <head><style>html, body { margin: 0; padding: 0; }</style></head>
+              <body>
+                <div style="width:80px; height:40px; background-image: url({{CheckerboardTileDataUri}}); background-repeat: no-repeat; background-size: cover; background-position: center;"></div>
+              </body>
+            </html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var image = renderer.RenderToPng(document, new DefaultRenderDevice
+        {
+            ViewPortWidth = 80,
+            ViewPortHeight = 40,
+        });
+
+        VisualSnapshotVerifier.VerifyOrCreate(
+          snapshotName: "scales-background-image-to-cover-box.png",
+          actualPng: image.Data,
+          perChannelTolerance: 0,
+          maxDifferentPixels: 0);
+    }
+
     private static async Task<AngleSharp.Dom.IDocument> ParseAsync(string html, IConfiguration? configuration = null)
     {
         var context = BrowsingContext.New(configuration ?? Configuration.Default.WithCss());

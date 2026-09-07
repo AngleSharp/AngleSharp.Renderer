@@ -519,7 +519,7 @@ public sealed class HtmlRenderer
             return;
         }
 
-        var box = ResolveBoxStyle(styleMap);
+        var box = ResolveBoxStyle(styleMap, element);
         var marginTop = ParseLength(styleMap, "margin-top", flowContainingWidth, box.Margin.Top, allowAuto: false);
         var marginBottom = ParseLength(styleMap, "margin-bottom", flowContainingWidth, box.Margin.Bottom, allowAuto: false);
         var marginLeft = ParseLength(styleMap, "margin-left", flowContainingWidth, box.Margin.Left, allowAuto: true);
@@ -2897,8 +2897,20 @@ public sealed class HtmlRenderer
         }
         else
         {
-            AddIfPresent(map, "background-image", style.GetPropertyValue("background-image"));
+            // AngleSharp.Css does compute a `url(...)` background-image (unlike the `overflow`
+            // shorthand quirk documented elsewhere), but as a normalized, quoted `url("...")` - the
+            // raw inline `style=""` fallback below matches the pattern the grid/flex properties
+            // above already use for their own AngleSharp.Css computation gaps, kept here as the
+            // same defensive fallback for the rare case computation reports nothing at all.
+            var computedBackgroundImage = style.GetPropertyValue("background-image");
+            AddIfPresent(map, "background-image", string.IsNullOrWhiteSpace(computedBackgroundImage)
+                ? ParseStyleAttributeValue(inlineStyle, "background-image")
+                : computedBackgroundImage);
         }
+
+        AddIfPresent(map, "background-repeat", string.IsNullOrWhiteSpace(style.GetPropertyValue("background-repeat")) ? ParseStyleAttributeValue(inlineStyle, "background-repeat") : style.GetPropertyValue("background-repeat"));
+        AddIfPresent(map, "background-position", string.IsNullOrWhiteSpace(style.GetPropertyValue("background-position")) ? ParseStyleAttributeValue(inlineStyle, "background-position") : style.GetPropertyValue("background-position"));
+        AddIfPresent(map, "background-size", string.IsNullOrWhiteSpace(style.GetPropertyValue("background-size")) ? ParseStyleAttributeValue(inlineStyle, "background-size") : style.GetPropertyValue("background-size"));
         AddIfPresent(map, "font-size", style.GetFontSize());
         AddIfPresent(map, "font-family", style.GetFontFamily());
         AddIfPresent(map, "font-weight", style.GetPropertyValue("font-weight"));
@@ -3076,7 +3088,7 @@ public sealed class HtmlRenderer
             : 0;
     }
 
-    private static BoxStyle ResolveBoxStyle(Dictionary<string, string> styleMap)
+    private static BoxStyle ResolveBoxStyle(Dictionary<string, string> styleMap, IElement element)
     {
         var margin = new EdgeSizes(
             Top: ParseLength(styleMap, "margin-top", 0f, 0f, allowAuto: false),
@@ -3101,7 +3113,7 @@ public sealed class HtmlRenderer
         borderWidth = ApplyBorderStyleToWidths(borderWidth, borderStyle);
 
         var backgroundColor = ParseColor(styleMap.TryGetValue("background-color", out var background) ? background : null, RenderColor.Transparent);
-        var backgroundPaint = ParseBackgroundPaint(styleMap, backgroundColor);
+        var backgroundPaint = ParseBackgroundPaint(styleMap, backgroundColor, element);
         var borderColor = ParseColor(
             styleMap.TryGetValue("border-top-color", out var topColor) ? topColor :
             styleMap.TryGetValue("border-right-color", out var rightColor) ? rightColor :
@@ -3510,12 +3522,30 @@ public sealed class HtmlRenderer
     private static bool TryGetOrLoadImageResource(IElement element, string? source, out CachedImageResource? imageResource)
     {
         imageResource = null;
-        if (string.IsNullOrWhiteSpace(source))
-        {
-            return false;
-        }
 
-        var cacheKey = source.Trim();
+        return !string.IsNullOrWhiteSpace(source) &&
+               TryGetOrLoadCachedResource(element, source.Trim(), TryLoadImageResource, out imageResource);
+    }
+
+    /// <summary>
+    /// Resolves a `background-image: url(...)` reference to a decoded, cached image, sharing the
+    /// same per-document <see cref="DocumentImageCache"/> (keyed by the same trimmed URL string) as
+    /// an `&lt;img src&gt;` reference to the exact same URL - one fetch serves both. Unlike
+    /// <see cref="TryGetOrLoadImageResource"/>, there is no <see cref="ILoadableElement"/> download
+    /// already in flight to consult first: a CSS property value has no DOM-level load of its own,
+    /// so <see cref="TryLoadBackgroundImageResource"/> always resolves the URL itself (data URI, or
+    /// the network - and only the network - when the browsing context has an
+    /// <see cref="IDocumentLoader"/> configured), mirroring how <c>@font-face url()</c> sources are
+    /// handled in <c>FontFaceLoader</c>.
+    /// </summary>
+    private static bool TryGetOrLoadBackgroundImageResource(IElement element, string url, out CachedImageResource? imageResource) =>
+        TryGetOrLoadCachedResource(element, url.Trim(), TryLoadBackgroundImageResource, out imageResource);
+
+    private delegate bool ImageResourceLoader(IElement element, string source, out CachedImageResource? imageResource);
+
+    private static bool TryGetOrLoadCachedResource(IElement element, string cacheKey, ImageResourceLoader loader, out CachedImageResource? imageResource)
+    {
+        imageResource = null;
         var cache = GetImageCache(element);
 
         if (cache is not null)
@@ -3529,28 +3559,17 @@ public sealed class HtmlRenderer
             }
         }
 
-        if (!TryLoadImageResource(element, source, out imageResource))
-        {
-            if (cache is not null)
-            {
-                lock (cache.Resources)
-                {
-                    cache.Resources[cacheKey] = null;
-                }
-            }
-
-            return false;
-        }
+        var loaded = loader(element, cacheKey, out imageResource);
 
         if (cache is not null)
         {
             lock (cache.Resources)
             {
-                cache.Resources[cacheKey] = imageResource;
+                cache.Resources[cacheKey] = loaded ? imageResource : null;
             }
         }
 
-        return true;
+        return loaded;
     }
 
     private static DocumentImageCache? GetImageCache(IElement element)
@@ -3597,7 +3616,74 @@ public sealed class HtmlRenderer
             mimeType = dataUriMimeType;
         }
 
-        if (bytes is null || bytes.Length == 0)
+        return bytes is not null && TryDecodeImageBytes(bytes, mimeType, out imageResource);
+    }
+
+    /// <summary>
+    /// Resolves a `background-image: url(...)` value: a data URI decodes inline, exactly like an
+    /// `&lt;img src&gt;` data URI; anything else is only ever fetched when the browsing context was
+    /// configured with an <see cref="IDocumentLoader"/> - matching how images and `@font-face`
+    /// sources are already handled, a renderer should not silently reach out to the network. The
+    /// fetch is synchronous (blocking on the download's Task) so the resource is
+    /// available - loaded and decoded - within the very same <c>BuildDisplayList</c> call that
+    /// requested it, the same way an `&lt;img&gt;`'s already-in-flight <c>CurrentDownload</c> is
+    /// awaited: this renderer has no separate "repaint later once loaded" pass to defer to.
+    /// </summary>
+    private static bool TryLoadBackgroundImageResource(IElement element, string url, out CachedImageResource? imageResource)
+    {
+        imageResource = null;
+
+        if (TryParseDataUri(url, out var dataUriBytes, out var dataUriMimeType))
+        {
+            return dataUriBytes is not null && TryDecodeImageBytes(dataUriBytes, dataUriMimeType, out imageResource);
+        }
+
+        var document = element.Owner;
+        var loader = document?.Context.GetService<IDocumentLoader>();
+
+        if (document is null || loader is null)
+        {
+            return false;
+        }
+
+        try
+        {
+            var target = new Url(document.BaseUrl, url);
+            var download = loader.FetchAsync(DocumentRequest.Get(target, source: document, referer: document.BaseUri));
+            var response = download.Task.GetAwaiter().GetResult();
+
+            if (response?.Content is null)
+            {
+                return false;
+            }
+
+            using var content = response.Content;
+            using var buffer = new MemoryStream();
+            content.CopyTo(buffer);
+            var bytes = buffer.ToArray();
+
+            if (bytes.Length == 0)
+            {
+                return false;
+            }
+
+            var mimeType = response.Headers?.TryGetValue("Content-Type", out var contentType) == true && !string.IsNullOrWhiteSpace(contentType)
+                ? contentType
+                : "image/unknown";
+
+            return TryDecodeImageBytes(bytes, mimeType, out imageResource);
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    private static bool TryDecodeImageBytes(byte[] bytes, string? mimeType, out CachedImageResource? imageResource)
+    {
+        imageResource = null;
+
+        if (bytes.Length == 0)
         {
             return false;
         }
@@ -3619,10 +3705,7 @@ public sealed class HtmlRenderer
             return false;
         }
 
-        var naturalWidth = skImage.Width;
-        var naturalHeight = skImage.Height;
-
-        imageResource = new CachedImageResource(bytes, mimeType ?? "image/unknown", naturalWidth, naturalHeight);
+        imageResource = new CachedImageResource(bytes, mimeType ?? "image/unknown", skImage.Width, skImage.Height);
         return true;
     }
 
@@ -3959,7 +4042,7 @@ public sealed class HtmlRenderer
             return;
         }
 
-        if (paint is RenderGradientPaint)
+        if (paint is RenderGradientPaint or RenderImagePaint)
         {
             displayList.FillRect(new RenderRect(x, y, width, height), paint, clampedRadii);
         }
@@ -4149,14 +4232,218 @@ public sealed class HtmlRenderer
         return false;
     }
 
-    private static RenderPaint ParseBackgroundPaint(Dictionary<string, string> styleMap, RenderColor fallbackColor)
+    private static RenderPaint ParseBackgroundPaint(Dictionary<string, string> styleMap, RenderColor fallbackColor, IElement element)
     {
         if (!styleMap.TryGetValue("background-image", out var backgroundImage) || string.IsNullOrWhiteSpace(backgroundImage))
         {
             return new RenderColorPaint(fallbackColor);
         }
 
-        return ParseGradientPaint(backgroundImage, fallbackColor);
+        var trimmed = backgroundImage.Trim();
+
+        if (string.Equals(trimmed, "none", StringComparison.OrdinalIgnoreCase))
+        {
+            return new RenderColorPaint(fallbackColor);
+        }
+
+        if (TryExtractCssUrl(trimmed, out var url))
+        {
+            // A background image that fails to load (bad data URI, 404, no IDocumentLoader
+            // configured, unsupported format) falls back to the background-color exactly like a
+            // browser does - the box is never left entirely unpainted because of it.
+            return TryGetOrLoadBackgroundImageResource(element, url, out var imageResource) && imageResource is not null
+                ? BuildImagePaint(imageResource, styleMap)
+                : new RenderColorPaint(fallbackColor);
+        }
+
+        return ParseGradientPaint(trimmed, fallbackColor);
+    }
+
+    private static bool TryExtractCssUrl(string value, out string url)
+    {
+        url = string.Empty;
+
+        if (!value.StartsWith("url(", StringComparison.OrdinalIgnoreCase))
+        {
+            return false;
+        }
+
+        var close = value.LastIndexOf(')');
+
+        if (close < 4)
+        {
+            return false;
+        }
+
+        url = value[4..close].Trim().Trim('\'', '"').Trim();
+        return url.Length > 0;
+    }
+
+    private static RenderPaint BuildImagePaint(CachedImageResource imageResource, Dictionary<string, string> styleMap)
+    {
+        var image = new RenderedImage(imageResource.Bytes, imageResource.NaturalWidth, imageResource.NaturalHeight, imageResource.MimeType);
+        var (repeatX, repeatY) = ParseBackgroundRepeat(styleMap);
+        var (positionX, positionY) = ParseBackgroundPosition(styleMap);
+        var size = ParseBackgroundSize(styleMap);
+
+        return new RenderImagePaint(image, repeatX, repeatY, positionX, positionY, size);
+    }
+
+    /// <summary>
+    /// Parses `background-repeat`. Only the single-keyword and two-keyword-per-axis forms are
+    /// recognized; `space`/`round` fall back to tiling like plain `repeat` rather than the spacing
+    /// they actually specify, since neither is otherwise implemented. The CSS initial value is
+    /// `repeat` on both axes.
+    /// </summary>
+    private static (bool RepeatX, bool RepeatY) ParseBackgroundRepeat(Dictionary<string, string> styleMap)
+    {
+        if (!styleMap.TryGetValue("background-repeat", out var value) || string.IsNullOrWhiteSpace(value))
+        {
+            return (true, true);
+        }
+
+        var tokens = value.Trim().Split(' ', StringSplitOptions.RemoveEmptyEntries);
+
+        if (tokens.Length == 0)
+        {
+            return (true, true);
+        }
+
+        bool IsRepeating(string token) => token.ToLowerInvariant() is "repeat" or "space" or "round";
+
+        return tokens[0].ToLowerInvariant() switch
+        {
+            "repeat-x" => (true, false),
+            "repeat-y" => (false, true),
+            "no-repeat" when tokens.Length == 1 => (false, false),
+            _ when tokens.Length >= 2 => (IsRepeating(tokens[0]), IsRepeating(tokens[1])),
+            _ => (IsRepeating(tokens[0]), IsRepeating(tokens[0])),
+        };
+    }
+
+    /// <summary>
+    /// Parses `background-position`. Only the common one- and two-value forms are recognized
+    /// (keywords, percentages, lengths); the four-value `&lt;side&gt; &lt;offset&gt;` edge-relative
+    /// syntax is not. The CSS initial value is `0% 0%` (top-left).
+    /// </summary>
+    private static (RenderBackgroundPositionComponent X, RenderBackgroundPositionComponent Y) ParseBackgroundPosition(Dictionary<string, string> styleMap)
+    {
+        if (!styleMap.TryGetValue("background-position", out var value) || string.IsNullOrWhiteSpace(value))
+        {
+            return (RenderBackgroundPositionComponent.Zero, RenderBackgroundPositionComponent.Zero);
+        }
+
+        var tokens = value.Trim().Split(' ', StringSplitOptions.RemoveEmptyEntries);
+
+        if (tokens.Length == 0)
+        {
+            return (RenderBackgroundPositionComponent.Zero, RenderBackgroundPositionComponent.Zero);
+        }
+
+        if (tokens.Length == 1)
+        {
+            // A single token positions the X axis (or both, for `center`); the Y axis defaults to
+            // centered, matching the CSS single-value `background-position` rule.
+            var only = tokens[0].ToLowerInvariant();
+
+            if (only is "top" or "bottom")
+            {
+                return (new RenderBackgroundPositionComponent(0.5f, 0f), ParsePositionComponent(only));
+            }
+
+            return (ParsePositionComponent(only), new RenderBackgroundPositionComponent(0.5f, 0f));
+        }
+
+        return (ParsePositionComponent(tokens[0]), ParsePositionComponent(tokens[1]));
+    }
+
+    private static RenderBackgroundPositionComponent ParsePositionComponent(string token)
+    {
+        return token.ToLowerInvariant() switch
+        {
+            "left" or "top" => RenderBackgroundPositionComponent.Zero,
+            "right" or "bottom" => new RenderBackgroundPositionComponent(1f, 0f),
+            "center" => new RenderBackgroundPositionComponent(0.5f, 0f),
+            _ => ParsePositionLength(token),
+        };
+    }
+
+    private static RenderBackgroundPositionComponent ParsePositionLength(string token)
+    {
+        var trimmed = token.Trim();
+
+        if (trimmed.EndsWith("%", StringComparison.Ordinal) &&
+            float.TryParse(trimmed[..^1], NumberStyles.Float, CultureInfo.InvariantCulture, out var percent))
+        {
+            return new RenderBackgroundPositionComponent(percent / 100f, 0f);
+        }
+
+        if (TryParsePixelValue(trimmed, out var pixels))
+        {
+            return new RenderBackgroundPositionComponent(0f, pixels);
+        }
+
+        return RenderBackgroundPositionComponent.Zero;
+    }
+
+    /// <summary>
+    /// Parses `background-size`. The CSS initial value is `auto` (the image's own natural size).
+    /// </summary>
+    private static RenderBackgroundSize ParseBackgroundSize(Dictionary<string, string> styleMap)
+    {
+        if (!styleMap.TryGetValue("background-size", out var value) || string.IsNullOrWhiteSpace(value))
+        {
+            return RenderBackgroundSize.Auto;
+        }
+
+        var trimmed = value.Trim();
+
+        if (string.Equals(trimmed, "cover", StringComparison.OrdinalIgnoreCase))
+        {
+            return new RenderBackgroundSize(RenderBackgroundSizeKind.Cover);
+        }
+
+        if (string.Equals(trimmed, "contain", StringComparison.OrdinalIgnoreCase))
+        {
+            return new RenderBackgroundSize(RenderBackgroundSizeKind.Contain);
+        }
+
+        var tokens = trimmed.Split(' ', StringSplitOptions.RemoveEmptyEntries);
+
+        if (tokens.Length == 0)
+        {
+            return RenderBackgroundSize.Auto;
+        }
+
+        var width = ParseSizeAxisToken(tokens[0]);
+        // A single-value `background-size` sizes only the width explicitly; the height is always
+        // `auto` (proportional to the image's aspect ratio), never a copy of the width token.
+        var height = tokens.Length > 1 ? ParseSizeAxisToken(tokens[1]) : new RenderBackgroundSizeAxis(true, false, 0f);
+
+        return new RenderBackgroundSize(RenderBackgroundSizeKind.Explicit, width, height);
+    }
+
+    private static RenderBackgroundSizeAxis ParseSizeAxisToken(string token)
+    {
+        var trimmed = token.Trim();
+
+        if (string.Equals(trimmed, "auto", StringComparison.OrdinalIgnoreCase))
+        {
+            return new RenderBackgroundSizeAxis(true, false, 0f);
+        }
+
+        if (trimmed.EndsWith("%", StringComparison.Ordinal) &&
+            float.TryParse(trimmed[..^1], NumberStyles.Float, CultureInfo.InvariantCulture, out var percent))
+        {
+            return new RenderBackgroundSizeAxis(false, true, percent / 100f);
+        }
+
+        if (TryParsePixelValue(trimmed, out var pixels))
+        {
+            return new RenderBackgroundSizeAxis(false, false, pixels);
+        }
+
+        return new RenderBackgroundSizeAxis(true, false, 0f);
     }
 
     private static RenderPaint ParseGradientPaint(string rawValue, RenderColor fallbackColor)

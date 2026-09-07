@@ -92,6 +92,131 @@ public sealed class HtmlRendererTests
     }
 
     [Fact]
+    public async Task BuildDisplayList_PaintsBackgroundImageFromDataUri()
+    {
+        var document = await ParseAsync("""
+            <html><body>
+                <div style="width:80px; height:60px; background-image: url(data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAACklEQVR4nGMAAQABAA4A4cQTmwAAAABJRU5ErkJggg==);"></div>
+            </body></html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, new DefaultRenderDevice
+        {
+            ViewPortWidth = 240,
+            ViewPortHeight = 160,
+            FontSize = 16f,
+        });
+
+        var fill = Assert.Single(displayList.Commands.OfType<FillRectCommand>().Where(f => f.Paint is RenderImagePaint));
+        var imagePaint = Assert.IsType<RenderImagePaint>(fill.Paint);
+
+        Assert.NotEmpty(imagePaint.Image.Data);
+        Assert.Equal(1, imagePaint.Image.Width);
+        Assert.Equal(1, imagePaint.Image.Height);
+        // CSS initial values: `repeat repeat`, `0% 0%`, `auto`.
+        Assert.True(imagePaint.RepeatX);
+        Assert.True(imagePaint.RepeatY);
+        Assert.Equal(RenderBackgroundPositionComponent.Zero, imagePaint.PositionX);
+        Assert.Equal(RenderBackgroundPositionComponent.Zero, imagePaint.PositionY);
+        Assert.Equal(RenderBackgroundSizeKind.Auto, imagePaint.Size.Kind);
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_ParsesBackgroundRepeatPositionAndSize()
+    {
+        var document = await ParseAsync("""
+            <html><body>
+                <div style="width:80px; height:60px; background-image: url(data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAACklEQVR4nGMAAQABAA4A4cQTmwAAAABJRU5ErkJggg==); background-repeat: no-repeat; background-position: right bottom; background-size: cover;"></div>
+            </body></html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, new DefaultRenderDevice
+        {
+            ViewPortWidth = 240,
+            ViewPortHeight = 160,
+            FontSize = 16f,
+        });
+
+        var fill = Assert.Single(displayList.Commands.OfType<FillRectCommand>().Where(f => f.Paint is RenderImagePaint));
+        var imagePaint = Assert.IsType<RenderImagePaint>(fill.Paint);
+
+        Assert.False(imagePaint.RepeatX);
+        Assert.False(imagePaint.RepeatY);
+        Assert.Equal(new RenderBackgroundPositionComponent(1f, 0f), imagePaint.PositionX);
+        Assert.Equal(new RenderBackgroundPositionComponent(1f, 0f), imagePaint.PositionY);
+        Assert.Equal(RenderBackgroundSizeKind.Cover, imagePaint.Size.Kind);
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_FetchesAndCachesHttpBackgroundImagePerDocument()
+    {
+        var requester = new SingleResponseImageRequester(Convert.FromBase64String("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAACklEQVR4nGMAAQABAA4A4cQTmwAAAABJRU5ErkJggg=="));
+        var configuration = Configuration.Default
+            .WithCss()
+            .With(requester)
+            .WithDefaultLoader(new LoaderOptions
+            {
+                IsResourceLoadingEnabled = true,
+            });
+
+        var document = await ParseAsync("""
+            <html><body>
+                <div style="width:80px; height:60px; background-image: url(http://assets.test/tile.png);"></div>
+            </body></html>
+            """, configuration, "http://example.test/");
+
+        var renderer = new HtmlRenderer();
+
+        var first = renderer.BuildDisplayList(document, new DefaultRenderDevice
+        {
+            ViewPortWidth = 240,
+            ViewPortHeight = 160,
+            FontSize = 16f,
+        });
+
+        var second = renderer.BuildDisplayList(document, new DefaultRenderDevice
+        {
+            ViewPortWidth = 240,
+            ViewPortHeight = 160,
+            FontSize = 16f,
+        });
+
+        Assert.IsType<RenderImagePaint>(Assert.Single(first.Commands.OfType<FillRectCommand>().Where(f => f.Paint is RenderImagePaint)).Paint);
+        Assert.IsType<RenderImagePaint>(Assert.Single(second.Commands.OfType<FillRectCommand>().Where(f => f.Paint is RenderImagePaint)).Paint);
+        // Requested once and reused on the second render - not re-fetched every time the display
+        // list is rebuilt, the same guarantee already established for <img>.
+        Assert.Equal(1, requester.ContentReadSessionCount);
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_WithoutDocumentLoader_FallsBackToBackgroundColorForNetworkUrl()
+    {
+        // No IDocumentLoader is registered here, so a network background-image URL must never be
+        // fetched - matching how <img> and @font-face url() sources already behave. The box still
+        // paints (its background-color), it just does not get the image.
+        var document = await ParseAsync("""
+            <html><body>
+                <div style="width:80px; height:60px; background-color:#0000ff; background-image: url(http://assets.test/tile.png);"></div>
+            </body></html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, new DefaultRenderDevice
+        {
+            ViewPortWidth = 240,
+            ViewPortHeight = 160,
+            FontSize = 16f,
+        });
+
+        Assert.DoesNotContain(displayList.Commands, command => command is FillRectCommand fill && fill.Paint is RenderImagePaint);
+
+        var colorFill = Assert.Single(displayList.Commands.OfType<FillRectCommand>().Where(f => f.Color.Equals(new RenderColor(0, 0, 255))));
+        Assert.IsType<RenderColorPaint>(colorFill.Paint);
+    }
+
+    [Fact]
     public async Task BuildDisplayList_PaintsSvgImageElementFromDataUri()
     {
         var document = await ParseAsync("""

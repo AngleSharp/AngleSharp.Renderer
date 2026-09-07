@@ -266,8 +266,104 @@ public sealed class SkiaRenderBackend : IRenderBackend, ITextMeasurer
                 Style = SKPaintStyle.Fill,
             },
             RenderGradientPaint gradientPaint => CreateGradientPaint(gradientPaint.Gradient, rect),
+            RenderImagePaint imagePaint => CreateImagePaint(imagePaint, rect),
             _ => throw new NotSupportedException($"Unsupported paint type: {paint.GetType().Name}"),
         };
+    }
+
+    /// <summary>
+    /// Builds a `background-image: url(...)` paint as a tiled/positioned image shader, resolving
+    /// <see cref="RenderImagePaint.Size"/> and the position components against <paramref name="rect"/>
+    /// - the box's own final geometry, not known when the paint was constructed (see
+    /// <see cref="RenderImagePaint"/>'s own remarks). This mirrors <c>SvgPatternBuilder</c>'s
+    /// tile-to-user-space matrix technique: build the shader in the image's own natural pixel space,
+    /// then let a constructor-time <see cref="SKMatrix"/> position and scale it - not the inverse
+    /// (the same "local space maps directly into world space" behavior already verified for the
+    /// gradient shaders above).
+    /// </summary>
+    private static SKPaint CreateImagePaint(RenderImagePaint imagePaint, RenderRect rect)
+    {
+        var paint = new SKPaint
+        {
+            IsAntialias = true,
+            Style = SKPaintStyle.Fill,
+        };
+
+        if (rect.Width <= 0f || rect.Height <= 0f)
+        {
+            return paint;
+        }
+
+        using var data = SKData.CreateCopy(imagePaint.Image.Data);
+        using var image = SKImage.FromEncodedData(data);
+
+        if (image is null || image.Width <= 0 || image.Height <= 0)
+        {
+            return paint;
+        }
+
+        var (drawWidth, drawHeight) = ResolveBackgroundImageSize(imagePaint.Size, image.Width, image.Height, rect.Width, rect.Height);
+
+        if (drawWidth <= 0f || drawHeight <= 0f)
+        {
+            return paint;
+        }
+
+        var originX = rect.X + (imagePaint.PositionX.Percentage * (rect.Width - drawWidth)) + imagePaint.PositionX.OffsetPixels;
+        var originY = rect.Y + (imagePaint.PositionY.Percentage * (rect.Height - drawHeight)) + imagePaint.PositionY.OffsetPixels;
+
+        var localMatrix = new SKMatrix(
+            drawWidth / image.Width, 0f, originX,
+            0f, drawHeight / image.Height, originY,
+            0f, 0f, 1f);
+
+        // `no-repeat` uses Decal (transparent outside the single placed tile), not Clamp - Clamp
+        // would smear the image's edge pixels across the rest of the box instead of leaving it
+        // uncovered, which is what CSS actually specifies for a non-repeating axis.
+        var tileX = imagePaint.RepeatX ? SKShaderTileMode.Repeat : SKShaderTileMode.Decal;
+        var tileY = imagePaint.RepeatY ? SKShaderTileMode.Repeat : SKShaderTileMode.Decal;
+
+        paint.Shader = SKShader.CreateImage(image, tileX, tileY, localMatrix);
+        return paint;
+    }
+
+    /// <summary>
+    /// Resolves a `background-size` value against the image's natural pixel size and the box's
+    /// rendered rect, matching the CSS `cover`/`contain`/explicit-axis sizing algorithms.
+    /// </summary>
+    private static (float Width, float Height) ResolveBackgroundImageSize(RenderBackgroundSize size, int naturalWidth, int naturalHeight, float boxWidth, float boxHeight)
+    {
+        switch (size.Kind)
+        {
+            case RenderBackgroundSizeKind.Cover:
+            {
+                var scale = Math.Max(boxWidth / naturalWidth, boxHeight / naturalHeight);
+                return (naturalWidth * scale, naturalHeight * scale);
+            }
+            case RenderBackgroundSizeKind.Contain:
+            {
+                var scale = Math.Min(boxWidth / naturalWidth, boxHeight / naturalHeight);
+                return (naturalWidth * scale, naturalHeight * scale);
+            }
+            case RenderBackgroundSizeKind.Explicit:
+            {
+                var aspect = (float)naturalWidth / naturalHeight;
+                float? width = size.Width.IsAuto ? null : size.Width.IsPercentage ? size.Width.Value * boxWidth : size.Width.Value;
+                float? height = size.Height.IsAuto ? null : size.Height.IsPercentage ? size.Height.Value * boxHeight : size.Height.Value;
+
+                if (width is null && height is null)
+                {
+                    return (naturalWidth, naturalHeight);
+                }
+
+                width ??= height!.Value * aspect;
+                height ??= width.Value / aspect;
+
+                return (width.Value, height.Value);
+            }
+            default:
+                return (naturalWidth, naturalHeight);
+        }
     }
 
     private static SKPaint CreateGradientPaint(RenderGradient gradient, RenderRect rect)
