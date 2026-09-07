@@ -293,7 +293,7 @@ public sealed class HtmlRenderer
             return displayList;
         }
 
-        var textStyle = new RenderTextStyle(context.FontSize, context.TextColor, context.FontFamily, context.LineHeightMultiplier, 400f, false, false, false, context.TextColor, global::AngleSharp.Renderer.Rendering.RenderTextDecorationStyle.Solid, TextAlign.Left, 0f, 0f, 0f);
+        var textStyle = new RenderTextStyle(context.FontSize, context.TextColor, context.FontFamily, context.LineHeightMultiplier, 400f, false, false, false, context.TextColor, global::AngleSharp.Renderer.Rendering.RenderTextDecorationStyle.Solid, TextAlign.Left, 0f, 0f, 0f, []);
         var cursorY = contentY;
         var previousBlockMarginBottom = 0f;
         var suppressNextBlockTopMargin = false;
@@ -824,6 +824,7 @@ public sealed class HtmlRenderer
             paddingBottom);
 
         PaintBackground(displayList, box.BackgroundPaint, borderBoxX, borderBoxY, borderBoxWidth, borderBoxHeight, box.BorderRadius);
+        PaintBoxShadows(displayList, box.BoxShadows, borderBoxX, borderBoxY, borderBoxWidth, borderBoxHeight, box.BorderRadius);
         PaintBorder(displayList, box.BorderColor, borderBoxX, borderBoxY, borderBoxWidth, borderBoxHeight, box.BorderWidth, box.BorderRadius);
         PaintOutline(displayList, styleMap, borderBoxX, borderBoxY, borderBoxWidth, borderBoxHeight);
 
@@ -1170,6 +1171,8 @@ public sealed class HtmlRenderer
         {
             PaintBackground(displayList, box.BackgroundPaint, borderBoxX, borderBoxY, borderBoxWidth, borderBoxHeight, box.BorderRadius);
         }
+
+        PaintBoxShadows(displayList, box.BoxShadows, borderBoxX, borderBoxY, borderBoxWidth, borderBoxHeight, box.BorderRadius);
 
         RecordLayoutMetrics(
             node.Ref,
@@ -1585,7 +1588,9 @@ public sealed class HtmlRenderer
                 for (var lineIndex = 0; lineIndex < wrappedLines.Count; lineIndex++)
                 {
                     var line = wrappedLines[lineIndex];
-                    displayList.DrawText(line, lineX, lineY + (lineIndex * lineHeight), placement.CellTextStyle.Color, placement.CellTextStyle.FontSize, placement.CellTextStyle.FontFamily, placement.CellTextStyle.FontWeight, placement.CellTextStyle.IsItalic, placement.CellTextStyle.Underline, placement.CellTextStyle.StrikeThrough, placement.CellTextStyle.DecorationColor, placement.CellTextStyle.DecorationStyle, placement.CellTextStyle.LetterSpacing);
+                    var cellLineY = lineY + (lineIndex * lineHeight);
+                    PaintTextShadows(displayList, placement.CellTextStyle.TextShadows, line, lineX, cellLineY, placement.CellTextStyle);
+                    displayList.DrawText(line, lineX, cellLineY, placement.CellTextStyle.Color, placement.CellTextStyle.FontSize, placement.CellTextStyle.FontFamily, placement.CellTextStyle.FontWeight, placement.CellTextStyle.IsItalic, placement.CellTextStyle.Underline, placement.CellTextStyle.StrikeThrough, placement.CellTextStyle.DecorationColor, placement.CellTextStyle.DecorationStyle, placement.CellTextStyle.LetterSpacing);
                 }
             }
         }
@@ -1782,6 +1787,8 @@ public sealed class HtmlRenderer
         {
             PaintBackground(displayList, box.BackgroundPaint, borderBoxX, borderBoxY, borderBoxWidth, borderBoxHeight, box.BorderRadius);
         }
+
+        PaintBoxShadows(displayList, box.BoxShadows, borderBoxX, borderBoxY, borderBoxWidth, borderBoxHeight, box.BorderRadius);
 
         RecordLayoutMetrics(
             node.Ref,
@@ -2036,6 +2043,7 @@ public sealed class HtmlRenderer
             var lineX = x + (index == 0 ? firstLineIndent : 0f) + ResolveTextAlignmentOffset(textStyle.TextAlign, lineMaxWidth, lineWidth);
             var baselineY = cursorY + textStyle.VerticalAlignOffset;
 
+            PaintTextShadows(displayList, textStyle.TextShadows, line, lineX, baselineY, textStyle);
             displayList.DrawText(
                 line,
                 lineX,
@@ -2085,10 +2093,13 @@ public sealed class HtmlRenderer
                 inlineCursorX += spaceWidth;
             }
 
+            var wordBaselineY = inlineLineTop + textStyle.VerticalAlignOffset;
+
+            PaintTextShadows(displayList, textStyle.TextShadows, word, inlineCursorX, wordBaselineY, textStyle);
             displayList.DrawText(
                 word,
                 inlineCursorX,
-                inlineLineTop + textStyle.VerticalAlignOffset,
+                wordBaselineY,
                 textStyle.Color,
                 textStyle.FontSize,
                 textStyle.FontFamily,
@@ -2287,8 +2298,9 @@ public sealed class HtmlRenderer
         var letterSpacing = ParseLength(styleMap, "letter-spacing", inherited.FontSize, inherited.LetterSpacing, allowAuto: false);
         var textIndent = ParseLength(styleMap, "text-indent", inherited.FontSize, 0f, allowAuto: false);
         var verticalAlignOffset = ParseVerticalAlign(styleMap, fontSize);
+        var textShadows = ParseTextShadows(styleMap.TryGetValue("text-shadow", out var textShadowValue) ? textShadowValue : null, inherited.TextShadows);
 
-        return new RenderTextStyle(fontSize, color, fontFamily, lineHeight, fontWeight, isItalic, underline, strikeThrough, decorationColor, decorationStyle, textAlign, letterSpacing, textIndent, verticalAlignOffset);
+        return new RenderTextStyle(fontSize, color, fontFamily, lineHeight, fontWeight, isItalic, underline, strikeThrough, decorationColor, decorationStyle, textAlign, letterSpacing, textIndent, verticalAlignOffset, textShadows);
     }
 
     /// <summary>
@@ -2688,6 +2700,9 @@ public sealed class HtmlRenderer
         AddIfPresent(map, "border-bottom-right-radius", style.GetBorderBottomRightRadius());
         AddIfPresent(map, "border-bottom-left-radius", style.GetBorderBottomLeftRadius());
 
+        AddIfPresent(map, "box-shadow", style.GetBoxShadow());
+        AddIfPresent(map, "text-shadow", style.GetTextShadow());
+
         AddIfPresent(map, "outline-width", style.GetPropertyValue("outline-width"));
         AddIfPresent(map, "outline-style", style.GetPropertyValue("outline-style"));
         AddIfPresent(map, "outline-color", style.GetPropertyValue("outline-color"));
@@ -2944,7 +2959,151 @@ public sealed class HtmlRenderer
             bottomRightX, bottomRightY,
             bottomLeftX, bottomLeftY);
 
-        return new BoxStyle(margin, padding, borderWidth, backgroundPaint, borderColor, borderRadius);
+        var boxShadows = ParseBoxShadows(styleMap.TryGetValue("box-shadow", out var boxShadowValue) ? boxShadowValue : null);
+
+        return new BoxStyle(margin, padding, borderWidth, backgroundPaint, borderColor, borderRadius, boxShadows);
+    }
+
+    /// <summary>
+    /// Parses a `box-shadow` value into its comma-separated layers, in CSS authoring order
+    /// (first-listed shadow paints topmost among shadows). AngleSharp.Css's computed style
+    /// normalizes every layer's color to `rgba(r, g, b, a)` regardless of how it was authored
+    /// (`red`, `#f00`, ...), which <see cref="ExtractColorToken"/> relies on to split a layer's
+    /// color from its lengths without being confused by the commas inside `rgba(...)`.
+    /// </summary>
+    private static IReadOnlyList<RenderBoxShadow> ParseBoxShadows(string? value)
+    {
+        if (string.IsNullOrWhiteSpace(value) || string.Equals(value.Trim(), "none", StringComparison.OrdinalIgnoreCase))
+        {
+            return [];
+        }
+
+        var layers = SplitTopLevelCommaList(value);
+        var shadows = new List<RenderBoxShadow>(layers.Length);
+
+        foreach (var layer in layers)
+        {
+            if (ParseSingleBoxShadow(layer) is { } shadow)
+            {
+                shadows.Add(shadow);
+            }
+        }
+
+        return shadows;
+    }
+
+    private static RenderBoxShadow? ParseSingleBoxShadow(string layer)
+    {
+        var trimmed = layer.Trim();
+        var inset = false;
+
+        if (trimmed.StartsWith("inset", StringComparison.OrdinalIgnoreCase) && (trimmed.Length == 5 || char.IsWhiteSpace(trimmed[5])))
+        {
+            inset = true;
+            trimmed = trimmed[5..].TrimStart();
+        }
+        else if (trimmed.EndsWith("inset", StringComparison.OrdinalIgnoreCase) && (trimmed.Length == 5 || char.IsWhiteSpace(trimmed[^6])))
+        {
+            inset = true;
+            trimmed = trimmed[..^5].TrimEnd();
+        }
+
+        var (colorToken, remainder) = ExtractColorToken(trimmed);
+        var color = ParseColor(colorToken, RenderColor.Black);
+        var tokens = remainder.Split(' ', StringSplitOptions.RemoveEmptyEntries);
+
+        if (tokens.Length < 2)
+        {
+            return null;
+        }
+
+        var offsetX = ParseLengthValue(tokens[0], 0f, allowAuto: false);
+        var offsetY = ParseLengthValue(tokens[1], 0f, allowAuto: false);
+        var blurRadius = tokens.Length > 2 ? Math.Max(0f, ParseLengthValue(tokens[2], 0f, allowAuto: false)) : 0f;
+        var spreadRadius = tokens.Length > 3 ? ParseLengthValue(tokens[3], 0f, allowAuto: false) : 0f;
+
+        return new RenderBoxShadow(offsetX, offsetY, blurRadius, spreadRadius, color, inset);
+    }
+
+    /// <summary>
+    /// Parses a `text-shadow` value into its comma-separated layers, in CSS authoring order
+    /// (first-listed shadow paints topmost among shadows). Unlike `box-shadow`, a layer has no
+    /// `inset` keyword and no spread component.
+    /// </summary>
+    private static IReadOnlyList<RenderTextShadow> ParseTextShadows(string? value, IReadOnlyList<RenderTextShadow> inherited)
+    {
+        if (string.IsNullOrWhiteSpace(value))
+        {
+            return inherited;
+        }
+
+        if (string.Equals(value.Trim(), "none", StringComparison.OrdinalIgnoreCase))
+        {
+            return [];
+        }
+
+        var layers = SplitTopLevelCommaList(value);
+        var shadows = new List<RenderTextShadow>(layers.Length);
+
+        foreach (var layer in layers)
+        {
+            if (ParseSingleTextShadow(layer) is { } shadow)
+            {
+                shadows.Add(shadow);
+            }
+        }
+
+        return shadows;
+    }
+
+    private static RenderTextShadow? ParseSingleTextShadow(string layer)
+    {
+        var (colorToken, remainder) = ExtractColorToken(layer.Trim());
+        var color = ParseColor(colorToken, RenderColor.Black);
+        var tokens = remainder.Split(' ', StringSplitOptions.RemoveEmptyEntries);
+
+        if (tokens.Length < 2)
+        {
+            return null;
+        }
+
+        var offsetX = ParseLengthValue(tokens[0], 0f, allowAuto: false);
+        var offsetY = ParseLengthValue(tokens[1], 0f, allowAuto: false);
+        var blurRadius = tokens.Length > 2 ? Math.Max(0f, ParseLengthValue(tokens[2], 0f, allowAuto: false)) : 0f;
+
+        return new RenderTextShadow(offsetX, offsetY, blurRadius, color);
+    }
+
+    /// <summary>
+    /// Splits a shadow layer's color from its offset/blur/spread lengths. AngleSharp.Css always
+    /// normalizes a shadow's color to `rgba(r, g, b, a)`, so the color is located by its
+    /// parenthesized function call rather than by naive whitespace splitting, which would
+    /// otherwise be misled by the spaces after the commas inside `rgba(...)`. Falls back to
+    /// treating the last whitespace-separated token as the color for any value that reaches this
+    /// parser without going through AngleSharp.Css's own normalization.
+    /// </summary>
+    private static (string? ColorToken, string Remainder) ExtractColorToken(string value)
+    {
+        var functionStart = value.IndexOf("rgba(", StringComparison.OrdinalIgnoreCase);
+
+        if (functionStart < 0)
+        {
+            var lastSpace = value.TrimEnd().LastIndexOf(' ');
+            return lastSpace < 0
+                ? (value.Length > 0 ? value.Trim() : null, string.Empty)
+                : (value[(lastSpace + 1)..].Trim(), value[..lastSpace]);
+        }
+
+        var functionEnd = value.IndexOf(')', functionStart);
+
+        if (functionEnd < 0)
+        {
+            return (value[functionStart..].Trim(), value[..functionStart]);
+        }
+
+        var colorToken = value[functionStart..(functionEnd + 1)];
+        var remainder = value[..functionStart] + value[(functionEnd + 1)..];
+        return (colorToken, remainder);
     }
 
     /// <summary>
@@ -3355,6 +3514,40 @@ public sealed class HtmlRenderer
         return bytes.Length > 0;
     }
 
+    private static void PaintTextShadows(DisplayList displayList, IReadOnlyList<RenderTextShadow> shadows, string text, float x, float y, RenderTextStyle textStyle)
+    {
+        if (shadows.Count == 0 || string.IsNullOrEmpty(text))
+        {
+            return;
+        }
+
+        // The first-listed shadow paints topmost among shadows (though always behind the text
+        // itself), so shadows are added back-to-front: last-authored first, first-authored last.
+        for (var i = shadows.Count - 1; i >= 0; i--)
+        {
+            var shadow = shadows[i];
+            displayList.DrawTextShadow(text, x + shadow.OffsetX, y + shadow.OffsetY, shadow.Color, textStyle.FontSize, textStyle.FontFamily, textStyle.FontWeight, textStyle.IsItalic, shadow.BlurRadius, textStyle.LetterSpacing);
+        }
+    }
+
+    private static void PaintBoxShadows(DisplayList displayList, IReadOnlyList<RenderBoxShadow> shadows, float x, float y, float width, float height, RenderCornerRadii radii)
+    {
+        if (shadows.Count == 0 || width <= 0f || height <= 0f)
+        {
+            return;
+        }
+
+        var clampedRadii = radii.ClampToBox(width, height);
+        var borderBoxRect = new RenderRect(x, y, width, height);
+
+        // The first-listed shadow paints topmost among shadows (though always behind the box
+        // itself), so shadows are added back-to-front: last-authored first, first-authored last.
+        for (var i = shadows.Count - 1; i >= 0; i--)
+        {
+            displayList.DrawBoxShadow(borderBoxRect, clampedRadii, shadows[i]);
+        }
+    }
+
     private static void PaintBackground(DisplayList displayList, RenderPaint paint, float x, float y, float width, float height, RenderCornerRadii radii = default)
     {
         if (width <= 0f || height <= 0f)
@@ -3615,7 +3808,7 @@ public sealed class HtmlRenderer
     private static RenderGradient ParseLinearGradient(string rawValue, string functionName, bool repeating, RenderColor fallbackColor)
     {
         var inner = ExtractGradientInnerExpression(rawValue, functionName);
-        var parts = SplitGradientArguments(inner);
+        var parts = SplitTopLevelCommaList(inner);
         var startIndex = 0;
         var angleDegrees = 90f;
 
@@ -3637,7 +3830,7 @@ public sealed class HtmlRenderer
     private static RenderGradient ParseRadialGradient(string rawValue, string functionName, bool repeating, RenderColor fallbackColor)
     {
         var inner = ExtractGradientInnerExpression(rawValue, functionName);
-        var parts = SplitGradientArguments(inner);
+        var parts = SplitTopLevelCommaList(inner);
         var startIndex = 0;
 
         var isCircle = false;
@@ -3680,7 +3873,7 @@ public sealed class HtmlRenderer
     private static RenderGradient ParseConicGradient(string rawValue, string functionName, bool repeating, RenderColor fallbackColor)
     {
         var inner = ExtractGradientInnerExpression(rawValue, functionName);
-        var parts = SplitGradientArguments(inner);
+        var parts = SplitTopLevelCommaList(inner);
         var startIndex = 0;
         var angleDegrees = 0f;
         var centerX = 0.5f;
@@ -3873,7 +4066,7 @@ public sealed class HtmlRenderer
         return rawValue[(opening + 1)..closing].Trim();
     }
 
-    private static string[] SplitGradientArguments(string value)
+    private static string[] SplitTopLevelCommaList(string value)
     {
         if (string.IsNullOrWhiteSpace(value))
         {
@@ -4538,7 +4731,8 @@ public sealed class HtmlRenderer
         TextAlign TextAlign,
         float LetterSpacing,
         float TextIndent,
-        float VerticalAlignOffset);
+        float VerticalAlignOffset,
+        IReadOnlyList<global::AngleSharp.Renderer.Rendering.RenderTextShadow> TextShadows);
 
     private enum TextAlign
     {
@@ -4564,5 +4758,6 @@ public sealed class HtmlRenderer
         EdgeSizes BorderWidth,
         RenderPaint BackgroundPaint,
         RenderColor BorderColor,
-        RenderCornerRadii BorderRadius = default);
+        RenderCornerRadii BorderRadius,
+        IReadOnlyList<RenderBoxShadow> BoxShadows);
 }

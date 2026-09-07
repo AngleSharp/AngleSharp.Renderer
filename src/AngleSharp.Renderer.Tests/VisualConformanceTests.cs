@@ -1531,6 +1531,176 @@ public sealed class VisualConformanceTests
           maxDifferentPixels: 0);
     }
 
+    [Fact]
+    public async Task RenderToPng_PaintsOutsetBoxShadow()
+    {
+        var document = await ParseAsync("""
+            <html>
+              <head>
+                <style>html, body { margin: 0; padding: 0; }</style>
+              </head>
+              <body>
+                <div style="margin:20px; width:60px; height:40px; background-color:rgb(0,128,255); box-shadow: 6px 6px 8px rgba(0,0,0,0.6);"></div>
+              </body>
+            </html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var image = renderer.RenderToPng(document, new DefaultRenderDevice
+        {
+            ViewPortWidth = 130,
+            ViewPortHeight = 110,
+        });
+
+        VisualSnapshotVerifier.VerifyOrCreate(
+          snapshotName: "paints-outset-box-shadow.png",
+          actualPng: image.Data,
+          perChannelTolerance: 0,
+          maxDifferentPixels: 0);
+    }
+
+    [Fact]
+    public async Task RenderToPng_PaintsInsetBoxShadow()
+    {
+        var document = await ParseAsync("""
+            <html>
+              <head>
+                <style>html, body { margin: 0; padding: 0; }</style>
+              </head>
+              <body>
+                <div style="margin:20px; width:80px; height:50px; background-color:rgb(255,255,0); box-shadow: inset 0 0 0 8px rgba(0,0,0,0.7);"></div>
+              </body>
+            </html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var image = renderer.RenderToPng(document, new DefaultRenderDevice
+        {
+            ViewPortWidth = 130,
+            ViewPortHeight = 100,
+        });
+
+        VisualSnapshotVerifier.VerifyOrCreate(
+          snapshotName: "paints-inset-box-shadow.png",
+          actualPng: image.Data,
+          perChannelTolerance: 0,
+          maxDifferentPixels: 0);
+    }
+
+    [Fact]
+    public async Task RenderToPng_PaintsBoxShadowFollowingBorderRadius()
+    {
+        var document = await ParseAsync("""
+            <html>
+              <head>
+                <style>html, body { margin: 0; padding: 0; }</style>
+              </head>
+              <body>
+                <div style="margin:20px; width:70px; height:40px; border-radius:16px; background-color:rgb(0,200,0); box-shadow: 4px 4px 0 rgba(0,0,0,0.8);"></div>
+              </body>
+            </html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var image = renderer.RenderToPng(document, new DefaultRenderDevice
+        {
+            ViewPortWidth = 130,
+            ViewPortHeight = 100,
+        });
+
+        VisualSnapshotVerifier.VerifyOrCreate(
+          snapshotName: "paints-box-shadow-following-border-radius.png",
+          actualPng: image.Data,
+          perChannelTolerance: 0,
+          maxDifferentPixels: 0);
+    }
+
+    [Fact]
+    public async Task RenderToPng_PaintsMultipleBoxShadowsLayered()
+    {
+        var document = await ParseAsync("""
+            <html>
+              <head>
+                <style>html, body { margin: 0; padding: 0; }</style>
+              </head>
+              <body>
+                <div style="margin:20px; width:50px; height:30px; background-color:rgb(220,220,220); box-shadow: 3px 3px 0 rgba(255,0,0,1), 6px 6px 0 rgba(0,0,255,1);"></div>
+              </body>
+            </html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var image = renderer.RenderToPng(document, new DefaultRenderDevice
+        {
+            ViewPortWidth = 110,
+            ViewPortHeight = 90,
+        });
+
+        VisualSnapshotVerifier.VerifyOrCreate(
+          snapshotName: "paints-multiple-box-shadows-layered.png",
+          actualPng: image.Data,
+          perChannelTolerance: 0,
+          maxDifferentPixels: 0);
+    }
+
+    [Fact]
+    public async Task RenderToPng_PaintsTextShadow()
+    {
+        var document = await ParseAsync("""
+            <html>
+              <head>
+                <style>html, body { margin: 0; padding: 0; background-color: rgb(60,60,60); }</style>
+              </head>
+              <body>
+                <p style="margin:10px; font-family:sans-serif; font-size:28px; color:rgb(255,255,255); text-shadow: 2px 2px 3px rgba(0,0,0,0.9);">Hi</p>
+              </body>
+            </html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var image = renderer.RenderToPng(document, new DefaultRenderDevice
+        {
+            ViewPortWidth = 120,
+            ViewPortHeight = 70,
+            FontSize = 16f,
+        });
+
+        VisualSnapshotVerifier.VerifyOrCreate(
+          snapshotName: "paints-text-shadow.png",
+          actualPng: image.Data,
+          perChannelTolerance: TextRenderingToleranceChannel,
+          maxDifferentPixels: TextRenderingToleranceMaxPixels);
+    }
+
+    [Fact]
+    public async Task RenderToPng_PaintsMultipleTextShadowsLayered()
+    {
+        var document = await ParseAsync("""
+            <html>
+              <head>
+                <style>html, body { margin: 0; padding: 0; }</style>
+              </head>
+              <body>
+                <p style="margin:10px; font-family:sans-serif; font-size:28px; color:rgb(0,0,0); text-shadow: 2px 2px 0 rgba(255,0,0,1), 4px 4px 0 rgba(0,0,255,1);">Hi</p>
+              </body>
+            </html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var image = renderer.RenderToPng(document, new DefaultRenderDevice
+        {
+            ViewPortWidth = 120,
+            ViewPortHeight = 70,
+            FontSize = 16f,
+        });
+
+        VisualSnapshotVerifier.VerifyOrCreate(
+          snapshotName: "paints-multiple-text-shadows-layered.png",
+          actualPng: image.Data,
+          perChannelTolerance: TextRenderingToleranceChannel,
+          maxDifferentPixels: TextRenderingToleranceMaxPixels);
+    }
+
     private static async Task<byte[]> RenderCanvasSnapshotAsync(string html, Action<Canvas2DRenderingContext> draw)
     {
         var context = BrowsingContext.New(Configuration.Default.WithCss().WithRendering());

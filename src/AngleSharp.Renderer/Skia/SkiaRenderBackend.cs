@@ -58,14 +58,112 @@ public sealed class SkiaRenderBackend : IRenderBackend, ITextMeasurer
             case StrokeRoundedRectCommand strokeRoundedRect:
                 DrawStrokeRoundedRect(canvas, strokeRoundedRect);
                 break;
+            case DrawBoxShadowCommand boxShadow:
+                DrawBoxShadow(canvas, boxShadow);
+                break;
             case DrawImageCommand image:
                 DrawImage(canvas, image);
                 break;
             case DrawTextCommand text:
                 DrawText(canvas, text, fonts);
                 break;
+            case DrawTextShadowCommand textShadow:
+                DrawTextShadow(canvas, textShadow, fonts);
+                break;
         }
     }
+
+    private static void DrawBoxShadow(SKCanvas canvas, DrawBoxShadowCommand command)
+    {
+        var shadow = command.Shadow;
+
+        if (command.BorderBoxRect.IsEmpty || shadow.Color.A == 0)
+        {
+            return;
+        }
+
+        var borderBoxRect = new SKRect(
+            command.BorderBoxRect.X,
+            command.BorderBoxRect.Y,
+            command.BorderBoxRect.X + command.BorderBoxRect.Width,
+            command.BorderBoxRect.Y + command.BorderBoxRect.Height);
+
+        using var borderBoxRRect = new SKRoundRect();
+        borderBoxRRect.SetRectRadii(borderBoxRect, ToSkPoints(command.BorderBoxRadii));
+
+        using var paint = new SKPaint
+        {
+            Color = ToSkColor(shadow.Color),
+            IsAntialias = true,
+            Style = SKPaintStyle.Fill,
+        };
+
+        if (shadow.BlurRadius > 0f)
+        {
+            // Browsers commonly derive the Gaussian sigma as half the CSS blur radius.
+            paint.MaskFilter = SKMaskFilter.CreateBlur(SKBlurStyle.Normal, shadow.BlurRadius / 2f);
+        }
+
+        canvas.Save();
+
+        if (shadow.Inset)
+        {
+            // Per spec, an inset shadow is clipped to the border box, then painted as the area
+            // between a rect well outside the box and the spread/offset inner rect - i.e. the
+            // "ring" that is inside the border box but outside the (shrunk, moved) inner shape.
+            canvas.ClipRoundRect(borderBoxRRect, SKClipOperation.Intersect, antialias: true);
+
+            using var innerRRect = new SKRoundRect(borderBoxRRect);
+            ApplySpread(innerRRect, -shadow.SpreadRadius);
+            innerRRect.SetRectRadii(OffsetRect(innerRRect.Rect, shadow.OffsetX, shadow.OffsetY), innerRRect.Radii);
+
+            // A generous fixed outset keeps the even-odd path's outer boundary outside the
+            // blurred region in every direction, regardless of blur radius, spread, or offset.
+            var outerPadding = Math.Abs(shadow.OffsetX) + Math.Abs(shadow.OffsetY) + shadow.BlurRadius + Math.Abs(shadow.SpreadRadius) + 32f;
+            var outerRect = SKRect.Inflate(borderBoxRect, outerPadding, outerPadding);
+
+            using var path = new SKPath { FillType = SKPathFillType.EvenOdd };
+            path.AddRect(outerRect, SKPathDirection.Clockwise);
+            path.AddRoundRect(innerRRect, SKPathDirection.Clockwise);
+
+            canvas.DrawPath(path, paint);
+        }
+        else
+        {
+            // Clip OUT the border box's own shape so a transparent-background box does not show
+            // the shadow bleeding through its own interior, per spec.
+            canvas.ClipRoundRect(borderBoxRRect, SKClipOperation.Difference, antialias: true);
+
+            using var shadowRRect = new SKRoundRect(borderBoxRRect);
+            ApplySpread(shadowRRect, shadow.SpreadRadius);
+            shadowRRect.SetRectRadii(OffsetRect(shadowRRect.Rect, shadow.OffsetX, shadow.OffsetY), shadowRRect.Radii);
+
+            canvas.DrawRoundRect(shadowRRect, paint);
+        }
+
+        canvas.Restore();
+    }
+
+    /// <summary>
+    /// Grows or shrinks a rounded rect by a `box-shadow` spread amount, which may be negative
+    /// (shrink) - routed to <see cref="SKRoundRect.Inflate(float, float)"/> or
+    /// <see cref="SKRoundRect.Deflate(float, float)"/> explicitly, since neither is verified to
+    /// accept a negative argument as "the other operation".
+    /// </summary>
+    private static void ApplySpread(SKRoundRect rrect, float spread)
+    {
+        if (spread >= 0f)
+        {
+            rrect.Inflate(spread, spread);
+        }
+        else
+        {
+            rrect.Deflate(-spread, -spread);
+        }
+    }
+
+    private static SKRect OffsetRect(SKRect rect, float dx, float dy) =>
+        new(rect.Left + dx, rect.Top + dy, rect.Right + dx, rect.Bottom + dy);
 
     private static void DrawFillRect(SKCanvas canvas, FillRectCommand command)
     {
@@ -384,6 +482,28 @@ public sealed class SkiaRenderBackend : IRenderBackend, ITextMeasurer
                 DrawDecorationLine(canvas, decorationPaint, command.X, strikeY, textWidth, command.DecorationStyle);
             }
         }
+    }
+
+    private static void DrawTextShadow(SKCanvas canvas, DrawTextShadowCommand command, FontFaceSet fonts)
+    {
+        var font = new RenderFont(
+            command.FontFamily,
+            command.FontSize,
+            command.FontWeight,
+            command.IsItalic,
+            command.LetterSpacing,
+            fonts);
+
+        using var paint = SkiaTextShaping.CreateTextPaint(font);
+        paint.Color = ToSkColor(command.Color);
+
+        if (command.BlurRadius > 0f)
+        {
+            // Matches the same CSS-blur-radius-to-Gaussian-sigma approximation used for box-shadow.
+            paint.MaskFilter = SKMaskFilter.CreateBlur(SKBlurStyle.Normal, command.BlurRadius / 2f);
+        }
+
+        DrawTextWithLetterSpacing(canvas, paint, command.Text, command.X, command.Y, command.LetterSpacing);
     }
 
     private static void DrawDecorationLine(SKCanvas canvas, SKPaint paint, float x, float y, float width, RenderTextDecorationStyle style)

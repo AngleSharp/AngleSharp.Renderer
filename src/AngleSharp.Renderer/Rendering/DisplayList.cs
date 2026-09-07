@@ -67,6 +67,12 @@ public sealed class DisplayList
         Add(new StrokeRoundedRectCommand(rect, color, strokeWidth, radii));
 
     /// <summary>
+    /// Adds a `box-shadow` layer, painted relative to an element's border box.
+    /// </summary>
+    public void DrawBoxShadow(RenderRect borderBoxRect, RenderCornerRadii borderBoxRadii, RenderBoxShadow shadow) =>
+        Add(new DrawBoxShadowCommand(borderBoxRect, borderBoxRadii, shadow));
+
+    /// <summary>
     /// Adds an image draw command.
     /// </summary>
     public void DrawImage(RenderRect rect, RenderedImage image)
@@ -98,6 +104,27 @@ public sealed class DisplayList
 
         Add(new DrawTextCommand(text, x, y, color, fontSize, fontFamily, fontWeight, isItalic, underline, strikeThrough, decorationColor ?? color, decorationStyle, letterSpacing));
     }
+
+    /// <summary>
+    /// Adds a `text-shadow` layer, painted as a blurred copy of a text run behind it.
+    /// </summary>
+    public void DrawTextShadow(
+        string text,
+        float x,
+        float y,
+        RenderColor color,
+        float fontSize,
+        string fontFamily,
+        float fontWeight,
+        bool isItalic,
+        float blurRadius,
+        float letterSpacing)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(text);
+        ArgumentException.ThrowIfNullOrWhiteSpace(fontFamily);
+
+        Add(new DrawTextShadowCommand(text, x, y, color, fontSize, fontFamily, fontWeight, isItalic, blurRadius, letterSpacing));
+    }
 }
 
 /// <summary>
@@ -123,6 +150,11 @@ public sealed record FillRectCommand(RenderRect Rect, RenderPaint Paint, RenderC
 public sealed record StrokeRoundedRectCommand(RenderRect Rect, RenderColor Color, float StrokeWidth, RenderCornerRadii Radii) : RenderCommand;
 
 /// <summary>
+/// Paints one `box-shadow` layer relative to an element's border box.
+/// </summary>
+public sealed record DrawBoxShadowCommand(RenderRect BorderBoxRect, RenderCornerRadii BorderBoxRadii, RenderBoxShadow Shadow) : RenderCommand;
+
+/// <summary>
 /// Draws a single line of text at a baseline position.
 /// </summary>
 public sealed record DrawTextCommand(
@@ -138,6 +170,29 @@ public sealed record DrawTextCommand(
     bool StrikeThrough,
     RenderColor DecorationColor,
     RenderTextDecorationStyle DecorationStyle,
+    float LetterSpacing) : RenderCommand
+{
+    /// <summary>
+    /// Indicates whether the command should be rendered with a bold typeface.
+    /// </summary>
+    public bool IsBold => FontWeight >= 600f;
+}
+
+/// <summary>
+/// Paints a blurred copy of a text run behind the actual text (`text-shadow`). Carries only the
+/// fields needed to shape and rasterize glyphs identically to <see cref="DrawTextCommand"/> - a
+/// shadow has no underline/strike-through/decoration of its own.
+/// </summary>
+public sealed record DrawTextShadowCommand(
+    string Text,
+    float X,
+    float Y,
+    RenderColor Color,
+    float FontSize,
+    string FontFamily,
+    float FontWeight,
+    bool IsItalic,
+    float BlurRadius,
     float LetterSpacing) : RenderCommand
 {
     /// <summary>

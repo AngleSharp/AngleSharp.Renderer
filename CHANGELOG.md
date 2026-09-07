@@ -3,6 +3,8 @@
 Released on Wednesday, September 9 2026.
 
 - Added support for rounded corners
+- Added support for `text-shadow` declarations
+- Added support for `box-shadow` declarations
 
 # 0.3.0
 

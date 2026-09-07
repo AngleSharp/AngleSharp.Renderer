@@ -1943,6 +1943,197 @@ public sealed class HtmlRendererTests
         Assert.Equal(4, outlineFills.Length);
     }
 
+    [Fact]
+    public async Task BuildDisplayList_ParsesSingleOutsetBoxShadow()
+    {
+        var document = await ParseAsync("""
+            <html><body>
+                <div style="width:50px; height:20px; background-color:#00ff00; box-shadow: 2px 3px 4px 1px rgba(0, 0, 0, 0.5);"></div>
+            </body></html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, new DefaultRenderDevice
+        {
+            ViewPortWidth = 300,
+            ViewPortHeight = 200,
+        });
+
+        var shadow = Assert.Single(displayList.Commands.OfType<DrawBoxShadowCommand>());
+        Assert.Equal(2f, shadow.Shadow.OffsetX);
+        Assert.Equal(3f, shadow.Shadow.OffsetY);
+        Assert.Equal(4f, shadow.Shadow.BlurRadius);
+        Assert.Equal(1f, shadow.Shadow.SpreadRadius);
+        Assert.Equal(new RenderColor(0, 0, 0, 128), shadow.Shadow.Color);
+        Assert.False(shadow.Shadow.Inset);
+
+        // Per spec, box-shadow paints after the background (and before the border) - not before
+        // it - so an inset shadow is not hidden underneath an opaque background. For an outset
+        // shadow like this one, the shadow shape is clipped to never overlap the border box
+        // anyway, so this ordering has no visible effect here; it matters for the inset case.
+        var shadowIndex = Array.IndexOf(displayList.Commands.ToArray(), (RenderCommand)shadow);
+        var backgroundIndex = Array.FindIndex(displayList.Commands.ToArray(), c => c is FillRectCommand fill && fill.Color.Equals(new RenderColor(0, 255, 0)));
+        Assert.True(shadowIndex > backgroundIndex);
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_ParsesInsetBoxShadow()
+    {
+        var document = await ParseAsync("""
+            <html><body>
+                <div style="width:50px; height:20px; box-shadow: inset 0 0 5px rgba(255, 0, 0, 1);"></div>
+            </body></html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, new DefaultRenderDevice
+        {
+            ViewPortWidth = 300,
+            ViewPortHeight = 200,
+        });
+
+        var shadow = Assert.Single(displayList.Commands.OfType<DrawBoxShadowCommand>());
+        Assert.True(shadow.Shadow.Inset);
+        Assert.Equal(0f, shadow.Shadow.OffsetX);
+        Assert.Equal(0f, shadow.Shadow.OffsetY);
+        Assert.Equal(5f, shadow.Shadow.BlurRadius);
+        Assert.Equal(0f, shadow.Shadow.SpreadRadius);
+        Assert.Equal(new RenderColor(255, 0, 0), shadow.Shadow.Color);
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_PaintsMultipleBoxShadowsWithFirstListedOnTop()
+    {
+        var document = await ParseAsync("""
+            <html><body>
+                <div style="width:50px; height:20px; box-shadow: 1px 1px 0 rgba(255, 0, 0, 1), 2px 2px 0 rgba(0, 0, 255, 1);"></div>
+            </body></html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, new DefaultRenderDevice
+        {
+            ViewPortWidth = 300,
+            ViewPortHeight = 200,
+        });
+
+        var shadows = displayList.Commands.OfType<DrawBoxShadowCommand>().ToArray();
+        Assert.Equal(2, shadows.Length);
+
+        // The first-listed shadow (red) paints on top of the second (blue), so it is added to
+        // the display list last, even though it appears first in the CSS source.
+        Assert.Equal(new RenderColor(0, 0, 255), shadows[0].Shadow.Color);
+        Assert.Equal(new RenderColor(255, 0, 0), shadows[1].Shadow.Color);
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_TreatsBoxShadowNoneAsNoShadow()
+    {
+        var document = await ParseAsync("""
+            <html><body>
+                <div style="width:50px; height:20px; box-shadow: none;"></div>
+            </body></html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, new DefaultRenderDevice
+        {
+            ViewPortWidth = 300,
+            ViewPortHeight = 200,
+        });
+
+        Assert.Empty(displayList.Commands.OfType<DrawBoxShadowCommand>());
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_ParsesTextShadowAndPaintsItBeforeTheText()
+    {
+        var document = await ParseAsync("""
+            <html><body>
+                <p style="text-shadow: 1px 1px 2px rgba(0, 0, 0, 1);">Hi</p>
+            </body></html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, new DefaultRenderDevice
+        {
+            ViewPortWidth = 300,
+            ViewPortHeight = 200,
+        });
+
+        var commands = displayList.Commands.ToArray();
+        var shadow = Assert.Single(commands.OfType<DrawTextShadowCommand>());
+        var text = Assert.Single(commands.OfType<DrawTextCommand>());
+
+        Assert.Equal("Hi", shadow.Text);
+        Assert.Equal(text.X + 1f, shadow.X);
+        Assert.Equal(text.Y + 1f, shadow.Y);
+        Assert.Equal(2f, shadow.BlurRadius);
+        Assert.Equal(new RenderColor(0, 0, 0), shadow.Color);
+        Assert.True(Array.IndexOf(commands, (RenderCommand)shadow) < Array.IndexOf(commands, (RenderCommand)text));
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_PaintsMultipleTextShadowsWithFirstListedOnTop()
+    {
+        var document = await ParseAsync("""
+            <html><body>
+                <p style="text-shadow: 1px 1px 0 rgba(255, 0, 0, 1), 2px 2px 0 rgba(0, 0, 255, 1);">Hi</p>
+            </body></html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, new DefaultRenderDevice
+        {
+            ViewPortWidth = 300,
+            ViewPortHeight = 200,
+        });
+
+        var shadows = displayList.Commands.OfType<DrawTextShadowCommand>().ToArray();
+        Assert.Equal(2, shadows.Length);
+        Assert.Equal(new RenderColor(0, 0, 255), shadows[0].Color);
+        Assert.Equal(new RenderColor(255, 0, 0), shadows[1].Color);
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_InheritsTextShadowToChildrenWithoutTheirOwn()
+    {
+        var document = await ParseAsync("""
+            <html><body>
+                <div style="text-shadow: 1px 1px 2px rgba(255, 0, 0, 1);"><span>Hi</span></div>
+            </body></html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, new DefaultRenderDevice
+        {
+            ViewPortWidth = 300,
+            ViewPortHeight = 200,
+        });
+
+        var shadow = Assert.Single(displayList.Commands.OfType<DrawTextShadowCommand>());
+        Assert.Equal(new RenderColor(255, 0, 0), shadow.Color);
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_TextShadowNoneOverridesInheritedShadow()
+    {
+        var document = await ParseAsync("""
+            <html><body>
+                <div style="text-shadow: 1px 1px 2px rgba(255, 0, 0, 1);"><span style="text-shadow: none;">Hi</span></div>
+            </body></html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, new DefaultRenderDevice
+        {
+            ViewPortWidth = 300,
+            ViewPortHeight = 200,
+        });
+
+        Assert.Empty(displayList.Commands.OfType<DrawTextShadowCommand>());
+    }
+
     private static async Task<AngleSharp.Dom.IDocument> ParseAsync(string html, IConfiguration? configuration = null, string? address = null)
     {
         var context = BrowsingContext.New(configuration ?? Configuration.Default.WithCss());
