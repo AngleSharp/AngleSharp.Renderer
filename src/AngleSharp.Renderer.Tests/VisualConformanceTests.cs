@@ -1391,6 +1391,146 @@ public sealed class VisualConformanceTests
             maxDifferentPixels: TextRenderingToleranceMaxPixels);
       }
 
+    [Fact]
+    public async Task RenderToPng_PaintsUniformRoundedBoxBackgroundAndBorder()
+    {
+        var document = await ParseAsync("""
+            <html>
+              <head>
+                <style>html, body { margin: 0; padding: 0; }</style>
+              </head>
+              <body>
+                <div style="margin:10px; width:80px; height:50px; border:4px solid rgb(0,0,255); background-color:rgb(255,0,0); border-radius:12px;"></div>
+              </body>
+            </html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var image = renderer.RenderToPng(document, new DefaultRenderDevice
+        {
+            ViewPortWidth = 120,
+            ViewPortHeight = 90,
+        });
+
+        VisualSnapshotVerifier.VerifyOrCreate(
+          snapshotName: "paints-uniform-rounded-box-background-and-border.png",
+          actualPng: image.Data,
+          perChannelTolerance: 0,
+          maxDifferentPixels: 0);
+    }
+
+    [Fact]
+    public async Task RenderToPng_PaintsPillShapeFromClampedBorderRadius()
+    {
+        var document = await ParseAsync("""
+            <html>
+              <head>
+                <style>html, body { margin: 0; padding: 0; }</style>
+              </head>
+              <body>
+                <div style="margin:10px; width:100px; height:30px; background-color:rgb(0,128,255); border-radius:100px;"></div>
+              </body>
+            </html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var image = renderer.RenderToPng(document, new DefaultRenderDevice
+        {
+            ViewPortWidth = 120,
+            ViewPortHeight = 50,
+        });
+
+        VisualSnapshotVerifier.VerifyOrCreate(
+          snapshotName: "paints-pill-shape-from-clamped-border-radius.png",
+          actualPng: image.Data,
+          perChannelTolerance: 0,
+          maxDifferentPixels: 0);
+    }
+
+    [Fact]
+    public async Task RenderToPng_PaintsEllipticalBorderRadiusCorners()
+    {
+        var document = await ParseAsync("""
+            <html>
+              <head>
+                <style>html, body { margin: 0; padding: 0; }</style>
+              </head>
+              <body>
+                <div style="margin:10px; width:100px; height:60px; background-color:rgb(0,180,0); border-radius:40px / 20px;"></div>
+              </body>
+            </html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var image = renderer.RenderToPng(document, new DefaultRenderDevice
+        {
+            ViewPortWidth = 120,
+            ViewPortHeight = 80,
+        });
+
+        VisualSnapshotVerifier.VerifyOrCreate(
+          snapshotName: "paints-elliptical-border-radius-corners.png",
+          actualPng: image.Data,
+          perChannelTolerance: 0,
+          maxDifferentPixels: 0);
+    }
+
+    [Fact]
+    public async Task RenderToPng_PaintsPerCornerDifferentBorderRadii()
+    {
+        var document = await ParseAsync("""
+            <html>
+              <head>
+                <style>html, body { margin: 0; padding: 0; }</style>
+              </head>
+              <body>
+                <div style="margin:10px; width:100px; height:60px; background-color:rgb(255,128,0); border-top-left-radius:0; border-top-right-radius:24px; border-bottom-right-radius:0; border-bottom-left-radius:24px;"></div>
+              </body>
+            </html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var image = renderer.RenderToPng(document, new DefaultRenderDevice
+        {
+            ViewPortWidth = 120,
+            ViewPortHeight = 80,
+        });
+
+        VisualSnapshotVerifier.VerifyOrCreate(
+          snapshotName: "paints-per-corner-different-border-radii.png",
+          actualPng: image.Data,
+          perChannelTolerance: 0,
+          maxDifferentPixels: 0);
+    }
+
+    [Fact]
+    public async Task RenderToPng_FallsBackToStraightEdgesForMixedWidthRoundedBorder()
+    {
+        var document = await ParseAsync("""
+            <html>
+              <head>
+                <style>html, body { margin: 0; padding: 0; }</style>
+              </head>
+              <body>
+                <div style="margin:10px; width:80px; height:50px; border-top-width:2px; border-right-width:10px; border-bottom-width:2px; border-left-width:2px; border-style:solid; border-color:rgb(0,0,255); background-color:rgb(255,0,0); border-radius:12px;"></div>
+              </body>
+            </html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var image = renderer.RenderToPng(document, new DefaultRenderDevice
+        {
+            ViewPortWidth = 120,
+            ViewPortHeight = 90,
+        });
+
+        VisualSnapshotVerifier.VerifyOrCreate(
+          snapshotName: "falls-back-to-straight-edges-for-mixed-width-rounded-border.png",
+          actualPng: image.Data,
+          perChannelTolerance: 0,
+          maxDifferentPixels: 0);
+    }
+
     private static async Task<byte[]> RenderCanvasSnapshotAsync(string html, Action<Canvas2DRenderingContext> draw)
     {
         var context = BrowsingContext.New(Configuration.Default.WithCss().WithRendering());

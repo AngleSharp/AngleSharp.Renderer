@@ -44,6 +44,29 @@ public sealed class DisplayList
     }
 
     /// <summary>
+    /// Adds a filled rectangle command with per-corner rounding (`border-radius`).
+    /// </summary>
+    public void FillRect(RenderRect rect, RenderColor color, RenderCornerRadii radii) =>
+        Add(new FillRectCommand(rect, new RenderColorPaint(color), radii));
+
+    /// <summary>
+    /// Adds a filled rectangle command with per-corner rounding using a custom paint.
+    /// </summary>
+    public void FillRect(RenderRect rect, RenderPaint paint, RenderCornerRadii radii)
+    {
+        ArgumentNullException.ThrowIfNull(paint);
+        Add(new FillRectCommand(rect, paint, radii));
+    }
+
+    /// <summary>
+    /// Adds a stroked rounded rectangle command - used to paint a `border-radius` box's border
+    /// when all four edges share the same width, so the border can be drawn as a single ring
+    /// rather than four separate straight edges.
+    /// </summary>
+    public void StrokeRoundedRect(RenderRect rect, RenderColor color, float strokeWidth, RenderCornerRadii radii) =>
+        Add(new StrokeRoundedRectCommand(rect, color, strokeWidth, radii));
+
+    /// <summary>
     /// Adds an image draw command.
     /// </summary>
     public void DrawImage(RenderRect rect, RenderedImage image)
@@ -83,15 +106,21 @@ public sealed class DisplayList
 public abstract record RenderCommand;
 
 /// <summary>
-/// Draws a filled rectangle.
+/// Draws a filled rectangle, optionally with rounded corners (`border-radius`).
 /// </summary>
-public sealed record FillRectCommand(RenderRect Rect, RenderPaint Paint) : RenderCommand
+public sealed record FillRectCommand(RenderRect Rect, RenderPaint Paint, RenderCornerRadii Radii = default) : RenderCommand
 {
     /// <summary>
     /// Gets the solid color for this command when it uses a simple color paint.
     /// </summary>
     public RenderColor Color => Paint is RenderColorPaint colorPaint ? colorPaint.Color : RenderColor.Transparent;
 }
+
+/// <summary>
+/// Strokes a rounded rectangle's outline - used for a `border-radius` box's border when every
+/// edge shares the same width.
+/// </summary>
+public sealed record StrokeRoundedRectCommand(RenderRect Rect, RenderColor Color, float StrokeWidth, RenderCornerRadii Radii) : RenderCommand;
 
 /// <summary>
 /// Draws a single line of text at a baseline position.

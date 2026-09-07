@@ -823,8 +823,8 @@ public sealed class HtmlRenderer
             paddingTop,
             paddingBottom);
 
-        PaintBackground(displayList, box.BackgroundPaint, borderBoxX, borderBoxY, borderBoxWidth, borderBoxHeight);
-        PaintBorder(displayList, box.BorderColor, borderBoxX, borderBoxY, borderBoxWidth, borderBoxHeight, box.BorderWidth);
+        PaintBackground(displayList, box.BackgroundPaint, borderBoxX, borderBoxY, borderBoxWidth, borderBoxHeight, box.BorderRadius);
+        PaintBorder(displayList, box.BorderColor, borderBoxX, borderBoxY, borderBoxWidth, borderBoxHeight, box.BorderWidth, box.BorderRadius);
         PaintOutline(displayList, styleMap, borderBoxX, borderBoxY, borderBoxWidth, borderBoxHeight);
 
         if (TryResolveReplacedElementImage(node, styleMap, flowContainingWidth, borderBoxX + borderLeft + paddingLeft, borderBoxY + borderTop + paddingTop, out var image, out var imageRect))
@@ -1168,7 +1168,7 @@ public sealed class HtmlRenderer
         }
         else
         {
-            PaintBackground(displayList, box.BackgroundPaint, borderBoxX, borderBoxY, borderBoxWidth, borderBoxHeight);
+            PaintBackground(displayList, box.BackgroundPaint, borderBoxX, borderBoxY, borderBoxWidth, borderBoxHeight, box.BorderRadius);
         }
 
         RecordLayoutMetrics(
@@ -1186,7 +1186,7 @@ public sealed class HtmlRenderer
             paddingTop,
             paddingBottom);
 
-        PaintBorder(displayList, box.BorderColor, borderBoxX, borderBoxY, borderBoxWidth, borderBoxHeight, box.BorderWidth);
+        PaintBorder(displayList, box.BorderColor, borderBoxX, borderBoxY, borderBoxWidth, borderBoxHeight, box.BorderWidth, box.BorderRadius);
         PaintOutline(displayList, styleMap, borderBoxX, borderBoxY, borderBoxWidth, borderBoxHeight);
 
         if (TryResolveReplacedElementImage(node, styleMap, containingWidth, borderBoxX + borderLeft + paddingLeft, borderBoxY + borderTop + paddingTop, out var image, out var imageRect))
@@ -1780,7 +1780,7 @@ public sealed class HtmlRenderer
         }
         else
         {
-            PaintBackground(displayList, box.BackgroundPaint, borderBoxX, borderBoxY, borderBoxWidth, borderBoxHeight);
+            PaintBackground(displayList, box.BackgroundPaint, borderBoxX, borderBoxY, borderBoxWidth, borderBoxHeight, box.BorderRadius);
         }
 
         RecordLayoutMetrics(
@@ -1798,7 +1798,7 @@ public sealed class HtmlRenderer
             paddingTop,
             paddingBottom);
 
-        PaintBorder(displayList, box.BorderColor, borderBoxX, borderBoxY, borderBoxWidth, borderBoxHeight, box.BorderWidth);
+        PaintBorder(displayList, box.BorderColor, borderBoxX, borderBoxY, borderBoxWidth, borderBoxHeight, box.BorderWidth, box.BorderRadius);
         PaintOutline(displayList, styleMap, borderBoxX, borderBoxY, borderBoxWidth, borderBoxHeight);
 
         cursorY = flowBorderBoxY + borderBoxHeight;
@@ -2683,6 +2683,11 @@ public sealed class HtmlRenderer
         AddIfPresent(map, "border-bottom-color", style.GetBorderBottomColor());
         AddIfPresent(map, "border-left-color", style.GetBorderLeftColor());
 
+        AddIfPresent(map, "border-top-left-radius", style.GetBorderTopLeftRadius());
+        AddIfPresent(map, "border-top-right-radius", style.GetBorderTopRightRadius());
+        AddIfPresent(map, "border-bottom-right-radius", style.GetBorderBottomRightRadius());
+        AddIfPresent(map, "border-bottom-left-radius", style.GetBorderBottomLeftRadius());
+
         AddIfPresent(map, "outline-width", style.GetPropertyValue("outline-width"));
         AddIfPresent(map, "outline-style", style.GetPropertyValue("outline-style"));
         AddIfPresent(map, "outline-color", style.GetPropertyValue("outline-color"));
@@ -2929,7 +2934,43 @@ public sealed class HtmlRenderer
             null,
             RenderColor.Black);
 
-        return new BoxStyle(margin, padding, borderWidth, backgroundPaint, borderColor);
+        var (topLeftX, topLeftY) = ParseCornerRadius(styleMap, "border-top-left-radius");
+        var (topRightX, topRightY) = ParseCornerRadius(styleMap, "border-top-right-radius");
+        var (bottomRightX, bottomRightY) = ParseCornerRadius(styleMap, "border-bottom-right-radius");
+        var (bottomLeftX, bottomLeftY) = ParseCornerRadius(styleMap, "border-bottom-left-radius");
+        var borderRadius = new RenderCornerRadii(
+            topLeftX, topLeftY,
+            topRightX, topRightY,
+            bottomRightX, bottomRightY,
+            bottomLeftX, bottomLeftY);
+
+        return new BoxStyle(margin, padding, borderWidth, backgroundPaint, borderColor, borderRadius);
+    }
+
+    /// <summary>
+    /// Parses a `border-*-radius` longhand value, which AngleSharp.Css reports as one length
+    /// ("8px", for a circular corner) or two space-separated lengths ("8px 4px", horizontal then
+    /// vertical, for an elliptical corner). Percentages arrive already resolved to pixels by
+    /// AngleSharp.Css's computed style engine.
+    /// </summary>
+    private static (float X, float Y) ParseCornerRadius(Dictionary<string, string> styleMap, string propertyName)
+    {
+        if (!styleMap.TryGetValue(propertyName, out var value) || string.IsNullOrWhiteSpace(value))
+        {
+            return (0f, 0f);
+        }
+
+        var parts = value.Trim().Split(' ', StringSplitOptions.RemoveEmptyEntries);
+
+        if (parts.Length == 0)
+        {
+            return (0f, 0f);
+        }
+
+        var x = ParseLengthValue(parts[0], 0f, allowAuto: false);
+        var y = parts.Length > 1 ? ParseLengthValue(parts[1], 0f, allowAuto: false) : x;
+
+        return (x, y);
     }
 
     private static EdgeBorderStyle ResolveBorderStyles(Dictionary<string, string> styleMap)
@@ -3314,12 +3355,14 @@ public sealed class HtmlRenderer
         return bytes.Length > 0;
     }
 
-    private static void PaintBackground(DisplayList displayList, RenderPaint paint, float x, float y, float width, float height)
+    private static void PaintBackground(DisplayList displayList, RenderPaint paint, float x, float y, float width, float height, RenderCornerRadii radii = default)
     {
         if (width <= 0f || height <= 0f)
         {
             return;
         }
+
+        var clampedRadii = radii.ClampToBox(width, height);
 
         if (paint is RenderColorPaint colorPaint)
         {
@@ -3328,20 +3371,40 @@ public sealed class HtmlRenderer
                 return;
             }
 
-            displayList.FillRect(new RenderRect(x, y, width, height), colorPaint.Color);
+            displayList.FillRect(new RenderRect(x, y, width, height), colorPaint.Color, clampedRadii);
             return;
         }
 
         if (paint is RenderGradientPaint)
         {
-            displayList.FillRect(new RenderRect(x, y, width, height), paint);
+            displayList.FillRect(new RenderRect(x, y, width, height), paint, clampedRadii);
         }
     }
 
-    private static void PaintBorder(DisplayList displayList, RenderColor color, float x, float y, float width, float height, EdgeSizes border)
+    private static void PaintBorder(DisplayList displayList, RenderColor color, float x, float y, float width, float height, EdgeSizes border, RenderCornerRadii radii = default)
     {
         if (color.A == 0 || width <= 0f || height <= 0f)
         {
+            return;
+        }
+
+        var clampedRadii = radii.ClampToBox(width, height);
+
+        // A uniform-width border with rounded corners can be drawn as a single stroked ring; a
+        // border whose edges differ in width has no single stroke width to give the ring, so it
+        // falls back to the un-rounded four-rectangle path (a documented limitation - mixed-width
+        // rounded borders are rare enough not to warrant a per-edge rounded-quad implementation).
+        if (!clampedRadii.IsZero && border.Top > 0f && border.Top == border.Right && border.Top == border.Bottom && border.Top == border.Left)
+        {
+            var half = border.Top / 2f;
+            var strokeRect = new RenderRect(x + half, y + half, width - border.Top, height - border.Top);
+            var strokeRadii = new RenderCornerRadii(
+                Math.Max(0f, clampedRadii.TopLeftX - half), Math.Max(0f, clampedRadii.TopLeftY - half),
+                Math.Max(0f, clampedRadii.TopRightX - half), Math.Max(0f, clampedRadii.TopRightY - half),
+                Math.Max(0f, clampedRadii.BottomRightX - half), Math.Max(0f, clampedRadii.BottomRightY - half),
+                Math.Max(0f, clampedRadii.BottomLeftX - half), Math.Max(0f, clampedRadii.BottomLeftY - half));
+
+            displayList.StrokeRoundedRect(strokeRect, color, border.Top, strokeRadii);
             return;
         }
 
@@ -4500,5 +4563,6 @@ public sealed class HtmlRenderer
         EdgeSizes Padding,
         EdgeSizes BorderWidth,
         RenderPaint BackgroundPaint,
-        RenderColor BorderColor);
+        RenderColor BorderColor,
+        RenderCornerRadii BorderRadius = default);
 }

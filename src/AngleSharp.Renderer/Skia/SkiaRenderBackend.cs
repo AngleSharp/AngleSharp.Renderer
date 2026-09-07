@@ -55,6 +55,9 @@ public sealed class SkiaRenderBackend : IRenderBackend, ITextMeasurer
             case FillRectCommand fill:
                 DrawFillRect(canvas, fill);
                 break;
+            case StrokeRoundedRectCommand strokeRoundedRect:
+                DrawStrokeRoundedRect(canvas, strokeRoundedRect);
+                break;
             case DrawImageCommand image:
                 DrawImage(canvas, image);
                 break;
@@ -79,8 +82,52 @@ public sealed class SkiaRenderBackend : IRenderBackend, ITextMeasurer
             command.Rect.X + command.Rect.Width,
             command.Rect.Y + command.Rect.Height);
 
-        canvas.DrawRect(rect, paint);
+        if (command.Radii.IsZero)
+        {
+            canvas.DrawRect(rect, paint);
+        }
+        else
+        {
+            using var roundRect = new SKRoundRect();
+            roundRect.SetRectRadii(rect, ToSkPoints(command.Radii));
+            canvas.DrawRoundRect(roundRect, paint);
+        }
     }
+
+    private static void DrawStrokeRoundedRect(SKCanvas canvas, StrokeRoundedRectCommand command)
+    {
+        if (command.Rect.IsEmpty || command.Color.A == 0 || command.StrokeWidth <= 0f)
+        {
+            return;
+        }
+
+        var rect = new SKRect(
+            command.Rect.X,
+            command.Rect.Y,
+            command.Rect.X + command.Rect.Width,
+            command.Rect.Y + command.Rect.Height);
+
+        using var roundRect = new SKRoundRect();
+        roundRect.SetRectRadii(rect, ToSkPoints(command.Radii));
+
+        using var paint = new SKPaint
+        {
+            Color = ToSkColor(command.Color),
+            IsAntialias = true,
+            Style = SKPaintStyle.Stroke,
+            StrokeWidth = command.StrokeWidth,
+        };
+
+        canvas.DrawRoundRect(roundRect, paint);
+    }
+
+    private static SKPoint[] ToSkPoints(RenderCornerRadii radii) =>
+    [
+        new SKPoint(radii.TopLeftX, radii.TopLeftY),
+        new SKPoint(radii.TopRightX, radii.TopRightY),
+        new SKPoint(radii.BottomRightX, radii.BottomRightY),
+        new SKPoint(radii.BottomLeftX, radii.BottomLeftY),
+    ];
 
     private static SKPaint CreateFillPaint(RenderPaint paint, RenderRect rect)
     {

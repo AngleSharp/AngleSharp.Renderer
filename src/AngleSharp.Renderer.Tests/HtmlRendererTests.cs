@@ -1695,6 +1695,254 @@ public sealed class HtmlRendererTests
         Assert.True(blueIndex > redIndex);
     }
 
+    [Fact]
+    public async Task BuildDisplayList_AppliesUniformBorderRadiusToBackgroundFill()
+    {
+        var document = await ParseAsync("""
+            <html><body>
+                <div style="width:100px; height:60px; background-color:#00ff00; border-radius:8px;"></div>
+            </body></html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, new DefaultRenderDevice
+        {
+            ViewPortWidth = 300,
+            ViewPortHeight = 200,
+        });
+
+        var fills = displayList.Commands.OfType<FillRectCommand>().ToArray();
+        Assert.True(fills.Length >= 2);
+
+        var boxBackground = fills[1];
+        Assert.Equal(8f, boxBackground.Radii.TopLeftX);
+        Assert.Equal(8f, boxBackground.Radii.TopLeftY);
+        Assert.Equal(8f, boxBackground.Radii.TopRightX);
+        Assert.Equal(8f, boxBackground.Radii.TopRightY);
+        Assert.Equal(8f, boxBackground.Radii.BottomRightX);
+        Assert.Equal(8f, boxBackground.Radii.BottomRightY);
+        Assert.Equal(8f, boxBackground.Radii.BottomLeftX);
+        Assert.Equal(8f, boxBackground.Radii.BottomLeftY);
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_ParsesTwoValueBorderRadiusShorthand()
+    {
+        var document = await ParseAsync("""
+            <html><body>
+                <div style="width:100px; height:60px; background-color:#00ff00; border-radius:20px 5px;"></div>
+            </body></html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, new DefaultRenderDevice
+        {
+            ViewPortWidth = 300,
+            ViewPortHeight = 200,
+        });
+
+        var fills = displayList.Commands.OfType<FillRectCommand>().ToArray();
+        var boxBackground = fills[1];
+
+        // border-radius: 20px 5px -> top-left/bottom-right get 20px, top-right/bottom-left get 5px.
+        Assert.Equal(20f, boxBackground.Radii.TopLeftX);
+        Assert.Equal(5f, boxBackground.Radii.TopRightX);
+        Assert.Equal(20f, boxBackground.Radii.BottomRightX);
+        Assert.Equal(5f, boxBackground.Radii.BottomLeftX);
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_ParsesEllipticalBorderRadiusPerCornerLonghand()
+    {
+        var document = await ParseAsync("""
+            <html><body>
+                <div style="width:100px; height:60px; background-color:#00ff00; border-top-left-radius:20px 10px;"></div>
+            </body></html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, new DefaultRenderDevice
+        {
+            ViewPortWidth = 300,
+            ViewPortHeight = 200,
+        });
+
+        var fills = displayList.Commands.OfType<FillRectCommand>().ToArray();
+        var boxBackground = fills[1];
+
+        Assert.Equal(20f, boxBackground.Radii.TopLeftX);
+        Assert.Equal(10f, boxBackground.Radii.TopLeftY);
+        Assert.Equal(0f, boxBackground.Radii.TopRightX);
+        Assert.Equal(0f, boxBackground.Radii.BottomRightX);
+        Assert.Equal(0f, boxBackground.Radii.BottomLeftX);
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_ParsesSlashSeparatedBorderRadiusShorthand()
+    {
+        var document = await ParseAsync("""
+            <html><body>
+                <div style="width:100px; height:60px; background-color:#00ff00; border-radius:40px / 20px;"></div>
+            </body></html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, new DefaultRenderDevice
+        {
+            ViewPortWidth = 300,
+            ViewPortHeight = 200,
+        });
+
+        var fills = displayList.Commands.OfType<FillRectCommand>().ToArray();
+        var boxBackground = fills[1];
+
+        // border-radius: 40px / 20px -> every corner gets a 40px horizontal / 20px vertical
+        // elliptical radius (all four corners share the same X and share the same Y here, since
+        // no per-corner variation was given on either side of the slash).
+        Assert.Equal(40f, boxBackground.Radii.TopLeftX);
+        Assert.Equal(20f, boxBackground.Radii.TopLeftY);
+        Assert.Equal(40f, boxBackground.Radii.BottomRightX);
+        Assert.Equal(20f, boxBackground.Radii.BottomRightY);
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_ResolvesPercentageBorderRadiusAgainstBox()
+    {
+        var document = await ParseAsync("""
+            <html><body>
+                <div style="width:200px; height:80px; background-color:#00ff00; border-radius:10%;"></div>
+            </body></html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, new DefaultRenderDevice
+        {
+            ViewPortWidth = 300,
+            ViewPortHeight = 200,
+        });
+
+        var fills = displayList.Commands.OfType<FillRectCommand>().ToArray();
+        var boxBackground = fills[1];
+
+        // Verified against AngleSharp.Css 1.1.0: a border-radius percentage resolves against the
+        // containing block's width for both the horizontal and vertical component (here, the
+        // 300px viewport width -> 10% = 30px), not per-axis against the element's own width and
+        // height as the CSS spec technically prescribes - a quirk of the computed-style engine
+        // this renderer sits on top of, not something this renderer's own parsing controls. 30px
+        // on each side of a 200x80 box does not exceed either edge, so no overlap-clamping kicks
+        // in here (that path is covered separately by the pixel-radius clamp test below).
+        Assert.Equal(30f, boxBackground.Radii.TopLeftX);
+        Assert.Equal(30f, boxBackground.Radii.TopLeftY);
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_ClampsOverlappingBorderRadiiToBoxSize()
+    {
+        var document = await ParseAsync("""
+            <html><body>
+                <div style="width:40px; height:20px; background-color:#00ff00; border-radius:100px;"></div>
+            </body></html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, new DefaultRenderDevice
+        {
+            ViewPortWidth = 300,
+            ViewPortHeight = 200,
+        });
+
+        var fills = displayList.Commands.OfType<FillRectCommand>().ToArray();
+        var boxBackground = fills[1];
+
+        // A 100px radius on every corner of a 40x20 box would overlap; the CSS corner-overlap
+        // algorithm scales all radii down uniformly until the tightest edge (height=20, two
+        // 100px radii sharing it) just fits: scale = 20/200 = 0.1 -> 10px.
+        Assert.Equal(10f, boxBackground.Radii.TopLeftX, 0.001f);
+        Assert.Equal(10f, boxBackground.Radii.TopLeftY, 0.001f);
+        Assert.Equal(10f, boxBackground.Radii.BottomRightX, 0.001f);
+        Assert.Equal(10f, boxBackground.Radii.BottomRightY, 0.001f);
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_RendersUniformBorderRadiusBorderAsStrokedRoundedRect()
+    {
+        var document = await ParseAsync("""
+            <html><body>
+                <div style="width:100px; height:60px; border-width:4px; border-style:solid; border-color:#0000ff; border-radius:12px;"></div>
+            </body></html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, new DefaultRenderDevice
+        {
+            ViewPortWidth = 300,
+            ViewPortHeight = 200,
+        });
+
+        var strokedBorder = Assert.Single(displayList.Commands.OfType<StrokeRoundedRectCommand>());
+        Assert.Equal(new RenderColor(0, 0, 255), strokedBorder.Color);
+        Assert.Equal(4f, strokedBorder.StrokeWidth);
+
+        // The stroke is drawn along the border's centerline, half the border width inside the
+        // outer edge, so its radius is the outer 12px radius minus half the 4px border width.
+        Assert.Equal(10f, strokedBorder.Radii.TopLeftX, 0.001f);
+
+        // A rounded border is painted as a single ring, never as the four separate edge rectangles.
+        Assert.Empty(displayList.Commands.OfType<FillRectCommand>().Where(f => f.Color.Equals(new RenderColor(0, 0, 255))));
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_FallsBackToStraightEdgesForMixedWidthRoundedBorder()
+    {
+        var document = await ParseAsync("""
+            <html><body>
+                <div style="width:100px; height:60px; border-top-width:2px; border-right-width:6px; border-bottom-width:2px; border-left-width:2px; border-style:solid; border-color:#0000ff; border-radius:12px;"></div>
+            </body></html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, new DefaultRenderDevice
+        {
+            ViewPortWidth = 300,
+            ViewPortHeight = 200,
+        });
+
+        // Mixed edge widths have no single stroke width for a rounded ring, so the renderer falls
+        // back to the un-rounded four-rectangle border path.
+        Assert.Empty(displayList.Commands.OfType<StrokeRoundedRectCommand>());
+
+        var borderFills = displayList.Commands.OfType<FillRectCommand>()
+            .Where(f => f.Color.Equals(new RenderColor(0, 0, 255)))
+            .ToArray();
+        Assert.Equal(4, borderFills.Length);
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_DoesNotRoundOutlineWithBorderRadius()
+    {
+        var document = await ParseAsync("""
+            <html><body>
+                <div style="width:100px; height:60px; border-radius:12px; outline-width:3px; outline-style:solid; outline-color:#ff00ff;"></div>
+            </body></html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, new DefaultRenderDevice
+        {
+            ViewPortWidth = 300,
+            ViewPortHeight = 200,
+        });
+
+        // The outline is unaffected by border-radius per spec, so it stays a plain four-rectangle
+        // border rather than a StrokeRoundedRectCommand.
+        Assert.Empty(displayList.Commands.OfType<StrokeRoundedRectCommand>());
+
+        var outlineFills = displayList.Commands.OfType<FillRectCommand>()
+            .Where(f => f.Color.Equals(new RenderColor(255, 0, 255)))
+            .ToArray();
+        Assert.Equal(4, outlineFills.Length);
+    }
+
     private static async Task<AngleSharp.Dom.IDocument> ParseAsync(string html, IConfiguration? configuration = null, string? address = null)
     {
         var context = BrowsingContext.New(configuration ?? Configuration.Default.WithCss());

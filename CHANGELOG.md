@@ -2,7 +2,7 @@
 
 Released on Wednesday, September 9 2026.
 
-- ...
+- Added support for rounded corners
 
 # 0.3.0
 
