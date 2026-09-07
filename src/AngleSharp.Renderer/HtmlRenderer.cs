@@ -7,6 +7,7 @@ using System.Runtime.CompilerServices;
 using System.Text;
 using System.Threading;
 
+using AngleSharp;
 using AngleSharp.Css;
 using AngleSharp.Css.Dom;
 using AngleSharp.Css.RenderTree;
@@ -96,7 +97,7 @@ public sealed class HtmlRenderer
 
         try
         {
-            _ = BuildDisplayList(document, viewport, context, renderDevice);
+            _ = BuildDisplayList(document, viewport, context, renderDevice, measureFullExtent: true);
             return capture.Snapshot();
         }
         finally
@@ -234,7 +235,7 @@ public sealed class HtmlRenderer
 
         var context = CreateLayoutContext(document, renderDevice, _textMeasurer);
         var viewport = new RenderViewport(context.Width, context.Height);
-        var displayList = BuildDisplayList(document, viewport, context, renderDevice);
+        var displayList = BuildDisplayList(document, viewport, context, renderDevice, ResolveRootScrollOffsetY(document));
 
         return _backend.RenderToPng(displayList, viewport);
     }
@@ -264,10 +265,38 @@ public sealed class HtmlRenderer
 
         var context = CreateLayoutContext(document, renderDevice, _textMeasurer);
         var viewport = new RenderViewport(context.Width, context.Height);
-        return BuildDisplayList(document, viewport, context, renderDevice);
+        return BuildDisplayList(document, viewport, context, renderDevice, ResolveRootScrollOffsetY(document));
     }
 
-    private static DisplayList BuildDisplayList(IDocument document, RenderViewport viewport, LayoutContext context, IRenderDevice renderDevice)
+    /// <summary>
+    /// Resolves the page's vertical scroll offset from the interactive DOM harness, if one has
+    /// been created for the document's browsing context (via <c>IBrowsingContext.GetDomHarness()</c>
+    /// - typically through <see cref="IDomHarness.PaintToPng"/> or direct use of the CSSOM-view
+    /// scroll APIs). Returns 0 for the overwhelmingly common case of a document that was never
+    /// wired up for interactive use, so rendering stays unaffected unless a caller has actually
+    /// opted into scroll state existing at all. <see cref="CaptureLayoutMetrics"/> deliberately
+    /// does not call this - <c>getBoundingClientRect</c>/<c>scrollHeight</c>/max-scroll
+    /// calculations need the document's true, unscrolled layout to stay correct (and clamping a
+    /// newly-set scroll position depends on exactly that), so metrics capture always lays out at
+    /// scroll offset 0 regardless of whatever is currently scrolled into view for painting.
+    /// </summary>
+    private static float ResolveRootScrollOffsetY(IDocument document)
+    {
+        var scrollingElement = document.DocumentElement;
+
+        if (scrollingElement is null || !document.Context.TryGetDomHarness(out var harness) || harness is null)
+        {
+            return 0f;
+        }
+
+        // double.MaxValue as the clamp ceiling means this only floors at 0, never re-clamps to an
+        // upper bound - the stored value was already correctly clamped against the document's
+        // true scrollable extent when it was set via the public scrollTop/scrollTo DOM APIs
+        // (which measure with CaptureLayoutMetrics, unaffected by this method).
+        return (float)harness.GetScrollTop(scrollingElement, double.MaxValue);
+    }
+
+    private static DisplayList BuildDisplayList(IDocument document, RenderViewport viewport, LayoutContext context, IRenderDevice renderDevice, float scrollOffsetY = 0f, bool measureFullExtent = false)
     {
         var displayList = new DisplayList { Fonts = context.Fonts };
         displayList.FillRect(new RenderRect(0f, 0f, viewport.Width, viewport.Height), context.BackgroundColor);
@@ -285,7 +314,12 @@ public sealed class HtmlRenderer
         var root = body is null ? renderTree : renderTree.Find(body) ?? renderTree;
 
         var contentX = context.Padding;
-        var contentY = context.Padding;
+        // A positive scroll offset moves the page's content up relative to the fixed viewport
+        // surface - painted the same way as an unscrolled page, just starting from a Y position
+        // that can be negative. Content scrolled above or below the surface's fixed pixel bounds
+        // simply falls outside what a raster surface of that size can hold; no explicit clip is
+        // needed to hide it; Skia only ever writes pixels that exist within the surface itself.
+        var contentY = context.Padding - scrollOffsetY;
         var contentWidth = viewport.Width - (2f * context.Padding);
 
         if (contentWidth <= 0f)
@@ -300,6 +334,12 @@ public sealed class HtmlRenderer
         var activeFloatLeftOffset = 0f;
         var activeFloatBottom = 0f;
         var textIndentConsumed = false;
+
+        // Normal painting stops laying out content once it has gone past the visible viewport -
+        // there is no need to spend time measuring what will never be rasterized. Measuring the
+        // page's true scrollable extent (for scrollTop/scrollHeight/max-scroll purposes) needs the
+        // opposite: the full page, regardless of how tall it is relative to the viewport.
+        var maxY = measureFullExtent ? float.MaxValue : viewport.Height - context.Padding;
 
         foreach (var child in OrderChildrenForPainting(root.Children))
         {
@@ -317,11 +357,37 @@ public sealed class HtmlRenderer
                 textStyle: textStyle,
                 context: context,
                 displayList: displayList,
-                maxY: viewport.Height - context.Padding);
+                maxY: maxY);
 
-            if (cursorY > viewport.Height - context.Padding)
+            if (cursorY > maxY)
             {
                 break;
+            }
+        }
+
+        // The page's own scrolling elements (<html>/<body>) are never laid out as boxes of their
+        // own - the loop above only ever lays out *their children* directly onto the page canvas -
+        // so neither ever gets an ordinary RecordLayoutMetrics call the way a normal descendant
+        // does. Synthesizing one here, sized to the full stacked content height, is what lets
+        // GetScrollHeight()/GetMaxScrollTop() (via ElementCssomViewExtensions.GetScrollExtents,
+        // which reads exactly this metrics map) treat the document as scrollable at all. This is a
+        // no-op outside of CaptureLayoutMetrics, since RecordLayoutMetrics itself only does
+        // anything while that capture is active.
+        if (body is not null)
+        {
+            // The synthesized box represents the *client* (viewport) area, not the total content
+            // height - GetScrollExtents (ElementCssomViewExtensions) separately walks this map for
+            // every actual descendant (each already carrying its own, normally-recorded metrics)
+            // to work out how far content actually extends past this box, exactly the way it
+            // already does for any other scrollable element. Recording the full content height
+            // here instead would make the client and scroll heights identical, so nothing would
+            // ever look scrollable.
+            var clientHeight = Math.Max(0f, viewport.Height - (2f * context.Padding));
+            RecordLayoutMetrics(body, contentX, contentY, contentWidth, clientHeight, 0f, 0f, 0f, 0f, 0f, 0f, 0f, 0f);
+
+            if (document.DocumentElement is not null)
+            {
+                RecordLayoutMetrics(document.DocumentElement, contentX, contentY, contentWidth, clientHeight, 0f, 0f, 0f, 0f, 0f, 0f, 0f, 0f);
             }
         }
 

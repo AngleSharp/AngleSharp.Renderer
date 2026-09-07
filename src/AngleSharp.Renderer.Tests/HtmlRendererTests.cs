@@ -2633,6 +2633,99 @@ public sealed class HtmlRendererTests
         Assert.Single(displayList.Commands.OfType<PopClipCommand>());
     }
 
+    [Fact]
+    public async Task BuildDisplayList_AppliesRootScrollOffsetToPaintedContent()
+    {
+        var renderDevice = new DefaultRenderDevice
+        {
+            ViewPortWidth = 200,
+            ViewPortHeight = 80,
+            DeviceWidth = 200,
+            DeviceHeight = 80,
+            FontSize = 16,
+        };
+        var configuration = Configuration.Default.WithCss().WithRenderDevice(renderDevice);
+        var document = await ParseAsync("""
+            <html>
+              <head><style>html, body { margin: 0; padding: 0; }</style></head>
+              <body>
+                <div style="width:50px; height:300px; background-color:#ff0000;"></div>
+              </body>
+            </html>
+            """, configuration);
+
+        var renderer = new HtmlRenderer();
+        var unscrolled = renderer.BuildDisplayList(document, renderDevice);
+        var unscrolledFill = Assert.Single(unscrolled.Commands.OfType<FillRectCommand>().Where(f => f.Color.Equals(new RenderColor(255, 0, 0))));
+
+        document.Context.GetDomHarness();
+        document.DocumentElement.SetScrollTop(40);
+
+        var scrolled = renderer.BuildDisplayList(document, renderDevice);
+        var scrolledFill = Assert.Single(scrolled.Commands.OfType<FillRectCommand>().Where(f => f.Color.Equals(new RenderColor(255, 0, 0))));
+
+        Assert.Equal(unscrolledFill.Rect.Y - 40f, scrolledFill.Rect.Y);
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_ClampsRootScrollOffsetToScrollableExtent()
+    {
+        var renderDevice = new DefaultRenderDevice
+        {
+            ViewPortWidth = 200,
+            ViewPortHeight = 80,
+            DeviceWidth = 200,
+            DeviceHeight = 80,
+            FontSize = 16,
+        };
+        var configuration = Configuration.Default.WithCss().WithRenderDevice(renderDevice);
+        var document = await ParseAsync("""
+            <html>
+              <head><style>html, body { margin: 0; padding: 0; }</style></head>
+              <body>
+                <div style="width:50px; height:150px; background-color:#ff0000;"></div>
+              </body>
+            </html>
+            """, configuration);
+
+        document.Context.GetDomHarness();
+        document.DocumentElement.SetScrollTop(100_000);
+
+        var maxScrollTop = document.DocumentElement.GetScrollTop();
+        Assert.True(maxScrollTop > 0);
+        Assert.True(maxScrollTop < 100_000);
+
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, renderDevice);
+        var fill = Assert.Single(displayList.Commands.OfType<FillRectCommand>().Where(f => f.Color.Equals(new RenderColor(255, 0, 0))));
+
+        // Clamped to the true scrollable extent, not the (much larger) value that was set.
+        Assert.Equal(-(float)maxScrollTop, fill.Rect.Y);
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_WithoutHarness_IgnoresScrollAndRendersUnaffected()
+    {
+        // No IRenderDevice service is registered here, so no DOM harness can even exist for this
+        // context - confirms rendering is completely unaffected (and does not throw) for the
+        // overwhelmingly common case of a document that was never wired up for interactive use.
+        var document = await ParseAsync("""
+            <html><body>
+                <div style="width:50px; height:20px; background-color:#00ff00;"></div>
+            </body></html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, new DefaultRenderDevice
+        {
+            ViewPortWidth = 300,
+            ViewPortHeight = 200,
+        });
+
+        var fill = Assert.Single(displayList.Commands.OfType<FillRectCommand>().Where(f => f.Color.Equals(new RenderColor(0, 255, 0))));
+        Assert.Equal(0f, fill.Rect.Y);
+    }
+
     private static async Task<AngleSharp.Dom.IDocument> ParseAsync(string html, IConfiguration? configuration = null, string? address = null)
     {
         var context = BrowsingContext.New(configuration ?? Configuration.Default.WithCss());

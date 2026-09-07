@@ -2,6 +2,7 @@ namespace AngleSharp.Renderer.Tests;
 
 using AngleSharp;
 using AngleSharp.Css;
+using AngleSharp.Dom;
 using AngleSharp.Html.Dom;
 
 [Trait("Category", "Visual")]
@@ -2073,9 +2074,89 @@ public sealed class VisualConformanceTests
         return canvasContext.ToImage("image/png");
     }
 
-    private static async Task<AngleSharp.Dom.IDocument> ParseAsync(string html)
+    [Fact]
+    public async Task RenderToPng_PaintsTopOfTallPageWhenUnscrolled()
     {
-        var context = BrowsingContext.New(Configuration.Default.WithCss());
+        var image = await RenderScrolledTallPageAsync(scrollTop: null, viewportHeight: 80);
+
+        VisualSnapshotVerifier.VerifyOrCreate(
+          snapshotName: "paints-top-of-tall-page-when-unscrolled.png",
+          actualPng: image.Data,
+          perChannelTolerance: 0,
+          maxDifferentPixels: 0);
+    }
+
+    [Fact]
+    public async Task RenderToPng_PaintsOnlyBottomOfTallPageWhenScrollOffsetIsLargeEnough()
+    {
+        // The page is 5 stacked 40px bands (200px total) in an 80px-tall viewport - scrolling by
+        // 120px moves past the first three bands entirely, so only the last two (green, blue)
+        // should paint, shifted up to fill the viewport exactly as the unscrolled page's first two
+        // bands (red, orange) do in the sibling test above.
+        var image = await RenderScrolledTallPageAsync(scrollTop: 120, viewportHeight: 80);
+
+        VisualSnapshotVerifier.VerifyOrCreate(
+          snapshotName: "paints-only-bottom-of-tall-page-when-scroll-offset-is-large-enough.png",
+          actualPng: image.Data,
+          perChannelTolerance: 0,
+          maxDifferentPixels: 0);
+    }
+
+    [Fact]
+    public async Task RenderToPng_PaintsMiddleOfTallPageAtAnArbitrarySettableScrollOffset()
+    {
+        // A scroll offset that isn't aligned to a band boundary (100px lands 20px into the third
+        // band, yellow) proves the offset is a continuously "settable" pixel value, not just a
+        // switch between a fixed top/bottom view - the viewport should show the bottom 20px of
+        // yellow, all 40px of green, then the top 20px of blue. 100px is also comfortably within
+        // the page's actual 120px max scroll (200px content - 80px viewport), unlike a larger
+        // value that would just clamp to the same view as the "scrolled past the top" test above.
+        var image = await RenderScrolledTallPageAsync(scrollTop: 100, viewportHeight: 80);
+
+        VisualSnapshotVerifier.VerifyOrCreate(
+          snapshotName: "paints-middle-of-tall-page-at-an-arbitrary-settable-scroll-offset.png",
+          actualPng: image.Data,
+          perChannelTolerance: 0,
+          maxDifferentPixels: 0);
+    }
+
+    private static async Task<AngleSharp.Renderer.Rendering.RenderedImage> RenderScrolledTallPageAsync(double? scrollTop, int viewportHeight)
+    {
+        var renderDevice = new DefaultRenderDevice
+        {
+            ViewPortWidth = 80,
+            ViewPortHeight = viewportHeight,
+            DeviceWidth = 80,
+            DeviceHeight = viewportHeight,
+            FontSize = 16,
+        };
+        var configuration = Configuration.Default.WithCss().WithRenderDevice(renderDevice);
+        var document = await ParseAsync("""
+            <html>
+              <head><style>html, body { margin: 0; padding: 0; }</style></head>
+              <body>
+                <div style="width:80px; height:40px; background-color:rgb(255,0,0);"></div>
+                <div style="width:80px; height:40px; background-color:rgb(255,165,0);"></div>
+                <div style="width:80px; height:40px; background-color:rgb(255,255,0);"></div>
+                <div style="width:80px; height:40px; background-color:rgb(0,180,0);"></div>
+                <div style="width:80px; height:40px; background-color:rgb(0,0,255);"></div>
+              </body>
+            </html>
+            """, configuration);
+
+        if (scrollTop.HasValue)
+        {
+            document.Context.GetDomHarness();
+            document.DocumentElement.SetScrollTop(scrollTop.Value);
+        }
+
+        var renderer = new HtmlRenderer();
+        return renderer.RenderToPng(document, renderDevice);
+    }
+
+    private static async Task<AngleSharp.Dom.IDocument> ParseAsync(string html, IConfiguration? configuration = null)
+    {
+        var context = BrowsingContext.New(configuration ?? Configuration.Default.WithCss());
         return await context.OpenAsync(request => request.Content(html));
     }
 }
