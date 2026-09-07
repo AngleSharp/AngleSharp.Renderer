@@ -2522,7 +2522,10 @@ public sealed class HtmlRenderer
             if (string.Equals(property, "background-image", StringComparison.OrdinalIgnoreCase) &&
                 (value.StartsWith("linear-gradient", StringComparison.OrdinalIgnoreCase) ||
                  value.StartsWith("radial-gradient", StringComparison.OrdinalIgnoreCase) ||
-                 value.StartsWith("conic-gradient", StringComparison.OrdinalIgnoreCase)))
+                 value.StartsWith("conic-gradient", StringComparison.OrdinalIgnoreCase) ||
+                 value.StartsWith("repeating-linear-gradient", StringComparison.OrdinalIgnoreCase) ||
+                 value.StartsWith("repeating-radial-gradient", StringComparison.OrdinalIgnoreCase) ||
+                 value.StartsWith("repeating-conic-gradient", StringComparison.OrdinalIgnoreCase)))
             {
                 gradientValue = value;
                 continue;
@@ -3513,27 +3516,42 @@ public sealed class HtmlRenderer
     {
         var value = rawValue.Trim();
 
+        if (value.StartsWith("repeating-linear-gradient", StringComparison.OrdinalIgnoreCase))
+        {
+            return new RenderGradientPaint(ParseLinearGradient(value, "repeating-linear-gradient", repeating: true, fallbackColor));
+        }
+
         if (value.StartsWith("linear-gradient", StringComparison.OrdinalIgnoreCase))
         {
-            return new RenderGradientPaint(ParseLinearGradient(value, fallbackColor));
+            return new RenderGradientPaint(ParseLinearGradient(value, "linear-gradient", repeating: false, fallbackColor));
+        }
+
+        if (value.StartsWith("repeating-radial-gradient", StringComparison.OrdinalIgnoreCase))
+        {
+            return new RenderGradientPaint(ParseRadialGradient(value, "repeating-radial-gradient", repeating: true, fallbackColor));
         }
 
         if (value.StartsWith("radial-gradient", StringComparison.OrdinalIgnoreCase))
         {
-            return new RenderGradientPaint(ParseRadialGradient(value, fallbackColor));
+            return new RenderGradientPaint(ParseRadialGradient(value, "radial-gradient", repeating: false, fallbackColor));
+        }
+
+        if (value.StartsWith("repeating-conic-gradient", StringComparison.OrdinalIgnoreCase))
+        {
+            return new RenderGradientPaint(ParseConicGradient(value, "repeating-conic-gradient", repeating: true, fallbackColor));
         }
 
         if (value.StartsWith("conic-gradient", StringComparison.OrdinalIgnoreCase))
         {
-            return new RenderGradientPaint(ParseConicGradient(value, fallbackColor));
+            return new RenderGradientPaint(ParseConicGradient(value, "conic-gradient", repeating: false, fallbackColor));
         }
 
         return new RenderColorPaint(fallbackColor);
     }
 
-    private static RenderGradient ParseLinearGradient(string rawValue, RenderColor fallbackColor)
+    private static RenderGradient ParseLinearGradient(string rawValue, string functionName, bool repeating, RenderColor fallbackColor)
     {
-        var inner = ExtractGradientInnerExpression(rawValue, "linear-gradient");
+        var inner = ExtractGradientInnerExpression(rawValue, functionName);
         var parts = SplitGradientArguments(inner);
         var startIndex = 0;
         var angleDegrees = 90f;
@@ -3550,47 +3568,228 @@ public sealed class HtmlRenderer
         }
 
         var stops = ParseGradientStops(parts.Skip(startIndex).ToArray(), fallbackColor);
-        return new RenderGradient(RenderGradientKind.Linear, stops, AngleDegrees: angleDegrees);
+        return new RenderGradient(RenderGradientKind.Linear, stops, AngleDegrees: angleDegrees, Repeating: repeating);
     }
 
-    private static RenderGradient ParseRadialGradient(string rawValue, RenderColor fallbackColor)
+    private static RenderGradient ParseRadialGradient(string rawValue, string functionName, bool repeating, RenderColor fallbackColor)
     {
-        var inner = ExtractGradientInnerExpression(rawValue, "radial-gradient");
+        var inner = ExtractGradientInnerExpression(rawValue, functionName);
         var parts = SplitGradientArguments(inner);
         var startIndex = 0;
 
-        if (parts.Length > 0)
+        var isCircle = false;
+        var sizeKind = RenderGradientSizeKind.FarthestCorner;
+        float? explicitRadiusX = null;
+        float? explicitRadiusY = null;
+        var centerX = 0.5f;
+        var centerY = 0.5f;
+
+        if (parts.Length > 0 && LooksLikeRadialConfiguration(parts[0]))
         {
-            var first = parts[0].Trim();
-            if (first.StartsWith("circle", StringComparison.OrdinalIgnoreCase) || first.StartsWith("ellipse", StringComparison.OrdinalIgnoreCase))
+            var configText = parts[0].Trim();
+            startIndex = 1;
+
+            var atIndex = configText.IndexOf(" at ", StringComparison.OrdinalIgnoreCase);
+            var shapeSizeText = atIndex >= 0 ? configText[..atIndex].Trim() : configText;
+            var positionText = atIndex >= 0 ? configText[(atIndex + 4)..].Trim() : null;
+
+            ParseRadialShapeAndSize(shapeSizeText, out isCircle, out sizeKind, out explicitRadiusX, out explicitRadiusY);
+
+            if (positionText is not null)
             {
-                startIndex = 1;
+                (centerX, centerY) = ParsePosition(positionText);
             }
         }
 
         var stops = ParseGradientStops(parts.Skip(startIndex).ToArray(), fallbackColor);
-        return new RenderGradient(RenderGradientKind.Radial, stops);
+        return new RenderGradient(
+            RenderGradientKind.Radial,
+            stops,
+            CenterX: centerX,
+            CenterY: centerY,
+            IsCircle: isCircle,
+            Repeating: repeating,
+            SizeKind: sizeKind,
+            ExplicitRadiusX: explicitRadiusX,
+            ExplicitRadiusY: explicitRadiusY);
     }
 
-    private static RenderGradient ParseConicGradient(string rawValue, RenderColor fallbackColor)
+    private static RenderGradient ParseConicGradient(string rawValue, string functionName, bool repeating, RenderColor fallbackColor)
     {
-        var inner = ExtractGradientInnerExpression(rawValue, "conic-gradient");
+        var inner = ExtractGradientInnerExpression(rawValue, functionName);
         var parts = SplitGradientArguments(inner);
         var startIndex = 0;
         var angleDegrees = 0f;
+        var centerX = 0.5f;
+        var centerY = 0.5f;
 
         if (parts.Length > 0)
         {
             var first = parts[0].Trim();
-            if (first.StartsWith("from", StringComparison.OrdinalIgnoreCase))
+
+            if (first.StartsWith("from", StringComparison.OrdinalIgnoreCase) || first.StartsWith("at", StringComparison.OrdinalIgnoreCase))
             {
-                angleDegrees = ParseAngle(first[4..].Trim());
+                var atIndex = first.IndexOf(" at ", StringComparison.OrdinalIgnoreCase);
+                var fromText = atIndex >= 0 ? first[..atIndex].Trim() : first;
+                var positionText = atIndex >= 0
+                    ? first[(atIndex + 4)..].Trim()
+                    : (first.StartsWith("at", StringComparison.OrdinalIgnoreCase) ? first[2..].Trim() : null);
+
+                if (fromText.StartsWith("from", StringComparison.OrdinalIgnoreCase))
+                {
+                    angleDegrees = ParseAngle(fromText[4..].Trim());
+                }
+
+                if (positionText is not null)
+                {
+                    (centerX, centerY) = ParsePosition(positionText);
+                }
+
                 startIndex = 1;
             }
         }
 
-        var stops = ParseGradientStops(parts.Skip(startIndex).ToArray(), fallbackColor);
-        return new RenderGradient(RenderGradientKind.Conic, stops, AngleDegrees: angleDegrees);
+        var stops = ParseGradientStops(parts.Skip(startIndex).ToArray(), fallbackColor, isConic: true);
+        return new RenderGradient(RenderGradientKind.Conic, stops, AngleDegrees: angleDegrees, CenterX: centerX, CenterY: centerY, Repeating: repeating);
+    }
+
+    /// <summary>
+    /// Distinguishes a radial-gradient's leading `&lt;ending-shape&gt; || &lt;size&gt; [at
+    /// &lt;position&gt;]` configuration clause from what is actually just its first color stop -
+    /// a color stop never starts with a shape/size keyword, "at", or a bare length.
+    /// </summary>
+    private static bool LooksLikeRadialConfiguration(string part)
+    {
+        var lower = part.Trim().ToLowerInvariant();
+
+        return lower.StartsWith("circle", StringComparison.Ordinal) ||
+               lower.StartsWith("ellipse", StringComparison.Ordinal) ||
+               lower.StartsWith("closest-", StringComparison.Ordinal) ||
+               lower.StartsWith("farthest-", StringComparison.Ordinal) ||
+               lower.StartsWith("at ", StringComparison.Ordinal) ||
+               lower.Contains(" at ", StringComparison.Ordinal) ||
+               (TryParsePixelValue(lower.Split(' ')[0], out _) && !lower.Contains(','));
+    }
+
+    private static void ParseRadialShapeAndSize(string text, out bool isCircle, out RenderGradientSizeKind sizeKind, out float? explicitRadiusX, out float? explicitRadiusY)
+    {
+        isCircle = false;
+        sizeKind = RenderGradientSizeKind.FarthestCorner;
+        explicitRadiusX = null;
+        explicitRadiusY = null;
+
+        if (string.IsNullOrWhiteSpace(text))
+        {
+            return;
+        }
+
+        var tokens = text.Split(' ', StringSplitOptions.RemoveEmptyEntries);
+        var lengths = new List<float>();
+
+        foreach (var token in tokens)
+        {
+            switch (token.ToLowerInvariant())
+            {
+                case "circle":
+                    isCircle = true;
+                    break;
+                case "ellipse":
+                    isCircle = false;
+                    break;
+                case "closest-side":
+                    sizeKind = RenderGradientSizeKind.ClosestSide;
+                    break;
+                case "farthest-side":
+                    sizeKind = RenderGradientSizeKind.FarthestSide;
+                    break;
+                case "closest-corner":
+                    sizeKind = RenderGradientSizeKind.ClosestCorner;
+                    break;
+                case "farthest-corner":
+                    sizeKind = RenderGradientSizeKind.FarthestCorner;
+                    break;
+                default:
+                    if (TryParsePixelValue(token, out var pixels))
+                    {
+                        lengths.Add(pixels);
+                    }
+
+                    break;
+            }
+        }
+
+        if (lengths.Count > 0)
+        {
+            sizeKind = RenderGradientSizeKind.Explicit;
+            explicitRadiusX = lengths[0];
+            explicitRadiusY = lengths.Count > 1 ? lengths[1] : lengths[0];
+
+            if (lengths.Count == 1)
+            {
+                // A single explicit length implies a circle - CSS grammar doesn't allow one
+                // length with an explicit "ellipse" keyword (that needs two lengths).
+                isCircle = true;
+            }
+        }
+    }
+
+    private static readonly string[] PositionKeywords = ["left", "right", "top", "bottom", "center"];
+
+    /// <summary>
+    /// Parses a CSS `&lt;position&gt;` value (1-2 tokens, keywords and/or percentages, in either
+    /// order for keywords) into fractional (0-1) X/Y coordinates. Absolute lengths (`at 20px
+    /// 10px`) and the 4-value edge-offset syntax are not supported and fall back to center.
+    /// </summary>
+    private static (float X, float Y) ParsePosition(string text)
+    {
+        var tokens = text.Trim().Split(' ', StringSplitOptions.RemoveEmptyEntries);
+
+        if (tokens.Length == 0)
+        {
+            return (0.5f, 0.5f);
+        }
+
+        float? x = null;
+        float? y = null;
+
+        foreach (var token in tokens)
+        {
+            switch (token.ToLowerInvariant())
+            {
+                case "left":
+                    x = 0f;
+                    break;
+                case "right":
+                    x = 1f;
+                    break;
+                case "top":
+                    y = 0f;
+                    break;
+                case "bottom":
+                    y = 1f;
+                    break;
+            }
+        }
+
+        var positionalTokens = tokens.Where(token => !PositionKeywords.Contains(token.ToLowerInvariant())).ToArray();
+        var assignedX = x is not null;
+
+        foreach (var token in positionalTokens)
+        {
+            var value = ParseStopPosition(token);
+
+            if (!assignedX)
+            {
+                x = value;
+                assignedX = true;
+            }
+            else if (y is null)
+            {
+                y = value;
+            }
+        }
+
+        return (x ?? 0.5f, y ?? 0.5f);
     }
 
     private static string ExtractGradientInnerExpression(string rawValue, string functionName)
@@ -3656,7 +3855,7 @@ public sealed class HtmlRenderer
         return parts.ToArray();
     }
 
-    private static IReadOnlyList<RenderGradientStop> ParseGradientStops(string[] parts, RenderColor fallbackColor)
+    private static IReadOnlyList<RenderGradientStop> ParseGradientStops(string[] parts, RenderColor fallbackColor, bool isConic = false)
     {
         if (parts.Length == 0)
         {
@@ -3678,22 +3877,42 @@ public sealed class HtmlRenderer
             var positionToken = separatorIndex >= 0 ? part[(separatorIndex + 1)..].Trim() : string.Empty;
 
             var color = ParseColor(colorToken, fallbackColor);
-            var position = string.IsNullOrWhiteSpace(positionToken)
-                ? (parts.Length == 1 ? 0f : (index / (float)Math.Max(1, parts.Length - 1)))
-                : ParseStopPosition(positionToken);
+            var autoPosition = parts.Length == 1 ? 0f : (index / (float)Math.Max(1, parts.Length - 1));
 
-            stops.Add(new RenderGradientStop(position, color));
+            if (string.IsNullOrWhiteSpace(positionToken))
+            {
+                stops.Add(new RenderGradientStop(autoPosition, color));
+            }
+            else if (!isConic && TryParsePixelValue(positionToken, out var pixels))
+            {
+                // An absolute-length stop position ("red 10px") cannot become a fraction until
+                // the gradient's own rendered geometry (line length/radius) is known, so the raw
+                // pixel value is carried through and resolved by the backend at paint time.
+                stops.Add(new RenderGradientStop(autoPosition, color, pixels));
+            }
+            else
+            {
+                stops.Add(new RenderGradientStop(ParseStopPosition(positionToken, isConic), color));
+            }
         }
 
         return stops;
     }
 
-    private static float ParseStopPosition(string rawPosition)
+    private static float ParseStopPosition(string rawPosition, bool isConic = false)
     {
         var value = rawPosition.Trim();
         if (string.IsNullOrWhiteSpace(value))
         {
             return 0f;
+        }
+
+        // conic-gradient stops are naturally written as angles ("90deg", "0.25turn"), which are a
+        // fraction of the full circle rather than of a linear 0-100% run - resolve those first.
+        if (isConic && TryParseAngle(value, out var angleDegrees))
+        {
+            var normalizedDegrees = ((angleDegrees % 360f) + 360f) % 360f;
+            return Math.Clamp(normalizedDegrees / 360f, 0f, 1f);
         }
 
         if (value.EndsWith("%", StringComparison.Ordinal) &&
@@ -3739,16 +3958,32 @@ public sealed class HtmlRenderer
     private static bool TryParseAngle(string value, out float angleDegrees)
     {
         angleDegrees = 90f;
+        var trimmed = value.Trim();
 
-        if (value.EndsWith("deg", StringComparison.Ordinal) &&
-            float.TryParse(value[..^3].Trim(), NumberStyles.Float, CultureInfo.InvariantCulture, out var degrees))
+        if (trimmed.EndsWith("deg", StringComparison.Ordinal) &&
+            float.TryParse(trimmed[..^3].Trim(), NumberStyles.Float, CultureInfo.InvariantCulture, out var degrees))
         {
             angleDegrees = degrees;
             return true;
         }
 
-        if (value.EndsWith("rad", StringComparison.Ordinal) &&
-            float.TryParse(value[..^3].Trim(), NumberStyles.Float, CultureInfo.InvariantCulture, out var radians))
+        if (trimmed.EndsWith("grad", StringComparison.Ordinal) &&
+            float.TryParse(trimmed[..^4].Trim(), NumberStyles.Float, CultureInfo.InvariantCulture, out var gradians))
+        {
+            angleDegrees = gradians * 0.9f;
+            return true;
+        }
+
+        if (trimmed.EndsWith("turn", StringComparison.Ordinal) &&
+            float.TryParse(trimmed[..^4].Trim(), NumberStyles.Float, CultureInfo.InvariantCulture, out var turns))
+        {
+            angleDegrees = turns * 360f;
+            return true;
+        }
+
+        // Checked after "grad" - "grad" also ends with "rad" and would otherwise be misread here.
+        if (trimmed.EndsWith("rad", StringComparison.Ordinal) &&
+            float.TryParse(trimmed[..^3].Trim(), NumberStyles.Float, CultureInfo.InvariantCulture, out var radians))
         {
             angleDegrees = radians * 180f / (float)Math.PI;
             return true;
@@ -3827,8 +4062,172 @@ public sealed class HtmlRenderer
             return RenderColor.Transparent;
         }
 
+        // Regular box/text colors are normalized by AngleSharp.Css's own computed-style engine
+        // before they ever reach this method (it resolves "red" to an rgb()/hex form itself), so
+        // this named-color table only matters for values this renderer parses from raw CSS text
+        // itself - chiefly gradient stop colors, since a `background-image: linear-gradient(...)`
+        // function's internals are opaque to AngleSharp.Css and are hand-parsed here instead.
+        // Without it, every named gradient stop color silently fell back to the same color,
+        // producing an invisible (fallback-to-fallback) "gradient".
+        if (NamedColors.TryGetValue(color, out var named))
+        {
+            return named;
+        }
+
         return fallback;
     }
+
+    private static readonly IReadOnlyDictionary<string, RenderColor> NamedColors = new Dictionary<string, RenderColor>(StringComparer.OrdinalIgnoreCase)
+    {
+        ["aliceblue"] = new RenderColor(240, 248, 255),
+        ["antiquewhite"] = new RenderColor(250, 235, 215),
+        ["aqua"] = new RenderColor(0, 255, 255),
+        ["aquamarine"] = new RenderColor(127, 255, 212),
+        ["azure"] = new RenderColor(240, 255, 255),
+        ["beige"] = new RenderColor(245, 245, 220),
+        ["bisque"] = new RenderColor(255, 228, 196),
+        ["black"] = new RenderColor(0, 0, 0),
+        ["blanchedalmond"] = new RenderColor(255, 235, 205),
+        ["blue"] = new RenderColor(0, 0, 255),
+        ["blueviolet"] = new RenderColor(138, 43, 226),
+        ["brown"] = new RenderColor(165, 42, 42),
+        ["burlywood"] = new RenderColor(222, 184, 135),
+        ["cadetblue"] = new RenderColor(95, 158, 160),
+        ["chartreuse"] = new RenderColor(127, 255, 0),
+        ["chocolate"] = new RenderColor(210, 105, 30),
+        ["coral"] = new RenderColor(255, 127, 80),
+        ["cornflowerblue"] = new RenderColor(100, 149, 237),
+        ["cornsilk"] = new RenderColor(255, 248, 220),
+        ["crimson"] = new RenderColor(220, 20, 60),
+        ["cyan"] = new RenderColor(0, 255, 255),
+        ["darkblue"] = new RenderColor(0, 0, 139),
+        ["darkcyan"] = new RenderColor(0, 139, 139),
+        ["darkgoldenrod"] = new RenderColor(184, 134, 11),
+        ["darkgray"] = new RenderColor(169, 169, 169),
+        ["darkgreen"] = new RenderColor(0, 100, 0),
+        ["darkgrey"] = new RenderColor(169, 169, 169),
+        ["darkkhaki"] = new RenderColor(189, 183, 107),
+        ["darkmagenta"] = new RenderColor(139, 0, 139),
+        ["darkolivegreen"] = new RenderColor(85, 107, 47),
+        ["darkorange"] = new RenderColor(255, 140, 0),
+        ["darkorchid"] = new RenderColor(153, 50, 204),
+        ["darkred"] = new RenderColor(139, 0, 0),
+        ["darksalmon"] = new RenderColor(233, 150, 122),
+        ["darkseagreen"] = new RenderColor(143, 188, 143),
+        ["darkslateblue"] = new RenderColor(72, 61, 139),
+        ["darkslategray"] = new RenderColor(47, 79, 79),
+        ["darkslategrey"] = new RenderColor(47, 79, 79),
+        ["darkturquoise"] = new RenderColor(0, 206, 209),
+        ["darkviolet"] = new RenderColor(148, 0, 211),
+        ["deeppink"] = new RenderColor(255, 20, 147),
+        ["deepskyblue"] = new RenderColor(0, 191, 255),
+        ["dimgray"] = new RenderColor(105, 105, 105),
+        ["dimgrey"] = new RenderColor(105, 105, 105),
+        ["dodgerblue"] = new RenderColor(30, 144, 255),
+        ["firebrick"] = new RenderColor(178, 34, 34),
+        ["floralwhite"] = new RenderColor(255, 250, 240),
+        ["forestgreen"] = new RenderColor(34, 139, 34),
+        ["fuchsia"] = new RenderColor(255, 0, 255),
+        ["gainsboro"] = new RenderColor(220, 220, 220),
+        ["ghostwhite"] = new RenderColor(248, 248, 255),
+        ["gold"] = new RenderColor(255, 215, 0),
+        ["goldenrod"] = new RenderColor(218, 165, 32),
+        ["gray"] = new RenderColor(128, 128, 128),
+        ["green"] = new RenderColor(0, 128, 0),
+        ["greenyellow"] = new RenderColor(173, 255, 47),
+        ["grey"] = new RenderColor(128, 128, 128),
+        ["honeydew"] = new RenderColor(240, 255, 240),
+        ["hotpink"] = new RenderColor(255, 105, 180),
+        ["indianred"] = new RenderColor(205, 92, 92),
+        ["indigo"] = new RenderColor(75, 0, 130),
+        ["ivory"] = new RenderColor(255, 255, 240),
+        ["khaki"] = new RenderColor(240, 230, 140),
+        ["lavender"] = new RenderColor(230, 230, 250),
+        ["lavenderblush"] = new RenderColor(255, 240, 245),
+        ["lawngreen"] = new RenderColor(124, 252, 0),
+        ["lemonchiffon"] = new RenderColor(255, 250, 205),
+        ["lightblue"] = new RenderColor(173, 216, 230),
+        ["lightcoral"] = new RenderColor(240, 128, 128),
+        ["lightcyan"] = new RenderColor(224, 255, 255),
+        ["lightgoldenrodyellow"] = new RenderColor(250, 250, 210),
+        ["lightgray"] = new RenderColor(211, 211, 211),
+        ["lightgreen"] = new RenderColor(144, 238, 144),
+        ["lightgrey"] = new RenderColor(211, 211, 211),
+        ["lightpink"] = new RenderColor(255, 182, 193),
+        ["lightsalmon"] = new RenderColor(255, 160, 122),
+        ["lightseagreen"] = new RenderColor(32, 178, 170),
+        ["lightskyblue"] = new RenderColor(135, 206, 250),
+        ["lightslategray"] = new RenderColor(119, 136, 153),
+        ["lightslategrey"] = new RenderColor(119, 136, 153),
+        ["lightsteelblue"] = new RenderColor(176, 196, 222),
+        ["lightyellow"] = new RenderColor(255, 255, 224),
+        ["lime"] = new RenderColor(0, 255, 0),
+        ["limegreen"] = new RenderColor(50, 205, 50),
+        ["linen"] = new RenderColor(250, 240, 230),
+        ["magenta"] = new RenderColor(255, 0, 255),
+        ["maroon"] = new RenderColor(128, 0, 0),
+        ["mediumaquamarine"] = new RenderColor(102, 205, 170),
+        ["mediumblue"] = new RenderColor(0, 0, 205),
+        ["mediumorchid"] = new RenderColor(186, 85, 211),
+        ["mediumpurple"] = new RenderColor(147, 112, 219),
+        ["mediumseagreen"] = new RenderColor(60, 179, 113),
+        ["mediumslateblue"] = new RenderColor(123, 104, 238),
+        ["mediumspringgreen"] = new RenderColor(0, 250, 154),
+        ["mediumturquoise"] = new RenderColor(72, 209, 204),
+        ["mediumvioletred"] = new RenderColor(199, 21, 133),
+        ["midnightblue"] = new RenderColor(25, 25, 112),
+        ["mintcream"] = new RenderColor(245, 255, 250),
+        ["mistyrose"] = new RenderColor(255, 228, 225),
+        ["moccasin"] = new RenderColor(255, 228, 181),
+        ["navajowhite"] = new RenderColor(255, 222, 173),
+        ["navy"] = new RenderColor(0, 0, 128),
+        ["oldlace"] = new RenderColor(253, 245, 230),
+        ["olive"] = new RenderColor(128, 128, 0),
+        ["olivedrab"] = new RenderColor(107, 142, 35),
+        ["orange"] = new RenderColor(255, 165, 0),
+        ["orangered"] = new RenderColor(255, 69, 0),
+        ["orchid"] = new RenderColor(218, 112, 214),
+        ["palegoldenrod"] = new RenderColor(238, 232, 170),
+        ["palegreen"] = new RenderColor(152, 251, 152),
+        ["paleturquoise"] = new RenderColor(175, 238, 238),
+        ["palevioletred"] = new RenderColor(219, 112, 147),
+        ["papayawhip"] = new RenderColor(255, 239, 213),
+        ["peachpuff"] = new RenderColor(255, 218, 185),
+        ["peru"] = new RenderColor(205, 133, 63),
+        ["pink"] = new RenderColor(255, 192, 203),
+        ["plum"] = new RenderColor(221, 160, 221),
+        ["powderblue"] = new RenderColor(176, 224, 230),
+        ["purple"] = new RenderColor(128, 0, 128),
+        ["rebeccapurple"] = new RenderColor(102, 51, 153),
+        ["red"] = new RenderColor(255, 0, 0),
+        ["rosybrown"] = new RenderColor(188, 143, 143),
+        ["royalblue"] = new RenderColor(65, 105, 225),
+        ["saddlebrown"] = new RenderColor(139, 69, 19),
+        ["salmon"] = new RenderColor(250, 128, 114),
+        ["sandybrown"] = new RenderColor(244, 164, 96),
+        ["seagreen"] = new RenderColor(46, 139, 87),
+        ["seashell"] = new RenderColor(255, 245, 238),
+        ["sienna"] = new RenderColor(160, 82, 45),
+        ["silver"] = new RenderColor(192, 192, 192),
+        ["skyblue"] = new RenderColor(135, 206, 235),
+        ["slateblue"] = new RenderColor(106, 90, 205),
+        ["slategray"] = new RenderColor(112, 128, 144),
+        ["slategrey"] = new RenderColor(112, 128, 144),
+        ["snow"] = new RenderColor(255, 250, 250),
+        ["springgreen"] = new RenderColor(0, 255, 127),
+        ["steelblue"] = new RenderColor(70, 130, 180),
+        ["tan"] = new RenderColor(210, 180, 140),
+        ["teal"] = new RenderColor(0, 128, 128),
+        ["thistle"] = new RenderColor(216, 191, 216),
+        ["tomato"] = new RenderColor(255, 99, 71),
+        ["turquoise"] = new RenderColor(64, 224, 208),
+        ["violet"] = new RenderColor(238, 130, 238),
+        ["wheat"] = new RenderColor(245, 222, 179),
+        ["white"] = new RenderColor(255, 255, 255),
+        ["whitesmoke"] = new RenderColor(245, 245, 245),
+        ["yellow"] = new RenderColor(255, 255, 0),
+        ["yellowgreen"] = new RenderColor(154, 205, 50),
+    };
 
     private static bool TryParseColorChannel(string raw, out byte value)
     {

@@ -106,51 +106,172 @@ public sealed class SkiaRenderBackend : IRenderBackend, ITextMeasurer
         };
 
         var colors = gradient.Stops.Select(stop => new SKColor(stop.Color.R, stop.Color.G, stop.Color.B, stop.Color.A)).ToArray();
-        var positions = gradient.Stops.Select(stop => stop.Position).ToArray();
 
-        var centerX = rect.X + (rect.Width / 2f);
-        var centerY = rect.Y + (rect.Height / 2f);
-        var radius = (float)Math.Max(rect.Width, rect.Height) / 2f;
+        var centerX = rect.X + (gradient.CenterX * rect.Width);
+        var centerY = rect.Y + (gradient.CenterY * rect.Height);
+        var diagonal = (float)Math.Sqrt((rect.Width * rect.Width) + (rect.Height * rect.Height));
+        var (unscaledRx, unscaledRy) = gradient.Kind == RenderGradientKind.Radial
+            ? ComputeRadialRadii(gradient, rect, centerX, centerY)
+            : (0f, 0f);
+
+        // An absolute-length stop position ("red 10px") only becomes a fraction once the
+        // gradient's own rendered geometry is known - the gradient line's length for linear, the
+        // resolved (pre-repeat-scale) radius for radial. Conic stops use angles, never lengths.
+        var referenceLength = gradient.Kind switch
+        {
+            RenderGradientKind.Linear => diagonal,
+            RenderGradientKind.Radial => Math.Max(unscaledRx, unscaledRy),
+            _ => 0f,
+        };
+
+        var rawPositions = gradient.Stops
+            .Select(stop => stop.AbsolutePositionPixels is { } pixels && referenceLength > 0f
+                ? Math.Clamp(pixels / referenceLength, 0f, 1f)
+                : stop.Position)
+            .ToArray();
+
+        var tileMode = gradient.Repeating ? SKShaderTileMode.Repeat : SKShaderTileMode.Clamp;
+
+        // A repeating-*-gradient's defined stops are one period of an infinitely repeated
+        // pattern. Rescaling every position by the last stop's position makes that period fill
+        // the shader's whole [0,1] domain; shrinking the shader's own geometric extent by the
+        // same factor (see each Create*Shader below) then gives Repeat room to tile the rest.
+        // This assumes the first stop is at/near 0%, the overwhelmingly common case - a repeating
+        // gradient whose first stop is well past 0% renders its period at the right cadence but
+        // not anchored at the exact original offset.
+        var repeatScale = 1f;
+        var positions = rawPositions;
+
+        if (gradient.Repeating && rawPositions.Length > 0)
+        {
+            var maxPosition = rawPositions.Max();
+
+            if (maxPosition > 0f && maxPosition < 1f)
+            {
+                repeatScale = maxPosition;
+                positions = rawPositions.Select(position => position / maxPosition).ToArray();
+            }
+        }
 
         paint.Shader = gradient.Kind switch
         {
-            RenderGradientKind.Linear => CreateLinearGradientShader(gradient, rect),
-            RenderGradientKind.Radial => SKShader.CreateRadialGradient(
-                new SKPoint(centerX, centerY),
-                radius,
-                colors,
-                positions,
-                SKShaderTileMode.Clamp),
-            RenderGradientKind.Conic => SKShader.CreateSweepGradient(
-                new SKPoint(centerX, centerY),
-                colors,
-                positions),
+            RenderGradientKind.Linear => CreateLinearGradientShader(gradient, centerX, centerY, diagonal, colors, positions, tileMode, repeatScale),
+            RenderGradientKind.Radial => CreateRadialGradientShader(centerX, centerY, unscaledRx, unscaledRy, colors, positions, tileMode, repeatScale),
+            RenderGradientKind.Conic => CreateConicGradientShader(gradient, centerX, centerY, colors, positions, tileMode, repeatScale),
             _ => throw new NotSupportedException($"Unsupported gradient kind: {gradient.Kind}"),
         };
 
         return paint;
     }
 
-    private static SKShader CreateLinearGradientShader(RenderGradient gradient, RenderRect rect)
+    private static SKShader CreateLinearGradientShader(RenderGradient gradient, float centerX, float centerY, float diagonal, SKColor[] colors, float[] positions, SKShaderTileMode tileMode, float repeatScale)
     {
-        var centerX = rect.X + (rect.Width / 2f);
-        var centerY = rect.Y + (rect.Height / 2f);
-        var diagonal = Math.Sqrt((rect.Width * rect.Width) + (rect.Height * rect.Height));
-        var halfDiagonal = (float)diagonal / 2f;
+        var halfDiagonal = diagonal / 2f;
         var radians = (gradient.AngleDegrees % 360f + 360f) % 360f;
         var angle = radians * (Math.PI / 180d);
         var dx = (float)Math.Cos(angle);
         var dy = (float)Math.Sin(angle);
 
         var start = new SKPoint(centerX - (dx * halfDiagonal), centerY - (dy * halfDiagonal));
-        var end = new SKPoint(centerX + (dx * halfDiagonal), centerY + (dy * halfDiagonal));
+        var fullEnd = new SKPoint(centerX + (dx * halfDiagonal), centerY + (dy * halfDiagonal));
+        var end = new SKPoint(start.X + ((fullEnd.X - start.X) * repeatScale), start.Y + ((fullEnd.Y - start.Y) * repeatScale));
 
-        return SKShader.CreateLinearGradient(
-            start,
-            end,
-            gradient.Stops.Select(stop => new SKColor(stop.Color.R, stop.Color.G, stop.Color.B, stop.Color.A)).ToArray(),
-            gradient.Stops.Select(stop => stop.Position).ToArray(),
-            SKShaderTileMode.Clamp);
+        return SKShader.CreateLinearGradient(start, end, colors, positions, tileMode);
+    }
+
+    private static SKShader CreateRadialGradientShader(float centerX, float centerY, float unscaledRx, float unscaledRy, SKColor[] colors, float[] positions, SKShaderTileMode tileMode, float repeatScale)
+    {
+        var rx = Math.Max(0.0001f, unscaledRx * repeatScale);
+        var ry = Math.Max(0.0001f, unscaledRy * repeatScale);
+
+        if (Math.Abs(rx - ry) < 0.01f)
+        {
+            // A circle - no elliptical distortion needed, so the plain center+radius overload
+            // (unambiguous, no matrix semantics to get backwards) is enough.
+            return SKShader.CreateRadialGradient(new SKPoint(centerX, centerY), rx, colors, positions, tileMode);
+        }
+
+        // An ellipse: build the gradient as a unit circle at the origin, then use the
+        // constructor-time local-matrix overload to map it onto an ellipse of the right size at
+        // the right position. Verified empirically (not just by API docs) that this matrix maps
+        // the shader's local space directly into world space - i.e. this scales/positions the
+        // visible gradient exactly as constructed, not its inverse.
+        var matrix = new SKMatrix(rx, 0f, centerX, 0f, ry, centerY, 0f, 0f, 1f);
+        return SKShader.CreateRadialGradient(new SKPoint(0f, 0f), 1f, colors, positions, tileMode, matrix);
+    }
+
+    /// <summary>
+    /// Resolves a radial gradient's ending-shape radii from its <see cref="RenderGradientSizeKind"/>,
+    /// matching the CSS `&lt;size&gt;` keyword definitions (farthest-corner is the CSS default).
+    /// </summary>
+    private static (float Rx, float Ry) ComputeRadialRadii(RenderGradient gradient, RenderRect rect, float centerX, float centerY)
+    {
+        if (gradient.SizeKind == RenderGradientSizeKind.Explicit && gradient.ExplicitRadiusX is { } explicitX)
+        {
+            var explicitY = gradient.ExplicitRadiusY ?? explicitX;
+            return gradient.IsCircle ? (explicitX, explicitX) : (explicitX, explicitY);
+        }
+
+        var nearestX = Math.Min(Math.Abs(centerX - rect.X), Math.Abs((rect.X + rect.Width) - centerX));
+        var farthestX = Math.Max(Math.Abs(centerX - rect.X), Math.Abs((rect.X + rect.Width) - centerX));
+        var nearestY = Math.Min(Math.Abs(centerY - rect.Y), Math.Abs((rect.Y + rect.Height) - centerY));
+        var farthestY = Math.Max(Math.Abs(centerY - rect.Y), Math.Abs((rect.Y + rect.Height) - centerY));
+
+        if (gradient.IsCircle)
+        {
+            var radius = gradient.SizeKind switch
+            {
+                RenderGradientSizeKind.ClosestSide => Math.Min(nearestX, nearestY),
+                RenderGradientSizeKind.FarthestSide => Math.Max(farthestX, farthestY),
+                RenderGradientSizeKind.ClosestCorner => (float)Math.Sqrt((nearestX * nearestX) + (nearestY * nearestY)),
+                _ => (float)Math.Sqrt((farthestX * farthestX) + (farthestY * farthestY)),
+            };
+
+            return (radius, radius);
+        }
+
+        return gradient.SizeKind switch
+        {
+            RenderGradientSizeKind.ClosestSide => (nearestX, nearestY),
+            RenderGradientSizeKind.FarthestSide => (farthestX, farthestY),
+            RenderGradientSizeKind.ClosestCorner => EllipseThroughCorner(nearestX, nearestY, rect.Width, rect.Height),
+            _ => EllipseThroughCorner(farthestX, farthestY, rect.Width, rect.Height),
+        };
+    }
+
+    /// <summary>
+    /// The semi-axes of an ellipse that shares the box's aspect ratio and passes through a corner
+    /// offset by (<paramref name="dx"/>, <paramref name="dy"/>) from its center - the CSS
+    /// closest-corner/farthest-corner ellipse sizing algorithm.
+    /// </summary>
+    private static (float Rx, float Ry) EllipseThroughCorner(float dx, float dy, float boxWidth, float boxHeight)
+    {
+        if (boxWidth <= 0f || boxHeight <= 0f)
+        {
+            return (Math.Abs(dx), Math.Abs(dy));
+        }
+
+        var aspect = boxWidth / boxHeight;
+        var ry = (float)Math.Sqrt(((double)dx * dx / (aspect * aspect)) + ((double)dy * dy));
+        var rx = aspect * ry;
+
+        return (rx, ry);
+    }
+
+    private static SKShader CreateConicGradientShader(RenderGradient gradient, float centerX, float centerY, SKColor[] colors, float[] positions, SKShaderTileMode tileMode, float repeatScale)
+    {
+        // Skia's sweep gradient silently degenerates to a zero-width (solid first-color) span
+        // once endAngle exceeds 360 - verified empirically, it does not treat e.g. [270,630] as
+        // "a full revolution starting at 270". So the shader's own angle span always stays a
+        // plain [0, 360*repeatScale], and CSS's "from <angle>" rotation - plus the fact that CSS
+        // conic-gradient's 0deg points up while Skia's sweep 0deg points right, both clockwise
+        // (also verified empirically) - is applied via the constructor-time rotation matrix
+        // instead, the same "shader-local-space maps directly into world-space" mechanism already
+        // used for elliptical radial gradients.
+        var rotation = SKMatrix.CreateRotationDegrees(gradient.AngleDegrees - 90f, centerX, centerY);
+        var endAngle = 360f * repeatScale;
+
+        return SKShader.CreateSweepGradient(new SKPoint(centerX, centerY), colors, positions, tileMode, 0f, endAngle, rotation);
     }
 
     private static void DrawImage(SKCanvas canvas, DrawImageCommand command)
