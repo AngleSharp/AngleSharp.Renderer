@@ -2,6 +2,7 @@
 
 Released on Wednesday, September 9 2026.
 
+- Improved support for clipping and `overflow` declarations
 - Added support for rounded corners
 - Added support for `text-shadow` declarations
 - Added support for `box-shadow` declarations

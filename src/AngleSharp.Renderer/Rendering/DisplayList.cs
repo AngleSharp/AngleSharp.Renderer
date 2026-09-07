@@ -45,6 +45,18 @@ public sealed class DisplayList
     }
 
     /// <summary>
+    /// Begins clipping every command up to the matching <see cref="PopClip"/> to a rectangle
+    /// (`overflow: hidden`/`scroll`/`auto`). Pairs must nest like a stack, matching how a backend
+    /// implements this as a save/clip/restore scope.
+    /// </summary>
+    public void PushClip(RenderRect rect, RenderCornerRadii radii) => Add(new PushClipCommand(rect, radii));
+
+    /// <summary>
+    /// Ends the clip scope started by the matching <see cref="PushClip"/>.
+    /// </summary>
+    public void PopClip() => Add(new PopClipCommand());
+
+    /// <summary>
     /// Adds a filled rectangle command.
     /// </summary>
     public void FillRect(RenderRect rect, RenderColor color) => Add(new FillRectCommand(rect, new RenderColorPaint(color)));
@@ -168,6 +180,17 @@ public sealed record StrokeRoundedRectCommand(RenderRect Rect, RenderColor Color
 /// Paints one `box-shadow` layer relative to an element's border box.
 /// </summary>
 public sealed record DrawBoxShadowCommand(RenderRect BorderBoxRect, RenderCornerRadii BorderBoxRadii, RenderBoxShadow Shadow) : RenderCommand;
+
+/// <summary>
+/// Begins clipping every following command, up to the matching <see cref="PopClipCommand"/>, to
+/// <see cref="Rect"/> (`overflow: hidden`/`scroll`/`auto`).
+/// </summary>
+public sealed record PushClipCommand(RenderRect Rect, RenderCornerRadii Radii) : RenderCommand;
+
+/// <summary>
+/// Ends the clip scope started by the matching <see cref="PushClipCommand"/>.
+/// </summary>
+public sealed record PopClipCommand : RenderCommand;
 
 /// <summary>
 /// Draws a single line of text at a baseline position.

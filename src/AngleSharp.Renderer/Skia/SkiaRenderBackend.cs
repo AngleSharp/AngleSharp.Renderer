@@ -70,6 +70,34 @@ public sealed class SkiaRenderBackend : IRenderBackend, ITextMeasurer
             case DrawTextShadowCommand textShadow:
                 DrawTextShadow(canvas, textShadow, fonts);
                 break;
+            case PushClipCommand pushClip:
+                PushClip(canvas, pushClip);
+                break;
+            case PopClipCommand:
+                canvas.Restore();
+                break;
+        }
+    }
+
+    private static void PushClip(SKCanvas canvas, PushClipCommand command)
+    {
+        canvas.Save();
+
+        var rect = new SKRect(
+            command.Rect.X,
+            command.Rect.Y,
+            command.Rect.X + command.Rect.Width,
+            command.Rect.Y + command.Rect.Height);
+
+        if (command.Radii.IsZero)
+        {
+            canvas.ClipRect(rect, SKClipOperation.Intersect, antialias: true);
+        }
+        else
+        {
+            using var roundRect = new SKRoundRect();
+            roundRect.SetRectRadii(rect, ToSkPoints(command.Radii));
+            canvas.ClipRoundRect(roundRect, SKClipOperation.Intersect, antialias: true);
         }
     }
 

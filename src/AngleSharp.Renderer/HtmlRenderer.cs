@@ -835,16 +835,38 @@ public sealed class HtmlRenderer
             paddingTop,
             paddingBottom);
 
+        var clipsOverflow = ShouldClipOverflow(styleMap);
+
         var boxPaintBuffer = new DisplayList();
         PaintBackground(boxPaintBuffer, box.BackgroundPaint, borderBoxX, borderBoxY, borderBoxWidth, borderBoxHeight, box.BorderRadius);
         PaintBoxShadows(boxPaintBuffer, box.BoxShadows, borderBoxX, borderBoxY, borderBoxWidth, borderBoxHeight, box.BorderRadius);
         PaintBorder(boxPaintBuffer, box.BorderColor, borderBoxX, borderBoxY, borderBoxWidth, borderBoxHeight, box.BorderWidth, box.BorderRadius);
         PaintOutline(boxPaintBuffer, styleMap, borderBoxX, borderBoxY, borderBoxWidth, borderBoxHeight);
+
+        if (clipsOverflow)
+        {
+            // Per spec, overflow clips at the padding edge - content can extend into the padding
+            // but not past it - so the clip rect is the padding box, not the border box. Border
+            // and outline are unaffected because they were already appended above, outside this
+            // clip scope's push.
+            var clipRect = new RenderRect(
+                borderBoxX + borderLeft,
+                borderBoxY + borderTop,
+                Math.Max(0f, borderBoxWidth - borderLeft - borderRight),
+                Math.Max(0f, borderBoxHeight - borderTop - borderBottom));
+            boxPaintBuffer.PushClip(clipRect, box.BorderRadius.ClampToBox(borderBoxWidth, borderBoxHeight));
+        }
+
         displayList.InsertRange(boxPaintInsertIndex, boxPaintBuffer.Commands);
 
         if (TryResolveReplacedElementImage(node, styleMap, flowContainingWidth, borderBoxX + borderLeft + paddingLeft, borderBoxY + borderTop + paddingTop, out var image, out var imageRect))
         {
             displayList.DrawImage(imageRect, image!);
+        }
+
+        if (clipsOverflow)
+        {
+            displayList.PopClip();
         }
 
         if (isFloatLeft)
@@ -1212,11 +1234,29 @@ public sealed class HtmlRenderer
 
         PaintBorder(boxPaintBuffer, box.BorderColor, borderBoxX, borderBoxY, borderBoxWidth, borderBoxHeight, box.BorderWidth, box.BorderRadius);
         PaintOutline(boxPaintBuffer, styleMap, borderBoxX, borderBoxY, borderBoxWidth, borderBoxHeight);
+
+        var clipsOverflow = ShouldClipOverflow(styleMap);
+
+        if (clipsOverflow)
+        {
+            var clipRect = new RenderRect(
+                borderBoxX + borderLeft,
+                borderBoxY + borderTop,
+                Math.Max(0f, borderBoxWidth - borderLeft - borderRight),
+                Math.Max(0f, borderBoxHeight - borderTop - borderBottom));
+            boxPaintBuffer.PushClip(clipRect, box.BorderRadius.ClampToBox(borderBoxWidth, borderBoxHeight));
+        }
+
         displayList.InsertRange(boxPaintInsertIndex, boxPaintBuffer.Commands);
 
         if (TryResolveReplacedElementImage(node, styleMap, containingWidth, borderBoxX + borderLeft + paddingLeft, borderBoxY + borderTop + paddingTop, out var image, out var imageRect))
         {
             displayList.DrawImage(imageRect, image!);
+        }
+
+        if (clipsOverflow)
+        {
+            displayList.PopClip();
         }
 
         cursorY = flowBorderBoxY + borderBoxHeight;
@@ -1836,7 +1876,25 @@ public sealed class HtmlRenderer
 
         PaintBorder(boxPaintBuffer, box.BorderColor, borderBoxX, borderBoxY, borderBoxWidth, borderBoxHeight, box.BorderWidth, box.BorderRadius);
         PaintOutline(boxPaintBuffer, styleMap, borderBoxX, borderBoxY, borderBoxWidth, borderBoxHeight);
+
+        var clipsOverflow = ShouldClipOverflow(styleMap);
+
+        if (clipsOverflow)
+        {
+            var clipRect = new RenderRect(
+                borderBoxX + borderLeft,
+                borderBoxY + borderTop,
+                Math.Max(0f, borderBoxWidth - borderLeft - borderRight),
+                Math.Max(0f, borderBoxHeight - borderTop - borderBottom));
+            boxPaintBuffer.PushClip(clipRect, box.BorderRadius.ClampToBox(borderBoxWidth, borderBoxHeight));
+        }
+
         displayList.InsertRange(boxPaintInsertIndex, boxPaintBuffer.Commands);
+
+        if (clipsOverflow)
+        {
+            displayList.PopClip();
+        }
 
         cursorY = flowBorderBoxY + borderBoxHeight;
         previousBlockMarginBottom = effectiveMarginBottom + context.ParagraphSpacing;
@@ -2736,6 +2794,10 @@ public sealed class HtmlRenderer
         AddIfPresent(map, "list-style-type", style.GetPropertyValue("list-style-type"));
         AddIfPresent(map, "list-style-position", style.GetPropertyValue("list-style-position"));
 
+        AddIfPresent(map, "overflow", style.GetPropertyValue("overflow"));
+        AddIfPresent(map, "overflow-x", style.GetPropertyValue("overflow-x"));
+        AddIfPresent(map, "overflow-y", style.GetPropertyValue("overflow-y"));
+
         AddIfPresent(map, "outline-width", style.GetPropertyValue("outline-width"));
         AddIfPresent(map, "outline-style", style.GetPropertyValue("outline-style"));
         AddIfPresent(map, "outline-color", style.GetPropertyValue("outline-color"));
@@ -3619,6 +3681,32 @@ public sealed class HtmlRenderer
 
         return isInside ? textStyle with { TextIndent = textStyle.TextIndent + markerWidth + MarkerGap } : textStyle;
     }
+
+    /// <summary>
+    /// Whether an element's `overflow` clips its content. `scroll` and `auto` are treated the
+    /// same as `hidden`: a rendered PNG has no scrollbars or interactivity, so anything a browser
+    /// would let the user scroll to reveal is, here, simply clipped away like `hidden`.
+    /// </summary>
+    private static bool ShouldClipOverflow(Dictionary<string, string> styleMap) =>
+        IsClippingOverflowValue(ResolveOverflowAxis(styleMap, "overflow-x")) ||
+        IsClippingOverflowValue(ResolveOverflowAxis(styleMap, "overflow-y"));
+
+    /// <summary>
+    /// Resolves one overflow axis. AngleSharp.Css's `overflow` shorthand does not decompose into
+    /// `overflow-x`/`overflow-y` in its computed style (verified empirically) - unlike a real
+    /// cascade, the longhand and shorthand never coexist in the computed declaration here, so the
+    /// longhand is preferred when both happen to be present and the shorthand is used as a
+    /// fallback, rather than needing to resolve cascade precedence between them.
+    /// </summary>
+    private static string ResolveOverflowAxis(Dictionary<string, string> styleMap, string longhandProperty) =>
+        styleMap.TryGetValue(longhandProperty, out var axisValue) && !string.IsNullOrWhiteSpace(axisValue)
+            ? axisValue.Trim().ToLowerInvariant()
+            : styleMap.TryGetValue("overflow", out var shorthandValue) && !string.IsNullOrWhiteSpace(shorthandValue)
+                ? shorthandValue.Trim().ToLowerInvariant()
+                : "visible";
+
+    private static bool IsClippingOverflowValue(string overflowValue) =>
+        overflowValue is "hidden" or "scroll" or "auto";
 
     private static string ResolveListStyleType(Dictionary<string, string> styleMap) =>
         styleMap.TryGetValue("list-style-type", out var value) && !string.IsNullOrWhiteSpace(value)

@@ -1931,6 +1931,133 @@ public sealed class VisualConformanceTests
           maxDifferentPixels: TextRenderingToleranceMaxPixels);
     }
 
+    [Fact]
+    public async Task RenderToPng_ClipsOverflowHiddenContentToBox()
+    {
+        var document = await ParseAsync("""
+            <html>
+              <head>
+                <style>html, body { margin: 0; padding: 0; }</style>
+              </head>
+              <body>
+                <div style="margin:10px; width:50px; height:30px; overflow:hidden; background-color:rgb(230,230,230); position:relative;">
+                    <div style="position:absolute; left:20px; top:10px; width:60px; height:60px; background-color:rgb(255,0,0);"></div>
+                </div>
+              </body>
+            </html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var image = renderer.RenderToPng(document, new DefaultRenderDevice
+        {
+            ViewPortWidth = 100,
+            ViewPortHeight = 80,
+        });
+
+        VisualSnapshotVerifier.VerifyOrCreate(
+          snapshotName: "clips-overflow-hidden-content-to-box.png",
+          actualPng: image.Data,
+          perChannelTolerance: 0,
+          maxDifferentPixels: 0);
+    }
+
+    [Fact]
+    public async Task RenderToPng_DoesNotClipOverflowVisibleContent()
+    {
+        var document = await ParseAsync("""
+            <html>
+              <head>
+                <style>html, body { margin: 0; padding: 0; }</style>
+              </head>
+              <body>
+                <div style="margin:10px; width:50px; height:30px; background-color:rgb(230,230,230); position:relative;">
+                    <div style="position:absolute; left:20px; top:10px; width:60px; height:60px; background-color:rgb(255,0,0);"></div>
+                </div>
+              </body>
+            </html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var image = renderer.RenderToPng(document, new DefaultRenderDevice
+        {
+            ViewPortWidth = 100,
+            ViewPortHeight = 80,
+        });
+
+        VisualSnapshotVerifier.VerifyOrCreate(
+          snapshotName: "does-not-clip-overflow-visible-content.png",
+          actualPng: image.Data,
+          perChannelTolerance: 0,
+          maxDifferentPixels: 0);
+    }
+
+    [Fact]
+    public async Task RenderToPng_ClipsToRoundedShapeWithBorderRadius()
+    {
+        var document = await ParseAsync("""
+            <html>
+              <head>
+                <style>html, body { margin: 0; padding: 0; }</style>
+              </head>
+              <body>
+                <div style="margin:10px; width:60px; height:60px; border-radius:16px; overflow:hidden; position:relative;">
+                    <div style="position:absolute; left:-10px; top:-10px; width:100px; height:100px; background-color:rgb(0,120,215);"></div>
+                </div>
+              </body>
+            </html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var image = renderer.RenderToPng(document, new DefaultRenderDevice
+        {
+            ViewPortWidth = 100,
+            ViewPortHeight = 100,
+        });
+
+        VisualSnapshotVerifier.VerifyOrCreate(
+          snapshotName: "clips-to-rounded-shape-with-border-radius.png",
+          actualPng: image.Data,
+          perChannelTolerance: 0,
+          maxDifferentPixels: 0);
+    }
+
+    [Fact]
+    public async Task RenderToPng_ClipsOversizedNormalFlowChildToBox()
+    {
+        // A child's own explicit width is not constrained by its parent's - a plain, normal-flow
+        // (non-absolute) child can be wider than its container, which is a common real-world
+        // overflow trigger (an oversized image, a wide table, ...), distinct from the
+        // position:absolute escape the other tests here use. The child is deliberately no taller
+        // than the parent's own height, since this renderer's auto content height always grows to
+        // fit a normal-flow child vertically (height behaves like a floor, not a cap) - so a
+        // taller child would just grow the parent instead of overflowing it.
+        var document = await ParseAsync("""
+            <html>
+              <head>
+                <style>html, body { margin: 0; padding: 0; }</style>
+              </head>
+              <body>
+                <div style="margin:10px; width:40px; height:30px; overflow:hidden; background-color:rgb(230,230,230);">
+                    <div style="width:80px; height:20px; background-color:rgb(255,0,0);"></div>
+                </div>
+              </body>
+            </html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var image = renderer.RenderToPng(document, new DefaultRenderDevice
+        {
+            ViewPortWidth = 100,
+            ViewPortHeight = 100,
+        });
+
+        VisualSnapshotVerifier.VerifyOrCreate(
+          snapshotName: "clips-oversized-normal-flow-child-to-box.png",
+          actualPng: image.Data,
+          perChannelTolerance: 0,
+          maxDifferentPixels: 0);
+    }
+
     private static async Task<byte[]> RenderCanvasSnapshotAsync(string html, Action<Canvas2DRenderingContext> draw)
     {
         var context = BrowsingContext.New(Configuration.Default.WithCss().WithRendering());

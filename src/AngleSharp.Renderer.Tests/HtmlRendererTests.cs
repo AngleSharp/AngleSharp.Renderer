@@ -2450,6 +2450,189 @@ public sealed class HtmlRendererTests
         Assert.True(text.X > marker.Rect.X);
     }
 
+    [Fact]
+    public async Task BuildDisplayList_DoesNotClipWhenOverflowIsVisible()
+    {
+        var document = await ParseAsync("""
+            <html><body>
+                <div style="width:50px; height:20px;"><p>Hi</p></div>
+            </body></html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, new DefaultRenderDevice
+        {
+            ViewPortWidth = 300,
+            ViewPortHeight = 200,
+        });
+
+        Assert.Empty(displayList.Commands.OfType<PushClipCommand>());
+        Assert.Empty(displayList.Commands.OfType<PopClipCommand>());
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_PushesClipToPaddingBoxWhenOverflowHidden()
+    {
+        var document = await ParseAsync("""
+            <html><body>
+                <div style="width:100px; height:50px; border:5px solid black; padding:3px; overflow:hidden;"><p>Hi</p></div>
+            </body></html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, new DefaultRenderDevice
+        {
+            ViewPortWidth = 300,
+            ViewPortHeight = 200,
+        });
+
+        var push = Assert.Single(displayList.Commands.OfType<PushClipCommand>());
+        Assert.Single(displayList.Commands.OfType<PopClipCommand>());
+
+        // The border box is 100 + 2*5 (border) + 2*3 (padding) = 116 wide; the clip region is the
+        // padding box, which excludes the border but includes the padding: border box minus the
+        // 5px border on each side.
+        Assert.Equal(5f, push.Rect.X);
+        Assert.Equal(5f, push.Rect.Y);
+        Assert.Equal(106f, push.Rect.Width);
+        Assert.Equal(56f, push.Rect.Height);
+    }
+
+    [Theory]
+    [InlineData("scroll")]
+    [InlineData("auto")]
+    [InlineData("hidden")]
+    public async Task BuildDisplayList_ClipsForScrollAutoAndHiddenOverflow(string overflowValue)
+    {
+        var document = await ParseAsync($$"""
+            <html><body>
+                <div style="width:50px; height:20px; overflow:{{overflowValue}};"><p>Hi</p></div>
+            </body></html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, new DefaultRenderDevice
+        {
+            ViewPortWidth = 300,
+            ViewPortHeight = 200,
+        });
+
+        Assert.Single(displayList.Commands.OfType<PushClipCommand>());
+        Assert.Single(displayList.Commands.OfType<PopClipCommand>());
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_ClipsWhenEitherOverflowAxisIsHidden()
+    {
+        var document = await ParseAsync("""
+            <html><body>
+                <div style="width:50px; height:20px; overflow-x:hidden; overflow-y:visible;"><p>Hi</p></div>
+            </body></html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, new DefaultRenderDevice
+        {
+            ViewPortWidth = 300,
+            ViewPortHeight = 200,
+        });
+
+        // This renderer clips with a single rectangle covering both axes together whenever either
+        // axis requests clipping - it does not clip one axis while leaving the other open.
+        Assert.Single(displayList.Commands.OfType<PushClipCommand>());
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_ClipWrapsChildContentBetweenPushAndPop()
+    {
+        var document = await ParseAsync("""
+            <html><body>
+                <div style="width:50px; height:20px; overflow:hidden;"><p>Hi</p></div>
+            </body></html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, new DefaultRenderDevice
+        {
+            ViewPortWidth = 300,
+            ViewPortHeight = 200,
+        });
+
+        var commands = displayList.Commands.ToArray();
+        var pushIndex = Array.FindIndex(commands, c => c is PushClipCommand);
+        var popIndex = Array.FindIndex(commands, c => c is PopClipCommand);
+        var textIndex = Array.FindIndex(commands, c => c is DrawTextCommand t && t.Text == "Hi");
+
+        Assert.True(pushIndex >= 0);
+        Assert.True(popIndex > pushIndex);
+        Assert.True(textIndex > pushIndex && textIndex < popIndex);
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_ClipShapeFollowsBorderRadius()
+    {
+        var document = await ParseAsync("""
+            <html><body>
+                <div style="width:100px; height:50px; border-radius:12px; overflow:hidden;"><p>Hi</p></div>
+            </body></html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, new DefaultRenderDevice
+        {
+            ViewPortWidth = 300,
+            ViewPortHeight = 200,
+        });
+
+        var push = Assert.Single(displayList.Commands.OfType<PushClipCommand>());
+        Assert.False(push.Radii.IsZero);
+        Assert.Equal(12f, push.Radii.TopLeftX);
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_ClipsFlexContainerToOwnBounds()
+    {
+        var document = await ParseAsync("""
+            <html><body>
+                <div style="display:flex; width:80px; height:30px; overflow:hidden;">
+                    <div style="width:20px; height:20px;">Hi</div>
+                </div>
+            </body></html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, new DefaultRenderDevice
+        {
+            ViewPortWidth = 300,
+            ViewPortHeight = 200,
+        });
+
+        Assert.Single(displayList.Commands.OfType<PushClipCommand>());
+        Assert.Single(displayList.Commands.OfType<PopClipCommand>());
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_ClipsGridContainerToOwnBounds()
+    {
+        var document = await ParseAsync("""
+            <html><body>
+                <div style="display:grid; grid-template-columns: 1fr; width:80px; height:30px; overflow:hidden;">
+                    <div style="width:20px; height:20px;">Hi</div>
+                </div>
+            </body></html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, new DefaultRenderDevice
+        {
+            ViewPortWidth = 300,
+            ViewPortHeight = 200,
+        });
+
+        Assert.Single(displayList.Commands.OfType<PushClipCommand>());
+        Assert.Single(displayList.Commands.OfType<PopClipCommand>());
+    }
+
     private static async Task<AngleSharp.Dom.IDocument> ParseAsync(string html, IConfiguration? configuration = null, string? address = null)
     {
         var context = BrowsingContext.New(configuration ?? Configuration.Default.WithCss());
