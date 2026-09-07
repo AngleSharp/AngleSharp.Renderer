@@ -8,6 +8,7 @@ Released on Monday, September 7 2026.
 - Added rendering images
 - Added flexbox layout mode
 - Added grid layout mode
+- Added support for SVG (images, inline, ...)
 - Added CSSOM View specification
 
 # 0.2.0

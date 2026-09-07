@@ -24,6 +24,8 @@ public sealed class HtmlRenderer
 {
     // Per-document cache keeps image payloads stable across repeated renders of the same DOM instance.
     private static readonly ConditionalWeakTable<IDocument, DocumentImageCache> s_imageCacheByDocument = new();
+    // Inline <svg> markup has no URL to key a per-document cache on, so it is cached per element instead.
+    private static readonly ConditionalWeakTable<IElement, CachedImageResource> s_inlineSvgCacheByElement = new();
     private static readonly AsyncLocal<LayoutCapture?> s_layoutCapture = new();
     private static readonly ITextMeasurer s_defaultTextMeasurer = new SkiaTextMeasurer();
 
@@ -410,7 +412,7 @@ public sealed class HtmlRenderer
             return;
         }
 
-        var renderAsBlock = ShouldRenderAsBlock(computedStyle) || string.Equals(tagName, "img", StringComparison.OrdinalIgnoreCase);
+        var renderAsBlock = ShouldRenderAsBlock(computedStyle) || IsReplacedElementTag(tagName);
         var isInlineBlock = IsInlineBlock(computedStyle);
         var currentTextStyle = ResolveTextStyle(styleMap, inheritedTextStyle);
 
@@ -558,7 +560,12 @@ public sealed class HtmlRenderer
         var inlineLineHeight = currentTextStyle.FontSize * currentTextStyle.LineHeightMultiplier;
         var inlineCursorX = flowContainingX + (textIndentConsumed ? 0f : currentTextStyle.TextIndent);
 
-        var orderedChildren = OrderChildrenForPainting(node.Children).ToList();
+        // An <svg> root's children are foreign-namespaced SVG elements (circle, text, title, ...),
+        // not HTML flow content; it is rasterized as a single replaced element below, so its
+        // subtree must never be walked as if it were normal inline/block content.
+        var orderedChildren = string.Equals(tagName, "svg", StringComparison.OrdinalIgnoreCase)
+            ? []
+            : OrderChildrenForPainting(node.Children).ToList();
         var hasInlineRun = orderedChildren.Any(child =>
             (child is ElementRenderNode childElement &&
              !ShouldRenderAsBlock(childElement.ComputedStyle) &&
@@ -820,8 +827,7 @@ public sealed class HtmlRenderer
         PaintBorder(displayList, box.BorderColor, borderBoxX, borderBoxY, borderBoxWidth, borderBoxHeight, box.BorderWidth);
         PaintOutline(displayList, styleMap, borderBoxX, borderBoxY, borderBoxWidth, borderBoxHeight);
 
-        if (string.Equals(tagName, "img", StringComparison.OrdinalIgnoreCase) &&
-            TryResolveImage(node, styleMap, flowContainingWidth, borderBoxX + borderLeft + paddingLeft, borderBoxY + borderTop + paddingTop, out var image, out var imageRect))
+        if (TryResolveReplacedElementImage(node, styleMap, flowContainingWidth, borderBoxX + borderLeft + paddingLeft, borderBoxY + borderTop + paddingTop, out var image, out var imageRect))
         {
             displayList.DrawImage(imageRect, image!);
         }
@@ -1183,8 +1189,7 @@ public sealed class HtmlRenderer
         PaintBorder(displayList, box.BorderColor, borderBoxX, borderBoxY, borderBoxWidth, borderBoxHeight, box.BorderWidth);
         PaintOutline(displayList, styleMap, borderBoxX, borderBoxY, borderBoxWidth, borderBoxHeight);
 
-        if (string.Equals(node.Ref.LocalName, "img", StringComparison.OrdinalIgnoreCase) &&
-            TryResolveImage(node, styleMap, containingWidth, borderBoxX + borderLeft + paddingLeft, borderBoxY + borderTop + paddingTop, out var image, out var imageRect))
+        if (TryResolveReplacedElementImage(node, styleMap, containingWidth, borderBoxX + borderLeft + paddingLeft, borderBoxY + borderTop + paddingTop, out var image, out var imageRect))
         {
             displayList.DrawImage(imageRect, image!);
         }
@@ -3024,6 +3029,14 @@ public sealed class HtmlRenderer
             new EdgeSizes(outlineWidth, outlineWidth, outlineWidth, outlineWidth));
     }
 
+    private static bool IsReplacedElementTag(string tagName) =>
+        string.Equals(tagName, "img", StringComparison.OrdinalIgnoreCase) ||
+        string.Equals(tagName, "svg", StringComparison.OrdinalIgnoreCase);
+
+    private static bool TryResolveReplacedElementImage(ElementRenderNode node, Dictionary<string, string> styleMap, float containingWidth, float x, float y, out RenderedImage? image, out RenderRect rect) =>
+        TryResolveImage(node, styleMap, containingWidth, x, y, out image, out rect) ||
+        TryResolveInlineSvg(node, styleMap, containingWidth, x, y, out image, out rect);
+
     private static bool TryResolveImage(ElementRenderNode node, Dictionary<string, string> styleMap, float containingWidth, float x, float y, out RenderedImage? image, out RenderRect rect)
     {
         image = null;
@@ -3039,6 +3052,32 @@ public sealed class HtmlRenderer
         {
             return false;
         }
+
+        return TryResolveReplacedElementRect(imageResource, styleMap, containingWidth, x, y, out image, out rect);
+    }
+
+    private static bool TryResolveInlineSvg(ElementRenderNode node, Dictionary<string, string> styleMap, float containingWidth, float x, float y, out RenderedImage? image, out RenderRect rect)
+    {
+        image = null;
+        rect = default;
+
+        if (!string.Equals(node.Ref.LocalName, "svg", StringComparison.OrdinalIgnoreCase))
+        {
+            return false;
+        }
+
+        if (!TryGetOrLoadInlineSvgResource(node.Ref, out var imageResource) || imageResource is null)
+        {
+            return false;
+        }
+
+        return TryResolveReplacedElementRect(imageResource, styleMap, containingWidth, x, y, out image, out rect);
+    }
+
+    private static bool TryResolveReplacedElementRect(CachedImageResource imageResource, Dictionary<string, string> styleMap, float containingWidth, float x, float y, out RenderedImage? image, out RenderRect rect)
+    {
+        image = null;
+        rect = default;
 
         var width = ParseLength(styleMap, "width", containingWidth, float.NaN, allowAuto: true);
         var height = ParseLength(styleMap, "height", containingWidth, float.NaN, allowAuto: true);
@@ -3068,6 +3107,39 @@ public sealed class HtmlRenderer
 
         image = new RenderedImage(imageResource.Bytes, (int)Math.Max(1, Math.Round(width)), (int)Math.Max(1, Math.Round(height)), imageResource.MimeType);
         rect = new RenderRect(x, y, width, height);
+        return true;
+    }
+
+    private static bool TryGetOrLoadInlineSvgResource(IElement element, out CachedImageResource? imageResource)
+    {
+        if (s_inlineSvgCacheByElement.TryGetValue(element, out var cached))
+        {
+            imageResource = cached;
+            return true;
+        }
+
+        if (!TryRasterizeInlineSvgElement(element, out imageResource) || imageResource is null)
+        {
+            return false;
+        }
+
+        s_inlineSvgCacheByElement.AddOrUpdate(element, imageResource);
+        return true;
+    }
+
+    private static bool TryRasterizeInlineSvgElement(IElement element, out CachedImageResource? imageResource)
+    {
+        imageResource = null;
+
+        // The already-parsed element is walked directly - AngleSharp parsed this SVG once, as
+        // part of the host document, and it is never serialized back to text and re-parsed. Only
+        // the SVG's own presentation attributes/style apply - page CSS never cascades into it.
+        if (!SvgRasterizer.TryRasterizeElement(element, out var pngBytes, out var naturalWidth, out var naturalHeight))
+        {
+            return false;
+        }
+
+        imageResource = new CachedImageResource(pngBytes, "image/png", naturalWidth, naturalHeight);
         return true;
     }
 
@@ -3164,6 +3236,17 @@ public sealed class HtmlRenderer
         if (bytes is null || bytes.Length == 0)
         {
             return false;
+        }
+
+        if (SvgRasterizer.IsSvg(bytes))
+        {
+            if (!SvgRasterizer.TryRasterizeMarkup(bytes, out var rasterizedBytes, out var svgNaturalWidth, out var svgNaturalHeight))
+            {
+                return false;
+            }
+
+            imageResource = new CachedImageResource(rasterizedBytes, "image/png", svgNaturalWidth, svgNaturalHeight);
+            return true;
         }
 
         using var skImage = SKImage.FromEncodedData(bytes);

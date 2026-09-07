@@ -92,6 +92,79 @@ public sealed class HtmlRendererTests
     }
 
     [Fact]
+    public async Task BuildDisplayList_PaintsSvgImageElementFromDataUri()
+    {
+        var document = await ParseAsync("""
+            <html><body>
+                <img src="data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHdpZHRoPSIxMCIgaGVpZ2h0PSIxMCI+PHJlY3Qgd2lkdGg9IjEwIiBoZWlnaHQ9IjEwIiBmaWxsPSJyZWQiLz48L3N2Zz4=" style="width:40px; height:40px;" />
+            </body></html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, new DefaultRenderDevice
+        {
+            ViewPortWidth = 240,
+            ViewPortHeight = 160,
+            FontSize = 16f,
+        });
+
+        var imageCommand = Assert.Single(displayList.Commands.OfType<DrawImageCommand>());
+        Assert.Equal(40f, imageCommand.Rect.Width);
+        Assert.Equal(40f, imageCommand.Rect.Height);
+        Assert.NotEmpty(imageCommand.Image.Data);
+        Assert.Equal("image/png", imageCommand.Image.MimeType);
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_PaintsInlineSvgAsReplacedElement()
+    {
+        var document = await ParseAsync("""
+            <html><body>
+                <svg width="10" height="10" viewBox="0 0 10 10">
+                    <circle cx="5" cy="5" r="4" fill="green"></circle>
+                </svg>
+            </body></html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, new DefaultRenderDevice
+        {
+            ViewPortWidth = 240,
+            ViewPortHeight = 160,
+            FontSize = 16f,
+        });
+
+        var imageCommand = Assert.Single(displayList.Commands.OfType<DrawImageCommand>());
+        Assert.Equal(10f, imageCommand.Rect.Width);
+        Assert.Equal(10f, imageCommand.Rect.Height);
+        Assert.NotEmpty(imageCommand.Image.Data);
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_IgnoresInlineSvgTitleTextContent()
+    {
+        var document = await ParseAsync("""
+            <html><body>
+                <svg width="10" height="10" viewBox="0 0 10 10">
+                    <title>This must not be painted as page text</title>
+                    <circle cx="5" cy="5" r="4" fill="green"></circle>
+                </svg>
+            </body></html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, new DefaultRenderDevice
+        {
+            ViewPortWidth = 240,
+            ViewPortHeight = 160,
+            FontSize = 16f,
+        });
+
+        Assert.Single(displayList.Commands.OfType<DrawImageCommand>());
+        Assert.DoesNotContain(displayList.Commands.OfType<DrawTextCommand>(), command => command.Text.Contains("must not be painted"));
+    }
+
+    [Fact]
     public async Task BuildDisplayList_ParsesLinearGradientBackgrounds()
     {
         var document = await ParseAsync("""

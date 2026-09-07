@@ -512,6 +512,646 @@ public sealed class VisualConformanceTests
           maxDifferentPixels: 0);
     }
 
+    [Fact]
+    public async Task RenderToPng_RendersSvgImageSource()
+    {
+        var document = await ParseAsync("""
+            <html>
+              <head>
+                <style>html, body { margin: 0; padding: 0; }</style>
+              </head>
+              <body>
+                <img src="data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHdpZHRoPSIxMCIgaGVpZ2h0PSIxMCI+PHJlY3Qgd2lkdGg9IjEwIiBoZWlnaHQ9IjEwIiBmaWxsPSJyZWQiLz48L3N2Zz4=" style="width:60px; height:60px;" />
+              </body>
+            </html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var image = renderer.RenderToPng(document, new DefaultRenderDevice
+        {
+            ViewPortWidth = 100,
+            ViewPortHeight = 100,
+        });
+
+        VisualSnapshotVerifier.VerifyOrCreate(
+          snapshotName: "renders-svg-image-source.png",
+          actualPng: image.Data,
+          perChannelTolerance: 0,
+          maxDifferentPixels: 0);
+    }
+
+    [Fact]
+    public async Task RenderToPng_RendersInlineSvgShapes()
+    {
+        var document = await ParseAsync("""
+            <html>
+              <head>
+                <style>html, body { margin: 0; padding: 0; }</style>
+              </head>
+              <body>
+                <svg width="60" height="60" viewBox="0 0 60 60">
+                  <rect x="0" y="0" width="60" height="60" fill="rgb(0,0,255)"></rect>
+                  <circle cx="30" cy="30" r="20" fill="rgb(0,255,0)"></circle>
+                </svg>
+              </body>
+            </html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var image = renderer.RenderToPng(document, new DefaultRenderDevice
+        {
+            ViewPortWidth = 100,
+            ViewPortHeight = 100,
+        });
+
+        VisualSnapshotVerifier.VerifyOrCreate(
+          snapshotName: "renders-inline-svg-shapes.png",
+          actualPng: image.Data,
+          perChannelTolerance: 0,
+          maxDifferentPixels: 0);
+    }
+
+    [Fact]
+    public async Task RenderToPng_RendersInlineSvgPathAndTransform()
+    {
+        var document = await ParseAsync("""
+            <html>
+              <head>
+                <style>html, body { margin: 0; padding: 0; }</style>
+              </head>
+              <body>
+                <svg width="100" height="100" viewBox="0 0 100 100">
+                  <path d="M10 10 L70 10 A20 20 0 0 1 70 50 L10 50 Z" fill="rgb(255,140,0)"></path>
+                  <g transform="translate(75,75) rotate(45)">
+                    <rect x="-10" y="-10" width="20" height="20" fill="rgb(128,0,128)"></rect>
+                  </g>
+                </svg>
+              </body>
+            </html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var image = renderer.RenderToPng(document, new DefaultRenderDevice
+        {
+            ViewPortWidth = 100,
+            ViewPortHeight = 100,
+        });
+
+        VisualSnapshotVerifier.VerifyOrCreate(
+          snapshotName: "renders-inline-svg-path-and-transform.png",
+          actualPng: image.Data,
+          perChannelTolerance: 0,
+          maxDifferentPixels: 0);
+    }
+
+    [Fact]
+    public async Task RenderToPng_RendersInlineSvgLinearGradient()
+    {
+        var document = await ParseAsync("""
+            <html>
+              <head>
+                <style>html, body { margin: 0; padding: 0; }</style>
+              </head>
+              <body>
+                <svg width="100" height="100" viewBox="0 0 100 100">
+                  <defs>
+                    <linearGradient id="g" x1="0" y1="0" x2="1" y2="0">
+                      <stop offset="0" stop-color="rgb(255,0,0)"></stop>
+                      <stop offset="1" stop-color="rgb(0,0,255)"></stop>
+                    </linearGradient>
+                  </defs>
+                  <rect x="0" y="0" width="100" height="100" fill="url(#g)"></rect>
+                </svg>
+              </body>
+            </html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var image = renderer.RenderToPng(document, new DefaultRenderDevice
+        {
+            ViewPortWidth = 100,
+            ViewPortHeight = 100,
+        });
+
+        VisualSnapshotVerifier.VerifyOrCreate(
+          snapshotName: "renders-inline-svg-linear-gradient.png",
+          actualPng: image.Data,
+          perChannelTolerance: 0,
+          maxDifferentPixels: 0);
+    }
+
+    [Fact]
+    public async Task RenderToPng_RendersInlineSvgRadialGradient()
+    {
+        var document = await ParseAsync("""
+            <html>
+              <head>
+                <style>html, body { margin: 0; padding: 0; }</style>
+              </head>
+              <body>
+                <svg width="100" height="100" viewBox="0 0 100 100">
+                  <defs>
+                    <radialGradient id="g" cx="0.5" cy="0.5" r="0.5">
+                      <stop offset="0" stop-color="rgb(255,255,0)"></stop>
+                      <stop offset="1" stop-color="rgb(0,128,0)"></stop>
+                    </radialGradient>
+                  </defs>
+                  <circle cx="50" cy="50" r="45" fill="url(#g)"></circle>
+                </svg>
+              </body>
+            </html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var image = renderer.RenderToPng(document, new DefaultRenderDevice
+        {
+            ViewPortWidth = 100,
+            ViewPortHeight = 100,
+        });
+
+        VisualSnapshotVerifier.VerifyOrCreate(
+          snapshotName: "renders-inline-svg-radial-gradient.png",
+          actualPng: image.Data,
+          perChannelTolerance: 0,
+          maxDifferentPixels: 0);
+    }
+
+    [Fact]
+    public async Task RenderToPng_RendersInlineSvgUseElement()
+    {
+        var document = await ParseAsync("""
+            <html>
+              <head>
+                <style>html, body { margin: 0; padding: 0; }</style>
+              </head>
+              <body>
+                <svg width="100" height="50" viewBox="0 0 100 50">
+                  <defs>
+                    <circle id="dot" cx="0" cy="0" r="15" fill="rgb(220,20,60)"></circle>
+                  </defs>
+                  <use href="#dot" x="25" y="25"></use>
+                  <use href="#dot" x="75" y="25"></use>
+                </svg>
+              </body>
+            </html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var image = renderer.RenderToPng(document, new DefaultRenderDevice
+        {
+            ViewPortWidth = 100,
+            ViewPortHeight = 50,
+        });
+
+        VisualSnapshotVerifier.VerifyOrCreate(
+          snapshotName: "renders-inline-svg-use-element.png",
+          actualPng: image.Data,
+          perChannelTolerance: 0,
+          maxDifferentPixels: 0);
+    }
+
+    [Fact]
+    public async Task RenderToPng_RendersInlineSvgTextWithTspanAndAnchor()
+    {
+        var document = await ParseAsync("""
+            <html>
+              <head>
+                <style>html, body { margin: 0; padding: 0; }</style>
+              </head>
+              <body>
+                <svg width="160" height="60" viewBox="0 0 160 60">
+                  <text x="80" y="30" font-size="20" font-family="sans-serif" fill="rgb(0,0,0)" text-anchor="middle">Hi<tspan fill="rgb(200,0,0)">!</tspan></text>
+                </svg>
+              </body>
+            </html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var image = renderer.RenderToPng(document, new DefaultRenderDevice
+        {
+            ViewPortWidth = 160,
+            ViewPortHeight = 60,
+        });
+
+        VisualSnapshotVerifier.VerifyOrCreate(
+          snapshotName: "renders-inline-svg-text.png",
+          actualPng: image.Data,
+          perChannelTolerance: 0,
+          maxDifferentPixels: 0);
+    }
+
+    [Fact]
+    public async Task RenderToPng_RendersInlineSvgClipPath()
+    {
+        var document = await ParseAsync("""
+            <html>
+              <head>
+                <style>html, body { margin: 0; padding: 0; }</style>
+              </head>
+              <body>
+                <svg width="100" height="100" viewBox="0 0 100 100">
+                  <defs>
+                    <clipPath id="c">
+                      <circle cx="50" cy="50" r="35"></circle>
+                    </clipPath>
+                  </defs>
+                  <rect x="0" y="0" width="100" height="100" fill="rgb(255,140,0)" clip-path="url(#c)"></rect>
+                </svg>
+              </body>
+            </html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var image = renderer.RenderToPng(document, new DefaultRenderDevice
+        {
+            ViewPortWidth = 100,
+            ViewPortHeight = 100,
+        });
+
+        VisualSnapshotVerifier.VerifyOrCreate(
+          snapshotName: "renders-inline-svg-clip-path.png",
+          actualPng: image.Data,
+          perChannelTolerance: 0,
+          maxDifferentPixels: 0);
+    }
+
+    [Fact]
+    public async Task RenderToPng_RendersInlineSvgMask()
+    {
+        var document = await ParseAsync("""
+            <html>
+              <head>
+                <style>html, body { margin: 0; padding: 0; }</style>
+              </head>
+              <body>
+                <svg width="100" height="100" viewBox="0 0 100 100">
+                  <defs>
+                    <mask id="m">
+                      <rect x="0" y="0" width="100" height="100" fill="white"></rect>
+                      <circle cx="50" cy="50" r="25" fill="black"></circle>
+                    </mask>
+                  </defs>
+                  <rect x="0" y="0" width="100" height="100" fill="rgb(0,128,0)" mask="url(#m)"></rect>
+                </svg>
+              </body>
+            </html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var image = renderer.RenderToPng(document, new DefaultRenderDevice
+        {
+            ViewPortWidth = 100,
+            ViewPortHeight = 100,
+        });
+
+        VisualSnapshotVerifier.VerifyOrCreate(
+          snapshotName: "renders-inline-svg-mask.png",
+          actualPng: image.Data,
+          perChannelTolerance: 0,
+          maxDifferentPixels: 0);
+    }
+
+    [Fact]
+    public async Task RenderToPng_RendersInlineSvgPreserveAspectRatioSlice()
+    {
+        var document = await ParseAsync("""
+            <html>
+              <head>
+                <style>html, body { margin: 0; padding: 0; }</style>
+              </head>
+              <body>
+                <svg width="100" height="100" viewBox="0 0 200 100" preserveAspectRatio="xMidYMid slice">
+                  <rect x="0" y="0" width="100" height="100" fill="rgb(255,0,0)"></rect>
+                  <rect x="100" y="0" width="100" height="100" fill="rgb(0,0,255)"></rect>
+                </svg>
+              </body>
+            </html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var image = renderer.RenderToPng(document, new DefaultRenderDevice
+        {
+            ViewPortWidth = 100,
+            ViewPortHeight = 100,
+        });
+
+        VisualSnapshotVerifier.VerifyOrCreate(
+          snapshotName: "renders-inline-svg-preserve-aspect-ratio-slice.png",
+          actualPng: image.Data,
+          perChannelTolerance: 0,
+          maxDifferentPixels: 0);
+    }
+
+    [Fact]
+    public async Task RenderToPng_RendersInlineSvgInternalStyleSheet()
+    {
+        var document = await ParseAsync("""
+            <html>
+              <head>
+                <style>html, body { margin: 0; padding: 0; }</style>
+              </head>
+              <body>
+                <svg width="100" height="100" viewBox="0 0 100 100">
+                  <style>
+                    .box { fill: rgb(0,0,255); }
+                    #special { fill: rgb(0,128,0); }
+                    rect { stroke: rgb(0,0,0); stroke-width: 2; }
+                  </style>
+                  <rect class="box" x="5" y="5" width="40" height="40"></rect>
+                  <rect id="special" class="box" x="55" y="55" width="40" height="40"></rect>
+                </svg>
+              </body>
+            </html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var image = renderer.RenderToPng(document, new DefaultRenderDevice
+        {
+            ViewPortWidth = 100,
+            ViewPortHeight = 100,
+        });
+
+        VisualSnapshotVerifier.VerifyOrCreate(
+          snapshotName: "renders-inline-svg-internal-stylesheet.png",
+          actualPng: image.Data,
+          perChannelTolerance: 0,
+          maxDifferentPixels: 0);
+    }
+
+    [Fact]
+    public async Task RenderToPng_RendersInlineSvgPercentageLengths()
+    {
+        var document = await ParseAsync("""
+            <html>
+              <head>
+                <style>html, body { margin: 0; padding: 0; }</style>
+              </head>
+              <body>
+                <svg width="100" height="100" viewBox="0 0 100 100">
+                  <rect x="0%" y="0%" width="100%" height="100%" fill="rgb(0,0,255)"></rect>
+                  <circle cx="50%" cy="50%" r="30%" fill="rgb(255,255,0)"></circle>
+                </svg>
+              </body>
+            </html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var image = renderer.RenderToPng(document, new DefaultRenderDevice
+        {
+            ViewPortWidth = 100,
+            ViewPortHeight = 100,
+        });
+
+        VisualSnapshotVerifier.VerifyOrCreate(
+          snapshotName: "renders-inline-svg-percentage-lengths.png",
+          actualPng: image.Data,
+          perChannelTolerance: 0,
+          maxDifferentPixels: 0);
+    }
+
+    [Fact]
+    public async Task RenderToPng_RendersNestedSvgViewport()
+    {
+        var document = await ParseAsync("""
+            <html>
+              <head>
+                <style>html, body { margin: 0; padding: 0; }</style>
+              </head>
+              <body>
+                <svg width="100" height="100" viewBox="0 0 100 100">
+                  <rect x="0" y="0" width="100" height="100" fill="rgb(220,220,220)"></rect>
+                  <svg x="10" y="10" width="50" height="50" viewBox="0 0 10 10">
+                    <circle cx="5" cy="5" r="5" fill="rgb(0,128,0)"></circle>
+                  </svg>
+                </svg>
+              </body>
+            </html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var image = renderer.RenderToPng(document, new DefaultRenderDevice
+        {
+            ViewPortWidth = 100,
+            ViewPortHeight = 100,
+        });
+
+        VisualSnapshotVerifier.VerifyOrCreate(
+          snapshotName: "renders-nested-svg-viewport.png",
+          actualPng: image.Data,
+          perChannelTolerance: 0,
+          maxDifferentPixels: 0);
+    }
+
+    [Fact]
+    public async Task RenderToPng_RendersSymbolViaUse()
+    {
+        var document = await ParseAsync("""
+            <html>
+              <head>
+                <style>html, body { margin: 0; padding: 0; }</style>
+              </head>
+              <body>
+                <svg width="100" height="50" viewBox="0 0 100 50">
+                  <defs>
+                    <symbol id="icon" viewBox="0 0 10 10">
+                      <rect x="0" y="0" width="10" height="10" fill="rgb(220,20,60)"></rect>
+                    </symbol>
+                  </defs>
+                  <use href="#icon" x="5" y="5" width="40" height="40"></use>
+                  <use href="#icon" x="55" y="5" width="40" height="40"></use>
+                </svg>
+              </body>
+            </html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var image = renderer.RenderToPng(document, new DefaultRenderDevice
+        {
+            ViewPortWidth = 100,
+            ViewPortHeight = 50,
+        });
+
+        VisualSnapshotVerifier.VerifyOrCreate(
+          snapshotName: "renders-symbol-via-use.png",
+          actualPng: image.Data,
+          perChannelTolerance: 0,
+          maxDifferentPixels: 0);
+    }
+
+    [Fact]
+    public async Task RenderToPng_RendersInlineSvgCurrentColor()
+    {
+        var document = await ParseAsync("""
+            <html>
+              <head>
+                <style>html, body { margin: 0; padding: 0; }</style>
+              </head>
+              <body>
+                <svg width="100" height="100" viewBox="0 0 100 100" color="rgb(0,128,0)">
+                  <rect x="10" y="10" width="80" height="80" fill="currentColor"></rect>
+                </svg>
+              </body>
+            </html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var image = renderer.RenderToPng(document, new DefaultRenderDevice
+        {
+            ViewPortWidth = 100,
+            ViewPortHeight = 100,
+        });
+
+        VisualSnapshotVerifier.VerifyOrCreate(
+          snapshotName: "renders-inline-svg-current-color.png",
+          actualPng: image.Data,
+          perChannelTolerance: 0,
+          maxDifferentPixels: 0);
+    }
+
+    [Fact]
+    public async Task RenderToPng_RendersInlineSvgExplicitMaskRegion()
+    {
+        var document = await ParseAsync("""
+            <html>
+              <head>
+                <style>html, body { margin: 0; padding: 0; }</style>
+              </head>
+              <body>
+                <svg width="100" height="100" viewBox="0 0 100 100">
+                  <defs>
+                    <mask id="m" maskUnits="userSpaceOnUse" x="0" y="0" width="50" height="100">
+                      <rect x="0" y="0" width="100" height="100" fill="white"></rect>
+                    </mask>
+                  </defs>
+                  <rect x="0" y="0" width="100" height="100" fill="rgb(0,128,0)" mask="url(#m)"></rect>
+                </svg>
+              </body>
+            </html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var image = renderer.RenderToPng(document, new DefaultRenderDevice
+        {
+            ViewPortWidth = 100,
+            ViewPortHeight = 100,
+        });
+
+        VisualSnapshotVerifier.VerifyOrCreate(
+          snapshotName: "renders-inline-svg-explicit-mask-region.png",
+          actualPng: image.Data,
+          perChannelTolerance: 0,
+          maxDifferentPixels: 0);
+    }
+
+    [Fact]
+    public async Task RenderToPng_RendersInlineSvgPatternFill()
+    {
+        var document = await ParseAsync("""
+            <html>
+              <head>
+                <style>html, body { margin: 0; padding: 0; }</style>
+              </head>
+              <body>
+                <svg width="100" height="100" viewBox="0 0 100 100">
+                  <defs>
+                    <pattern id="p" patternUnits="userSpaceOnUse" x="0" y="0" width="20" height="20">
+                      <rect x="0" y="0" width="20" height="20" fill="rgb(255,255,255)"></rect>
+                      <rect x="0" y="0" width="10" height="10" fill="rgb(0,0,255)"></rect>
+                      <rect x="10" y="10" width="10" height="10" fill="rgb(0,0,255)"></rect>
+                    </pattern>
+                  </defs>
+                  <rect x="0" y="0" width="100" height="100" fill="url(#p)"></rect>
+                </svg>
+              </body>
+            </html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var image = renderer.RenderToPng(document, new DefaultRenderDevice
+        {
+            ViewPortWidth = 100,
+            ViewPortHeight = 100,
+        });
+
+        VisualSnapshotVerifier.VerifyOrCreate(
+          snapshotName: "renders-inline-svg-pattern-fill.png",
+          actualPng: image.Data,
+          perChannelTolerance: 0,
+          maxDifferentPixels: 0);
+    }
+
+    [Fact]
+    public async Task RenderToPng_RendersInlineSvgGaussianBlurFilter()
+    {
+        var document = await ParseAsync("""
+            <html>
+              <head>
+                <style>html, body { margin: 0; padding: 0; }</style>
+              </head>
+              <body>
+                <svg width="100" height="100" viewBox="0 0 100 100">
+                  <defs>
+                    <filter id="f">
+                      <feGaussianBlur stdDeviation="4"></feGaussianBlur>
+                    </filter>
+                  </defs>
+                  <circle cx="50" cy="50" r="30" fill="rgb(0,0,255)" filter="url(#f)"></circle>
+                </svg>
+              </body>
+            </html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var image = renderer.RenderToPng(document, new DefaultRenderDevice
+        {
+            ViewPortWidth = 100,
+            ViewPortHeight = 100,
+        });
+
+        VisualSnapshotVerifier.VerifyOrCreate(
+          snapshotName: "renders-inline-svg-gaussian-blur-filter.png",
+          actualPng: image.Data,
+          perChannelTolerance: 0,
+          maxDifferentPixels: 0);
+    }
+
+    [Fact]
+    public async Task RenderToPng_IgnoresMediaRuleInsideInlineSvgStyle()
+    {
+        var document = await ParseAsync("""
+            <html>
+              <head>
+                <style>html, body { margin: 0; padding: 0; }</style>
+              </head>
+              <body>
+                <svg width="100" height="100" viewBox="0 0 100 100">
+                  <style>
+                    /* comment */
+                    @media (min-width: 1px) {
+                      rect { fill: rgb(255,0,0); }
+                    }
+                    rect { fill: rgb(0,128,0); }
+                  </style>
+                  <rect x="10" y="10" width="80" height="80"></rect>
+                </svg>
+              </body>
+            </html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var image = renderer.RenderToPng(document, new DefaultRenderDevice
+        {
+            ViewPortWidth = 100,
+            ViewPortHeight = 100,
+        });
+
+        VisualSnapshotVerifier.VerifyOrCreate(
+          snapshotName: "ignores-media-rule-inside-inline-svg-style.png",
+          actualPng: image.Data,
+          perChannelTolerance: 0,
+          maxDifferentPixels: 0);
+    }
+
       [Fact]
       public async Task RenderToPng_RendersWebSafeFontFamiliesDifferently()
       {
