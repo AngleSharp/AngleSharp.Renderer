@@ -30,6 +30,21 @@ public sealed class DisplayList
     }
 
     /// <summary>
+    /// Splices commands into the list at a specific index, shifting everything from that index
+    /// onward later. Used to place a box's own background/border/shadow/outline commands before
+    /// its children's commands once the box's size is known - an auto-sized box cannot paint its
+    /// own background until its children have been laid out to measure it, but CSS requires that
+    /// background to paint *behind* those children, not on top of them.
+    /// </summary>
+    /// <param name="index">The position to insert at; 0 is the very start of the list.</param>
+    /// <param name="commands">The commands to insert, in order.</param>
+    public void InsertRange(int index, IEnumerable<RenderCommand> commands)
+    {
+        ArgumentNullException.ThrowIfNull(commands);
+        _commands.InsertRange(index, commands);
+    }
+
+    /// <summary>
     /// Adds a filled rectangle command.
     /// </summary>
     public void FillRect(RenderRect rect, RenderColor color) => Add(new FillRectCommand(rect, new RenderColorPaint(color)));

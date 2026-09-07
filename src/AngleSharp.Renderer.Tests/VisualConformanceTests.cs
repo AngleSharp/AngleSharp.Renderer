@@ -1701,6 +1701,236 @@ public sealed class VisualConformanceTests
           maxDifferentPixels: TextRenderingToleranceMaxPixels);
     }
 
+    [Fact]
+    public async Task RenderToPng_PaintsOwnBackgroundBehindOwnDirectTextContent()
+    {
+        var document = await ParseAsync("""
+            <html>
+              <head>
+                <style>html, body { margin: 0; padding: 0; }</style>
+              </head>
+              <body>
+                <div style="width:100px; height:40px; background-color:rgb(255,0,0); color:rgb(0,0,0); font-size:24px;">Hi</div>
+              </body>
+            </html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var image = renderer.RenderToPng(document, new DefaultRenderDevice
+        {
+            ViewPortWidth = 120,
+            ViewPortHeight = 60,
+            FontSize = 16f,
+        });
+
+        VisualSnapshotVerifier.VerifyOrCreate(
+          snapshotName: "paints-own-background-behind-own-text.png",
+          actualPng: image.Data,
+          perChannelTolerance: TextRenderingToleranceChannel,
+          maxDifferentPixels: TextRenderingToleranceMaxPixels);
+    }
+
+    [Fact]
+    public async Task RenderToPng_RendersUnorderedListWithDiscBullets()
+    {
+        var document = await ParseAsync("""
+            <html>
+              <head>
+                <style>html, body { margin: 0; padding: 0; }</style>
+              </head>
+              <body>
+                <ul style="font-family:sans-serif; font-size:18px; color:rgb(0,0,0); margin-top:10px; margin-right:10px; margin-bottom:10px;">
+                    <li>One</li>
+                    <li>Two</li>
+                </ul>
+              </body>
+            </html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var image = renderer.RenderToPng(document, new DefaultRenderDevice
+        {
+            ViewPortWidth = 160,
+            ViewPortHeight = 90,
+            FontSize = 16f,
+        });
+
+        VisualSnapshotVerifier.VerifyOrCreate(
+          snapshotName: "renders-unordered-list-with-disc-bullets.png",
+          actualPng: image.Data,
+          perChannelTolerance: TextRenderingToleranceChannel,
+          maxDifferentPixels: TextRenderingToleranceMaxPixels);
+    }
+
+    [Fact]
+    public async Task RenderToPng_RendersOrderedListWithDecimalMarkers()
+    {
+        var document = await ParseAsync("""
+            <html>
+              <head>
+                <style>html, body { margin: 0; padding: 0; }</style>
+              </head>
+              <body>
+                <ol style="font-family:sans-serif; font-size:18px; color:rgb(0,0,0); margin-top:10px; margin-right:10px; margin-bottom:10px;">
+                    <li>First</li>
+                    <li>Second</li>
+                    <li>Third</li>
+                </ol>
+              </body>
+            </html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var image = renderer.RenderToPng(document, new DefaultRenderDevice
+        {
+            ViewPortWidth = 160,
+            ViewPortHeight = 110,
+            FontSize = 16f,
+        });
+
+        VisualSnapshotVerifier.VerifyOrCreate(
+          snapshotName: "renders-ordered-list-with-decimal-markers.png",
+          actualPng: image.Data,
+          perChannelTolerance: TextRenderingToleranceChannel,
+          maxDifferentPixels: TextRenderingToleranceMaxPixels);
+    }
+
+    [Fact]
+    public async Task RenderToPng_RendersSquareAndCircleListStyleTypes()
+    {
+        var document = await ParseAsync("""
+            <html>
+              <head>
+                <style>html, body { margin: 0; padding: 0; }</style>
+              </head>
+              <body>
+                <ul style="font-family:sans-serif; font-size:18px; color:rgb(0,0,0); margin-top:10px; margin-right:10px; margin-bottom:10px; list-style-type:square;">
+                    <li>Square</li>
+                </ul>
+                <ul style="font-family:sans-serif; font-size:18px; color:rgb(0,0,0); margin-top:0; margin-right:10px; margin-bottom:10px; list-style-type:circle;">
+                    <li>Circle</li>
+                </ul>
+              </body>
+            </html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var image = renderer.RenderToPng(document, new DefaultRenderDevice
+        {
+            ViewPortWidth = 160,
+            ViewPortHeight = 90,
+            FontSize = 16f,
+        });
+
+        VisualSnapshotVerifier.VerifyOrCreate(
+          snapshotName: "renders-square-and-circle-list-style-types.png",
+          actualPng: image.Data,
+          perChannelTolerance: TextRenderingToleranceChannel,
+          maxDifferentPixels: TextRenderingToleranceMaxPixels);
+    }
+
+    [Fact]
+    public async Task RenderToPng_RendersNestedListWithIndependentNumbering()
+    {
+        var document = await ParseAsync("""
+            <html>
+              <head>
+                <style>html, body { margin: 0; padding: 0; }</style>
+              </head>
+              <body>
+                <ol style="font-family:sans-serif; font-size:16px; color:rgb(0,0,0); margin-top:10px; margin-right:10px; margin-bottom:10px;">
+                    <li>Parent
+                        <ol style="margin-top:0; margin-bottom:0;">
+                            <li>Child</li>
+                        </ol>
+                    </li>
+                    <li>Sibling</li>
+                </ol>
+              </body>
+            </html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var image = renderer.RenderToPng(document, new DefaultRenderDevice
+        {
+            ViewPortWidth = 180,
+            ViewPortHeight = 130,
+            FontSize = 16f,
+        });
+
+        VisualSnapshotVerifier.VerifyOrCreate(
+          snapshotName: "renders-nested-list-with-independent-numbering.png",
+          actualPng: image.Data,
+          perChannelTolerance: TextRenderingToleranceChannel,
+          maxDifferentPixels: TextRenderingToleranceMaxPixels);
+    }
+
+    [Fact]
+    public async Task RenderToPng_RendersStyledListItemsWithBackgroundColor()
+    {
+        var document = await ParseAsync("""
+            <html>
+              <head>
+                <style>html, body { margin: 0; padding: 0; }</style>
+              </head>
+              <body>
+                <ul style="font-family:sans-serif; font-size:16px; color:rgb(255,255,255); margin-top:10px; margin-right:10px; margin-bottom:10px; list-style-type:none;">
+                    <li style="background-color:rgb(0,120,215); padding:4px; margin-bottom:4px;">Styled item one</li>
+                    <li style="background-color:rgb(0,150,80); padding:4px;">Styled item two</li>
+                </ul>
+              </body>
+            </html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var image = renderer.RenderToPng(document, new DefaultRenderDevice
+        {
+            ViewPortWidth = 220,
+            ViewPortHeight = 100,
+            FontSize = 16f,
+        });
+
+        VisualSnapshotVerifier.VerifyOrCreate(
+          snapshotName: "renders-styled-list-items-with-background-color.png",
+          actualPng: image.Data,
+          perChannelTolerance: TextRenderingToleranceChannel,
+          maxDifferentPixels: TextRenderingToleranceMaxPixels);
+    }
+
+    [Fact]
+    public async Task RenderToPng_ComparesListStylePositionInsideAndOutside()
+    {
+        var document = await ParseAsync("""
+            <html>
+              <head>
+                <style>html, body { margin: 0; padding: 0; }</style>
+              </head>
+              <body>
+                <ul style="font-family:sans-serif; font-size:16px; color:rgb(0,0,0); width:90px; margin-top:10px; margin-right:10px; margin-bottom:10px; list-style-position:outside;">
+                    <li>Outside position keeps the marker in the gutter</li>
+                </ul>
+                <ul style="font-family:sans-serif; font-size:16px; color:rgb(0,0,0); width:90px; margin-top:0; margin-right:10px; margin-bottom:10px; list-style-position:inside;">
+                    <li>Inside position puts the marker on the first line</li>
+                </ul>
+              </body>
+            </html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var image = renderer.RenderToPng(document, new DefaultRenderDevice
+        {
+            ViewPortWidth = 160,
+            ViewPortHeight = 280,
+            FontSize = 16f,
+        });
+
+        VisualSnapshotVerifier.VerifyOrCreate(
+          snapshotName: "compares-list-style-position-inside-and-outside.png",
+          actualPng: image.Data,
+          perChannelTolerance: TextRenderingToleranceChannel,
+          maxDifferentPixels: TextRenderingToleranceMaxPixels);
+    }
+
     private static async Task<byte[]> RenderCanvasSnapshotAsync(string html, Action<Canvas2DRenderingContext> draw)
     {
         var context = BrowsingContext.New(Configuration.Default.WithCss().WithRendering());

@@ -549,6 +549,18 @@ public sealed class HtmlRenderer
         var contentX = borderBoxX + borderLeft + paddingLeft;
         var contentY = borderBoxY + borderTop + paddingTop;
 
+        // The box's own background/border/shadow/outline must paint behind its children, but an
+        // auto-sized box's height is only known after its children are laid out (and therefore
+        // appended to the display list) - so their commands are built into a scratch buffer here
+        // and spliced in before this index once the box's final size is known, rather than simply
+        // appended (which would paint them on top of - and hide - the children).
+        var boxPaintInsertIndex = displayList.Commands.Count;
+
+        if (string.Equals(display, "list-item", StringComparison.OrdinalIgnoreCase))
+        {
+            currentTextStyle = PaintListItemMarker(displayList, element, styleMap, currentTextStyle, context, borderBoxX, contentX, contentY);
+        }
+
         var childCursorY = contentY;
         var childPreviousBlockMarginBottom = 0f;
         var childSuppressNextBlockTopMargin = collapseWithFirstChild && !float.Equals(effectiveMarginTop, marginTop);
@@ -823,10 +835,12 @@ public sealed class HtmlRenderer
             paddingTop,
             paddingBottom);
 
-        PaintBackground(displayList, box.BackgroundPaint, borderBoxX, borderBoxY, borderBoxWidth, borderBoxHeight, box.BorderRadius);
-        PaintBoxShadows(displayList, box.BoxShadows, borderBoxX, borderBoxY, borderBoxWidth, borderBoxHeight, box.BorderRadius);
-        PaintBorder(displayList, box.BorderColor, borderBoxX, borderBoxY, borderBoxWidth, borderBoxHeight, box.BorderWidth, box.BorderRadius);
-        PaintOutline(displayList, styleMap, borderBoxX, borderBoxY, borderBoxWidth, borderBoxHeight);
+        var boxPaintBuffer = new DisplayList();
+        PaintBackground(boxPaintBuffer, box.BackgroundPaint, borderBoxX, borderBoxY, borderBoxWidth, borderBoxHeight, box.BorderRadius);
+        PaintBoxShadows(boxPaintBuffer, box.BoxShadows, borderBoxX, borderBoxY, borderBoxWidth, borderBoxHeight, box.BorderRadius);
+        PaintBorder(boxPaintBuffer, box.BorderColor, borderBoxX, borderBoxY, borderBoxWidth, borderBoxHeight, box.BorderWidth, box.BorderRadius);
+        PaintOutline(boxPaintBuffer, styleMap, borderBoxX, borderBoxY, borderBoxWidth, borderBoxHeight);
+        displayList.InsertRange(boxPaintInsertIndex, boxPaintBuffer.Commands);
 
         if (TryResolveReplacedElementImage(node, styleMap, flowContainingWidth, borderBoxX + borderLeft + paddingLeft, borderBoxY + borderTop + paddingTop, out var image, out var imageRect))
         {
@@ -896,6 +910,11 @@ public sealed class HtmlRenderer
         float borderBoxX,
         float borderBoxY)
     {
+        // See the matching comment in LayoutElement: the container's own background/border must
+        // paint behind its items, but its auto-sized height is only known after they are laid out
+        // (and appended), so their paint commands are spliced in before this index instead.
+        var boxPaintInsertIndex = displayList.Commands.Count;
+
         var flexDirection = GetFlexDirection(styleMap);
         var isRowDirection = !string.Equals(flexDirection, "column", StringComparison.OrdinalIgnoreCase) && !string.Equals(flexDirection, "column-reverse", StringComparison.OrdinalIgnoreCase);
         var isReverseDirection = string.Equals(flexDirection, "row-reverse", StringComparison.OrdinalIgnoreCase) || string.Equals(flexDirection, "column-reverse", StringComparison.OrdinalIgnoreCase);
@@ -1163,16 +1182,18 @@ public sealed class HtmlRenderer
             effectiveMarginBottom = CollapseMargins(effectiveMarginBottom, childPreviousBlockMarginBottom);
         }
 
+        var boxPaintBuffer = new DisplayList();
+
         if (box.BackgroundPaint is RenderColorPaint colorPaint && colorPaint.Color.A == 0)
         {
-            displayList.FillRect(new RenderRect(borderBoxX, borderBoxY, borderBoxWidth, borderBoxHeight), RenderColor.Transparent);
+            boxPaintBuffer.FillRect(new RenderRect(borderBoxX, borderBoxY, borderBoxWidth, borderBoxHeight), RenderColor.Transparent);
         }
         else
         {
-            PaintBackground(displayList, box.BackgroundPaint, borderBoxX, borderBoxY, borderBoxWidth, borderBoxHeight, box.BorderRadius);
+            PaintBackground(boxPaintBuffer, box.BackgroundPaint, borderBoxX, borderBoxY, borderBoxWidth, borderBoxHeight, box.BorderRadius);
         }
 
-        PaintBoxShadows(displayList, box.BoxShadows, borderBoxX, borderBoxY, borderBoxWidth, borderBoxHeight, box.BorderRadius);
+        PaintBoxShadows(boxPaintBuffer, box.BoxShadows, borderBoxX, borderBoxY, borderBoxWidth, borderBoxHeight, box.BorderRadius);
 
         RecordLayoutMetrics(
             node.Ref,
@@ -1189,8 +1210,9 @@ public sealed class HtmlRenderer
             paddingTop,
             paddingBottom);
 
-        PaintBorder(displayList, box.BorderColor, borderBoxX, borderBoxY, borderBoxWidth, borderBoxHeight, box.BorderWidth, box.BorderRadius);
-        PaintOutline(displayList, styleMap, borderBoxX, borderBoxY, borderBoxWidth, borderBoxHeight);
+        PaintBorder(boxPaintBuffer, box.BorderColor, borderBoxX, borderBoxY, borderBoxWidth, borderBoxHeight, box.BorderWidth, box.BorderRadius);
+        PaintOutline(boxPaintBuffer, styleMap, borderBoxX, borderBoxY, borderBoxWidth, borderBoxHeight);
+        displayList.InsertRange(boxPaintInsertIndex, boxPaintBuffer.Commands);
 
         if (TryResolveReplacedElementImage(node, styleMap, containingWidth, borderBoxX + borderLeft + paddingLeft, borderBoxY + borderTop + paddingTop, out var image, out var imageRect))
         {
@@ -1656,6 +1678,11 @@ public sealed class HtmlRenderer
         float borderBoxX,
         float borderBoxY)
     {
+        // See the matching comment in LayoutElement: the container's own background/border must
+        // paint behind its items, but its auto-sized height is only known after they are laid out
+        // (and appended), so their paint commands are spliced in before this index instead.
+        var boxPaintInsertIndex = displayList.Commands.Count;
+
         var columns = ParseGridTrackList(styleMap, "grid-template-columns", containingWidth, 1);
         var columnGap = ParseGridGap(styleMap, "column-gap", containingWidth, 0)
             ?? ParseGridGap(styleMap, "gap", containingWidth, 0);
@@ -1779,16 +1806,18 @@ public sealed class HtmlRenderer
             effectiveMarginBottom = CollapseMargins(effectiveMarginBottom, previousBlockMarginBottom);
         }
 
+        var boxPaintBuffer = new DisplayList();
+
         if (box.BackgroundPaint is RenderColorPaint colorPaint && colorPaint.Color.A == 0)
         {
-            displayList.FillRect(new RenderRect(borderBoxX, borderBoxY, borderBoxWidth, borderBoxHeight), RenderColor.Transparent);
+            boxPaintBuffer.FillRect(new RenderRect(borderBoxX, borderBoxY, borderBoxWidth, borderBoxHeight), RenderColor.Transparent);
         }
         else
         {
-            PaintBackground(displayList, box.BackgroundPaint, borderBoxX, borderBoxY, borderBoxWidth, borderBoxHeight, box.BorderRadius);
+            PaintBackground(boxPaintBuffer, box.BackgroundPaint, borderBoxX, borderBoxY, borderBoxWidth, borderBoxHeight, box.BorderRadius);
         }
 
-        PaintBoxShadows(displayList, box.BoxShadows, borderBoxX, borderBoxY, borderBoxWidth, borderBoxHeight, box.BorderRadius);
+        PaintBoxShadows(boxPaintBuffer, box.BoxShadows, borderBoxX, borderBoxY, borderBoxWidth, borderBoxHeight, box.BorderRadius);
 
         RecordLayoutMetrics(
             node.Ref,
@@ -1805,8 +1834,9 @@ public sealed class HtmlRenderer
             paddingTop,
             paddingBottom);
 
-        PaintBorder(displayList, box.BorderColor, borderBoxX, borderBoxY, borderBoxWidth, borderBoxHeight, box.BorderWidth, box.BorderRadius);
-        PaintOutline(displayList, styleMap, borderBoxX, borderBoxY, borderBoxWidth, borderBoxHeight);
+        PaintBorder(boxPaintBuffer, box.BorderColor, borderBoxX, borderBoxY, borderBoxWidth, borderBoxHeight, box.BorderWidth, box.BorderRadius);
+        PaintOutline(boxPaintBuffer, styleMap, borderBoxX, borderBoxY, borderBoxWidth, borderBoxHeight);
+        displayList.InsertRange(boxPaintInsertIndex, boxPaintBuffer.Commands);
 
         cursorY = flowBorderBoxY + borderBoxHeight;
         previousBlockMarginBottom = effectiveMarginBottom + context.ParagraphSpacing;
@@ -2703,6 +2733,9 @@ public sealed class HtmlRenderer
         AddIfPresent(map, "box-shadow", style.GetBoxShadow());
         AddIfPresent(map, "text-shadow", style.GetTextShadow());
 
+        AddIfPresent(map, "list-style-type", style.GetPropertyValue("list-style-type"));
+        AddIfPresent(map, "list-style-position", style.GetPropertyValue("list-style-position"));
+
         AddIfPresent(map, "outline-width", style.GetPropertyValue("outline-width"));
         AddIfPresent(map, "outline-style", style.GetPropertyValue("outline-style"));
         AddIfPresent(map, "outline-color", style.GetPropertyValue("outline-color"));
@@ -3512,6 +3545,210 @@ public sealed class HtmlRenderer
         }
 
         return bytes.Length > 0;
+    }
+
+    /// <summary>
+    /// Paints a `display: list-item` element's marker (bullet or number) and, for
+    /// `list-style-position: inside`, returns a copy of <paramref name="textStyle"/> whose
+    /// <see cref="RenderTextStyle.TextIndent"/> is widened to make room for it on the first line.
+    /// Safe to widen locally: <see cref="ResolveTextStyle"/> never falls back to an inherited
+    /// <c>TextIndent</c> (each element re-derives its own from its own style map, defaulting to
+    /// 0), so this local adjustment cannot leak into nested descendants' own indent.
+    /// </summary>
+    private static RenderTextStyle PaintListItemMarker(
+        DisplayList displayList,
+        IElement element,
+        Dictionary<string, string> styleMap,
+        RenderTextStyle textStyle,
+        LayoutContext context,
+        float borderBoxX,
+        float contentX,
+        float contentY)
+    {
+        var listStyleType = ResolveListStyleType(styleMap);
+
+        if (string.Equals(listStyleType, "none", StringComparison.OrdinalIgnoreCase))
+        {
+            return textStyle;
+        }
+
+        var isInside = styleMap.TryGetValue("list-style-position", out var positionValue) &&
+            string.Equals(positionValue.Trim(), "inside", StringComparison.OrdinalIgnoreCase);
+
+        // Aligns the marker with the first line of the li's own content, assuming that content
+        // starts as normal inline text at the default vertical-align - the common case, but an
+        // approximation when a li's first child is itself a block (its own first line may sit at
+        // a different offset than this).
+        var markerBaselineY = contentY + (textStyle.FontSize * textStyle.LineHeightMultiplier) + textStyle.VerticalAlignOffset;
+
+        // Not derived from any spec metric - a small, fixed visual gap between the marker and the
+        // content that follows it, matching the general proportions browsers use.
+        const float MarkerGap = 6f;
+
+        if (IsShapeListStyleType(listStyleType))
+        {
+            var markerSize = Math.Max(2f, textStyle.FontSize * 0.35f);
+            var markerTop = markerBaselineY - (textStyle.FontSize * 0.68f);
+            var markerLeft = isInside ? contentX : borderBoxX - MarkerGap - markerSize;
+            var markerRect = new RenderRect(markerLeft, markerTop, markerSize, markerSize);
+            var circularRadii = new RenderCornerRadii(
+                markerSize / 2f, markerSize / 2f, markerSize / 2f, markerSize / 2f,
+                markerSize / 2f, markerSize / 2f, markerSize / 2f, markerSize / 2f);
+
+            switch (listStyleType)
+            {
+                case "circle":
+                    displayList.StrokeRoundedRect(markerRect, textStyle.Color, Math.Max(1f, textStyle.FontSize * 0.08f), circularRadii);
+                    break;
+                case "square":
+                    displayList.FillRect(markerRect, textStyle.Color);
+                    break;
+                default: // disc
+                    displayList.FillRect(markerRect, textStyle.Color, circularRadii);
+                    break;
+            }
+
+            return isInside ? textStyle with { TextIndent = textStyle.TextIndent + markerSize + MarkerGap } : textStyle;
+        }
+
+        var markerText = FormatListMarkerText(ResolveListItemOrdinal(element), listStyleType);
+        var markerWidth = MeasureTextWidth(context, markerText, textStyle);
+        var markerX = isInside ? contentX : borderBoxX - MarkerGap - markerWidth;
+
+        displayList.DrawText(markerText, markerX, markerBaselineY, textStyle.Color, textStyle.FontSize, textStyle.FontFamily, textStyle.FontWeight, textStyle.IsItalic, letterSpacing: textStyle.LetterSpacing);
+
+        return isInside ? textStyle with { TextIndent = textStyle.TextIndent + markerWidth + MarkerGap } : textStyle;
+    }
+
+    private static string ResolveListStyleType(Dictionary<string, string> styleMap) =>
+        styleMap.TryGetValue("list-style-type", out var value) && !string.IsNullOrWhiteSpace(value)
+            ? value.Trim().ToLowerInvariant()
+            : "disc";
+
+    private static bool IsShapeListStyleType(string listStyleType) =>
+        listStyleType is "disc" or "circle" or "square";
+
+    /// <summary>
+    /// Formats an ordinal into the marker text for a numbered `list-style-type`. Any keyword this
+    /// renderer does not specifically implement (and plain `decimal`) falls back to a decimal
+    /// number, matching how browsers treat an unsupported `list-style-type` value.
+    /// </summary>
+    private static string FormatListMarkerText(int ordinal, string listStyleType) => listStyleType switch
+    {
+        "decimal-leading-zero" => (ordinal is >= 0 and < 10 ? "0" + ordinal.ToString(CultureInfo.InvariantCulture) : ordinal.ToString(CultureInfo.InvariantCulture)) + ".",
+        "lower-alpha" or "lower-latin" => FormatAlphaListMarker(ordinal, upper: false) + ".",
+        "upper-alpha" or "upper-latin" => FormatAlphaListMarker(ordinal, upper: true) + ".",
+        "lower-roman" => FormatRomanListMarker(ordinal, upper: false) + ".",
+        "upper-roman" => FormatRomanListMarker(ordinal, upper: true) + ".",
+        _ => ordinal.ToString(CultureInfo.InvariantCulture) + ".",
+    };
+
+    /// <summary>
+    /// Formats a 1-based ordinal as a base-26 letter sequence (a, b, ..., z, aa, ab, ...),
+    /// matching `list-style-type: lower-alpha`/`upper-alpha`.
+    /// </summary>
+    private static string FormatAlphaListMarker(int ordinal, bool upper)
+    {
+        if (ordinal < 1)
+        {
+            return ordinal.ToString(CultureInfo.InvariantCulture);
+        }
+
+        var baseChar = upper ? 'A' : 'a';
+        var chars = new Stack<char>();
+        var remaining = ordinal;
+
+        while (remaining > 0)
+        {
+            remaining--;
+            chars.Push((char)(baseChar + (remaining % 26)));
+            remaining /= 26;
+        }
+
+        return new string(chars.ToArray());
+    }
+
+    private static readonly (int Value, string Symbol)[] s_romanNumeralValues =
+    [
+        (1000, "M"), (900, "CM"), (500, "D"), (400, "CD"),
+        (100, "C"), (90, "XC"), (50, "L"), (40, "XL"),
+        (10, "X"), (9, "IX"), (5, "V"), (4, "IV"), (1, "I"),
+    ];
+
+    /// <summary>
+    /// Formats an ordinal as a Roman numeral, matching `list-style-type: lower-roman`/`upper-roman`.
+    /// Roman numerals have no standard representation outside 1-3999, so values outside that range
+    /// fall back to a plain decimal number, matching typical browser behavior.
+    /// </summary>
+    private static string FormatRomanListMarker(int ordinal, bool upper)
+    {
+        if (ordinal is < 1 or > 3999)
+        {
+            return ordinal.ToString(CultureInfo.InvariantCulture);
+        }
+
+        var builder = new StringBuilder();
+        var remaining = ordinal;
+
+        foreach (var (value, symbol) in s_romanNumeralValues)
+        {
+            while (remaining >= value)
+            {
+                builder.Append(symbol);
+                remaining -= value;
+            }
+        }
+
+        var result = builder.ToString();
+        return upper ? result : result.ToLowerInvariant();
+    }
+
+    /// <summary>
+    /// Resolves a `&lt;li&gt;`'s 1-based ordinal from its position among its parent's direct
+    /// `&lt;li&gt;` children in document order - not from a render-tree traversal order, which
+    /// can reorder for z-index/absolute positioning, and not from any generic CSS counter, since
+    /// only the common `&lt;ol&gt;`/`&lt;li&gt;` counting model (`start`, `reversed`, per-item
+    /// `value`) is implemented. A `&lt;li&gt;` outside any `&lt;ol&gt;`/`&lt;ul&gt;` still resolves
+    /// to 1, matching how browsers render a bare `&lt;li&gt;`.
+    /// </summary>
+    private static int ResolveListItemOrdinal(IElement liElement)
+    {
+        var parent = liElement.ParentElement;
+
+        if (parent is null)
+        {
+            return 1;
+        }
+
+        var isOrderedList = string.Equals(parent.LocalName, "ol", StringComparison.OrdinalIgnoreCase);
+        var reversed = isOrderedList && parent.HasAttribute("reversed");
+        var counter = isOrderedList && int.TryParse(parent.GetAttribute("start"), NumberStyles.Integer, CultureInfo.InvariantCulture, out var explicitStart)
+            ? explicitStart
+            : reversed
+                ? parent.Children.Count(c => string.Equals(c.LocalName, "li", StringComparison.OrdinalIgnoreCase))
+                : 1;
+
+        foreach (var child in parent.Children)
+        {
+            if (!string.Equals(child.LocalName, "li", StringComparison.OrdinalIgnoreCase))
+            {
+                continue;
+            }
+
+            if (int.TryParse(child.GetAttribute("value"), NumberStyles.Integer, CultureInfo.InvariantCulture, out var overrideValue))
+            {
+                counter = overrideValue;
+            }
+
+            if (ReferenceEquals(child, liElement))
+            {
+                return counter;
+            }
+
+            counter += reversed ? -1 : 1;
+        }
+
+        return counter;
     }
 
     private static void PaintTextShadows(DisplayList displayList, IReadOnlyList<RenderTextShadow> shadows, string text, float x, float y, RenderTextStyle textStyle)

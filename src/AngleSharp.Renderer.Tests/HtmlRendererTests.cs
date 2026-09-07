@@ -1641,7 +1641,7 @@ public sealed class HtmlRendererTests
     }
 
     [Fact]
-    public async Task BuildDisplayList_PaintsNegativeZIndexBeforeInFlowBackground()
+    public async Task BuildDisplayList_PaintsNegativeZIndexOnTopOfOwnStackingContextBackground()
     {
         var document = await ParseAsync("""
             <html><body>
@@ -1664,7 +1664,13 @@ public sealed class HtmlRendererTests
 
         Assert.True(greenIndex >= 0);
         Assert.True(redIndex >= 0);
-        Assert.True(redIndex < greenIndex);
+
+        // Per CSS 2.1 Appendix E, a stacking context's own background/border paints first, and
+        // its negative-z-index descendants paint immediately after (on top of) that background -
+        // not before/behind it. So the red z-index:-1 child paints after the green box's own
+        // background, even though it still paints before the green box's normal in-flow content
+        // (there is none here) and before any positive/zero-z-index descendants.
+        Assert.True(redIndex > greenIndex);
     }
 
     [Fact]
@@ -2132,6 +2138,316 @@ public sealed class HtmlRendererTests
         });
 
         Assert.Empty(displayList.Commands.OfType<DrawTextShadowCommand>());
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_PaintsOwnBackgroundBehindOwnDirectTextContent()
+    {
+        // Regression test: an auto-height box's own background can only be sized once its
+        // children are measured, which used to mean it was appended to the display list (and so
+        // painted) AFTER its children's commands - silently hiding any direct text content behind
+        // an opaque background. The fix splices the box's own background/border/shadow/outline
+        // commands in before its children's once the box's final size is known.
+        var document = await ParseAsync("""
+            <html><body>
+                <div style="width:100px; height:40px; background-color:#ff0000;">Hi</div>
+            </body></html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, new DefaultRenderDevice
+        {
+            ViewPortWidth = 300,
+            ViewPortHeight = 200,
+        });
+
+        var commands = displayList.Commands.ToArray();
+        var backgroundIndex = Array.FindIndex(commands, c => c is FillRectCommand fill && fill.Color.Equals(new RenderColor(255, 0, 0)));
+        var textIndex = Array.FindIndex(commands, c => c is DrawTextCommand text && text.Text == "Hi");
+
+        Assert.True(backgroundIndex >= 0);
+        Assert.True(textIndex >= 0);
+        Assert.True(backgroundIndex < textIndex);
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_RendersUnorderedListWithDiscMarkers()
+    {
+        var document = await ParseAsync("""
+            <html><body>
+                <ul>
+                    <li>One</li>
+                    <li>Two</li>
+                </ul>
+            </body></html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, new DefaultRenderDevice
+        {
+            ViewPortWidth = 300,
+            ViewPortHeight = 200,
+            FontSize = 16f,
+        });
+
+        // A disc marker is a small circular FillRectCommand (full corner radii), distinguishable
+        // from an ordinary square background fill.
+        var discMarkers = displayList.Commands.OfType<FillRectCommand>()
+            .Where(f => !f.Radii.IsZero && f.Rect.Width < 10f)
+            .ToArray();
+        Assert.Equal(2, discMarkers.Length);
+
+        Assert.Contains(displayList.Commands, c => c is DrawTextCommand t && t.Text == "One");
+        Assert.Contains(displayList.Commands, c => c is DrawTextCommand t && t.Text == "Two");
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_RendersOrderedListWithDecimalMarkers()
+    {
+        var document = await ParseAsync("""
+            <html><body>
+                <ol>
+                    <li>First</li>
+                    <li>Second</li>
+                </ol>
+            </body></html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, new DefaultRenderDevice
+        {
+            ViewPortWidth = 300,
+            ViewPortHeight = 200,
+            FontSize = 16f,
+        });
+
+        var texts = displayList.Commands.OfType<DrawTextCommand>().ToArray();
+        Assert.Contains(texts, t => t.Text == "1.");
+        Assert.Contains(texts, t => t.Text == "2.");
+        Assert.Contains(texts, t => t.Text == "First");
+        Assert.Contains(texts, t => t.Text == "Second");
+
+        // The marker for "First" sits to the left of the "First" text it labels.
+        var marker = texts.Single(t => t.Text == "1.");
+        var content = texts.Single(t => t.Text == "First");
+        Assert.True(marker.X < content.X);
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_RespectsOlStartAttribute()
+    {
+        var document = await ParseAsync("""
+            <html><body>
+                <ol start="5">
+                    <li>a</li>
+                    <li>b</li>
+                </ol>
+            </body></html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, new DefaultRenderDevice
+        {
+            ViewPortWidth = 300,
+            ViewPortHeight = 200,
+            FontSize = 16f,
+        });
+
+        var texts = displayList.Commands.OfType<DrawTextCommand>().ToArray();
+        Assert.Contains(texts, t => t.Text == "5.");
+        Assert.Contains(texts, t => t.Text == "6.");
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_RespectsLiValueAttributeOverride()
+    {
+        var document = await ParseAsync("""
+            <html><body>
+                <ol>
+                    <li>a</li>
+                    <li value="10">b</li>
+                    <li>c</li>
+                </ol>
+            </body></html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, new DefaultRenderDevice
+        {
+            ViewPortWidth = 300,
+            ViewPortHeight = 200,
+            FontSize = 16f,
+        });
+
+        var texts = displayList.Commands.OfType<DrawTextCommand>().ToArray();
+        Assert.Contains(texts, t => t.Text == "1.");
+        Assert.Contains(texts, t => t.Text == "10.");
+        Assert.Contains(texts, t => t.Text == "11.");
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_RespectsOlReversedAttribute()
+    {
+        var document = await ParseAsync("""
+            <html><body>
+                <ol reversed="reversed">
+                    <li>a</li>
+                    <li>b</li>
+                    <li>c</li>
+                </ol>
+            </body></html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, new DefaultRenderDevice
+        {
+            ViewPortWidth = 300,
+            ViewPortHeight = 200,
+            FontSize = 16f,
+        });
+
+        var texts = displayList.Commands.OfType<DrawTextCommand>().ToArray();
+        Assert.Contains(texts, t => t.Text == "3.");
+        Assert.Contains(texts, t => t.Text == "2.");
+        Assert.Contains(texts, t => t.Text == "1.");
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_RendersLowerRomanMarkers()
+    {
+        var document = await ParseAsync("""
+            <html><body>
+                <ol style="list-style-type: lower-roman;">
+                    <li>a</li>
+                    <li>b</li>
+                    <li>c</li>
+                    <li>d</li>
+                </ol>
+            </body></html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, new DefaultRenderDevice
+        {
+            ViewPortWidth = 300,
+            ViewPortHeight = 200,
+            FontSize = 16f,
+        });
+
+        var texts = displayList.Commands.OfType<DrawTextCommand>().ToArray();
+        Assert.Contains(texts, t => t.Text == "i.");
+        Assert.Contains(texts, t => t.Text == "ii.");
+        Assert.Contains(texts, t => t.Text == "iii.");
+        Assert.Contains(texts, t => t.Text == "iv.");
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_RendersUpperAlphaMarkers()
+    {
+        var document = await ParseAsync("""
+            <html><body>
+                <ol style="list-style-type: upper-alpha;">
+                    <li>a</li>
+                    <li>b</li>
+                    <li>c</li>
+                </ol>
+            </body></html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, new DefaultRenderDevice
+        {
+            ViewPortWidth = 300,
+            ViewPortHeight = 200,
+            FontSize = 16f,
+        });
+
+        var texts = displayList.Commands.OfType<DrawTextCommand>().ToArray();
+        Assert.Contains(texts, t => t.Text == "A.");
+        Assert.Contains(texts, t => t.Text == "B.");
+        Assert.Contains(texts, t => t.Text == "C.");
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_SuppressesMarkerWhenListStyleTypeIsNone()
+    {
+        var document = await ParseAsync("""
+            <html><body>
+                <ul style="list-style-type: none;">
+                    <li>One</li>
+                </ul>
+            </body></html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, new DefaultRenderDevice
+        {
+            ViewPortWidth = 300,
+            ViewPortHeight = 200,
+            FontSize = 16f,
+        });
+
+        Assert.Empty(displayList.Commands.OfType<FillRectCommand>().Where(f => !f.Radii.IsZero && f.Rect.Width < 10f));
+        Assert.Contains(displayList.Commands, c => c is DrawTextCommand t && t.Text == "One");
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_NestedListsNumberIndependently()
+    {
+        var document = await ParseAsync("""
+            <html><body>
+                <ol>
+                    <li>a
+                        <ol>
+                            <li>nested</li>
+                        </ol>
+                    </li>
+                    <li>b</li>
+                </ol>
+            </body></html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, new DefaultRenderDevice
+        {
+            ViewPortWidth = 300,
+            ViewPortHeight = 200,
+            FontSize = 16f,
+        });
+
+        var texts = displayList.Commands.OfType<DrawTextCommand>().Select(t => t.Text).ToArray();
+
+        // Two "1." markers: the outer list's first item and the (independently-numbered) nested
+        // list's own first item. The outer list's second item is "2.", unaffected by nesting.
+        Assert.Equal(2, texts.Count(t => t == "1."));
+        Assert.Contains("2.", texts);
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_ListStylePositionInsideStartsMarkerAtContentEdge()
+    {
+        var document = await ParseAsync("""
+            <html><body>
+                <ul style="list-style-position: inside;">
+                    <li>One</li>
+                </ul>
+            </body></html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, new DefaultRenderDevice
+        {
+            ViewPortWidth = 300,
+            ViewPortHeight = 200,
+            FontSize = 16f,
+        });
+
+        var marker = displayList.Commands.OfType<FillRectCommand>().Single(f => !f.Radii.IsZero && f.Rect.Width < 10f);
+        var text = displayList.Commands.OfType<DrawTextCommand>().Single(t => t.Text == "One");
+
+        // "inside" starts the marker at the li's own content edge and pushes the text to make
+        // room for it, rather than placing the marker in the gutter to the left of that edge.
+        Assert.True(text.X > marker.Rect.X);
     }
 
     private static async Task<AngleSharp.Dom.IDocument> ParseAsync(string html, IConfiguration? configuration = null, string? address = null)
