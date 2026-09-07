@@ -1,6 +1,5 @@
 using AngleSharp.Renderer.Rendering;
-using System.Reflection;
-using System.Threading;
+using System.Linq;
 
 using SkiaSharp;
 
@@ -9,25 +8,16 @@ namespace AngleSharp.Renderer.Skia;
 /// <summary>
 /// Uses SkiaSharp to render a display list.
 /// </summary>
-public sealed class SkiaRenderBackend : IRenderBackend
+/// <remarks>
+/// The backend also measures text, so a renderer using it lays out against the same advance
+/// widths it paints with.
+/// </remarks>
+public sealed class SkiaRenderBackend : IRenderBackend, ITextMeasurer
 {
-    private const string FontResourcePrefix = "AngleSharp.Renderer.Resources.Fonts.";
+    private readonly SkiaTextMeasurer _textMeasurer = new();
 
-    private static readonly Lazy<IReadOnlyDictionary<string, BundledFontFamily>> BundledFonts =
-        new(CreateBundledFonts, LazyThreadSafetyMode.ExecutionAndPublication);
-
-    private static readonly IReadOnlyDictionary<string, string> GenericFontMappings =
-        new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
-        {
-            ["serif"] = "serif",
-            ["sans-serif"] = "sans-serif",
-            ["monospace"] = "monospace",
-            ["cursive"] = "sans-serif",
-            ["fantasy"] = "serif",
-            ["dejavu serif"] = "serif",
-            ["dejavu sans"] = "sans-serif",
-            ["dejavu sans mono"] = "monospace",
-        };
+    /// <inheritdoc />
+    public float MeasureWidth(string text, RenderFont font) => _textMeasurer.MeasureWidth(text, font);
 
     /// <inheritdoc />
     public RenderedImage RenderToPng(DisplayList displayList, RenderViewport viewport)
@@ -48,7 +38,7 @@ public sealed class SkiaRenderBackend : IRenderBackend
 
         foreach (var command in displayList.Commands)
         {
-            DrawCommand(canvas, command);
+            DrawCommand(canvas, command, displayList.Fonts);
         }
 
         using var image = surface.Snapshot();
@@ -58,15 +48,18 @@ public sealed class SkiaRenderBackend : IRenderBackend
         return new RenderedImage(data.ToArray(), viewport.Width, viewport.Height, "image/png");
     }
 
-    private static void DrawCommand(SKCanvas canvas, RenderCommand command)
+    private static void DrawCommand(SKCanvas canvas, RenderCommand command, FontFaceSet fonts)
     {
         switch (command)
         {
             case FillRectCommand fill:
                 DrawFillRect(canvas, fill);
                 break;
+            case DrawImageCommand image:
+                DrawImage(canvas, image);
+                break;
             case DrawTextCommand text:
-                DrawText(canvas, text);
+                DrawText(canvas, text, fonts);
                 break;
         }
     }
@@ -78,12 +71,7 @@ public sealed class SkiaRenderBackend : IRenderBackend
             return;
         }
 
-        using var paint = new SKPaint
-        {
-            Color = ToSkColor(command.Color),
-            IsAntialias = true,
-            Style = SKPaintStyle.Fill,
-        };
+        using var paint = CreateFillPaint(command.Paint, command.Rect);
 
         var rect = new SKRect(
             command.Rect.X,
@@ -94,24 +82,234 @@ public sealed class SkiaRenderBackend : IRenderBackend
         canvas.DrawRect(rect, paint);
     }
 
-    private static void DrawText(SKCanvas canvas, DrawTextCommand command)
+    private static SKPaint CreateFillPaint(RenderPaint paint, RenderRect rect)
     {
-        var fontStyle = new SKFontStyle(
-            command.FontWeight >= 600f ? SKFontStyleWeight.Bold : SKFontStyleWeight.Normal,
-            SKFontStyleWidth.Normal,
-            command.IsItalic ? SKFontStyleSlant.Italic : SKFontStyleSlant.Upright);
-
-        using var paint = new SKPaint
+        return paint switch
         {
-            Color = ToSkColor(command.Color),
-            IsAntialias = true,
-            SubpixelText = false,
-            LcdRenderText = false,
-            HintingLevel = SKPaintHinting.Normal,
-            TextSize = command.FontSize,
-            Typeface = CreateTypeface(command.FontFamily, fontStyle),
-            TextSkewX = command.IsItalic ? -0.25f : 0f,
+            RenderColorPaint colorPaint => new SKPaint
+            {
+                Color = ToSkColor(colorPaint.Color),
+                IsAntialias = true,
+                Style = SKPaintStyle.Fill,
+            },
+            RenderGradientPaint gradientPaint => CreateGradientPaint(gradientPaint.Gradient, rect),
+            _ => throw new NotSupportedException($"Unsupported paint type: {paint.GetType().Name}"),
         };
+    }
+
+    private static SKPaint CreateGradientPaint(RenderGradient gradient, RenderRect rect)
+    {
+        var paint = new SKPaint
+        {
+            IsAntialias = true,
+            Style = SKPaintStyle.Fill,
+        };
+
+        var colors = gradient.Stops.Select(stop => new SKColor(stop.Color.R, stop.Color.G, stop.Color.B, stop.Color.A)).ToArray();
+
+        var centerX = rect.X + (gradient.CenterX * rect.Width);
+        var centerY = rect.Y + (gradient.CenterY * rect.Height);
+        var diagonal = (float)Math.Sqrt((rect.Width * rect.Width) + (rect.Height * rect.Height));
+        var (unscaledRx, unscaledRy) = gradient.Kind == RenderGradientKind.Radial
+            ? ComputeRadialRadii(gradient, rect, centerX, centerY)
+            : (0f, 0f);
+
+        // An absolute-length stop position ("red 10px") only becomes a fraction once the
+        // gradient's own rendered geometry is known - the gradient line's length for linear, the
+        // resolved (pre-repeat-scale) radius for radial. Conic stops use angles, never lengths.
+        var referenceLength = gradient.Kind switch
+        {
+            RenderGradientKind.Linear => diagonal,
+            RenderGradientKind.Radial => Math.Max(unscaledRx, unscaledRy),
+            _ => 0f,
+        };
+
+        var rawPositions = gradient.Stops
+            .Select(stop => stop.AbsolutePositionPixels is { } pixels && referenceLength > 0f
+                ? Math.Clamp(pixels / referenceLength, 0f, 1f)
+                : stop.Position)
+            .ToArray();
+
+        var tileMode = gradient.Repeating ? SKShaderTileMode.Repeat : SKShaderTileMode.Clamp;
+
+        // A repeating-*-gradient's defined stops are one period of an infinitely repeated
+        // pattern. Rescaling every position by the last stop's position makes that period fill
+        // the shader's whole [0,1] domain; shrinking the shader's own geometric extent by the
+        // same factor (see each Create*Shader below) then gives Repeat room to tile the rest.
+        // This assumes the first stop is at/near 0%, the overwhelmingly common case - a repeating
+        // gradient whose first stop is well past 0% renders its period at the right cadence but
+        // not anchored at the exact original offset.
+        var repeatScale = 1f;
+        var positions = rawPositions;
+
+        if (gradient.Repeating && rawPositions.Length > 0)
+        {
+            var maxPosition = rawPositions.Max();
+
+            if (maxPosition > 0f && maxPosition < 1f)
+            {
+                repeatScale = maxPosition;
+                positions = rawPositions.Select(position => position / maxPosition).ToArray();
+            }
+        }
+
+        paint.Shader = gradient.Kind switch
+        {
+            RenderGradientKind.Linear => CreateLinearGradientShader(gradient, centerX, centerY, diagonal, colors, positions, tileMode, repeatScale),
+            RenderGradientKind.Radial => CreateRadialGradientShader(centerX, centerY, unscaledRx, unscaledRy, colors, positions, tileMode, repeatScale),
+            RenderGradientKind.Conic => CreateConicGradientShader(gradient, centerX, centerY, colors, positions, tileMode, repeatScale),
+            _ => throw new NotSupportedException($"Unsupported gradient kind: {gradient.Kind}"),
+        };
+
+        return paint;
+    }
+
+    private static SKShader CreateLinearGradientShader(RenderGradient gradient, float centerX, float centerY, float diagonal, SKColor[] colors, float[] positions, SKShaderTileMode tileMode, float repeatScale)
+    {
+        var halfDiagonal = diagonal / 2f;
+        var radians = (gradient.AngleDegrees % 360f + 360f) % 360f;
+        var angle = radians * (Math.PI / 180d);
+        var dx = (float)Math.Cos(angle);
+        var dy = (float)Math.Sin(angle);
+
+        var start = new SKPoint(centerX - (dx * halfDiagonal), centerY - (dy * halfDiagonal));
+        var fullEnd = new SKPoint(centerX + (dx * halfDiagonal), centerY + (dy * halfDiagonal));
+        var end = new SKPoint(start.X + ((fullEnd.X - start.X) * repeatScale), start.Y + ((fullEnd.Y - start.Y) * repeatScale));
+
+        return SKShader.CreateLinearGradient(start, end, colors, positions, tileMode);
+    }
+
+    private static SKShader CreateRadialGradientShader(float centerX, float centerY, float unscaledRx, float unscaledRy, SKColor[] colors, float[] positions, SKShaderTileMode tileMode, float repeatScale)
+    {
+        var rx = Math.Max(0.0001f, unscaledRx * repeatScale);
+        var ry = Math.Max(0.0001f, unscaledRy * repeatScale);
+
+        if (Math.Abs(rx - ry) < 0.01f)
+        {
+            // A circle - no elliptical distortion needed, so the plain center+radius overload
+            // (unambiguous, no matrix semantics to get backwards) is enough.
+            return SKShader.CreateRadialGradient(new SKPoint(centerX, centerY), rx, colors, positions, tileMode);
+        }
+
+        // An ellipse: build the gradient as a unit circle at the origin, then use the
+        // constructor-time local-matrix overload to map it onto an ellipse of the right size at
+        // the right position. Verified empirically (not just by API docs) that this matrix maps
+        // the shader's local space directly into world space - i.e. this scales/positions the
+        // visible gradient exactly as constructed, not its inverse.
+        var matrix = new SKMatrix(rx, 0f, centerX, 0f, ry, centerY, 0f, 0f, 1f);
+        return SKShader.CreateRadialGradient(new SKPoint(0f, 0f), 1f, colors, positions, tileMode, matrix);
+    }
+
+    /// <summary>
+    /// Resolves a radial gradient's ending-shape radii from its <see cref="RenderGradientSizeKind"/>,
+    /// matching the CSS `&lt;size&gt;` keyword definitions (farthest-corner is the CSS default).
+    /// </summary>
+    private static (float Rx, float Ry) ComputeRadialRadii(RenderGradient gradient, RenderRect rect, float centerX, float centerY)
+    {
+        if (gradient.SizeKind == RenderGradientSizeKind.Explicit && gradient.ExplicitRadiusX is { } explicitX)
+        {
+            var explicitY = gradient.ExplicitRadiusY ?? explicitX;
+            return gradient.IsCircle ? (explicitX, explicitX) : (explicitX, explicitY);
+        }
+
+        var nearestX = Math.Min(Math.Abs(centerX - rect.X), Math.Abs((rect.X + rect.Width) - centerX));
+        var farthestX = Math.Max(Math.Abs(centerX - rect.X), Math.Abs((rect.X + rect.Width) - centerX));
+        var nearestY = Math.Min(Math.Abs(centerY - rect.Y), Math.Abs((rect.Y + rect.Height) - centerY));
+        var farthestY = Math.Max(Math.Abs(centerY - rect.Y), Math.Abs((rect.Y + rect.Height) - centerY));
+
+        if (gradient.IsCircle)
+        {
+            var radius = gradient.SizeKind switch
+            {
+                RenderGradientSizeKind.ClosestSide => Math.Min(nearestX, nearestY),
+                RenderGradientSizeKind.FarthestSide => Math.Max(farthestX, farthestY),
+                RenderGradientSizeKind.ClosestCorner => (float)Math.Sqrt((nearestX * nearestX) + (nearestY * nearestY)),
+                _ => (float)Math.Sqrt((farthestX * farthestX) + (farthestY * farthestY)),
+            };
+
+            return (radius, radius);
+        }
+
+        return gradient.SizeKind switch
+        {
+            RenderGradientSizeKind.ClosestSide => (nearestX, nearestY),
+            RenderGradientSizeKind.FarthestSide => (farthestX, farthestY),
+            RenderGradientSizeKind.ClosestCorner => EllipseThroughCorner(nearestX, nearestY, rect.Width, rect.Height),
+            _ => EllipseThroughCorner(farthestX, farthestY, rect.Width, rect.Height),
+        };
+    }
+
+    /// <summary>
+    /// The semi-axes of an ellipse that shares the box's aspect ratio and passes through a corner
+    /// offset by (<paramref name="dx"/>, <paramref name="dy"/>) from its center - the CSS
+    /// closest-corner/farthest-corner ellipse sizing algorithm.
+    /// </summary>
+    private static (float Rx, float Ry) EllipseThroughCorner(float dx, float dy, float boxWidth, float boxHeight)
+    {
+        if (boxWidth <= 0f || boxHeight <= 0f)
+        {
+            return (Math.Abs(dx), Math.Abs(dy));
+        }
+
+        var aspect = boxWidth / boxHeight;
+        var ry = (float)Math.Sqrt(((double)dx * dx / (aspect * aspect)) + ((double)dy * dy));
+        var rx = aspect * ry;
+
+        return (rx, ry);
+    }
+
+    private static SKShader CreateConicGradientShader(RenderGradient gradient, float centerX, float centerY, SKColor[] colors, float[] positions, SKShaderTileMode tileMode, float repeatScale)
+    {
+        // Skia's sweep gradient silently degenerates to a zero-width (solid first-color) span
+        // once endAngle exceeds 360 - verified empirically, it does not treat e.g. [270,630] as
+        // "a full revolution starting at 270". So the shader's own angle span always stays a
+        // plain [0, 360*repeatScale], and CSS's "from <angle>" rotation - plus the fact that CSS
+        // conic-gradient's 0deg points up while Skia's sweep 0deg points right, both clockwise
+        // (also verified empirically) - is applied via the constructor-time rotation matrix
+        // instead, the same "shader-local-space maps directly into world-space" mechanism already
+        // used for elliptical radial gradients.
+        var rotation = SKMatrix.CreateRotationDegrees(gradient.AngleDegrees - 90f, centerX, centerY);
+        var endAngle = 360f * repeatScale;
+
+        return SKShader.CreateSweepGradient(new SKPoint(centerX, centerY), colors, positions, tileMode, 0f, endAngle, rotation);
+    }
+
+    private static void DrawImage(SKCanvas canvas, DrawImageCommand command)
+    {
+        if (command.Image.Data.Length == 0 || command.Rect.IsEmpty)
+        {
+            return;
+        }
+
+        using var data = SKData.CreateCopy(command.Image.Data);
+        using var image = SKImage.FromEncodedData(data);
+        if (image is null)
+        {
+            return;
+        }
+
+        var rect = new SKRect(
+            command.Rect.X,
+            command.Rect.Y,
+            command.Rect.X + command.Rect.Width,
+            command.Rect.Y + command.Rect.Height);
+
+        using var paint = new SKPaint { IsAntialias = true, FilterQuality = SKFilterQuality.High };
+        canvas.DrawImage(image, rect, paint);
+    }
+
+    private static void DrawText(SKCanvas canvas, DrawTextCommand command, FontFaceSet fonts)
+    {
+        var font = new RenderFont(
+            command.FontFamily,
+            command.FontSize,
+            command.FontWeight,
+            command.IsItalic,
+            command.LetterSpacing,
+            fonts);
+
+        using var paint = SkiaTextShaping.CreateTextPaint(font);
+        paint.Color = ToSkColor(command.Color);
 
         DrawTextWithLetterSpacing(canvas, paint, command.Text, command.X, command.Y, command.LetterSpacing);
 
@@ -125,7 +323,7 @@ public sealed class SkiaRenderBackend : IRenderBackend
                 StrokeWidth = Math.Max(1f, command.FontSize / 14f),
             };
 
-            var textWidth = MeasureTextWidth(paint, command.Text, command.LetterSpacing);
+            var textWidth = SkiaTextShaping.MeasureTextWidth(paint, command.Text, command.LetterSpacing);
 
             if (command.Underline)
             {
@@ -170,74 +368,6 @@ public sealed class SkiaRenderBackend : IRenderBackend
         }
     }
 
-    private static SKTypeface CreateTypeface(string fontFamily, SKFontStyle fontStyle)
-    {
-        var isBold = fontStyle.Weight >= (int)SKFontStyleWeight.Bold;
-
-        var families = fontFamily.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
-
-        foreach (var family in families)
-        {
-            var normalized = family.Trim('\'', '"', ' ');
-
-            if (string.IsNullOrWhiteSpace(normalized))
-            {
-                continue;
-            }
-
-            if (GenericFontMappings.TryGetValue(normalized, out var bundledFamilyKey) &&
-                BundledFonts.Value.TryGetValue(bundledFamilyKey, out var bundledFamily))
-            {
-                return isBold ? bundledFamily.Bold : bundledFamily.Regular;
-            }
-
-            var typeface = SKTypeface.FromFamilyName(normalized, fontStyle);
-
-            if (typeface is not null)
-            {
-                return typeface;
-            }
-        }
-
-        if (BundledFonts.Value.TryGetValue("sans-serif", out var defaultFamily))
-        {
-            return isBold ? defaultFamily.Bold : defaultFamily.Regular;
-        }
-
-        return SKTypeface.FromFamilyName(fontFamily, fontStyle) ?? SKTypeface.Default;
-    }
-
-    private static IReadOnlyDictionary<string, BundledFontFamily> CreateBundledFonts()
-    {
-        var sansRegular = LoadBundledTypeface("DejaVuSans.ttf");
-        var sansBold = LoadBundledTypeface("DejaVuSans-Bold.ttf");
-        var serifRegular = LoadBundledTypeface("DejaVuSerif.ttf");
-        var serifBold = LoadBundledTypeface("DejaVuSerif-Bold.ttf");
-        var monoRegular = LoadBundledTypeface("DejaVuSansMono.ttf");
-        var monoBold = LoadBundledTypeface("DejaVuSansMono-Bold.ttf");
-
-        return new Dictionary<string, BundledFontFamily>(StringComparer.OrdinalIgnoreCase)
-        {
-            ["sans-serif"] = new BundledFontFamily(sansRegular, sansBold),
-            ["serif"] = new BundledFontFamily(serifRegular, serifBold),
-            ["monospace"] = new BundledFontFamily(monoRegular, monoBold),
-        };
-    }
-
-    private static SKTypeface LoadBundledTypeface(string fileName)
-    {
-        var assembly = typeof(SkiaRenderBackend).Assembly;
-        var resourceName = string.Concat(FontResourcePrefix, fileName);
-
-        using var stream = assembly.GetManifestResourceStream(resourceName)
-            ?? throw new InvalidOperationException($"Bundled font resource not found: {resourceName}");
-        using var data = SKData.Create(stream)
-            ?? throw new InvalidOperationException($"Unable to read bundled font resource: {resourceName}");
-
-        return SKTypeface.FromData(data)
-            ?? throw new InvalidOperationException($"Unable to load bundled font resource: {resourceName}");
-    }
-
     private static void DrawTextWithLetterSpacing(SKCanvas canvas, SKPaint paint, string text, float x, float y, float letterSpacing)
     {
         if (letterSpacing <= 0f)
@@ -256,24 +386,6 @@ public sealed class SkiaRenderBackend : IRenderBackend
         }
     }
 
-    private static float MeasureTextWidth(SKPaint paint, string text, float letterSpacing)
-    {
-        if (letterSpacing <= 0f)
-        {
-            return paint.MeasureText(text);
-        }
-
-        var width = 0f;
-
-        foreach (var character in text)
-        {
-            width += paint.MeasureText(character.ToString()) + letterSpacing;
-        }
-
-        return width > 0f ? width - letterSpacing : 0f;
-    }
-
     private static SKColor ToSkColor(RenderColor color) => new(color.R, color.G, color.B, color.A);
 
-    private readonly record struct BundledFontFamily(SKTypeface Regular, SKTypeface Bold);
 }

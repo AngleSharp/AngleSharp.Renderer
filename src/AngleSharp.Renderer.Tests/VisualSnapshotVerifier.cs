@@ -7,6 +7,19 @@ namespace AngleSharp.Renderer.Tests;
 internal static class VisualSnapshotVerifier
 {
     private const string StrictModeEnvironmentVariable = "ANGLESHARP_SNAPSHOT_STRICT";
+    private const string UpdateModeEnvironmentVariable = "ANGLESHARP_SNAPSHOT_UPDATE";
+
+    /// <summary>
+    /// The platforms a baseline has to exist for. Skia rasterizes glyphs through a different
+    /// scaler per platform (FreeType on Linux, DirectWrite on Windows, CoreText on macOS), so
+    /// the very same font file produces different anti-aliasing and the baselines cannot be shared.
+    /// </summary>
+    public static readonly string[] SupportedPlatformSuffixes = ["linux", "macos", "windows"];
+
+    /// <summary>
+    /// Gets the directory holding the committed baseline images.
+    /// </summary>
+    public static string VerificationAssetsPath => Path.Combine(GetProjectRoot(), "verification-assets");
 
     public static void VerifyOrCreate(
         string snapshotName,
@@ -26,15 +39,24 @@ internal static class VisualSnapshotVerifier
         var failurePath = Path.Combine(failureAssetsPath, platformSnapshotName);
         var diffPath = Path.Combine(failureAssetsPath, Path.GetFileNameWithoutExtension(platformSnapshotName) + ".diff.png");
 
+        if (IsEnabled(UpdateModeEnvironmentVariable))
+        {
+            File.WriteAllBytes(baselinePath, actualPng);
+            DeleteIfExists(failurePath);
+            DeleteIfExists(diffPath);
+            return;
+        }
+
         if (!File.Exists(baselinePath))
         {
-            if (IsStrictModeEnabled())
+            if (IsEnabled(StrictModeEnvironmentVariable))
             {
                 File.WriteAllBytes(failurePath, actualPng);
 
                 throw new XunitException(
                     $"Missing baseline snapshot '{platformSnapshotName}' while strict mode is enabled ({StrictModeEnvironmentVariable}=1). " +
-                    $"Create baseline at: {baselinePath}. Actual output written to: {failurePath}.");
+                    $"Create baseline at: {baselinePath}. Actual output written to: {failurePath}. " +
+                    "Baselines for all platforms are produced by the 'Update Snapshots' GitHub workflow.");
             }
 
             File.WriteAllBytes(baselinePath, actualPng);
@@ -46,16 +68,8 @@ internal static class VisualSnapshotVerifier
 
         if (comparison.IsMatch(maxDifferentPixels))
         {
-            if (File.Exists(failurePath))
-            {
-                File.Delete(failurePath);
-            }
-
-            if (File.Exists(diffPath))
-            {
-                File.Delete(diffPath);
-            }
-
+            DeleteIfExists(failurePath);
+            DeleteIfExists(diffPath);
             return;
         }
 
@@ -66,7 +80,7 @@ internal static class VisualSnapshotVerifier
             $"Visual snapshot mismatch for '{platformSnapshotName}'. " +
             $"Expected size {comparison.ExpectedWidth}x{comparison.ExpectedHeight}, " +
             $"actual size {comparison.ActualWidth}x{comparison.ActualHeight}, " +
-            $"different pixels: {comparison.DifferentPixels} (allowed: {maxDifferentPixels}), " +
+            $"different pixels: {comparison.DifferentPixels} ({comparison.DifferentPixelRatio:P2}, allowed: {maxDifferentPixels}), " +
             $"channel tolerance: {perChannelTolerance}. " +
             $"Baseline: {baselinePath}. Failure output: {failurePath}. Diff output: {diffPath}.");
     }
@@ -106,12 +120,20 @@ internal static class VisualSnapshotVerifier
         return Environment.OSVersion.Platform.ToString().ToLowerInvariant();
     }
 
-    private static bool IsStrictModeEnabled()
+    private static bool IsEnabled(string environmentVariable)
     {
-        var strictModeValue = Environment.GetEnvironmentVariable(StrictModeEnvironmentVariable);
+        var value = Environment.GetEnvironmentVariable(environmentVariable);
 
-        return string.Equals(strictModeValue, "1", StringComparison.OrdinalIgnoreCase) ||
-               string.Equals(strictModeValue, "true", StringComparison.OrdinalIgnoreCase);
+        return string.Equals(value, "1", StringComparison.OrdinalIgnoreCase) ||
+               string.Equals(value, "true", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static void DeleteIfExists(string path)
+    {
+        if (File.Exists(path))
+        {
+            File.Delete(path);
+        }
     }
 
     private static string GetProjectRoot()
@@ -228,5 +250,14 @@ internal static class VisualSnapshotVerifier
         byte[] DiffPng)
     {
         public bool IsMatch(int maxDifferentPixels) => DifferentPixels <= maxDifferentPixels;
+
+        public double DifferentPixelRatio
+        {
+            get
+            {
+                var total = Math.Max(ExpectedWidth * ExpectedHeight, ActualWidth * ActualHeight);
+                return total > 0 ? (double)DifferentPixels / total : 0d;
+            }
+        }
     }
 }

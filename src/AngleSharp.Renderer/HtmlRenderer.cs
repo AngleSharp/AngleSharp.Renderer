@@ -1,22 +1,145 @@
+namespace AngleSharp.Renderer;
+
 using System.Globalization;
+using System.IO;
 using System.Linq;
+using System.Runtime.CompilerServices;
 using System.Text;
+using System.Threading;
 
 using AngleSharp.Css;
 using AngleSharp.Css.Dom;
 using AngleSharp.Css.RenderTree;
 using AngleSharp.Dom;
+using AngleSharp.Io;
 using AngleSharp.Renderer.Rendering;
 using AngleSharp.Renderer.Skia;
 
-namespace AngleSharp.Renderer;
+using SkiaSharp;
 
 /// <summary>
 /// Renders HTML documents into image output.
 /// </summary>
 public sealed class HtmlRenderer
 {
+    // Per-document cache keeps image payloads stable across repeated renders of the same DOM instance.
+    private static readonly ConditionalWeakTable<IDocument, DocumentImageCache> s_imageCacheByDocument = new();
+    // Inline <svg> markup has no URL to key a per-document cache on, so it is cached per element instead.
+    private static readonly ConditionalWeakTable<IElement, CachedImageResource> s_inlineSvgCacheByElement = new();
+    private static readonly AsyncLocal<LayoutCapture?> s_layoutCapture = new();
+    private static readonly ITextMeasurer s_defaultTextMeasurer = new SkiaTextMeasurer();
+
+    private const float CollapsedBorderWidth = 1f;
+
     private readonly IRenderBackend _backend;
+    private readonly ITextMeasurer _textMeasurer;
+
+    private sealed class DocumentImageCache
+    {
+        public Dictionary<string, CachedImageResource?> Resources { get; } = new(StringComparer.Ordinal);
+    }
+
+    private sealed record CachedImageResource(byte[] Bytes, string MimeType, int NaturalWidth, int NaturalHeight);
+
+    internal readonly record struct ElementLayoutMetrics(
+        float BorderBoxX,
+        float BorderBoxY,
+        float BorderBoxWidth,
+        float BorderBoxHeight,
+        float BorderLeft,
+        float BorderRight,
+        float BorderTop,
+        float BorderBottom,
+        float PaddingLeft,
+        float PaddingRight,
+        float PaddingTop,
+        float PaddingBottom);
+
+    private readonly record struct LayoutContext(
+        int Width,
+        int Height,
+        RenderColor BackgroundColor,
+        RenderColor TextColor,
+        float Padding,
+        string FontFamily,
+        float FontSize,
+        float LineHeightMultiplier,
+        float ParagraphSpacing,
+        ITextMeasurer TextMeasurer,
+        FontFaceSet Fonts);
+
+    private sealed class LayoutCapture
+    {
+        private readonly Dictionary<IElement, ElementLayoutMetrics> _metricsByElement = new(ReferenceEqualityComparer.Instance);
+
+        public void Record(IElement element, ElementLayoutMetrics metrics)
+        {
+            _metricsByElement[element] = metrics;
+        }
+
+        public IReadOnlyDictionary<IElement, ElementLayoutMetrics> Snapshot()
+        {
+            return _metricsByElement;
+        }
+    }
+
+    internal static IReadOnlyDictionary<IElement, ElementLayoutMetrics> CaptureLayoutMetrics(IDocument document, IRenderDevice renderDevice)
+    {
+        ArgumentNullException.ThrowIfNull(document);
+        ArgumentNullException.ThrowIfNull(renderDevice);
+
+        var context = CreateLayoutContext(document, renderDevice, s_defaultTextMeasurer);
+        var viewport = new RenderViewport(context.Width, context.Height);
+        var capture = new LayoutCapture();
+        var previous = s_layoutCapture.Value;
+        s_layoutCapture.Value = capture;
+
+        try
+        {
+            _ = BuildDisplayList(document, viewport, context, renderDevice);
+            return capture.Snapshot();
+        }
+        finally
+        {
+            s_layoutCapture.Value = previous;
+        }
+    }
+
+    private static void RecordLayoutMetrics(
+        IElement element,
+        float borderBoxX,
+        float borderBoxY,
+        float borderBoxWidth,
+        float borderBoxHeight,
+        float borderLeft,
+        float borderRight,
+        float borderTop,
+        float borderBottom,
+        float paddingLeft,
+        float paddingRight,
+        float paddingTop,
+        float paddingBottom)
+    {
+        var capture = s_layoutCapture.Value;
+        if (capture is null)
+        {
+            return;
+        }
+
+        capture.Record(element, new ElementLayoutMetrics(
+            borderBoxX,
+            borderBoxY,
+            borderBoxWidth,
+            borderBoxHeight,
+            borderLeft,
+            borderRight,
+            borderTop,
+            borderBottom,
+            paddingLeft,
+            paddingRight,
+            paddingTop,
+            paddingBottom));
+    }
 
     /// <summary>
     /// Creates a new renderer with a default Skia backend.
@@ -27,28 +150,91 @@ public sealed class HtmlRenderer
     }
 
     /// <summary>
-    /// Creates a new renderer with a specific backend.
+    /// Creates a new renderer with a specific backend. A backend that measures text itself is
+    /// used for layout as well, so that layout and rasterization agree on advance widths.
     /// </summary>
     /// <param name="backend">The backend used for rasterization.</param>
     public HtmlRenderer(IRenderBackend backend)
+        : this(backend, (backend as ITextMeasurer) ?? s_defaultTextMeasurer)
+    {
+    }
+
+    /// <summary>
+    /// Creates a new renderer with a specific backend and text measurer.
+    /// </summary>
+    /// <param name="backend">The backend used for rasterization.</param>
+    /// <param name="textMeasurer">The measurer used to compute advance widths during layout.</param>
+    public HtmlRenderer(IRenderBackend backend, ITextMeasurer textMeasurer)
     {
         ArgumentNullException.ThrowIfNull(backend);
+        ArgumentNullException.ThrowIfNull(textMeasurer);
         _backend = backend;
+        _textMeasurer = textMeasurer;
+    }
+
+    private static LayoutContext CreateLayoutContext(IDocument document, IRenderDevice renderDevice, ITextMeasurer textMeasurer)
+    {
+        var width = Math.Max(1, (int)Math.Round(Convert.ToDouble(renderDevice.ViewPortWidth)));
+        var height = Math.Max(1, (int)Math.Round(Convert.ToDouble(renderDevice.ViewPortHeight)));
+        var defaultFontSize = Math.Max(1f, (float)renderDevice.FontSize);
+        var defaultFontFamily = "sans-serif";
+        var defaultLineHeight = 1.35f;
+        var defaultTextColor = RenderColor.Black;
+        var defaultBackgroundColor = RenderColor.White;
+
+        var rootElement = document.Body ?? document.DocumentElement;
+        if (rootElement is not null)
+        {
+            var styleMap = CreateStyleMap(rootElement.ComputeCurrentStyle(), rootElement);
+            defaultFontSize = ParseLength(styleMap, "font-size", defaultFontSize, defaultFontSize, allowAuto: false);
+            defaultFontFamily = styleMap.TryGetValue("font-family", out var family) && !string.IsNullOrWhiteSpace(family)
+                ? family.Trim('\'', '"', ' ')
+                : defaultFontFamily;
+            defaultLineHeight = ParseLineHeight(styleMap, defaultLineHeight);
+            defaultTextColor = ParseColor(styleMap.TryGetValue("color", out var colorValue) ? colorValue : null, defaultTextColor);
+            defaultBackgroundColor = ParseColor(styleMap.TryGetValue("background-color", out var backgroundValue) ? backgroundValue : null, defaultBackgroundColor);
+        }
+
+        return new LayoutContext(
+            Width: width,
+            Height: height,
+            BackgroundColor: defaultBackgroundColor,
+            TextColor: defaultTextColor,
+            Padding: 0f,
+            FontFamily: defaultFontFamily,
+            FontSize: defaultFontSize,
+            LineHeightMultiplier: defaultLineHeight,
+            ParagraphSpacing: 0f,
+            TextMeasurer: textMeasurer,
+            Fonts: FontFaceLoader.Load(document));
     }
 
     /// <summary>
     /// Renders the given document to a PNG image.
     /// </summary>
     /// <param name="document">The source document.</param>
-    /// <param name="options">Optional rendering settings.</param>
     /// <returns>The rendered PNG image.</returns>
-    public RenderedImage RenderToPng(IDocument document, HtmlRenderOptions? options = null)
+    public RenderedImage RenderToPng(IDocument document)
     {
         ArgumentNullException.ThrowIfNull(document);
+        var renderDevice = document.Context.GetService<IRenderDevice>();
+        return RenderToPng(document, renderDevice!);
+    }
 
-        var effectiveOptions = options ?? new HtmlRenderOptions();
-        var viewport = new RenderViewport(effectiveOptions.Width, effectiveOptions.Height);
-        var displayList = BuildDisplayList(document, viewport, effectiveOptions);
+    /// <summary>
+    /// Renders the given document to a PNG image.
+    /// </summary>
+    /// <param name="document">The source document.</param>
+    /// <param name="renderDevice">The render device used for viewport and typography defaults.</param>
+    /// <returns>The rendered PNG image.</returns>
+    public RenderedImage RenderToPng(IDocument document, IRenderDevice renderDevice)
+    {
+        ArgumentNullException.ThrowIfNull(document);
+        ArgumentNullException.ThrowIfNull(renderDevice);
+
+        var context = CreateLayoutContext(document, renderDevice, _textMeasurer);
+        var viewport = new RenderViewport(context.Width, context.Height);
+        var displayList = BuildDisplayList(document, viewport, context, renderDevice);
 
         return _backend.RenderToPng(displayList, viewport);
     }
@@ -57,21 +243,34 @@ public sealed class HtmlRenderer
     /// Builds a display list from the given document.
     /// </summary>
     /// <param name="document">The source document.</param>
-    /// <param name="options">Optional rendering settings.</param>
     /// <returns>The generated display list.</returns>
-    public DisplayList BuildDisplayList(IDocument document, HtmlRenderOptions? options = null)
+    public DisplayList BuildDisplayList(IDocument document)
     {
         ArgumentNullException.ThrowIfNull(document);
-
-        var effectiveOptions = options ?? new HtmlRenderOptions();
-        var viewport = new RenderViewport(effectiveOptions.Width, effectiveOptions.Height);
-        return BuildDisplayList(document, viewport, effectiveOptions);
+        var renderDevice = document.Context.GetService<IRenderDevice>();
+        return BuildDisplayList(document, renderDevice!);
     }
 
-    private static DisplayList BuildDisplayList(IDocument document, RenderViewport viewport, HtmlRenderOptions options)
+    /// <summary>
+    /// Builds a display list from the given document.
+    /// </summary>
+    /// <param name="document">The source document.</param>
+    /// <param name="renderDevice">The render device used for viewport and typography defaults.</param>
+    /// <returns>The generated display list.</returns>
+    public DisplayList BuildDisplayList(IDocument document, IRenderDevice renderDevice)
     {
-        var displayList = new DisplayList();
-        displayList.FillRect(new RenderRect(0f, 0f, viewport.Width, viewport.Height), options.BackgroundColor);
+        ArgumentNullException.ThrowIfNull(document);
+        ArgumentNullException.ThrowIfNull(renderDevice);
+
+        var context = CreateLayoutContext(document, renderDevice, _textMeasurer);
+        var viewport = new RenderViewport(context.Width, context.Height);
+        return BuildDisplayList(document, viewport, context, renderDevice);
+    }
+
+    private static DisplayList BuildDisplayList(IDocument document, RenderViewport viewport, LayoutContext context, IRenderDevice renderDevice)
+    {
+        var displayList = new DisplayList { Fonts = context.Fonts };
+        displayList.FillRect(new RenderRect(0f, 0f, viewport.Width, viewport.Height), context.BackgroundColor);
 
         var window = document.DefaultView;
         if (window is null)
@@ -79,29 +278,22 @@ public sealed class HtmlRenderer
             return displayList;
         }
 
-        var renderDevice = new DefaultRenderDevice
-        {
-            ViewPortWidth = viewport.Width,
-            ViewPortHeight = viewport.Height,
-            DeviceWidth = viewport.Width,
-            DeviceHeight = viewport.Height,
-            FontSize = options.FontSize,
-        };
+        PrepareDocumentForRendering(document);
 
         var renderTree = window.Render(renderDevice);
         var body = document.Body;
         var root = body is null ? renderTree : renderTree.Find(body) ?? renderTree;
 
-        var contentX = options.Padding;
-        var contentY = options.Padding;
-        var contentWidth = viewport.Width - (2f * options.Padding);
+        var contentX = context.Padding;
+        var contentY = context.Padding;
+        var contentWidth = viewport.Width - (2f * context.Padding);
 
         if (contentWidth <= 0f)
         {
             return displayList;
         }
 
-        var textStyle = new RenderTextStyle(options.FontSize, options.TextColor, options.FontFamily, options.LineHeightMultiplier, 400f, false, false, false, options.TextColor, global::AngleSharp.Renderer.Rendering.RenderTextDecorationStyle.Solid, TextAlign.Left, 0f, 0f, 0f);
+        var textStyle = new RenderTextStyle(context.FontSize, context.TextColor, context.FontFamily, context.LineHeightMultiplier, 400f, false, false, false, context.TextColor, global::AngleSharp.Renderer.Rendering.RenderTextDecorationStyle.Solid, TextAlign.Left, 0f, 0f, 0f);
         var cursorY = contentY;
         var previousBlockMarginBottom = 0f;
         var suppressNextBlockTopMargin = false;
@@ -123,11 +315,11 @@ public sealed class HtmlRenderer
                 activeFloatBottom: ref activeFloatBottom,
                 textIndentConsumed: ref textIndentConsumed,
                 textStyle: textStyle,
-                options: options,
+                context: context,
                 displayList: displayList,
-                maxY: viewport.Height - options.Padding);
+                maxY: viewport.Height - context.Padding);
 
-            if (cursorY > viewport.Height - options.Padding)
+            if (cursorY > viewport.Height - context.Padding)
             {
                 break;
             }
@@ -148,17 +340,21 @@ public sealed class HtmlRenderer
         ref float activeFloatBottom,
         ref bool textIndentConsumed,
         RenderTextStyle textStyle,
-        HtmlRenderOptions options,
+        LayoutContext context,
         DisplayList displayList,
-        float maxY)
+        float maxY,
+        bool isFlexItem = false,
+        bool isRowDirection = true,
+        float? flexMainSize = null,
+        float? flexCrossSize = null)
     {
         switch (node)
         {
             case TextRenderNode textNode:
-                LayoutTextNode(textNode.Ref, containingX, containingWidth, ref cursorY, ref previousBlockMarginBottom, ref suppressNextBlockTopMargin, ref activeFloatLeftOffset, ref activeFloatBottom, ref textIndentConsumed, textStyle, options, displayList, maxY);
+                LayoutTextNode(textNode.Ref, containingX, containingWidth, ref cursorY, ref previousBlockMarginBottom, ref suppressNextBlockTopMargin, ref activeFloatLeftOffset, ref activeFloatBottom, ref textIndentConsumed, textStyle, context, displayList, maxY);
                 return;
             case ElementRenderNode element:
-                LayoutElement(element, containingX, containingY, containingWidth, ref cursorY, ref previousBlockMarginBottom, ref suppressNextBlockTopMargin, ref activeFloatLeftOffset, ref activeFloatBottom, ref textIndentConsumed, textStyle, options, displayList, maxY);
+                LayoutElement(element, containingX, containingY, containingWidth, ref cursorY, ref previousBlockMarginBottom, ref suppressNextBlockTopMargin, ref activeFloatLeftOffset, ref activeFloatBottom, ref textIndentConsumed, textStyle, context, displayList, maxY, isFlexItem, isRowDirection, flexMainSize, flexCrossSize);
                 return;
             default:
                 return;
@@ -177,13 +373,17 @@ public sealed class HtmlRenderer
         ref float activeFloatBottom,
         ref bool textIndentConsumed,
         RenderTextStyle inheritedTextStyle,
-        HtmlRenderOptions options,
+        LayoutContext context,
         DisplayList displayList,
-        float maxY)
+        float maxY,
+        bool isFlexItem = false,
+        bool isRowDirection = true,
+        float? flexMainSize = null,
+        float? flexCrossSize = null)
     {
         var element = node.Ref;
         var computedStyle = node.ComputedStyle;
-        var styleMap = CreateStyleMap(node.ComputedStyle);
+        var styleMap = CreateStyleMap(node.ComputedStyle, node.Ref);
 
         if (!node.IsVisible())
         {
@@ -208,11 +408,11 @@ public sealed class HtmlRenderer
 
         if (string.Equals(display, "table", StringComparison.OrdinalIgnoreCase))
         {
-            LayoutTable(node, containingX, containingY, containingWidth, ref cursorY, ref previousBlockMarginBottom, ref suppressNextBlockTopMargin, ref activeFloatLeftOffset, ref activeFloatBottom, ref textIndentConsumed, inheritedTextStyle, options, displayList, maxY);
+            LayoutTable(node, containingX, containingY, containingWidth, ref cursorY, ref previousBlockMarginBottom, ref suppressNextBlockTopMargin, ref activeFloatLeftOffset, ref activeFloatBottom, ref textIndentConsumed, inheritedTextStyle, context, displayList, maxY);
             return;
         }
 
-        var renderAsBlock = ShouldRenderAsBlock(computedStyle);
+        var renderAsBlock = ShouldRenderAsBlock(computedStyle) || IsReplacedElementTag(tagName);
         var isInlineBlock = IsInlineBlock(computedStyle);
         var currentTextStyle = ResolveTextStyle(styleMap, inheritedTextStyle);
 
@@ -237,7 +437,7 @@ public sealed class HtmlRenderer
             var inlineText = NormalizeWhitespace(element.TextContent ?? string.Empty);
             if (inlineText.Length > 0)
             {
-                    LayoutWrappedText(inlineText, flowContainingX, flowContainingWidth, ref cursorY, currentTextStyle, options, displayList, maxY, textIndentConsumed ? 0f : currentTextStyle.TextIndent);
+                    LayoutWrappedText(inlineText, flowContainingX, flowContainingWidth, ref cursorY, currentTextStyle, context, displayList, maxY, textIndentConsumed ? 0f : currentTextStyle.TextIndent);
                     textIndentConsumed = true;
             }
 
@@ -298,7 +498,15 @@ public sealed class HtmlRenderer
             effectiveMarginTop = CollapseMargins(marginTop, firstChildTopMargin);
         }
 
-        var specifiedContentWidth = ParseLength(styleMap, "width", flowContainingWidth, float.NaN, allowAuto: true);
+        var specifiedContentWidth = ResolveFlexibleContentDimension(
+            styleMap,
+            flowContainingWidth,
+            float.NaN,
+            isFlexItem,
+            isRowDirection,
+            flexMainSize,
+            flexCrossSize,
+            propertyName: "width");
         ResolveHorizontalMetrics(
             flowContainingWidth,
             specifiedContentWidth,
@@ -329,12 +537,12 @@ public sealed class HtmlRenderer
         }
 
         var borderBoxX = isFixed
-            ? options.Padding + leftOffset
+            ? context.Padding + leftOffset
             : isAbsolute
                 ? containingX + leftOffset
                 : flowBorderBoxX + (isRelative ? leftOffset : 0f);
         var borderBoxY = isFixed
-            ? options.Padding + topOffset
+            ? context.Padding + topOffset
             : isAbsolute
                 ? containingY + topOffset
                 : flowBorderBoxY + (isRelative ? topOffset : 0f);
@@ -352,12 +560,85 @@ public sealed class HtmlRenderer
         var inlineLineHeight = currentTextStyle.FontSize * currentTextStyle.LineHeightMultiplier;
         var inlineCursorX = flowContainingX + (textIndentConsumed ? 0f : currentTextStyle.TextIndent);
 
-        var orderedChildren = OrderChildrenForPainting(node.Children).ToList();
+        // An <svg> root's children are foreign-namespaced SVG elements (circle, text, title, ...),
+        // not HTML flow content; it is rasterized as a single replaced element below, so its
+        // subtree must never be walked as if it were normal inline/block content.
+        var orderedChildren = string.Equals(tagName, "svg", StringComparison.OrdinalIgnoreCase)
+            ? []
+            : OrderChildrenForPainting(node.Children).ToList();
         var hasInlineRun = orderedChildren.Any(child =>
             (child is ElementRenderNode childElement &&
              !ShouldRenderAsBlock(childElement.ComputedStyle) &&
              !IsInlineBlock(childElement.ComputedStyle)) ||
             (child is ElementRenderNode childElementWithBr && string.Equals(childElementWithBr.Ref.LocalName, "br", StringComparison.OrdinalIgnoreCase)));
+
+        if (IsFlexContainer(styleMap))
+        {
+            LayoutFlexContainer(
+                node,
+                contentX,
+                contentY,
+                contentWidth,
+                ref cursorY,
+                ref previousBlockMarginBottom,
+                ref suppressNextBlockTopMargin,
+                ref activeFloatLeftOffset,
+                ref activeFloatBottom,
+                ref textIndentConsumed,
+                currentTextStyle,
+                context,
+                displayList,
+                maxY,
+                styleMap,
+                borderLeft,
+                borderTop,
+                borderRight,
+                borderBottom,
+                paddingLeft,
+                paddingRight,
+                paddingTop,
+                paddingBottom,
+                box,
+                flowBorderBoxX,
+                flowBorderBoxY,
+                borderBoxX,
+                borderBoxY);
+            return;
+        }
+
+        if (IsGridContainer(styleMap))
+        {
+            LayoutGridContainer(
+                node,
+                contentX,
+                contentY,
+                contentWidth,
+                ref cursorY,
+                ref previousBlockMarginBottom,
+                ref suppressNextBlockTopMargin,
+                ref activeFloatLeftOffset,
+                ref activeFloatBottom,
+                ref textIndentConsumed,
+                currentTextStyle,
+                context,
+                displayList,
+                maxY,
+                styleMap,
+                borderLeft,
+                borderTop,
+                borderRight,
+                borderBottom,
+                paddingLeft,
+                paddingRight,
+                paddingTop,
+                paddingBottom,
+                box,
+                flowBorderBoxX,
+                flowBorderBoxY,
+                borderBoxX,
+                borderBoxY);
+            return;
+        }
 
         if (!hasInlineRun)
         {
@@ -376,7 +657,7 @@ public sealed class HtmlRenderer
                         ref childActiveFloatBottom,
                         ref textIndentConsumed,
                         currentTextStyle,
-                        options,
+                        context,
                         displayList,
                         maxY);
                 }
@@ -394,7 +675,7 @@ public sealed class HtmlRenderer
                         activeFloatBottom: ref childActiveFloatBottom,
                         textIndentConsumed: ref childTextIndentConsumed,
                         textStyle: currentTextStyle,
-                        options: options,
+                        context: context,
                         displayList: displayList,
                         maxY: maxY);
                 }
@@ -433,7 +714,7 @@ public sealed class HtmlRenderer
                         activeFloatBottom: ref childActiveFloatBottom,
                         textIndentConsumed: ref childTextIndentConsumed,
                         textStyle: currentTextStyle,
-                        options: options,
+                        context: context,
                         displayList: displayList,
                         maxY: maxY);
                 }
@@ -453,7 +734,7 @@ public sealed class HtmlRenderer
                                 currentTextStyle,
                                 flowContainingX,
                                 flowContainingWidth,
-                                options.AverageCharacterWidthFactor,
+                                context,
                                 ref inlineCursorX,
                                 ref inlineLineTop,
                                 ref inlineLineHeight,
@@ -484,7 +765,7 @@ public sealed class HtmlRenderer
                                     childTextStyle,
                                     flowContainingX,
                                     flowContainingWidth,
-                                    options.AverageCharacterWidthFactor,
+                                    context,
                                     ref inlineCursorX,
                                     ref inlineLineTop,
                                     ref inlineLineHeight,
@@ -502,7 +783,15 @@ public sealed class HtmlRenderer
         }
 
         var autoContentHeight = Math.Max(0f, childCursorY - contentY);
-        var specifiedContentHeight = ParseLength(styleMap, "height", flowContainingWidth, float.NaN, allowAuto: true);
+        var specifiedContentHeight = ResolveFlexibleContentDimension(
+            styleMap,
+            flowContainingWidth,
+            float.NaN,
+            isFlexItem,
+            isRowDirection,
+            flexMainSize,
+            flexCrossSize,
+            propertyName: "height");
         var contentHeight = float.IsNaN(specifiedContentHeight) ? autoContentHeight : Math.Max(specifiedContentHeight, autoContentHeight);
 
         var borderBoxWidth = borderLeft + paddingLeft + contentWidth + paddingRight + borderRight;
@@ -519,9 +808,29 @@ public sealed class HtmlRenderer
             effectiveMarginBottom = CollapseMargins(marginBottom, childPreviousBlockMarginBottom);
         }
 
-        PaintBackground(displayList, box.BackgroundColor, borderBoxX, borderBoxY, borderBoxWidth, borderBoxHeight);
+        RecordLayoutMetrics(
+            node.Ref,
+            borderBoxX,
+            borderBoxY,
+            borderBoxWidth,
+            borderBoxHeight,
+            borderLeft,
+            borderRight,
+            borderTop,
+            borderBottom,
+            paddingLeft,
+            paddingRight,
+            paddingTop,
+            paddingBottom);
+
+        PaintBackground(displayList, box.BackgroundPaint, borderBoxX, borderBoxY, borderBoxWidth, borderBoxHeight);
         PaintBorder(displayList, box.BorderColor, borderBoxX, borderBoxY, borderBoxWidth, borderBoxHeight, box.BorderWidth);
         PaintOutline(displayList, styleMap, borderBoxX, borderBoxY, borderBoxWidth, borderBoxHeight);
+
+        if (TryResolveReplacedElementImage(node, styleMap, flowContainingWidth, borderBoxX + borderLeft + paddingLeft, borderBoxY + borderTop + paddingTop, out var image, out var imageRect))
+        {
+            displayList.DrawImage(imageRect, image!);
+        }
 
         if (isFloatLeft)
         {
@@ -541,7 +850,380 @@ public sealed class HtmlRenderer
         }
 
         cursorY = flowBorderBoxY + borderBoxHeight;
-        previousBlockMarginBottom = effectiveMarginBottom + options.ParagraphSpacing;
+        previousBlockMarginBottom = effectiveMarginBottom + context.ParagraphSpacing;
+    }
+
+    private readonly record struct FlexItemLayoutInfo(
+        IRenderNode Node,
+        Dictionary<string, string> Style,
+        float Order,
+        float FlexGrow,
+        float FlexShrink,
+        float BaseMainSize,
+        float CrossSize,
+        string AlignSelf);
+
+    private readonly record struct GridPlacement(int LineIndex, int Span);
+
+    private static void LayoutFlexContainer(
+        ElementRenderNode node,
+        float containingX,
+        float containingY,
+        float containingWidth,
+        ref float cursorY,
+        ref float previousBlockMarginBottom,
+        ref bool suppressNextBlockTopMargin,
+        ref float activeFloatLeftOffset,
+        ref float activeFloatBottom,
+        ref bool textIndentConsumed,
+        RenderTextStyle inheritedTextStyle,
+        LayoutContext context,
+        DisplayList displayList,
+        float maxY,
+        Dictionary<string, string> styleMap,
+        float borderLeft,
+        float borderTop,
+        float borderRight,
+        float borderBottom,
+        float paddingLeft,
+        float paddingRight,
+        float paddingTop,
+        float paddingBottom,
+        BoxStyle box,
+        float flowBorderBoxX,
+        float flowBorderBoxY,
+        float borderBoxX,
+        float borderBoxY)
+    {
+        var flexDirection = GetFlexDirection(styleMap);
+        var isRowDirection = !string.Equals(flexDirection, "column", StringComparison.OrdinalIgnoreCase) && !string.Equals(flexDirection, "column-reverse", StringComparison.OrdinalIgnoreCase);
+        var isReverseDirection = string.Equals(flexDirection, "row-reverse", StringComparison.OrdinalIgnoreCase) || string.Equals(flexDirection, "column-reverse", StringComparison.OrdinalIgnoreCase);
+        var justifyContent = GetJustifyContent(styleMap);
+        var alignItems = GetAlignItems(styleMap);
+        var flexWrap = GetFlexWrap(styleMap);
+        var alignContent = GetAlignContent(styleMap);
+        var flexItems = OrderChildrenForPainting(node.Children)
+            .Where(child => child is ElementRenderNode || child is TextRenderNode)
+            .Select(child => CreateFlexItemLayoutInfo(child, isRowDirection, containingWidth))
+            .OrderBy(item => item.Order)
+            .ToList();
+
+        if (flexItems.Count == 0)
+        {
+            cursorY = flowBorderBoxY + borderTop + paddingTop + borderBottom + paddingBottom;
+            previousBlockMarginBottom = 0f;
+            suppressNextBlockTopMargin = false;
+            return;
+        }
+
+        var containerMainSize = isRowDirection
+            ? ParseLength(styleMap, "width", containingWidth, containingWidth, allowAuto: true)
+            : ParseLength(styleMap, "height", containingWidth, containingWidth, allowAuto: true);
+
+        if (float.IsNaN(containerMainSize) || containerMainSize <= 0f)
+        {
+            containerMainSize = isRowDirection ? containingWidth : containingWidth;
+        }
+
+        var specifiedCrossSize = isRowDirection
+            ? ParseLength(styleMap, "height", containingWidth, float.NaN, allowAuto: true)
+            : ParseLength(styleMap, "width", containingWidth, float.NaN, allowAuto: true);
+        var containerCrossSize = float.IsNaN(specifiedCrossSize) ? 0f : specifiedCrossSize;
+
+        var contentWidth = containingWidth;
+        var contentHeight = containerCrossSize;
+
+        var lines = new List<List<FlexItemLayoutInfo>>();
+        var currentLine = new List<FlexItemLayoutInfo>();
+        var currentLineMainSize = 0f;
+
+        foreach (var item in flexItems)
+        {
+            if (string.Equals(flexWrap, "wrap", StringComparison.OrdinalIgnoreCase) && currentLine.Count > 0 && currentLineMainSize + item.BaseMainSize > containerMainSize && containerMainSize > 0f)
+            {
+                lines.Add(currentLine);
+                currentLine = new List<FlexItemLayoutInfo>();
+                currentLineMainSize = 0f;
+            }
+
+            currentLine.Add(item);
+            currentLineMainSize += item.BaseMainSize;
+        }
+
+        if (currentLine.Count > 0)
+        {
+            lines.Add(currentLine);
+        }
+
+        var lineCrossSizes = lines.Select(line => line.Count > 0 ? line.Max(item => item.CrossSize) : 0f).ToList();
+        var totalCrossSize = lineCrossSizes.Sum();
+        var remainingCrossSize = Math.Max(0f, containerCrossSize - totalCrossSize);
+        var crossSpacing = 0f;
+        var currentCrossOffset = 0f;
+
+        switch (alignContent)
+        {
+            case "center":
+                currentCrossOffset = remainingCrossSize / 2f;
+                break;
+            case "flex-end":
+                currentCrossOffset = remainingCrossSize;
+                break;
+            case "space-between":
+                crossSpacing = lines.Count > 1 ? remainingCrossSize / Math.Max(1, lines.Count - 1) : 0f;
+                break;
+            case "space-around":
+                crossSpacing = lines.Count > 0 ? remainingCrossSize / Math.Max(1, lines.Count) : 0f;
+                currentCrossOffset = crossSpacing / 2f;
+                break;
+            case "space-evenly":
+                crossSpacing = lines.Count > 0 ? remainingCrossSize / Math.Max(1, lines.Count + 1) : 0f;
+                currentCrossOffset = crossSpacing;
+                break;
+            default:
+                currentCrossOffset = 0f;
+                break;
+        }
+
+        var childCursorY = containingY;
+        var childPreviousBlockMarginBottom = 0f;
+        var childSuppressNextBlockTopMargin = false;
+        var childActiveFloatLeftOffset = 0f;
+        var childActiveFloatBottom = 0f;
+        var childTextIndentConsumed = false;
+        var totalLineMainSize = 0f;
+
+        for (var lineIndex = 0; lineIndex < lines.Count; lineIndex++)
+        {
+            var line = lines[lineIndex];
+            var lineBaseSize = line.Sum(item => item.BaseMainSize);
+            var lineGrowSum = line.Sum(item => item.FlexGrow);
+            var lineShrinkSum = line.Sum(item => item.FlexShrink);
+            var lineItems = new List<(FlexItemLayoutInfo Item, float FinalMainSize)>(line.Count);
+            var availableMainSize = Math.Max(0f, containerMainSize - lineBaseSize);
+            var lineMainSize = 0f;
+
+            foreach (var item in line)
+            {
+                var finalMainSize = item.BaseMainSize;
+
+                if (availableMainSize > 0f && lineGrowSum > 0f)
+                {
+                    finalMainSize = item.BaseMainSize + (availableMainSize * item.FlexGrow / lineGrowSum);
+                }
+                else if (availableMainSize < 0f && lineShrinkSum > 0f)
+                {
+                    finalMainSize = Math.Max(0f, item.BaseMainSize + (availableMainSize * item.FlexShrink / lineShrinkSum));
+                }
+
+                lineItems.Add((item, finalMainSize));
+                lineMainSize += finalMainSize;
+            }
+
+            var spacerCount = Math.Max(0, lineItems.Count - 1);
+            var lineMainSpacing = 0f;
+            var lineMainStart = 0f;
+
+            switch (justifyContent)
+            {
+                case "center":
+                    lineMainStart = Math.Max(0f, containerMainSize - lineMainSize) / 2f;
+                    break;
+                case "flex-end":
+                    lineMainStart = Math.Max(0f, containerMainSize - lineMainSize);
+                    break;
+                case "space-between":
+                    lineMainSpacing = lineItems.Count > 1 ? Math.Max(0f, containerMainSize - lineMainSize) / spacerCount : 0f;
+                    break;
+                case "space-around":
+                    lineMainSpacing = lineItems.Count > 0 ? Math.Max(0f, containerMainSize - lineMainSize) / lineItems.Count : 0f;
+                    lineMainStart = lineMainSpacing / 2f;
+                    break;
+                case "space-evenly":
+                    lineMainSpacing = lineItems.Count > 0 ? Math.Max(0f, containerMainSize - lineMainSize) / (lineItems.Count + 1) : 0f;
+                    lineMainStart = lineMainSpacing;
+                    break;
+                default:
+                    lineMainStart = 0f;
+                    break;
+            }
+
+            var lineCrossSize = lineItems.Count > 0 ? lineItems.Max(entry => entry.Item.CrossSize) : 0f;
+            var lineCrossPosition = currentCrossOffset;
+            var lineCrossStart = 0f;
+
+            if (string.Equals(alignItems, "center", StringComparison.OrdinalIgnoreCase))
+            {
+                lineCrossStart = containerCrossSize > 0f && lineCrossSize < containerCrossSize ? (containerCrossSize - lineCrossSize) / 2f : 0f;
+            }
+            else if (string.Equals(alignItems, "flex-end", StringComparison.OrdinalIgnoreCase))
+            {
+                lineCrossStart = containerCrossSize > 0f && lineCrossSize < containerCrossSize ? containerCrossSize - lineCrossSize : 0f;
+            }
+            else if (string.Equals(alignItems, "stretch", StringComparison.OrdinalIgnoreCase))
+            {
+                lineCrossStart = 0f;
+            }
+
+            var mainOffset = isReverseDirection ? containerMainSize - lineMainStart - lineMainSize : lineMainStart;
+            var currentMainOffset = 0f;
+
+            foreach (var (item, finalMainSize) in lineItems)
+            {
+                var resolvedCrossSize = item.CrossSize;
+                if (string.Equals(alignItems, "stretch", StringComparison.OrdinalIgnoreCase) && resolvedCrossSize <= 0f && containerCrossSize > 0f)
+                {
+                    resolvedCrossSize = containerCrossSize;
+                }
+
+                var itemCrossPosition = lineCrossPosition + lineCrossStart;
+                var alignSelf = item.AlignSelf;
+
+                if (string.Equals(alignSelf, "center", StringComparison.OrdinalIgnoreCase))
+                {
+                    itemCrossPosition = containerCrossSize > 0f && resolvedCrossSize < containerCrossSize ? (containerCrossSize - resolvedCrossSize) / 2f : 0f;
+                }
+                else if (string.Equals(alignSelf, "flex-end", StringComparison.OrdinalIgnoreCase))
+                {
+                    itemCrossPosition = containerCrossSize > 0f && resolvedCrossSize < containerCrossSize ? containerCrossSize - resolvedCrossSize : 0f;
+                }
+                else if (string.Equals(alignSelf, "stretch", StringComparison.OrdinalIgnoreCase) && resolvedCrossSize <= 0f && containerCrossSize > 0f)
+                {
+                    resolvedCrossSize = containerCrossSize;
+                    itemCrossPosition = 0f;
+                }
+                else if (!string.Equals(alignSelf, "auto", StringComparison.OrdinalIgnoreCase))
+                {
+                    itemCrossPosition = 0f;
+                }
+
+                var itemOffset = isReverseDirection
+                    ? mainOffset + currentMainOffset
+                    : lineMainStart + currentMainOffset;
+                var childX = isRowDirection ? containingX + itemOffset : containingX + itemCrossPosition;
+                var childY = isRowDirection ? containingY + itemCrossPosition + lineCrossPosition : containingY + itemOffset;
+                var childWidth = isRowDirection ? finalMainSize : resolvedCrossSize;
+                var childHeight = isRowDirection ? resolvedCrossSize : finalMainSize;
+
+                if (item.Node is TextRenderNode textNode)
+                {
+                    LayoutTextNode(textNode.Ref, childX, containingWidth, ref childCursorY, ref childPreviousBlockMarginBottom, ref childSuppressNextBlockTopMargin, ref childActiveFloatLeftOffset, ref childActiveFloatBottom, ref childTextIndentConsumed, inheritedTextStyle, context, displayList, maxY);
+                }
+                else if (item.Node is ElementRenderNode elementChild)
+                {
+                    var childContainingWidth = Math.Max(0f, childWidth);
+                    var childContainingHeight = Math.Max(0f, childHeight);
+                    var childCursor = isRowDirection ? containingY + itemCrossPosition + lineCrossPosition : containingY + itemOffset;
+                    var childBlockCursor = childCursor;
+                    var childPreviousBottom = 0f;
+                    var childSuppressMargin = false;
+                    var childTextIndent = false;
+                    var childActiveFloatLeft = 0f;
+                    var childActiveFloatBottomOffset = 0f;
+
+                    LayoutNode(
+                        node: elementChild,
+                        containingX: childX,
+                        containingY: childY,
+                        containingWidth: childContainingWidth,
+                        cursorY: ref childBlockCursor,
+                        previousBlockMarginBottom: ref childPreviousBottom,
+                        suppressNextBlockTopMargin: ref childSuppressMargin,
+                        activeFloatLeftOffset: ref childActiveFloatLeft,
+                        activeFloatBottom: ref childActiveFloatBottomOffset,
+                        textIndentConsumed: ref childTextIndent,
+                        textStyle: inheritedTextStyle,
+                        context: context,
+                        displayList: displayList,
+                        maxY: maxY,
+                        isFlexItem: true,
+                        isRowDirection: isRowDirection,
+                        flexMainSize: finalMainSize,
+                        flexCrossSize: resolvedCrossSize);
+                }
+
+                currentMainOffset += finalMainSize + lineMainSpacing;
+            }
+
+            currentCrossOffset += lineCrossSize + crossSpacing;
+            totalLineMainSize = Math.Max(totalLineMainSize, lineMainSize);
+        }
+
+        var autoContentHeight = Math.Max(0f, (isRowDirection ? containerCrossSize : containerMainSize) - 0f);
+        var specifiedContentHeight = ParseLength(styleMap, "height", containingWidth, float.NaN, allowAuto: true);
+        contentHeight = float.IsNaN(specifiedContentHeight) ? Math.Max(autoContentHeight, totalLineMainSize) : Math.Max(specifiedContentHeight, autoContentHeight);
+        var borderBoxWidth = borderLeft + paddingLeft + containingWidth + paddingRight + borderRight;
+        var borderBoxHeight = borderTop + paddingTop + contentHeight + paddingBottom + borderBottom;
+        var canCollapseWithLastChild = borderBottom <= 0f && paddingBottom <= 0f && float.IsNaN(specifiedContentHeight);
+        var effectiveMarginBottom = ParseLength(styleMap, "margin-bottom", containingWidth, box.Margin.Bottom, allowAuto: false);
+
+        if (canCollapseWithLastChild)
+        {
+            effectiveMarginBottom = CollapseMargins(effectiveMarginBottom, childPreviousBlockMarginBottom);
+        }
+
+        if (box.BackgroundPaint is RenderColorPaint colorPaint && colorPaint.Color.A == 0)
+        {
+            displayList.FillRect(new RenderRect(borderBoxX, borderBoxY, borderBoxWidth, borderBoxHeight), RenderColor.Transparent);
+        }
+        else
+        {
+            PaintBackground(displayList, box.BackgroundPaint, borderBoxX, borderBoxY, borderBoxWidth, borderBoxHeight);
+        }
+
+        RecordLayoutMetrics(
+            node.Ref,
+            borderBoxX,
+            borderBoxY,
+            borderBoxWidth,
+            borderBoxHeight,
+            borderLeft,
+            borderRight,
+            borderTop,
+            borderBottom,
+            paddingLeft,
+            paddingRight,
+            paddingTop,
+            paddingBottom);
+
+        PaintBorder(displayList, box.BorderColor, borderBoxX, borderBoxY, borderBoxWidth, borderBoxHeight, box.BorderWidth);
+        PaintOutline(displayList, styleMap, borderBoxX, borderBoxY, borderBoxWidth, borderBoxHeight);
+
+        if (TryResolveReplacedElementImage(node, styleMap, containingWidth, borderBoxX + borderLeft + paddingLeft, borderBoxY + borderTop + paddingTop, out var image, out var imageRect))
+        {
+            displayList.DrawImage(imageRect, image!);
+        }
+
+        cursorY = flowBorderBoxY + borderBoxHeight;
+        previousBlockMarginBottom = effectiveMarginBottom + context.ParagraphSpacing;
+        suppressNextBlockTopMargin = false;
+    }
+
+    private static float ResolveFlexibleContentDimension(
+        Dictionary<string, string> styleMap,
+        float relativeTo,
+        float defaultValue,
+        bool isFlexItem,
+        bool isRowDirection,
+        float? flexMainSize,
+        float? flexCrossSize,
+        string propertyName)
+    {
+        if (!isFlexItem)
+        {
+            return ParseLength(styleMap, propertyName, relativeTo, defaultValue, allowAuto: true);
+        }
+
+        if (string.Equals(propertyName, "width", StringComparison.OrdinalIgnoreCase))
+        {
+            return isRowDirection
+                ? (flexMainSize.HasValue ? flexMainSize.Value : ParseLength(styleMap, propertyName, relativeTo, defaultValue, allowAuto: true))
+                : (flexCrossSize.HasValue ? flexCrossSize.Value : ParseLength(styleMap, propertyName, relativeTo, defaultValue, allowAuto: true));
+        }
+
+        return isRowDirection
+            ? (flexCrossSize.HasValue ? flexCrossSize.Value : ParseLength(styleMap, propertyName, relativeTo, defaultValue, allowAuto: true))
+            : (flexMainSize.HasValue ? flexMainSize.Value : ParseLength(styleMap, propertyName, relativeTo, defaultValue, allowAuto: true));
     }
 
     private static IEnumerable<ElementRenderNode> CollectTableRows(ElementRenderNode tableNode)
@@ -575,7 +1257,7 @@ public sealed class HtmlRenderer
         ref float activeFloatBottom,
         ref bool textIndentConsumed,
         RenderTextStyle inheritedTextStyle,
-        HtmlRenderOptions options,
+        LayoutContext context,
         DisplayList displayList,
         float maxY)
     {
@@ -622,7 +1304,7 @@ public sealed class HtmlRenderer
                 .ToList())
             .ToList();
 
-        var tableCells = new List<(int RowIndex, int ColumnIndex, int ColumnSpan, int RowSpan, ElementRenderNode CellNode, Dictionary<string, string> CellStyle, RenderTextStyle CellTextStyle, string Text, float PaddingLeft, float PaddingRight, float PaddingTop, float PaddingBottom, float BorderLeftWidth, float BorderRightWidth, float BorderTopWidth, float BorderBottomWidth, RenderColor BackgroundColor)>();
+        var tableCells = new List<TableCellPlacement>();
         var rowSpanOccupancy = new List<int>();
         var columnCount = 0;
 
@@ -691,7 +1373,7 @@ public sealed class HtmlRenderer
                     nextRowSpanOccupancy[currentColumnIndex + spanOffset] = Math.Max(nextRowSpanOccupancy[currentColumnIndex + spanOffset], Math.Max(0, rowspan - 1));
                 }
 
-                tableCells.Add((rowIndex, currentColumnIndex, colspan, rowspan, cellNode, cellStyle, cellTextStyle, text,
+                tableCells.Add(new TableCellPlacement(rowIndex, currentColumnIndex, colspan, rowspan, cellNode, cellStyle, cellTextStyle, text,
                     ParseLength(cellStyle, "padding-left", containingWidth, 4f, allowAuto: false),
                     ParseLength(cellStyle, "padding-right", containingWidth, 4f, allowAuto: false),
                     ParseLength(cellStyle, "padding-top", containingWidth, 4f, allowAuto: false),
@@ -700,7 +1382,8 @@ public sealed class HtmlRenderer
                     ParseLength(cellStyle, "border-right-width", containingWidth, 1f, allowAuto: false),
                     ParseLength(cellStyle, "border-top-width", containingWidth, 1f, allowAuto: false),
                     ParseLength(cellStyle, "border-bottom-width", containingWidth, 1f, allowAuto: false),
-                    ParseColor(cellStyle.TryGetValue("background-color", out var backgroundColor) ? backgroundColor : null, RenderColor.Transparent)));
+                    ParseColor(cellStyle.TryGetValue("background-color", out var backgroundColor) ? backgroundColor : null, RenderColor.Transparent),
+                    ParseCellVerticalAlign(cellStyle)));
 
                 columnCount = Math.Max(columnCount, currentColumnIndex + colspan);
                 currentColumnIndex += colspan;
@@ -710,6 +1393,12 @@ public sealed class HtmlRenderer
             {
                 if (rowSpanOccupancy[index] > 0)
                 {
+                    // A row with fewer cells than the span reaches over leaves the new list short.
+                    while (index >= nextRowSpanOccupancy.Count)
+                    {
+                        nextRowSpanOccupancy.Add(0);
+                    }
+
                     nextRowSpanOccupancy[index] = Math.Max(nextRowSpanOccupancy[index], rowSpanOccupancy[index] - 1);
                 }
             }
@@ -731,7 +1420,7 @@ public sealed class HtmlRenderer
             var paddingRight = placement.PaddingRight;
             var borderLeftWidth = placement.BorderLeftWidth;
             var borderRightWidth = placement.BorderRightWidth;
-            var textWidth = placement.Text.Length > 0 ? EstimateTextWidth(placement.Text, placement.CellTextStyle.FontSize, options.AverageCharacterWidthFactor, placement.CellTextStyle.LetterSpacing) : 0f;
+            var textWidth = placement.Text.Length > 0 ? MeasureTextWidth(context, placement.Text, placement.CellTextStyle) : 0f;
             var minCellWidth = textWidth + paddingLeft + paddingRight + borderLeftWidth + borderRightWidth + 8f;
             var widthPerColumn = float.IsNaN(specifiedCellWidth) ? minCellWidth / Math.Max(1, placement.ColumnSpan) : specifiedCellWidth / Math.Max(1, placement.ColumnSpan);
 
@@ -781,23 +1470,33 @@ public sealed class HtmlRenderer
         var rowTopOffsets = new float[rowCellLists.Count];
         var rowHeights = new float[rowCellLists.Count];
 
-        foreach (var placement in tableCells)
+        // Cells confined to a single row establish the row heights on their own.
+        foreach (var placement in tableCells.Where(placement => placement.RowSpan <= 1))
         {
-            var contentWidth = Math.Max(0f, columnWidths.Skip(placement.ColumnIndex).Take(placement.ColumnSpan).Sum() - placement.PaddingLeft - placement.PaddingRight - placement.BorderLeftWidth - placement.BorderRightWidth);
-            var contentHeight = 0f;
-            var text = placement.Text;
+            rowHeights[placement.RowIndex] = Math.Max(rowHeights[placement.RowIndex], MeasureCellHeight(context, placement, columnWidths));
+        }
 
-            if (contentWidth > 0f && text.Length > 0)
-            {
-                var wrappedLines = WrapText(text, contentWidth, placement.CellTextStyle.FontSize, options.AverageCharacterWidthFactor, placement.CellTextStyle.LetterSpacing);
-                var lineHeight = placement.CellTextStyle.FontSize * placement.CellTextStyle.LineHeightMultiplier;
-                contentHeight = wrappedLines.Count * lineHeight;
-            }
+        for (var rowIndex = 0; rowIndex < rowHeights.Length; rowIndex++)
+        {
+            rowHeights[rowIndex] = Math.Max(rowHeights[rowIndex], 20f);
+        }
 
-            var effectiveHeight = Math.Max(20f, contentHeight + placement.PaddingTop + placement.PaddingBottom + placement.BorderTopWidth + placement.BorderBottomWidth);
-            for (var rowIndex = placement.RowIndex; rowIndex < placement.RowIndex + placement.RowSpan; rowIndex++)
+        // A spanning cell only has to fit across the rows it covers taken together, so it grows
+        // them by whatever is still missing rather than imposing its full height on each one.
+        foreach (var placement in tableCells.Where(placement => placement.RowSpan > 1))
+        {
+            var spannedRows = Enumerable.Range(placement.RowIndex, placement.RowSpan).ToArray();
+            var available = spannedRows.Sum(rowIndex => rowHeights[rowIndex]);
+            var required = MeasureCellHeight(context, placement, columnWidths);
+
+            if (required > available)
             {
-                rowHeights[rowIndex] = Math.Max(rowHeights[rowIndex], effectiveHeight);
+                var deficitPerRow = (required - available) / placement.RowSpan;
+
+                foreach (var rowIndex in spannedRows)
+                {
+                    rowHeights[rowIndex] += deficitPerRow;
+                }
             }
         }
 
@@ -829,31 +1528,59 @@ public sealed class HtmlRenderer
                 cellHeight += rowHeights[rowIndex];
             }
 
-            var contentHeight = 0f;
-            if (contentWidth > 0f && placement.Text.Length > 0)
+            RecordLayoutMetrics(
+                placement.CellNode.Ref,
+                cellX,
+                cellY,
+                cellWidth,
+                cellHeight,
+                placement.BorderLeftWidth,
+                placement.BorderRightWidth,
+                placement.BorderTopWidth,
+                placement.BorderBottomWidth,
+                placement.PaddingLeft,
+                placement.PaddingRight,
+                placement.PaddingTop,
+                placement.PaddingBottom);
+
+            displayList.FillRect(new RenderRect(cellX, cellY, cellWidth, cellHeight), placement.BackgroundColor);
+
+            if (borderCollapse)
             {
-                var wrappedLines = WrapText(placement.Text, contentWidth, placement.CellTextStyle.FontSize, options.AverageCharacterWidthFactor, placement.CellTextStyle.LetterSpacing);
-                var lineHeight = placement.CellTextStyle.FontSize * placement.CellTextStyle.LineHeightMultiplier;
-                contentHeight = wrappedLines.Count * lineHeight;
+                // Collapsed borders are shared, so each cell contributes only its top and left
+                // edge and the table frame closes the far sides. Drawing full outlines instead
+                // would lay two lines over every shared edge, and a grid spanning the whole table
+                // would cut straight through the cells that span rows or columns.
+                displayList.FillRect(new RenderRect(cellX, cellY, cellWidth, CollapsedBorderWidth), RenderColor.Black);
+                displayList.FillRect(new RenderRect(cellX, cellY, CollapsedBorderWidth, cellHeight), RenderColor.Black);
             }
-
-            var effectiveHeight = Math.Max(20f, contentHeight + placement.PaddingTop + placement.PaddingBottom + placement.BorderTopWidth + placement.BorderBottomWidth);
-            displayList.FillRect(new RenderRect(cellX, cellY, cellWidth, effectiveHeight), placement.BackgroundColor);
-
-            if (!borderCollapse)
+            else
             {
                 displayList.FillRect(new RenderRect(cellX, cellY, cellWidth, placement.BorderTopWidth), RenderColor.Black);
-                displayList.FillRect(new RenderRect(cellX + cellWidth - placement.BorderRightWidth, cellY, placement.BorderRightWidth, effectiveHeight), RenderColor.Black);
-                displayList.FillRect(new RenderRect(cellX, cellY + effectiveHeight - placement.BorderBottomWidth, cellWidth, placement.BorderBottomWidth), RenderColor.Black);
-                displayList.FillRect(new RenderRect(cellX, cellY, placement.BorderLeftWidth, effectiveHeight), RenderColor.Black);
+                displayList.FillRect(new RenderRect(cellX + cellWidth - placement.BorderRightWidth, cellY, placement.BorderRightWidth, cellHeight), RenderColor.Black);
+                displayList.FillRect(new RenderRect(cellX, cellY + cellHeight - placement.BorderBottomWidth, cellWidth, placement.BorderBottomWidth), RenderColor.Black);
+                displayList.FillRect(new RenderRect(cellX, cellY, placement.BorderLeftWidth, cellHeight), RenderColor.Black);
             }
 
             if (contentWidth > 0f && placement.Text.Length > 0)
             {
-                var wrappedLines = WrapText(placement.Text, contentWidth, placement.CellTextStyle.FontSize, options.AverageCharacterWidthFactor, placement.CellTextStyle.LetterSpacing);
+                var wrappedLines = WrapText(context, placement.Text, contentWidth, placement.CellTextStyle);
                 var lineHeight = placement.CellTextStyle.FontSize * placement.CellTextStyle.LineHeightMultiplier;
                 var lineX = cellX + placement.PaddingLeft + placement.BorderLeftWidth;
-                var lineY = cellY + placement.PaddingTop + placement.BorderTopWidth + lineHeight;
+
+                // The content box can be taller than the text, most visibly in a cell that spans
+                // rows, so the block of lines is placed according to the cell's vertical-align.
+                var contentBoxHeight = cellHeight - placement.PaddingTop - placement.PaddingBottom
+                    - placement.BorderTopWidth - placement.BorderBottomWidth;
+                var slack = Math.Max(0f, contentBoxHeight - (wrappedLines.Count * lineHeight));
+                var verticalOffset = placement.VerticalAlign switch
+                {
+                    CellVerticalAlign.Middle => slack / 2f,
+                    CellVerticalAlign.Bottom => slack,
+                    _ => 0f,
+                };
+
+                var lineY = cellY + placement.PaddingTop + placement.BorderTopWidth + verticalOffset + lineHeight;
 
                 for (var lineIndex = 0; lineIndex < wrappedLines.Count; lineIndex++)
                 {
@@ -865,32 +1592,383 @@ public sealed class HtmlRenderer
 
         if (borderCollapse)
         {
-            var collapsedBorderWidth = 1f;
-
-            displayList.FillRect(new RenderRect(tableX, tableY, tableWidth, collapsedBorderWidth), RenderColor.Black);
-            displayList.FillRect(new RenderRect(tableX, tableY + tableHeight - collapsedBorderWidth, tableWidth, collapsedBorderWidth), RenderColor.Black);
-            displayList.FillRect(new RenderRect(tableX, tableY, collapsedBorderWidth, tableHeight), RenderColor.Black);
-            displayList.FillRect(new RenderRect(tableX + tableWidth - collapsedBorderWidth, tableY, collapsedBorderWidth, tableHeight), RenderColor.Black);
-
-            var currentVerticalX = tableX;
-            for (var columnIndex = 1; columnIndex < columnCount; columnIndex++)
-            {
-                currentVerticalX += columnWidths[columnIndex - 1];
-                displayList.FillRect(new RenderRect(currentVerticalX, tableY, collapsedBorderWidth, tableHeight), RenderColor.Black);
-            }
-
-            var currentHorizontalY = tableY;
-            for (var rowIndex = 1; rowIndex < rowCellLists.Count; rowIndex++)
-            {
-                currentHorizontalY += rowHeights[rowIndex - 1];
-                displayList.FillRect(new RenderRect(tableX, currentHorizontalY, tableWidth, collapsedBorderWidth), RenderColor.Black);
-            }
+            // The interior lines come from the cell outlines above; only the frame is left, which
+            // also closes the edge of rows that hold fewer cells than the table has columns.
+            displayList.FillRect(new RenderRect(tableX, tableY, tableWidth, CollapsedBorderWidth), RenderColor.Black);
+            displayList.FillRect(new RenderRect(tableX, tableY + tableHeight - CollapsedBorderWidth, tableWidth, CollapsedBorderWidth), RenderColor.Black);
+            displayList.FillRect(new RenderRect(tableX, tableY, CollapsedBorderWidth, tableHeight), RenderColor.Black);
+            displayList.FillRect(new RenderRect(tableX + tableWidth - CollapsedBorderWidth, tableY, CollapsedBorderWidth, tableHeight), RenderColor.Black);
         }
+
+        RecordLayoutMetrics(
+            tableNode.Ref,
+            tableX,
+            tableY,
+            tableWidth,
+            tableHeight,
+            borderLeft: 0f,
+            borderRight: 0f,
+            borderTop: 0f,
+            borderBottom: 0f,
+            paddingLeft: 0f,
+            paddingRight: 0f,
+            paddingTop: 0f,
+            paddingBottom: 0f);
 
         displayList.FillRect(new RenderRect(tableX, tableY, tableWidth, tableHeight), RenderColor.Transparent);
         cursorY = tableY + tableHeight + 4f;
         previousBlockMarginBottom = 0f;
         suppressNextBlockTopMargin = false;
+    }
+
+    private static void LayoutGridContainer(
+        ElementRenderNode node,
+        float containingX,
+        float containingY,
+        float containingWidth,
+        ref float cursorY,
+        ref float previousBlockMarginBottom,
+        ref bool suppressNextBlockTopMargin,
+        ref float activeFloatLeftOffset,
+        ref float activeFloatBottom,
+        ref bool textIndentConsumed,
+        RenderTextStyle inheritedTextStyle,
+        LayoutContext context,
+        DisplayList displayList,
+        float maxY,
+        Dictionary<string, string> styleMap,
+        float borderLeft,
+        float borderTop,
+        float borderRight,
+        float borderBottom,
+        float paddingLeft,
+        float paddingRight,
+        float paddingTop,
+        float paddingBottom,
+        BoxStyle box,
+        float flowBorderBoxX,
+        float flowBorderBoxY,
+        float borderBoxX,
+        float borderBoxY)
+    {
+        var columns = ParseGridTrackList(styleMap, "grid-template-columns", containingWidth, 1);
+        var columnGap = ParseGridGap(styleMap, "column-gap", containingWidth, 0)
+            ?? ParseGridGap(styleMap, "gap", containingWidth, 0);
+        var rowGap = ParseGridGap(styleMap, "row-gap", containingWidth, 0)
+            ?? ParseGridGap(styleMap, "gap", containingWidth, 0);
+        var resolvedColumnGap = columnGap ?? 0f;
+        var resolvedRowGap = rowGap ?? 0f;
+        var gridItems = node.Children
+            .Where(child => child is ElementRenderNode || (child is TextRenderNode textNode && NormalizeWhitespace(textNode.Ref.Data).Length > 0))
+            .ToList();
+        var hasExplicitRowTracks = styleMap.TryGetValue("grid-template-rows", out var rowTemplateValue) && !string.IsNullOrWhiteSpace(rowTemplateValue);
+        var containerHeight = ParseLength(styleMap, "height", containingWidth, containingWidth, allowAuto: true);
+        var rows = hasExplicitRowTracks
+            ? ParseGridTrackList(styleMap, "grid-template-rows", containerHeight, 1)
+            : CreateAutoRows(gridItems.Count, columns.Count, containerHeight);
+
+        var currentColumn = 0;
+        var currentRow = 0;
+
+        foreach (var child in gridItems)
+        {
+            if (child is TextRenderNode textNode)
+            {
+                LayoutTextNode(textNode.Ref, containingX, containingWidth, ref cursorY, ref previousBlockMarginBottom, ref suppressNextBlockTopMargin, ref activeFloatLeftOffset, ref activeFloatBottom, ref textIndentConsumed, inheritedTextStyle, context, displayList, maxY);
+                continue;
+            }
+
+            if (child is not ElementRenderNode elementChild)
+            {
+                continue;
+            }
+
+            var placementColumn = ResolveGridPlacement(styleMap, elementChild, "grid-column", currentColumn);
+            var placementRow = ResolveGridPlacement(styleMap, elementChild, "grid-row", currentRow);
+            var effectivePlacementColumn = placementColumn;
+            var effectivePlacementRow = placementRow;
+
+            var hasExplicitColumnPlacement = elementChild.Ref.GetAttribute("data-render-grid-column") is not null;
+            var hasExplicitRowPlacement = elementChild.Ref.GetAttribute("data-render-grid-row") is not null;
+
+            if (hasExplicitColumnPlacement || hasExplicitRowPlacement)
+            {
+                effectivePlacementColumn = new GridPlacement(Math.Max(0, placementColumn.LineIndex), placementColumn.Span);
+                effectivePlacementRow = new GridPlacement(Math.Max(0, placementRow.LineIndex), placementRow.Span);
+            }
+            else
+            {
+                effectivePlacementColumn = new GridPlacement(Math.Max(0, currentColumn), placementColumn.Span);
+                effectivePlacementRow = new GridPlacement(Math.Max(0, currentRow), placementRow.Span);
+            }
+            var estimatedItemWidth = ResolveGridItemEstimatedSize(elementChild, styleMap, containingWidth, "width");
+            var estimatedItemHeight = ResolveGridItemEstimatedSize(elementChild, styleMap, containingWidth, "height");
+            var effectiveColumnCount = Math.Max(columns.Count, effectivePlacementColumn.LineIndex + effectivePlacementColumn.Span);
+            var effectiveRowCount = Math.Max(rows.Count, effectivePlacementRow.LineIndex + effectivePlacementRow.Span);
+
+            if (effectiveColumnCount > columns.Count)
+            {
+                columns.AddRange(Enumerable.Repeat(containingWidth, effectiveColumnCount - columns.Count));
+            }
+
+            if (effectiveRowCount > rows.Count)
+            {
+                rows.AddRange(Enumerable.Repeat(0f, effectiveRowCount - rows.Count));
+            }
+
+            EnsureGridTrackSize(columns, effectivePlacementColumn.LineIndex, estimatedItemWidth, containingWidth);
+            EnsureGridTrackSize(rows, effectivePlacementRow.LineIndex, estimatedItemHeight, 0f);
+
+            var contentX = borderBoxX + borderLeft + paddingLeft;
+            var contentY = borderBoxY + borderTop + paddingTop;
+            var cellX = contentX + GetGridTrackOffset(columns, effectivePlacementColumn.LineIndex, resolvedColumnGap);
+            var cellY = contentY + GetGridTrackOffset(rows, effectivePlacementRow.LineIndex, resolvedRowGap);
+            var cellWidth = GetGridTrackSpanSize(columns, effectivePlacementColumn.LineIndex, effectivePlacementColumn.Span, resolvedColumnGap, containingWidth);
+            var cellHeight = GetGridTrackSpanSize(rows, effectivePlacementRow.LineIndex, effectivePlacementRow.Span, resolvedRowGap, containingWidth);
+
+            var childCursor = cellY;
+            var childPreviousBlockMarginBottom = 0f;
+            var childSuppressNextBlockTopMargin = false;
+            var childActiveFloatLeftOffset = 0f;
+            var childActiveFloatBottom = 0f;
+            var childTextIndentConsumed = false;
+
+            LayoutNode(
+                node: elementChild,
+                containingX: cellX,
+                containingY: cellY,
+                containingWidth: Math.Max(0f, cellWidth),
+                cursorY: ref childCursor,
+                previousBlockMarginBottom: ref childPreviousBlockMarginBottom,
+                suppressNextBlockTopMargin: ref childSuppressNextBlockTopMargin,
+                activeFloatLeftOffset: ref childActiveFloatLeftOffset,
+                activeFloatBottom: ref childActiveFloatBottom,
+                textIndentConsumed: ref childTextIndentConsumed,
+                textStyle: inheritedTextStyle,
+                context: context,
+                displayList: displayList,
+                maxY: maxY,
+                isFlexItem: false,
+                isRowDirection: true,
+                flexMainSize: null,
+                flexCrossSize: null);
+
+            currentColumn++;
+            if (currentColumn >= columns.Count)
+            {
+                currentColumn = 0;
+                currentRow++;
+            }
+        }
+
+        var gridContentWidth = GetGridContentSize(columns, resolvedColumnGap, containingWidth);
+        var specifiedHeight = ParseLength(styleMap, "height", containingWidth, containingWidth, allowAuto: true);
+        var gridContentHeight = GetGridContentSize(rows, resolvedRowGap, specifiedHeight);
+        var borderBoxWidth = borderLeft + paddingLeft + Math.Max(containingWidth, gridContentWidth) + paddingRight + borderRight;
+        var borderBoxHeight = borderTop + paddingTop + Math.Max(ParseLength(styleMap, "height", containingWidth, containingWidth, allowAuto: true), gridContentHeight) + paddingBottom + borderBottom;
+        var canCollapseWithLastChild = borderBottom <= 0f && paddingBottom <= 0f;
+        var effectiveMarginBottom = ParseLength(styleMap, "margin-bottom", containingWidth, box.Margin.Bottom, allowAuto: false);
+
+        if (canCollapseWithLastChild)
+        {
+            effectiveMarginBottom = CollapseMargins(effectiveMarginBottom, previousBlockMarginBottom);
+        }
+
+        if (box.BackgroundPaint is RenderColorPaint colorPaint && colorPaint.Color.A == 0)
+        {
+            displayList.FillRect(new RenderRect(borderBoxX, borderBoxY, borderBoxWidth, borderBoxHeight), RenderColor.Transparent);
+        }
+        else
+        {
+            PaintBackground(displayList, box.BackgroundPaint, borderBoxX, borderBoxY, borderBoxWidth, borderBoxHeight);
+        }
+
+        RecordLayoutMetrics(
+            node.Ref,
+            borderBoxX,
+            borderBoxY,
+            borderBoxWidth,
+            borderBoxHeight,
+            borderLeft,
+            borderRight,
+            borderTop,
+            borderBottom,
+            paddingLeft,
+            paddingRight,
+            paddingTop,
+            paddingBottom);
+
+        PaintBorder(displayList, box.BorderColor, borderBoxX, borderBoxY, borderBoxWidth, borderBoxHeight, box.BorderWidth);
+        PaintOutline(displayList, styleMap, borderBoxX, borderBoxY, borderBoxWidth, borderBoxHeight);
+
+        cursorY = flowBorderBoxY + borderBoxHeight;
+        previousBlockMarginBottom = effectiveMarginBottom + context.ParagraphSpacing;
+        suppressNextBlockTopMargin = false;
+    }
+
+    private static float GetGridTrackOffset(IReadOnlyList<float> tracks, int index, float gap)
+    {
+        if (index <= 0)
+        {
+            return 0f;
+        }
+
+        var offset = 0f;
+        for (var current = 0; current < index && current < tracks.Count; current++)
+        {
+            offset += tracks[current];
+            offset += gap;
+        }
+
+        return offset;
+    }
+
+    private static float GetGridTrackSpanSize(IReadOnlyList<float> tracks, int index, int span, float gap, float fallback)
+    {
+        var totalSize = 0f;
+        var spanCount = Math.Max(1, span);
+
+        for (var current = 0; current < spanCount; current++)
+        {
+            var trackIndex = index + current;
+            totalSize += GetGridTrackSize(tracks, trackIndex, fallback);
+
+            if (current < spanCount - 1)
+            {
+                totalSize += gap;
+            }
+        }
+
+        return totalSize;
+    }
+
+    private static List<float> ParseGridTrackList(Dictionary<string, string> styleMap, string propertyName, float fallbackSize, int minimumCount)
+    {
+        if (!styleMap.TryGetValue(propertyName, out var rawValue) || string.IsNullOrWhiteSpace(rawValue))
+        {
+            var fallbackTracks = new List<float>(Math.Max(1, minimumCount));
+            var fallbackTrackSize = Math.Max(0f, fallbackSize / Math.Max(1, minimumCount));
+            for (var index = 0; index < Math.Max(1, minimumCount); index++)
+            {
+                fallbackTracks.Add(fallbackTrackSize);
+            }
+
+            return fallbackTracks;
+        }
+
+        var tracks = new List<float>();
+        foreach (var token in rawValue.Split(new[] { ' ', '\t', '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+        {
+            var normalized = token.Trim().ToLowerInvariant();
+            var trackSize = normalized switch
+            {
+                "auto" => Math.Max(0f, fallbackSize),
+                _ => ParseLengthValue(normalized, fallbackSize, allowAuto: false)
+            };
+
+            tracks.Add(float.IsNaN(trackSize) ? Math.Max(0f, fallbackSize) : Math.Max(0f, trackSize));
+        }
+
+        return tracks.Count > 0 ? tracks : new List<float> { Math.Max(0f, fallbackSize) };
+    }
+
+    private static List<float> CreateAutoRows(int itemCount, int columnCount, float containerHeight)
+    {
+        var rowCount = Math.Max(1, (int)Math.Ceiling((double)itemCount / Math.Max(1, columnCount)));
+        var fallbackRowSize = containerHeight > 0f ? containerHeight / rowCount : 0f;
+        return Enumerable.Range(0, rowCount).Select(_ => fallbackRowSize).ToList();
+    }
+
+    private static float? ParseGridGap(Dictionary<string, string> styleMap, string propertyName, float relativeTo, int tokenIndex)
+    {
+        if (!styleMap.TryGetValue(propertyName, out var rawValue) || string.IsNullOrWhiteSpace(rawValue))
+        {
+            return null;
+        }
+
+        var tokens = rawValue.Split(new[] { ' ', '\t', '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+        if (tokens.Length == 0)
+        {
+            return null;
+        }
+
+        var token = tokenIndex >= 0 && tokenIndex < tokens.Length ? tokens[tokenIndex] : tokens[^1];
+        var parsed = ParseLengthValue(token, float.NaN, allowAuto: false);
+        return float.IsNaN(parsed) ? null : parsed;
+    }
+
+    private static GridPlacement ResolveGridPlacement(Dictionary<string, string> styleMap, ElementRenderNode elementChild, string propertyName, int fallbackIndex)
+    {
+        var childStyleMap = CreateStyleMap(elementChild.ComputedStyle, elementChild.Ref);
+        if (!childStyleMap.TryGetValue(propertyName, out var rawValue) || string.IsNullOrWhiteSpace(rawValue))
+        {
+            return new GridPlacement(fallbackIndex, 1);
+        }
+
+        var tokens = rawValue.Split(new[] { ' ', '/', '\t', '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+        var startToken = tokens.FirstOrDefault(token => int.TryParse(token, out _));
+
+        if (startToken is not null && int.TryParse(startToken, out var explicitIndex))
+        {
+            return new GridPlacement(Math.Max(0, explicitIndex - 1), 1);
+        }
+
+        if (tokens.Length >= 3 && string.Equals(tokens[1], "span", StringComparison.OrdinalIgnoreCase) && int.TryParse(tokens[2], out var spanCount))
+        {
+            return new GridPlacement(Math.Max(0, fallbackIndex), Math.Max(1, spanCount));
+        }
+
+        return new GridPlacement(Math.Max(0, fallbackIndex), 1);
+    }
+
+    private static float ResolveGridItemEstimatedSize(ElementRenderNode elementChild, Dictionary<string, string> styleMap, float fallbackSize, string propertyName)
+    {
+        var rawValue = styleMap.TryGetValue(propertyName, out var value) && !string.IsNullOrWhiteSpace(value)
+            ? value
+            : null;
+
+        if (string.IsNullOrWhiteSpace(rawValue))
+        {
+            return fallbackSize;
+        }
+
+        var parsed = ParseLengthValue(rawValue, fallbackSize, allowAuto: false);
+        return float.IsNaN(parsed) ? fallbackSize : Math.Max(0f, parsed);
+    }
+
+    private static void EnsureGridTrackSize(List<float> tracks, int index, float size, float fallbackSize)
+    {
+        while (tracks.Count <= index)
+        {
+            tracks.Add(Math.Max(0f, fallbackSize));
+        }
+
+        if (tracks[index] <= 0f)
+        {
+            tracks[index] = Math.Max(0f, Math.Max(size, fallbackSize));
+        }
+    }
+
+    private static float GetGridTrackSize(IReadOnlyList<float> tracks, int index, float fallback)
+    {
+        if (index >= 0 && index < tracks.Count)
+        {
+            return tracks[index];
+        }
+
+        return fallback;
+    }
+
+    private static float GetGridContentSize(IReadOnlyList<float> tracks, float gap, float fallbackSize)
+    {
+        if (tracks.Count <= 1)
+        {
+            return Math.Max(fallbackSize, tracks.Sum());
+        }
+
+        var trackSize = tracks.Sum();
+        var gapSize = (tracks.Count - 1) * gap;
+        return Math.Max(fallbackSize, trackSize + gapSize);
     }
 
     private static void LayoutTextNode(
@@ -904,7 +1982,7 @@ public sealed class HtmlRenderer
         ref float activeFloatBottom,
         ref bool textIndentConsumed,
         RenderTextStyle textStyle,
-        HtmlRenderOptions options,
+        LayoutContext context,
         DisplayList displayList,
         float maxY)
     {
@@ -925,7 +2003,7 @@ public sealed class HtmlRenderer
         }
 
         var localFloatLeftOffset = cursorY < activeFloatBottom ? activeFloatLeftOffset : 0f;
-        LayoutWrappedText(text, containingX + localFloatLeftOffset, containingWidth - localFloatLeftOffset, ref cursorY, textStyle, options, displayList, maxY, textIndentConsumed ? 0f : textStyle.TextIndent);
+        LayoutWrappedText(text, containingX + localFloatLeftOffset, containingWidth - localFloatLeftOffset, ref cursorY, textStyle, context, displayList, maxY, textIndentConsumed ? 0f : textStyle.TextIndent);
         textIndentConsumed = true;
     }
 
@@ -935,13 +2013,13 @@ public sealed class HtmlRenderer
         float maxWidth,
         ref float cursorY,
         RenderTextStyle textStyle,
-        HtmlRenderOptions options,
+        LayoutContext context,
         DisplayList displayList,
         float maxY,
         float firstLineIndent)
     {
         var lineHeight = textStyle.FontSize * textStyle.LineHeightMultiplier;
-        var lines = WrapText(text, maxWidth, textStyle.FontSize, options.AverageCharacterWidthFactor, textStyle.LetterSpacing);
+        var lines = WrapText(context, text, maxWidth, textStyle);
 
         for (var index = 0; index < lines.Count; index++)
         {
@@ -953,7 +2031,7 @@ public sealed class HtmlRenderer
                 return;
             }
 
-            var lineWidth = EstimateTextWidth(line, textStyle.FontSize, options.AverageCharacterWidthFactor, textStyle.LetterSpacing);
+            var lineWidth = MeasureTextWidth(context, line, textStyle);
             var lineMaxWidth = index == 0 ? Math.Max(0f, maxWidth - firstLineIndent) : maxWidth;
             var lineX = x + (index == 0 ? firstLineIndent : 0f) + ResolveTextAlignmentOffset(textStyle.TextAlign, lineMaxWidth, lineWidth);
             var baselineY = cursorY + textStyle.VerticalAlignOffset;
@@ -981,7 +2059,7 @@ public sealed class HtmlRenderer
         RenderTextStyle textStyle,
         float flowX,
         float flowWidth,
-        float averageCharacterWidthFactor,
+        LayoutContext context,
         ref float inlineCursorX,
         ref float inlineLineTop,
         ref float inlineLineHeight,
@@ -989,11 +2067,11 @@ public sealed class HtmlRenderer
     {
         var words = text.Split(' ', StringSplitOptions.RemoveEmptyEntries);
         var rightEdge = flowX + flowWidth;
-        var spaceWidth = EstimateTextWidth(" ", textStyle.FontSize, averageCharacterWidthFactor, textStyle.LetterSpacing);
+        var spaceWidth = MeasureTextWidth(context, " ", textStyle);
 
         foreach (var word in words)
         {
-            var wordWidth = EstimateTextWidth(word, textStyle.FontSize, averageCharacterWidthFactor, textStyle.LetterSpacing);
+            var wordWidth = MeasureTextWidth(context, word, textStyle);
 
             if (inlineCursorX > flowX && inlineCursorX + spaceWidth + wordWidth > rightEdge)
             {
@@ -1031,6 +2109,130 @@ public sealed class HtmlRenderer
     private static string? GetDisplay(Dictionary<string, string> styleMap)
     {
         return styleMap.TryGetValue("display", out var display) ? display : null;
+    }
+
+    private static bool IsFlexContainer(Dictionary<string, string> styleMap)
+    {
+        var display = GetDisplay(styleMap);
+        return string.Equals(display, "flex", StringComparison.OrdinalIgnoreCase) || string.Equals(display, "inline-flex", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static bool IsGridContainer(Dictionary<string, string> styleMap)
+    {
+        var display = GetDisplay(styleMap);
+        return string.Equals(display, "grid", StringComparison.OrdinalIgnoreCase) || string.Equals(display, "inline-grid", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static string GetFlexDirection(Dictionary<string, string> styleMap)
+    {
+        return styleMap.TryGetValue("flex-direction", out var direction) && !string.IsNullOrWhiteSpace(direction)
+            ? direction.Trim().ToLowerInvariant()
+            : "row";
+    }
+
+    private static string GetJustifyContent(Dictionary<string, string> styleMap)
+    {
+        return styleMap.TryGetValue("justify-content", out var value) && !string.IsNullOrWhiteSpace(value)
+            ? value.Trim().ToLowerInvariant()
+            : "flex-start";
+    }
+
+    private static string GetAlignItems(Dictionary<string, string> styleMap)
+    {
+        return styleMap.TryGetValue("align-items", out var value) && !string.IsNullOrWhiteSpace(value)
+            ? value.Trim().ToLowerInvariant()
+            : "stretch";
+    }
+
+    private static string GetFlexWrap(Dictionary<string, string> styleMap)
+    {
+        return styleMap.TryGetValue("flex-wrap", out var value) && !string.IsNullOrWhiteSpace(value)
+            ? value.Trim().ToLowerInvariant()
+            : "nowrap";
+    }
+
+    private static string GetAlignContent(Dictionary<string, string> styleMap)
+    {
+        return styleMap.TryGetValue("align-content", out var value) && !string.IsNullOrWhiteSpace(value)
+            ? value.Trim().ToLowerInvariant()
+            : "stretch";
+    }
+
+    private static float GetFlexGrow(Dictionary<string, string> styleMap)
+    {
+        return styleMap.TryGetValue("flex-grow", out var value) && !string.IsNullOrWhiteSpace(value)
+            ? ParseLengthValue(value.Trim(), 0f, allowAuto: false)
+            : 0f;
+    }
+
+    private static float GetFlexShrink(Dictionary<string, string> styleMap)
+    {
+        return styleMap.TryGetValue("flex-shrink", out var value) && !string.IsNullOrWhiteSpace(value)
+            ? ParseLengthValue(value.Trim(), 1f, allowAuto: false)
+            : 1f;
+    }
+
+    private static float GetFlexOrder(Dictionary<string, string> styleMap)
+    {
+        return styleMap.TryGetValue("order", out var value) && !string.IsNullOrWhiteSpace(value)
+            ? ParseLengthValue(value.Trim(), 0f, allowAuto: false)
+            : 0f;
+    }
+
+    private static string GetAlignSelf(Dictionary<string, string> styleMap, string fallback)
+    {
+        if (!styleMap.TryGetValue("align-self", out var value) || string.IsNullOrWhiteSpace(value))
+        {
+            return fallback;
+        }
+
+        var normalized = value.Trim().ToLowerInvariant();
+        return normalized == "auto" ? fallback : normalized;
+    }
+
+    private static FlexItemLayoutInfo CreateFlexItemLayoutInfo(IRenderNode child, bool isRowDirection, float relativeTo)
+    {
+        if (child is not ElementRenderNode elementChild)
+        {
+            return new FlexItemLayoutInfo(child, new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase), 0f, 0f, 1f, 0f, 0f, "auto");
+        }
+
+        var childStyle = CreateStyleMap(elementChild.ComputedStyle, elementChild.Ref);
+        var baseMainSize = ResolveFlexBaseSize(childStyle, isRowDirection, relativeTo);
+        var crossSize = ResolveFlexCrossSize(childStyle, isRowDirection, relativeTo);
+        return new FlexItemLayoutInfo(
+            child,
+            childStyle,
+            GetFlexOrder(childStyle),
+            GetFlexGrow(childStyle),
+            GetFlexShrink(childStyle),
+            baseMainSize,
+            crossSize,
+            GetAlignSelf(childStyle, "auto"));
+    }
+
+    private static float ResolveFlexBaseSize(Dictionary<string, string> styleMap, bool isRowDirection, float relativeTo)
+    {
+        var flexBasis = ParseLength(styleMap, "flex-basis", relativeTo, float.NaN, allowAuto: true);
+        if (!float.IsNaN(flexBasis))
+        {
+            return flexBasis;
+        }
+
+        var mainSize = isRowDirection
+            ? ParseLength(styleMap, "width", relativeTo, float.NaN, allowAuto: true)
+            : ParseLength(styleMap, "height", relativeTo, float.NaN, allowAuto: true);
+
+        return float.IsNaN(mainSize) ? 0f : mainSize;
+    }
+
+    private static float ResolveFlexCrossSize(Dictionary<string, string> styleMap, bool isRowDirection, float relativeTo)
+    {
+        var crossSize = isRowDirection
+            ? ParseLength(styleMap, "height", relativeTo, float.NaN, allowAuto: true)
+            : ParseLength(styleMap, "width", relativeTo, float.NaN, allowAuto: true);
+
+        return float.IsNaN(crossSize) ? 0f : crossSize;
     }
 
     private static bool ShouldRenderAsBlock(ICssStyleDeclaration computedStyle)
@@ -1087,6 +2289,27 @@ public sealed class HtmlRenderer
         var verticalAlignOffset = ParseVerticalAlign(styleMap, fontSize);
 
         return new RenderTextStyle(fontSize, color, fontFamily, lineHeight, fontWeight, isItalic, underline, strikeThrough, decorationColor, decorationStyle, textAlign, letterSpacing, textIndent, verticalAlignOffset);
+    }
+
+    /// <summary>
+    /// Reads the box-level meaning of <c>vertical-align</c>, which is what the property means on a
+    /// table cell. On inline content the same property shifts the text instead, which is what
+    /// <see cref="ParseVerticalAlign"/> handles.
+    /// </summary>
+    private static CellVerticalAlign ParseCellVerticalAlign(Dictionary<string, string> styleMap)
+    {
+        if (!styleMap.TryGetValue("vertical-align", out var value) || string.IsNullOrWhiteSpace(value))
+        {
+            return CellVerticalAlign.Middle;
+        }
+
+        return value.Trim().ToLowerInvariant() switch
+        {
+            "top" or "text-top" => CellVerticalAlign.Top,
+            "bottom" or "text-bottom" => CellVerticalAlign.Bottom,
+            "middle" => CellVerticalAlign.Middle,
+            _ => CellVerticalAlign.Top,
+        };
     }
 
     private static float ParseVerticalAlign(Dictionary<string, string> styleMap, float fontSize)
@@ -1231,11 +2454,200 @@ public sealed class HtmlRenderer
         return defaultValue;
     }
 
-    private static Dictionary<string, string> CreateStyleMap(ICssStyleDeclaration style)
+    private static void PrepareDocumentForRendering(IDocument document)
+    {
+        ArgumentNullException.ThrowIfNull(document);
+
+        foreach (var element in document.All.OfType<IElement>())
+        {
+            var styleAttribute = element.GetAttribute("style");
+
+            if (string.IsNullOrWhiteSpace(styleAttribute))
+            {
+                continue;
+            }
+
+            var currentStyle = styleAttribute;
+            var changed = false;
+
+            if (TryExtractGradientBackground(currentStyle, out var gradientValue, out var updatedStyle))
+            {
+                currentStyle = updatedStyle;
+                changed = true;
+                element.SetAttribute("data-render-gradient", gradientValue);
+            }
+
+            if (TryExtractGridDeclarations(currentStyle, out var gridValues, out updatedStyle))
+            {
+                currentStyle = updatedStyle;
+                changed = true;
+
+                foreach (var entry in gridValues)
+                {
+                    element.SetAttribute($"data-render-{entry.Key}", entry.Value);
+                }
+            }
+
+            if (changed)
+            {
+                element.SetAttribute("style", currentStyle);
+            }
+        }
+    }
+
+    private static bool TryExtractGradientBackground(string styleAttribute, out string gradientValue, out string updatedStyle)
+    {
+        gradientValue = string.Empty;
+        updatedStyle = styleAttribute;
+
+        if (!styleAttribute.Contains("background-image", StringComparison.OrdinalIgnoreCase))
+        {
+            return false;
+        }
+
+        var declarations = styleAttribute.Split(';', StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries);
+        var remaining = new List<string>();
+
+        foreach (var declaration in declarations)
+        {
+            var separator = declaration.IndexOf(':');
+            if (separator <= 0)
+            {
+                continue;
+            }
+
+            var property = declaration[..separator].Trim();
+            var value = declaration[(separator + 1)..].Trim();
+
+            if (string.Equals(property, "background-image", StringComparison.OrdinalIgnoreCase) &&
+                (value.StartsWith("linear-gradient", StringComparison.OrdinalIgnoreCase) ||
+                 value.StartsWith("radial-gradient", StringComparison.OrdinalIgnoreCase) ||
+                 value.StartsWith("conic-gradient", StringComparison.OrdinalIgnoreCase) ||
+                 value.StartsWith("repeating-linear-gradient", StringComparison.OrdinalIgnoreCase) ||
+                 value.StartsWith("repeating-radial-gradient", StringComparison.OrdinalIgnoreCase) ||
+                 value.StartsWith("repeating-conic-gradient", StringComparison.OrdinalIgnoreCase)))
+            {
+                gradientValue = value;
+                continue;
+            }
+
+            remaining.Add(declaration);
+        }
+
+        if (string.IsNullOrWhiteSpace(gradientValue))
+        {
+            return false;
+        }
+
+        updatedStyle = string.Join(";", remaining);
+        return true;
+    }
+
+    private static bool TryExtractGridDeclarations(string styleAttribute, out Dictionary<string, string> values, out string updatedStyle)
+    {
+        values = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        updatedStyle = styleAttribute;
+
+        if (string.IsNullOrWhiteSpace(styleAttribute))
+        {
+            return false;
+        }
+
+        var declarations = styleAttribute.Split(';', StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries);
+        var remaining = new List<string>();
+        var strippedAny = false;
+
+        foreach (var declaration in declarations)
+        {
+            var separator = declaration.IndexOf(':');
+            if (separator <= 0)
+            {
+                continue;
+            }
+
+            var property = declaration[..separator].Trim();
+            var value = declaration[(separator + 1)..].Trim();
+
+            if (string.Equals(property, "grid-column", StringComparison.OrdinalIgnoreCase))
+            {
+                values["grid-column"] = value;
+                strippedAny = true;
+                continue;
+            }
+
+            if (string.Equals(property, "grid-row", StringComparison.OrdinalIgnoreCase))
+            {
+                values["grid-row"] = value;
+                strippedAny = true;
+                continue;
+            }
+
+            if (string.Equals(property, "grid-template-columns", StringComparison.OrdinalIgnoreCase))
+            {
+                values["grid-template-columns"] = value;
+                strippedAny = true;
+                continue;
+            }
+
+            if (string.Equals(property, "grid-template-rows", StringComparison.OrdinalIgnoreCase))
+            {
+                values["grid-template-rows"] = value;
+                strippedAny = true;
+                continue;
+            }
+
+            if (string.Equals(property, "column-gap", StringComparison.OrdinalIgnoreCase))
+            {
+                values["column-gap"] = value;
+                strippedAny = true;
+                continue;
+            }
+
+            if (string.Equals(property, "row-gap", StringComparison.OrdinalIgnoreCase))
+            {
+                values["row-gap"] = value;
+                strippedAny = true;
+                continue;
+            }
+
+            if (string.Equals(property, "gap", StringComparison.OrdinalIgnoreCase))
+            {
+                values["gap"] = value;
+                strippedAny = true;
+                continue;
+            }
+
+            remaining.Add(declaration);
+        }
+
+        if (!strippedAny)
+        {
+            return false;
+        }
+
+        updatedStyle = string.Join(";", remaining);
+        return true;
+    }
+
+    private static Dictionary<string, string> CreateStyleMap(ICssStyleDeclaration style, IElement? element = null)
     {
         var map = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        var inlineStyle = element?.GetAttribute("style");
+        var gridColumnValue = element?.GetAttribute("data-render-grid-column");
+        var gridRowValue = element?.GetAttribute("data-render-grid-row");
+        var gridTemplateColumnsValue = element?.GetAttribute("data-render-grid-template-columns");
+        var gridTemplateRowsValue = element?.GetAttribute("data-render-grid-template-rows");
+        var columnGapValue = element?.GetAttribute("data-render-column-gap");
+        var rowGapValue = element?.GetAttribute("data-render-row-gap");
+        var gapValue = element?.GetAttribute("data-render-gap");
 
-        AddIfPresent(map, "display", style.GetDisplay());
+        var displayValue = style.GetDisplay();
+        if (string.IsNullOrWhiteSpace(displayValue))
+        {
+            displayValue = ParseStyleAttributeValue(inlineStyle, "display");
+        }
+
+        AddIfPresent(map, "display", displayValue);
         AddIfPresent(map, "visibility", style.GetVisibility());
         AddIfPresent(map, "width", style.GetWidth());
         AddIfPresent(map, "height", style.GetHeight());
@@ -1276,6 +2688,36 @@ public sealed class HtmlRenderer
         AddIfPresent(map, "outline-color", style.GetPropertyValue("outline-color"));
 
         AddIfPresent(map, "background-color", style.GetBackgroundColor());
+        AddIfPresent(map, "grid-template-columns", !string.IsNullOrWhiteSpace(gridTemplateColumnsValue) ? gridTemplateColumnsValue : (string.IsNullOrWhiteSpace(style.GetPropertyValue("grid-template-columns")) ? ParseStyleAttributeValue(inlineStyle, "grid-template-columns") : style.GetPropertyValue("grid-template-columns")));
+        AddIfPresent(map, "grid-template-rows", !string.IsNullOrWhiteSpace(gridTemplateRowsValue) ? gridTemplateRowsValue : (string.IsNullOrWhiteSpace(style.GetPropertyValue("grid-template-rows")) ? ParseStyleAttributeValue(inlineStyle, "grid-template-rows") : style.GetPropertyValue("grid-template-rows")));
+        AddIfPresent(map, "column-gap", !string.IsNullOrWhiteSpace(columnGapValue) ? columnGapValue : (string.IsNullOrWhiteSpace(style.GetPropertyValue("column-gap")) ? ParseStyleAttributeValue(inlineStyle, "column-gap") : style.GetPropertyValue("column-gap")));
+        AddIfPresent(map, "row-gap", !string.IsNullOrWhiteSpace(rowGapValue) ? rowGapValue : (string.IsNullOrWhiteSpace(style.GetPropertyValue("row-gap")) ? ParseStyleAttributeValue(inlineStyle, "row-gap") : style.GetPropertyValue("row-gap")));
+        AddIfPresent(map, "gap", !string.IsNullOrWhiteSpace(gapValue) ? gapValue : (string.IsNullOrWhiteSpace(style.GetPropertyValue("gap")) ? ParseStyleAttributeValue(inlineStyle, "gap") : style.GetPropertyValue("gap")));
+        AddIfPresent(map, "grid-column", !string.IsNullOrWhiteSpace(gridColumnValue) ? gridColumnValue : ParseStyleAttributeValue(inlineStyle, "grid-column"));
+        AddIfPresent(map, "grid-row", !string.IsNullOrWhiteSpace(gridRowValue) ? gridRowValue : ParseStyleAttributeValue(inlineStyle, "grid-row"));
+        AddIfPresent(map, "flex-direction", string.IsNullOrWhiteSpace(style.GetPropertyValue("flex-direction")) ? ParseStyleAttributeValue(inlineStyle, "flex-direction") : style.GetPropertyValue("flex-direction"));
+        AddIfPresent(map, "justify-content", string.IsNullOrWhiteSpace(style.GetPropertyValue("justify-content")) ? ParseStyleAttributeValue(inlineStyle, "justify-content") : style.GetPropertyValue("justify-content"));
+        AddIfPresent(map, "align-items", string.IsNullOrWhiteSpace(style.GetPropertyValue("align-items")) ? ParseStyleAttributeValue(inlineStyle, "align-items") : style.GetPropertyValue("align-items"));
+        AddIfPresent(map, "align-self", string.IsNullOrWhiteSpace(style.GetPropertyValue("align-self")) ? ParseStyleAttributeValue(inlineStyle, "align-self") : style.GetPropertyValue("align-self"));
+        AddIfPresent(map, "flex-wrap", string.IsNullOrWhiteSpace(style.GetPropertyValue("flex-wrap")) ? ParseStyleAttributeValue(inlineStyle, "flex-wrap") : style.GetPropertyValue("flex-wrap"));
+        AddIfPresent(map, "flex-grow", string.IsNullOrWhiteSpace(style.GetPropertyValue("flex-grow")) ? ParseStyleAttributeValue(inlineStyle, "flex-grow") : style.GetPropertyValue("flex-grow"));
+        AddIfPresent(map, "flex-shrink", string.IsNullOrWhiteSpace(style.GetPropertyValue("flex-shrink")) ? ParseStyleAttributeValue(inlineStyle, "flex-shrink") : style.GetPropertyValue("flex-shrink"));
+        AddIfPresent(map, "flex-basis", string.IsNullOrWhiteSpace(style.GetPropertyValue("flex-basis")) ? ParseStyleAttributeValue(inlineStyle, "flex-basis") : style.GetPropertyValue("flex-basis"));
+        AddIfPresent(map, "order", string.IsNullOrWhiteSpace(style.GetPropertyValue("order")) ? ParseStyleAttributeValue(inlineStyle, "order") : style.GetPropertyValue("order"));
+        AddIfPresent(map, "align-content", string.IsNullOrWhiteSpace(style.GetPropertyValue("align-content")) ? ParseStyleAttributeValue(inlineStyle, "align-content") : style.GetPropertyValue("align-content"));
+
+        var backgroundImageValue = element is not null
+            ? element.GetAttribute("data-render-gradient")
+            : null;
+
+        if (!string.IsNullOrWhiteSpace(backgroundImageValue))
+        {
+            AddIfPresent(map, "background-image", backgroundImageValue);
+        }
+        else
+        {
+            AddIfPresent(map, "background-image", style.GetPropertyValue("background-image"));
+        }
         AddIfPresent(map, "font-size", style.GetFontSize());
         AddIfPresent(map, "font-family", style.GetFontFamily());
         AddIfPresent(map, "font-weight", style.GetPropertyValue("font-weight"));
@@ -1300,6 +2742,31 @@ public sealed class HtmlRenderer
         {
             map[property] = value;
         }
+    }
+
+    private static string? ParseStyleAttributeValue(string? styleAttribute, string propertyName)
+    {
+        if (string.IsNullOrWhiteSpace(styleAttribute))
+        {
+            return null;
+        }
+
+        foreach (var declaration in styleAttribute.Split(';', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+        {
+            var separatorIndex = declaration.IndexOf(':');
+            if (separatorIndex <= 0)
+            {
+                continue;
+            }
+
+            var candidateProperty = declaration[..separatorIndex].Trim();
+            if (string.Equals(candidateProperty, propertyName, StringComparison.OrdinalIgnoreCase))
+            {
+                return declaration[(separatorIndex + 1)..].Trim();
+            }
+        }
+
+        return null;
     }
 
     private static bool TryGetFirstCollapsibleChildTopMargin(ElementRenderNode node, float containingWidth, out float marginTop)
@@ -1341,7 +2808,7 @@ public sealed class HtmlRenderer
                 return false;
             }
 
-            var childStyle = CreateStyleMap(childElement.ComputedStyle);
+            var childStyle = CreateStyleMap(childElement.ComputedStyle, childElement.Ref);
             marginTop = ParseLength(childStyle, "margin-top", containingWidth, 0f, allowAuto: false);
             return true;
         }
@@ -1362,7 +2829,7 @@ public sealed class HtmlRenderer
         {
             if (child is ElementRenderNode elementChild)
             {
-                var childStyleMap = CreateStyleMap(elementChild.ComputedStyle);
+                var childStyleMap = CreateStyleMap(elementChild.ComputedStyle, elementChild.Ref);
 
                 if (IsOutOfFlowPositioned(childStyleMap))
                 {
@@ -1453,6 +2920,7 @@ public sealed class HtmlRenderer
         borderWidth = ApplyBorderStyleToWidths(borderWidth, borderStyle);
 
         var backgroundColor = ParseColor(styleMap.TryGetValue("background-color", out var background) ? background : null, RenderColor.Transparent);
+        var backgroundPaint = ParseBackgroundPaint(styleMap, backgroundColor);
         var borderColor = ParseColor(
             styleMap.TryGetValue("border-top-color", out var topColor) ? topColor :
             styleMap.TryGetValue("border-right-color", out var rightColor) ? rightColor :
@@ -1461,7 +2929,7 @@ public sealed class HtmlRenderer
             null,
             RenderColor.Black);
 
-        return new BoxStyle(margin, padding, borderWidth, backgroundColor, borderColor);
+        return new BoxStyle(margin, padding, borderWidth, backgroundPaint, borderColor);
     }
 
     private static EdgeBorderStyle ResolveBorderStyles(Dictionary<string, string> styleMap)
@@ -1564,14 +3032,310 @@ public sealed class HtmlRenderer
             new EdgeSizes(outlineWidth, outlineWidth, outlineWidth, outlineWidth));
     }
 
-    private static void PaintBackground(DisplayList displayList, RenderColor color, float x, float y, float width, float height)
+    private static bool IsReplacedElementTag(string tagName) =>
+        string.Equals(tagName, "img", StringComparison.OrdinalIgnoreCase) ||
+        string.Equals(tagName, "svg", StringComparison.OrdinalIgnoreCase);
+
+    private static bool TryResolveReplacedElementImage(ElementRenderNode node, Dictionary<string, string> styleMap, float containingWidth, float x, float y, out RenderedImage? image, out RenderRect rect) =>
+        TryResolveImage(node, styleMap, containingWidth, x, y, out image, out rect) ||
+        TryResolveInlineSvg(node, styleMap, containingWidth, x, y, out image, out rect);
+
+    private static bool TryResolveImage(ElementRenderNode node, Dictionary<string, string> styleMap, float containingWidth, float x, float y, out RenderedImage? image, out RenderRect rect)
     {
-        if (color.A == 0 || width <= 0f || height <= 0f)
+        image = null;
+        rect = default;
+
+        if (!string.Equals(node.Ref.LocalName, "img", StringComparison.OrdinalIgnoreCase))
+        {
+            return false;
+        }
+
+        var source = node.Ref.GetAttribute("src");
+        if (!TryGetOrLoadImageResource(node.Ref, source, out var imageResource) || imageResource is null)
+        {
+            return false;
+        }
+
+        return TryResolveReplacedElementRect(imageResource, styleMap, containingWidth, x, y, out image, out rect);
+    }
+
+    private static bool TryResolveInlineSvg(ElementRenderNode node, Dictionary<string, string> styleMap, float containingWidth, float x, float y, out RenderedImage? image, out RenderRect rect)
+    {
+        image = null;
+        rect = default;
+
+        if (!string.Equals(node.Ref.LocalName, "svg", StringComparison.OrdinalIgnoreCase))
+        {
+            return false;
+        }
+
+        if (!TryGetOrLoadInlineSvgResource(node.Ref, out var imageResource) || imageResource is null)
+        {
+            return false;
+        }
+
+        return TryResolveReplacedElementRect(imageResource, styleMap, containingWidth, x, y, out image, out rect);
+    }
+
+    private static bool TryResolveReplacedElementRect(CachedImageResource imageResource, Dictionary<string, string> styleMap, float containingWidth, float x, float y, out RenderedImage? image, out RenderRect rect)
+    {
+        image = null;
+        rect = default;
+
+        var width = ParseLength(styleMap, "width", containingWidth, float.NaN, allowAuto: true);
+        var height = ParseLength(styleMap, "height", containingWidth, float.NaN, allowAuto: true);
+
+        var naturalWidth = imageResource.NaturalWidth;
+        var naturalHeight = imageResource.NaturalHeight;
+
+        if (float.IsNaN(width) && float.IsNaN(height))
+        {
+            width = naturalWidth;
+            height = naturalHeight;
+        }
+        else if (float.IsNaN(width) && !float.IsNaN(height) && naturalWidth > 0f)
+        {
+            width = (height / naturalHeight) * naturalWidth;
+        }
+        else if (!float.IsNaN(width) && float.IsNaN(height) && naturalHeight > 0f)
+        {
+            height = (width / naturalWidth) * naturalHeight;
+        }
+
+        if (float.IsNaN(width) || float.IsNaN(height) || width <= 0f || height <= 0f)
+        {
+            width = naturalWidth;
+            height = naturalHeight;
+        }
+
+        image = new RenderedImage(imageResource.Bytes, (int)Math.Max(1, Math.Round(width)), (int)Math.Max(1, Math.Round(height)), imageResource.MimeType);
+        rect = new RenderRect(x, y, width, height);
+        return true;
+    }
+
+    private static bool TryGetOrLoadInlineSvgResource(IElement element, out CachedImageResource? imageResource)
+    {
+        if (s_inlineSvgCacheByElement.TryGetValue(element, out var cached))
+        {
+            imageResource = cached;
+            return true;
+        }
+
+        if (!TryRasterizeInlineSvgElement(element, out imageResource) || imageResource is null)
+        {
+            return false;
+        }
+
+        s_inlineSvgCacheByElement.AddOrUpdate(element, imageResource);
+        return true;
+    }
+
+    private static bool TryRasterizeInlineSvgElement(IElement element, out CachedImageResource? imageResource)
+    {
+        imageResource = null;
+
+        // The already-parsed element is walked directly - AngleSharp parsed this SVG once, as
+        // part of the host document, and it is never serialized back to text and re-parsed. Only
+        // the SVG's own presentation attributes/style apply - page CSS never cascades into it.
+        if (!SvgRasterizer.TryRasterizeElement(element, out var pngBytes, out var naturalWidth, out var naturalHeight))
+        {
+            return false;
+        }
+
+        imageResource = new CachedImageResource(pngBytes, "image/png", naturalWidth, naturalHeight);
+        return true;
+    }
+
+    private static bool TryGetOrLoadImageResource(IElement element, string? source, out CachedImageResource? imageResource)
+    {
+        imageResource = null;
+        if (string.IsNullOrWhiteSpace(source))
+        {
+            return false;
+        }
+
+        var cacheKey = source.Trim();
+        var cache = GetImageCache(element);
+
+        if (cache is not null)
+        {
+            lock (cache.Resources)
+            {
+                if (cache.Resources.TryGetValue(cacheKey, out imageResource))
+                {
+                    return imageResource is not null;
+                }
+            }
+        }
+
+        if (!TryLoadImageResource(element, source, out imageResource))
+        {
+            if (cache is not null)
+            {
+                lock (cache.Resources)
+                {
+                    cache.Resources[cacheKey] = null;
+                }
+            }
+
+            return false;
+        }
+
+        if (cache is not null)
+        {
+            lock (cache.Resources)
+            {
+                cache.Resources[cacheKey] = imageResource;
+            }
+        }
+
+        return true;
+    }
+
+    private static DocumentImageCache? GetImageCache(IElement element)
+    {
+        var owner = element.Owner;
+        return owner is null ? null : s_imageCacheByDocument.GetValue(owner, static _ => new DocumentImageCache());
+    }
+
+    private static bool TryLoadImageResource(IElement element, string? source, out CachedImageResource? imageResource)
+    {
+        imageResource = null;
+
+        byte[]? bytes = null;
+        string? mimeType = null;
+
+        if (element is ILoadableElement loadableElement && loadableElement.CurrentDownload is { Task: not null } download)
+        {
+            IResponse? response;
+
+            try
+            {
+                response = download.Task.GetAwaiter().GetResult();
+            }
+            catch
+            {
+                response = null;
+            }
+
+            if (response?.Content is not null)
+            {
+                using var sourceStream = response.Content;
+                using var memoryStream = new MemoryStream();
+                sourceStream.CopyTo(memoryStream);
+                bytes = memoryStream.ToArray();
+                mimeType = response.Headers?.TryGetValue("Content-Type", out var contentType) == true && !string.IsNullOrWhiteSpace(contentType)
+                    ? contentType
+                    : "image/unknown";
+            }
+        }
+
+        if (bytes is null && TryParseDataUri(source, out var dataUriBytes, out var dataUriMimeType))
+        {
+            bytes = dataUriBytes;
+            mimeType = dataUriMimeType;
+        }
+
+        if (bytes is null || bytes.Length == 0)
+        {
+            return false;
+        }
+
+        if (SvgRasterizer.IsSvg(bytes))
+        {
+            if (!SvgRasterizer.TryRasterizeMarkup(bytes, out var rasterizedBytes, out var svgNaturalWidth, out var svgNaturalHeight))
+            {
+                return false;
+            }
+
+            imageResource = new CachedImageResource(rasterizedBytes, "image/png", svgNaturalWidth, svgNaturalHeight);
+            return true;
+        }
+
+        using var skImage = SKImage.FromEncodedData(bytes);
+        if (skImage is null)
+        {
+            return false;
+        }
+
+        var naturalWidth = skImage.Width;
+        var naturalHeight = skImage.Height;
+
+        imageResource = new CachedImageResource(bytes, mimeType ?? "image/unknown", naturalWidth, naturalHeight);
+        return true;
+    }
+
+    private static bool TryParseDataUri(string? source, out byte[]? bytes, out string? mimeType)
+    {
+        bytes = null;
+        mimeType = null;
+
+        if (string.IsNullOrWhiteSpace(source) || !source.StartsWith("data:", StringComparison.OrdinalIgnoreCase))
+        {
+            return false;
+        }
+
+        var commaIndex = source.IndexOf(',');
+        if (commaIndex <= 5)
+        {
+            return false;
+        }
+
+        var header = source[5..commaIndex];
+        var isBase64 = header.EndsWith(";base64", StringComparison.OrdinalIgnoreCase);
+        var mediaType = isBase64 ? header[..^7] : header;
+        var payload = source[(commaIndex + 1)..];
+
+        if (string.IsNullOrEmpty(mediaType))
+        {
+            mimeType = "image/unknown";
+        }
+        else if (mediaType.StartsWith(";", StringComparison.Ordinal))
+        {
+            mimeType = "image/unknown";
+        }
+        else
+        {
+            mimeType = mediaType;
+        }
+
+        try
+        {
+            bytes = isBase64
+                ? Convert.FromBase64String(payload)
+                : Encoding.UTF8.GetBytes(Uri.UnescapeDataString(payload));
+        }
+        catch
+        {
+            bytes = null;
+            return false;
+        }
+
+        return bytes.Length > 0;
+    }
+
+    private static void PaintBackground(DisplayList displayList, RenderPaint paint, float x, float y, float width, float height)
+    {
+        if (width <= 0f || height <= 0f)
         {
             return;
         }
 
-        displayList.FillRect(new RenderRect(x, y, width, height), color);
+        if (paint is RenderColorPaint colorPaint)
+        {
+            if (colorPaint.Color.A == 0)
+            {
+                return;
+            }
+
+            displayList.FillRect(new RenderRect(x, y, width, height), colorPaint.Color);
+            return;
+        }
+
+        if (paint is RenderGradientPaint)
+        {
+            displayList.FillRect(new RenderRect(x, y, width, height), paint);
+        }
     }
 
     private static void PaintBorder(DisplayList displayList, RenderColor color, float x, float y, float width, float height, EdgeSizes border)
@@ -1738,6 +3502,501 @@ public sealed class HtmlRenderer
         return false;
     }
 
+    private static RenderPaint ParseBackgroundPaint(Dictionary<string, string> styleMap, RenderColor fallbackColor)
+    {
+        if (!styleMap.TryGetValue("background-image", out var backgroundImage) || string.IsNullOrWhiteSpace(backgroundImage))
+        {
+            return new RenderColorPaint(fallbackColor);
+        }
+
+        return ParseGradientPaint(backgroundImage, fallbackColor);
+    }
+
+    private static RenderPaint ParseGradientPaint(string rawValue, RenderColor fallbackColor)
+    {
+        var value = rawValue.Trim();
+
+        if (value.StartsWith("repeating-linear-gradient", StringComparison.OrdinalIgnoreCase))
+        {
+            return new RenderGradientPaint(ParseLinearGradient(value, "repeating-linear-gradient", repeating: true, fallbackColor));
+        }
+
+        if (value.StartsWith("linear-gradient", StringComparison.OrdinalIgnoreCase))
+        {
+            return new RenderGradientPaint(ParseLinearGradient(value, "linear-gradient", repeating: false, fallbackColor));
+        }
+
+        if (value.StartsWith("repeating-radial-gradient", StringComparison.OrdinalIgnoreCase))
+        {
+            return new RenderGradientPaint(ParseRadialGradient(value, "repeating-radial-gradient", repeating: true, fallbackColor));
+        }
+
+        if (value.StartsWith("radial-gradient", StringComparison.OrdinalIgnoreCase))
+        {
+            return new RenderGradientPaint(ParseRadialGradient(value, "radial-gradient", repeating: false, fallbackColor));
+        }
+
+        if (value.StartsWith("repeating-conic-gradient", StringComparison.OrdinalIgnoreCase))
+        {
+            return new RenderGradientPaint(ParseConicGradient(value, "repeating-conic-gradient", repeating: true, fallbackColor));
+        }
+
+        if (value.StartsWith("conic-gradient", StringComparison.OrdinalIgnoreCase))
+        {
+            return new RenderGradientPaint(ParseConicGradient(value, "conic-gradient", repeating: false, fallbackColor));
+        }
+
+        return new RenderColorPaint(fallbackColor);
+    }
+
+    private static RenderGradient ParseLinearGradient(string rawValue, string functionName, bool repeating, RenderColor fallbackColor)
+    {
+        var inner = ExtractGradientInnerExpression(rawValue, functionName);
+        var parts = SplitGradientArguments(inner);
+        var startIndex = 0;
+        var angleDegrees = 90f;
+
+        if (parts.Length > 0)
+        {
+            var first = parts[0].Trim();
+
+            if (TryParseDirection(first, out var parsedAngle))
+            {
+                angleDegrees = parsedAngle;
+                startIndex = 1;
+            }
+        }
+
+        var stops = ParseGradientStops(parts.Skip(startIndex).ToArray(), fallbackColor);
+        return new RenderGradient(RenderGradientKind.Linear, stops, AngleDegrees: angleDegrees, Repeating: repeating);
+    }
+
+    private static RenderGradient ParseRadialGradient(string rawValue, string functionName, bool repeating, RenderColor fallbackColor)
+    {
+        var inner = ExtractGradientInnerExpression(rawValue, functionName);
+        var parts = SplitGradientArguments(inner);
+        var startIndex = 0;
+
+        var isCircle = false;
+        var sizeKind = RenderGradientSizeKind.FarthestCorner;
+        float? explicitRadiusX = null;
+        float? explicitRadiusY = null;
+        var centerX = 0.5f;
+        var centerY = 0.5f;
+
+        if (parts.Length > 0 && LooksLikeRadialConfiguration(parts[0]))
+        {
+            var configText = parts[0].Trim();
+            startIndex = 1;
+
+            var atIndex = configText.IndexOf(" at ", StringComparison.OrdinalIgnoreCase);
+            var shapeSizeText = atIndex >= 0 ? configText[..atIndex].Trim() : configText;
+            var positionText = atIndex >= 0 ? configText[(atIndex + 4)..].Trim() : null;
+
+            ParseRadialShapeAndSize(shapeSizeText, out isCircle, out sizeKind, out explicitRadiusX, out explicitRadiusY);
+
+            if (positionText is not null)
+            {
+                (centerX, centerY) = ParsePosition(positionText);
+            }
+        }
+
+        var stops = ParseGradientStops(parts.Skip(startIndex).ToArray(), fallbackColor);
+        return new RenderGradient(
+            RenderGradientKind.Radial,
+            stops,
+            CenterX: centerX,
+            CenterY: centerY,
+            IsCircle: isCircle,
+            Repeating: repeating,
+            SizeKind: sizeKind,
+            ExplicitRadiusX: explicitRadiusX,
+            ExplicitRadiusY: explicitRadiusY);
+    }
+
+    private static RenderGradient ParseConicGradient(string rawValue, string functionName, bool repeating, RenderColor fallbackColor)
+    {
+        var inner = ExtractGradientInnerExpression(rawValue, functionName);
+        var parts = SplitGradientArguments(inner);
+        var startIndex = 0;
+        var angleDegrees = 0f;
+        var centerX = 0.5f;
+        var centerY = 0.5f;
+
+        if (parts.Length > 0)
+        {
+            var first = parts[0].Trim();
+
+            if (first.StartsWith("from", StringComparison.OrdinalIgnoreCase) || first.StartsWith("at", StringComparison.OrdinalIgnoreCase))
+            {
+                var atIndex = first.IndexOf(" at ", StringComparison.OrdinalIgnoreCase);
+                var fromText = atIndex >= 0 ? first[..atIndex].Trim() : first;
+                var positionText = atIndex >= 0
+                    ? first[(atIndex + 4)..].Trim()
+                    : (first.StartsWith("at", StringComparison.OrdinalIgnoreCase) ? first[2..].Trim() : null);
+
+                if (fromText.StartsWith("from", StringComparison.OrdinalIgnoreCase))
+                {
+                    angleDegrees = ParseAngle(fromText[4..].Trim());
+                }
+
+                if (positionText is not null)
+                {
+                    (centerX, centerY) = ParsePosition(positionText);
+                }
+
+                startIndex = 1;
+            }
+        }
+
+        var stops = ParseGradientStops(parts.Skip(startIndex).ToArray(), fallbackColor, isConic: true);
+        return new RenderGradient(RenderGradientKind.Conic, stops, AngleDegrees: angleDegrees, CenterX: centerX, CenterY: centerY, Repeating: repeating);
+    }
+
+    /// <summary>
+    /// Distinguishes a radial-gradient's leading `&lt;ending-shape&gt; || &lt;size&gt; [at
+    /// &lt;position&gt;]` configuration clause from what is actually just its first color stop -
+    /// a color stop never starts with a shape/size keyword, "at", or a bare length.
+    /// </summary>
+    private static bool LooksLikeRadialConfiguration(string part)
+    {
+        var lower = part.Trim().ToLowerInvariant();
+
+        return lower.StartsWith("circle", StringComparison.Ordinal) ||
+               lower.StartsWith("ellipse", StringComparison.Ordinal) ||
+               lower.StartsWith("closest-", StringComparison.Ordinal) ||
+               lower.StartsWith("farthest-", StringComparison.Ordinal) ||
+               lower.StartsWith("at ", StringComparison.Ordinal) ||
+               lower.Contains(" at ", StringComparison.Ordinal) ||
+               (TryParsePixelValue(lower.Split(' ')[0], out _) && !lower.Contains(','));
+    }
+
+    private static void ParseRadialShapeAndSize(string text, out bool isCircle, out RenderGradientSizeKind sizeKind, out float? explicitRadiusX, out float? explicitRadiusY)
+    {
+        isCircle = false;
+        sizeKind = RenderGradientSizeKind.FarthestCorner;
+        explicitRadiusX = null;
+        explicitRadiusY = null;
+
+        if (string.IsNullOrWhiteSpace(text))
+        {
+            return;
+        }
+
+        var tokens = text.Split(' ', StringSplitOptions.RemoveEmptyEntries);
+        var lengths = new List<float>();
+
+        foreach (var token in tokens)
+        {
+            switch (token.ToLowerInvariant())
+            {
+                case "circle":
+                    isCircle = true;
+                    break;
+                case "ellipse":
+                    isCircle = false;
+                    break;
+                case "closest-side":
+                    sizeKind = RenderGradientSizeKind.ClosestSide;
+                    break;
+                case "farthest-side":
+                    sizeKind = RenderGradientSizeKind.FarthestSide;
+                    break;
+                case "closest-corner":
+                    sizeKind = RenderGradientSizeKind.ClosestCorner;
+                    break;
+                case "farthest-corner":
+                    sizeKind = RenderGradientSizeKind.FarthestCorner;
+                    break;
+                default:
+                    if (TryParsePixelValue(token, out var pixels))
+                    {
+                        lengths.Add(pixels);
+                    }
+
+                    break;
+            }
+        }
+
+        if (lengths.Count > 0)
+        {
+            sizeKind = RenderGradientSizeKind.Explicit;
+            explicitRadiusX = lengths[0];
+            explicitRadiusY = lengths.Count > 1 ? lengths[1] : lengths[0];
+
+            if (lengths.Count == 1)
+            {
+                // A single explicit length implies a circle - CSS grammar doesn't allow one
+                // length with an explicit "ellipse" keyword (that needs two lengths).
+                isCircle = true;
+            }
+        }
+    }
+
+    private static readonly string[] PositionKeywords = ["left", "right", "top", "bottom", "center"];
+
+    /// <summary>
+    /// Parses a CSS `&lt;position&gt;` value (1-2 tokens, keywords and/or percentages, in either
+    /// order for keywords) into fractional (0-1) X/Y coordinates. Absolute lengths (`at 20px
+    /// 10px`) and the 4-value edge-offset syntax are not supported and fall back to center.
+    /// </summary>
+    private static (float X, float Y) ParsePosition(string text)
+    {
+        var tokens = text.Trim().Split(' ', StringSplitOptions.RemoveEmptyEntries);
+
+        if (tokens.Length == 0)
+        {
+            return (0.5f, 0.5f);
+        }
+
+        float? x = null;
+        float? y = null;
+
+        foreach (var token in tokens)
+        {
+            switch (token.ToLowerInvariant())
+            {
+                case "left":
+                    x = 0f;
+                    break;
+                case "right":
+                    x = 1f;
+                    break;
+                case "top":
+                    y = 0f;
+                    break;
+                case "bottom":
+                    y = 1f;
+                    break;
+            }
+        }
+
+        var positionalTokens = tokens.Where(token => !PositionKeywords.Contains(token.ToLowerInvariant())).ToArray();
+        var assignedX = x is not null;
+
+        foreach (var token in positionalTokens)
+        {
+            var value = ParseStopPosition(token);
+
+            if (!assignedX)
+            {
+                x = value;
+                assignedX = true;
+            }
+            else if (y is null)
+            {
+                y = value;
+            }
+        }
+
+        return (x ?? 0.5f, y ?? 0.5f);
+    }
+
+    private static string ExtractGradientInnerExpression(string rawValue, string functionName)
+    {
+        if (!rawValue.StartsWith(functionName, StringComparison.OrdinalIgnoreCase))
+        {
+            return string.Empty;
+        }
+
+        var opening = rawValue.IndexOf('(');
+        var closing = rawValue.LastIndexOf(')');
+
+        if (opening < 0 || closing <= opening)
+        {
+            return string.Empty;
+        }
+
+        return rawValue[(opening + 1)..closing].Trim();
+    }
+
+    private static string[] SplitGradientArguments(string value)
+    {
+        if (string.IsNullOrWhiteSpace(value))
+        {
+            return [];
+        }
+
+        var parts = new List<string>();
+        var current = new StringBuilder();
+        var depth = 0;
+
+        foreach (var character in value)
+        {
+            if (character == '(')
+            {
+                depth++;
+            }
+            else if (character == ')')
+            {
+                depth = Math.Max(0, depth - 1);
+            }
+            else if (character == ',' && depth == 0)
+            {
+                var part = current.ToString().Trim();
+                if (part.Length > 0)
+                {
+                    parts.Add(part);
+                }
+
+                current.Clear();
+                continue;
+            }
+
+            current.Append(character);
+        }
+
+        var last = current.ToString().Trim();
+        if (last.Length > 0)
+        {
+            parts.Add(last);
+        }
+
+        return parts.ToArray();
+    }
+
+    private static IReadOnlyList<RenderGradientStop> ParseGradientStops(string[] parts, RenderColor fallbackColor, bool isConic = false)
+    {
+        if (parts.Length == 0)
+        {
+            return [new RenderGradientStop(0f, fallbackColor)];
+        }
+
+        var stops = new List<RenderGradientStop>(parts.Length);
+
+        for (var index = 0; index < parts.Length; index++)
+        {
+            var part = parts[index].Trim();
+            if (part.Length == 0)
+            {
+                continue;
+            }
+
+            var separatorIndex = part.IndexOfAny([ ' ', '\t', '\n', '\r' ]);
+            var colorToken = separatorIndex >= 0 ? part[..separatorIndex].Trim() : part;
+            var positionToken = separatorIndex >= 0 ? part[(separatorIndex + 1)..].Trim() : string.Empty;
+
+            var color = ParseColor(colorToken, fallbackColor);
+            var autoPosition = parts.Length == 1 ? 0f : (index / (float)Math.Max(1, parts.Length - 1));
+
+            if (string.IsNullOrWhiteSpace(positionToken))
+            {
+                stops.Add(new RenderGradientStop(autoPosition, color));
+            }
+            else if (!isConic && TryParsePixelValue(positionToken, out var pixels))
+            {
+                // An absolute-length stop position ("red 10px") cannot become a fraction until
+                // the gradient's own rendered geometry (line length/radius) is known, so the raw
+                // pixel value is carried through and resolved by the backend at paint time.
+                stops.Add(new RenderGradientStop(autoPosition, color, pixels));
+            }
+            else
+            {
+                stops.Add(new RenderGradientStop(ParseStopPosition(positionToken, isConic), color));
+            }
+        }
+
+        return stops;
+    }
+
+    private static float ParseStopPosition(string rawPosition, bool isConic = false)
+    {
+        var value = rawPosition.Trim();
+        if (string.IsNullOrWhiteSpace(value))
+        {
+            return 0f;
+        }
+
+        // conic-gradient stops are naturally written as angles ("90deg", "0.25turn"), which are a
+        // fraction of the full circle rather than of a linear 0-100% run - resolve those first.
+        if (isConic && TryParseAngle(value, out var angleDegrees))
+        {
+            var normalizedDegrees = ((angleDegrees % 360f) + 360f) % 360f;
+            return Math.Clamp(normalizedDegrees / 360f, 0f, 1f);
+        }
+
+        if (value.EndsWith("%", StringComparison.Ordinal) &&
+            float.TryParse(value[..^1], NumberStyles.Float, CultureInfo.InvariantCulture, out var percent))
+        {
+            return Math.Clamp(percent / 100f, 0f, 1f);
+        }
+
+        if (float.TryParse(value, NumberStyles.Float, CultureInfo.InvariantCulture, out var numeric))
+        {
+            return Math.Clamp(numeric, 0f, 1f);
+        }
+
+        return 0f;
+    }
+
+    private static bool TryParseDirection(string value, out float angleDegrees)
+    {
+        angleDegrees = 90f;
+        var normalized = value.Trim().ToLowerInvariant();
+
+        if (normalized.StartsWith("to ", StringComparison.Ordinal))
+        {
+            var direction = normalized[3..].Trim();
+            angleDegrees = direction switch
+            {
+                "top" => 270f,
+                "right" => 0f,
+                "bottom" => 90f,
+                "left" => 180f,
+                "top right" or "right top" => 315f,
+                "top left" or "left top" => 225f,
+                "bottom right" or "right bottom" => 45f,
+                "bottom left" or "left bottom" => 135f,
+                _ => 90f,
+            };
+            return true;
+        }
+
+        return TryParseAngle(normalized, out angleDegrees);
+    }
+
+    private static bool TryParseAngle(string value, out float angleDegrees)
+    {
+        angleDegrees = 90f;
+        var trimmed = value.Trim();
+
+        if (trimmed.EndsWith("deg", StringComparison.Ordinal) &&
+            float.TryParse(trimmed[..^3].Trim(), NumberStyles.Float, CultureInfo.InvariantCulture, out var degrees))
+        {
+            angleDegrees = degrees;
+            return true;
+        }
+
+        if (trimmed.EndsWith("grad", StringComparison.Ordinal) &&
+            float.TryParse(trimmed[..^4].Trim(), NumberStyles.Float, CultureInfo.InvariantCulture, out var gradians))
+        {
+            angleDegrees = gradians * 0.9f;
+            return true;
+        }
+
+        if (trimmed.EndsWith("turn", StringComparison.Ordinal) &&
+            float.TryParse(trimmed[..^4].Trim(), NumberStyles.Float, CultureInfo.InvariantCulture, out var turns))
+        {
+            angleDegrees = turns * 360f;
+            return true;
+        }
+
+        // Checked after "grad" - "grad" also ends with "rad" and would otherwise be misread here.
+        if (trimmed.EndsWith("rad", StringComparison.Ordinal) &&
+            float.TryParse(trimmed[..^3].Trim(), NumberStyles.Float, CultureInfo.InvariantCulture, out var radians))
+        {
+            angleDegrees = radians * 180f / (float)Math.PI;
+            return true;
+        }
+
+        return false;
+    }
+
+    private static float ParseAngle(string value)
+    {
+        return TryParseAngle(value, out var angle) ? angle : 0f;
+    }
+
     private static RenderColor ParseColor(string? rawColor, RenderColor fallback)
     {
         if (string.IsNullOrWhiteSpace(rawColor))
@@ -1803,8 +4062,172 @@ public sealed class HtmlRenderer
             return RenderColor.Transparent;
         }
 
+        // Regular box/text colors are normalized by AngleSharp.Css's own computed-style engine
+        // before they ever reach this method (it resolves "red" to an rgb()/hex form itself), so
+        // this named-color table only matters for values this renderer parses from raw CSS text
+        // itself - chiefly gradient stop colors, since a `background-image: linear-gradient(...)`
+        // function's internals are opaque to AngleSharp.Css and are hand-parsed here instead.
+        // Without it, every named gradient stop color silently fell back to the same color,
+        // producing an invisible (fallback-to-fallback) "gradient".
+        if (NamedColors.TryGetValue(color, out var named))
+        {
+            return named;
+        }
+
         return fallback;
     }
+
+    private static readonly IReadOnlyDictionary<string, RenderColor> NamedColors = new Dictionary<string, RenderColor>(StringComparer.OrdinalIgnoreCase)
+    {
+        ["aliceblue"] = new RenderColor(240, 248, 255),
+        ["antiquewhite"] = new RenderColor(250, 235, 215),
+        ["aqua"] = new RenderColor(0, 255, 255),
+        ["aquamarine"] = new RenderColor(127, 255, 212),
+        ["azure"] = new RenderColor(240, 255, 255),
+        ["beige"] = new RenderColor(245, 245, 220),
+        ["bisque"] = new RenderColor(255, 228, 196),
+        ["black"] = new RenderColor(0, 0, 0),
+        ["blanchedalmond"] = new RenderColor(255, 235, 205),
+        ["blue"] = new RenderColor(0, 0, 255),
+        ["blueviolet"] = new RenderColor(138, 43, 226),
+        ["brown"] = new RenderColor(165, 42, 42),
+        ["burlywood"] = new RenderColor(222, 184, 135),
+        ["cadetblue"] = new RenderColor(95, 158, 160),
+        ["chartreuse"] = new RenderColor(127, 255, 0),
+        ["chocolate"] = new RenderColor(210, 105, 30),
+        ["coral"] = new RenderColor(255, 127, 80),
+        ["cornflowerblue"] = new RenderColor(100, 149, 237),
+        ["cornsilk"] = new RenderColor(255, 248, 220),
+        ["crimson"] = new RenderColor(220, 20, 60),
+        ["cyan"] = new RenderColor(0, 255, 255),
+        ["darkblue"] = new RenderColor(0, 0, 139),
+        ["darkcyan"] = new RenderColor(0, 139, 139),
+        ["darkgoldenrod"] = new RenderColor(184, 134, 11),
+        ["darkgray"] = new RenderColor(169, 169, 169),
+        ["darkgreen"] = new RenderColor(0, 100, 0),
+        ["darkgrey"] = new RenderColor(169, 169, 169),
+        ["darkkhaki"] = new RenderColor(189, 183, 107),
+        ["darkmagenta"] = new RenderColor(139, 0, 139),
+        ["darkolivegreen"] = new RenderColor(85, 107, 47),
+        ["darkorange"] = new RenderColor(255, 140, 0),
+        ["darkorchid"] = new RenderColor(153, 50, 204),
+        ["darkred"] = new RenderColor(139, 0, 0),
+        ["darksalmon"] = new RenderColor(233, 150, 122),
+        ["darkseagreen"] = new RenderColor(143, 188, 143),
+        ["darkslateblue"] = new RenderColor(72, 61, 139),
+        ["darkslategray"] = new RenderColor(47, 79, 79),
+        ["darkslategrey"] = new RenderColor(47, 79, 79),
+        ["darkturquoise"] = new RenderColor(0, 206, 209),
+        ["darkviolet"] = new RenderColor(148, 0, 211),
+        ["deeppink"] = new RenderColor(255, 20, 147),
+        ["deepskyblue"] = new RenderColor(0, 191, 255),
+        ["dimgray"] = new RenderColor(105, 105, 105),
+        ["dimgrey"] = new RenderColor(105, 105, 105),
+        ["dodgerblue"] = new RenderColor(30, 144, 255),
+        ["firebrick"] = new RenderColor(178, 34, 34),
+        ["floralwhite"] = new RenderColor(255, 250, 240),
+        ["forestgreen"] = new RenderColor(34, 139, 34),
+        ["fuchsia"] = new RenderColor(255, 0, 255),
+        ["gainsboro"] = new RenderColor(220, 220, 220),
+        ["ghostwhite"] = new RenderColor(248, 248, 255),
+        ["gold"] = new RenderColor(255, 215, 0),
+        ["goldenrod"] = new RenderColor(218, 165, 32),
+        ["gray"] = new RenderColor(128, 128, 128),
+        ["green"] = new RenderColor(0, 128, 0),
+        ["greenyellow"] = new RenderColor(173, 255, 47),
+        ["grey"] = new RenderColor(128, 128, 128),
+        ["honeydew"] = new RenderColor(240, 255, 240),
+        ["hotpink"] = new RenderColor(255, 105, 180),
+        ["indianred"] = new RenderColor(205, 92, 92),
+        ["indigo"] = new RenderColor(75, 0, 130),
+        ["ivory"] = new RenderColor(255, 255, 240),
+        ["khaki"] = new RenderColor(240, 230, 140),
+        ["lavender"] = new RenderColor(230, 230, 250),
+        ["lavenderblush"] = new RenderColor(255, 240, 245),
+        ["lawngreen"] = new RenderColor(124, 252, 0),
+        ["lemonchiffon"] = new RenderColor(255, 250, 205),
+        ["lightblue"] = new RenderColor(173, 216, 230),
+        ["lightcoral"] = new RenderColor(240, 128, 128),
+        ["lightcyan"] = new RenderColor(224, 255, 255),
+        ["lightgoldenrodyellow"] = new RenderColor(250, 250, 210),
+        ["lightgray"] = new RenderColor(211, 211, 211),
+        ["lightgreen"] = new RenderColor(144, 238, 144),
+        ["lightgrey"] = new RenderColor(211, 211, 211),
+        ["lightpink"] = new RenderColor(255, 182, 193),
+        ["lightsalmon"] = new RenderColor(255, 160, 122),
+        ["lightseagreen"] = new RenderColor(32, 178, 170),
+        ["lightskyblue"] = new RenderColor(135, 206, 250),
+        ["lightslategray"] = new RenderColor(119, 136, 153),
+        ["lightslategrey"] = new RenderColor(119, 136, 153),
+        ["lightsteelblue"] = new RenderColor(176, 196, 222),
+        ["lightyellow"] = new RenderColor(255, 255, 224),
+        ["lime"] = new RenderColor(0, 255, 0),
+        ["limegreen"] = new RenderColor(50, 205, 50),
+        ["linen"] = new RenderColor(250, 240, 230),
+        ["magenta"] = new RenderColor(255, 0, 255),
+        ["maroon"] = new RenderColor(128, 0, 0),
+        ["mediumaquamarine"] = new RenderColor(102, 205, 170),
+        ["mediumblue"] = new RenderColor(0, 0, 205),
+        ["mediumorchid"] = new RenderColor(186, 85, 211),
+        ["mediumpurple"] = new RenderColor(147, 112, 219),
+        ["mediumseagreen"] = new RenderColor(60, 179, 113),
+        ["mediumslateblue"] = new RenderColor(123, 104, 238),
+        ["mediumspringgreen"] = new RenderColor(0, 250, 154),
+        ["mediumturquoise"] = new RenderColor(72, 209, 204),
+        ["mediumvioletred"] = new RenderColor(199, 21, 133),
+        ["midnightblue"] = new RenderColor(25, 25, 112),
+        ["mintcream"] = new RenderColor(245, 255, 250),
+        ["mistyrose"] = new RenderColor(255, 228, 225),
+        ["moccasin"] = new RenderColor(255, 228, 181),
+        ["navajowhite"] = new RenderColor(255, 222, 173),
+        ["navy"] = new RenderColor(0, 0, 128),
+        ["oldlace"] = new RenderColor(253, 245, 230),
+        ["olive"] = new RenderColor(128, 128, 0),
+        ["olivedrab"] = new RenderColor(107, 142, 35),
+        ["orange"] = new RenderColor(255, 165, 0),
+        ["orangered"] = new RenderColor(255, 69, 0),
+        ["orchid"] = new RenderColor(218, 112, 214),
+        ["palegoldenrod"] = new RenderColor(238, 232, 170),
+        ["palegreen"] = new RenderColor(152, 251, 152),
+        ["paleturquoise"] = new RenderColor(175, 238, 238),
+        ["palevioletred"] = new RenderColor(219, 112, 147),
+        ["papayawhip"] = new RenderColor(255, 239, 213),
+        ["peachpuff"] = new RenderColor(255, 218, 185),
+        ["peru"] = new RenderColor(205, 133, 63),
+        ["pink"] = new RenderColor(255, 192, 203),
+        ["plum"] = new RenderColor(221, 160, 221),
+        ["powderblue"] = new RenderColor(176, 224, 230),
+        ["purple"] = new RenderColor(128, 0, 128),
+        ["rebeccapurple"] = new RenderColor(102, 51, 153),
+        ["red"] = new RenderColor(255, 0, 0),
+        ["rosybrown"] = new RenderColor(188, 143, 143),
+        ["royalblue"] = new RenderColor(65, 105, 225),
+        ["saddlebrown"] = new RenderColor(139, 69, 19),
+        ["salmon"] = new RenderColor(250, 128, 114),
+        ["sandybrown"] = new RenderColor(244, 164, 96),
+        ["seagreen"] = new RenderColor(46, 139, 87),
+        ["seashell"] = new RenderColor(255, 245, 238),
+        ["sienna"] = new RenderColor(160, 82, 45),
+        ["silver"] = new RenderColor(192, 192, 192),
+        ["skyblue"] = new RenderColor(135, 206, 235),
+        ["slateblue"] = new RenderColor(106, 90, 205),
+        ["slategray"] = new RenderColor(112, 128, 144),
+        ["slategrey"] = new RenderColor(112, 128, 144),
+        ["snow"] = new RenderColor(255, 250, 250),
+        ["springgreen"] = new RenderColor(0, 255, 127),
+        ["steelblue"] = new RenderColor(70, 130, 180),
+        ["tan"] = new RenderColor(210, 180, 140),
+        ["teal"] = new RenderColor(0, 128, 128),
+        ["thistle"] = new RenderColor(216, 191, 216),
+        ["tomato"] = new RenderColor(255, 99, 71),
+        ["turquoise"] = new RenderColor(64, 224, 208),
+        ["violet"] = new RenderColor(238, 130, 238),
+        ["wheat"] = new RenderColor(245, 222, 179),
+        ["white"] = new RenderColor(255, 255, 255),
+        ["whitesmoke"] = new RenderColor(245, 245, 245),
+        ["yellow"] = new RenderColor(255, 255, 0),
+        ["yellowgreen"] = new RenderColor(154, 205, 50),
+    };
 
     private static bool TryParseColorChannel(string raw, out byte value)
     {
@@ -1884,7 +4307,28 @@ public sealed class HtmlRenderer
         return fallback;
     }
 
-    private static IReadOnlyList<string> WrapText(string text, float maxWidth, float fontSize, float averageCharacterWidthFactor, float letterSpacing)
+    /// <summary>
+    /// The height a cell needs for its own content, independent of the rows it spans.
+    /// </summary>
+    private static float MeasureCellHeight(
+        LayoutContext context,
+        TableCellPlacement placement,
+        float[] columnWidths)
+    {
+        var contentWidth = Math.Max(0f, columnWidths.Skip(placement.ColumnIndex).Take(placement.ColumnSpan).Sum()
+            - placement.PaddingLeft - placement.PaddingRight - placement.BorderLeftWidth - placement.BorderRightWidth);
+        var contentHeight = 0f;
+
+        if (contentWidth > 0f && placement.Text.Length > 0)
+        {
+            var wrappedLines = WrapText(context, placement.Text, contentWidth, placement.CellTextStyle);
+            contentHeight = wrappedLines.Count * placement.CellTextStyle.FontSize * placement.CellTextStyle.LineHeightMultiplier;
+        }
+
+        return Math.Max(20f, contentHeight + placement.PaddingTop + placement.PaddingBottom + placement.BorderTopWidth + placement.BorderBottomWidth);
+    }
+
+    private static IReadOnlyList<string> WrapText(LayoutContext context, string text, float maxWidth, RenderTextStyle textStyle)
     {
         var words = text.Split(' ', StringSplitOptions.RemoveEmptyEntries);
 
@@ -1899,8 +4343,8 @@ public sealed class HtmlRenderer
 
         foreach (var word in words)
         {
-            var wordWidth = EstimateTextWidth(word, fontSize, averageCharacterWidthFactor, letterSpacing);
-            var separatorWidth = current.Length == 0 ? 0f : EstimateTextWidth(" ", fontSize, averageCharacterWidthFactor, letterSpacing);
+            var wordWidth = MeasureTextWidth(context, word, textStyle);
+            var separatorWidth = current.Length == 0 ? 0f : MeasureTextWidth(context, " ", textStyle);
 
             if (current.Length > 0 && currentWidth + separatorWidth + wordWidth > maxWidth)
             {
@@ -1927,30 +4371,16 @@ public sealed class HtmlRenderer
         return lines;
     }
 
-    private static float EstimateTextWidth(string text, float fontSize, float averageCharacterWidthFactor, float letterSpacing)
-    {
-        var width = 0f;
-        var characterCount = 0;
+    private static RenderFont ToRenderFont(RenderTextStyle textStyle, FontFaceSet fonts) => new(
+        textStyle.FontFamily,
+        textStyle.FontSize,
+        textStyle.FontWeight,
+        textStyle.IsItalic,
+        textStyle.LetterSpacing,
+        fonts);
 
-        foreach (var c in text)
-        {
-            characterCount++;
-            width += c switch
-            {
-                'i' or 'l' or '!' or '|' => fontSize * 0.35f,
-                'm' or 'w' or 'M' or 'W' => fontSize * 0.9f,
-                ' ' => fontSize * 0.33f,
-                _ => fontSize * averageCharacterWidthFactor,
-            };
-        }
-
-        if (characterCount > 1)
-        {
-            width += (characterCount - 1) * letterSpacing;
-        }
-
-        return width;
-    }
+    private static float MeasureTextWidth(LayoutContext context, string text, RenderTextStyle textStyle) =>
+        context.TextMeasurer.MeasureWidth(text, ToRenderFont(textStyle, context.Fonts));
 
     private static float ResolveTextAlignmentOffset(TextAlign align, float availableWidth, float textWidth)
     {
@@ -1997,6 +4427,40 @@ public sealed class HtmlRenderer
         return sb.ToString().Trim();
     }
 
+    /// <summary>
+    /// Where a cell's content sits within the box the cell occupies.
+    /// </summary>
+    /// <remarks>
+    /// <c>baseline</c> is treated as <c>top</c>: aligning the first line boxes of every cell in a
+    /// row against a shared baseline is not implemented.
+    /// </remarks>
+    private enum CellVerticalAlign
+    {
+        Top,
+        Middle,
+        Bottom,
+    }
+
+    private readonly record struct TableCellPlacement(
+        int RowIndex,
+        int ColumnIndex,
+        int ColumnSpan,
+        int RowSpan,
+        ElementRenderNode CellNode,
+        Dictionary<string, string> CellStyle,
+        RenderTextStyle CellTextStyle,
+        string Text,
+        float PaddingLeft,
+        float PaddingRight,
+        float PaddingTop,
+        float PaddingBottom,
+        float BorderLeftWidth,
+        float BorderRightWidth,
+        float BorderTopWidth,
+        float BorderBottomWidth,
+        RenderColor BackgroundColor,
+        CellVerticalAlign VerticalAlign);
+
     private readonly record struct RenderTextStyle(
         float FontSize,
         RenderColor Color,
@@ -2035,6 +4499,6 @@ public sealed class HtmlRenderer
         EdgeSizes Margin,
         EdgeSizes Padding,
         EdgeSizes BorderWidth,
-        RenderColor BackgroundColor,
+        RenderPaint BackgroundPaint,
         RenderColor BorderColor);
 }

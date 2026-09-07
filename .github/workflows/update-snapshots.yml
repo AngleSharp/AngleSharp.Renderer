@@ -1,0 +1,137 @@
+name: Update Snapshots
+
+# Visual baselines are platform specific, so a contributor can only ever regenerate the one
+# for the machine they are sitting at. This workflow renders them on all supported platforms
+# and pushes the complete set back, which is the only way to keep the matrix in sync.
+on:
+  workflow_dispatch:
+    inputs:
+      commit:
+        description: "Commit the regenerated baselines back to the branch"
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+
+env:
+  ANGLESHARP_VERSION: 1.8.0
+  ANGLESHARP_CSS_VERSION: 1.1.0
+
+jobs:
+  # Keep this matrix identical to the `test` matrix in ci.yml, images included - a baseline
+  # recorded on one image is not valid for another.
+  render:
+    name: Render (${{ matrix.name }})
+    runs-on: ${{ matrix.os }}
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux
+            os: ubuntu-22.04
+          - name: windows
+            os: windows-2022
+          - name: macos
+            os: macos-14
+
+    steps:
+    - uses: actions/checkout@v5
+      with:
+        ref: ${{ github.ref }}
+
+    - name: Setup dotnet
+      uses: actions/setup-dotnet@v5
+      with:
+        dotnet-version: |
+          8.0.x
+          10.0.x
+
+    - name: Render baselines
+      env:
+        ANGLESHARP_SNAPSHOT_UPDATE: 1
+      run: >
+        dotnet test src/AngleSharp.Renderer.Tests/AngleSharp.Renderer.Tests.csproj
+        --framework net8.0
+        --filter "Category=Visual"
+        -p:AngleSharpVersion=${{ env.ANGLESHARP_VERSION }}
+        -p:AngleSharpCssVersion=${{ env.ANGLESHARP_CSS_VERSION }}
+
+    - name: Upload baselines
+      uses: actions/upload-artifact@v4
+      with:
+        name: baselines-${{ matrix.name }}
+        path: src/AngleSharp.Renderer.Tests/verification-assets/*.${{ matrix.name }}.png
+        if-no-files-found: error
+
+  collect:
+    name: Collect and commit
+    needs: [render]
+    runs-on: ubuntu-22.04
+
+    steps:
+    - uses: actions/checkout@v5
+      with:
+        ref: ${{ github.ref }}
+
+    - name: Setup dotnet
+      uses: actions/setup-dotnet@v5
+      with:
+        dotnet-version: |
+          8.0.x
+          10.0.x
+
+    - name: Download baselines
+      uses: actions/download-artifact@v4
+      with:
+        pattern: baselines-*
+        merge-multiple: true
+        path: src/AngleSharp.Renderer.Tests/verification-assets
+
+    - name: Verify the platform matrix is complete
+      run: >
+        dotnet test src/AngleSharp.Renderer.Tests/AngleSharp.Renderer.Tests.csproj
+        --framework net8.0
+        --filter "Category=SnapshotCoverage"
+        -p:AngleSharpVersion=${{ env.ANGLESHARP_VERSION }}
+        -p:AngleSharpCssVersion=${{ env.ANGLESHARP_CSS_VERSION }}
+
+    - name: Summarize changes
+      run: |
+        {
+          echo "### Regenerated baselines"
+          echo
+          if git diff --quiet --exit-code -- src/AngleSharp.Renderer.Tests/verification-assets; then
+            echo "No baseline changed."
+          else
+            echo '```'
+            git diff --stat -- src/AngleSharp.Renderer.Tests/verification-assets
+            echo '```'
+          fi
+          echo
+          echo "Untracked:"
+          echo '```'
+          git ls-files --others --exclude-standard -- src/AngleSharp.Renderer.Tests/verification-assets
+          echo '```'
+        } >> "$GITHUB_STEP_SUMMARY"
+
+    - name: Commit baselines
+      if: inputs.commit
+      run: |
+        git config user.name "github-actions[bot]"
+        git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+        git add -- src/AngleSharp.Renderer.Tests/verification-assets
+        if git diff --cached --quiet --exit-code; then
+          echo "Baselines are already up to date."
+          exit 0
+        fi
+        git commit -m "Regenerate visual snapshot baselines for all platforms"
+        git push origin HEAD:${{ github.ref_name }}
+
+    - name: Upload combined baselines
+      if: ${{ !inputs.commit }}
+      uses: actions/upload-artifact@v4
+      with:
+        name: baselines-all
+        path: src/AngleSharp.Renderer.Tests/verification-assets/*.png

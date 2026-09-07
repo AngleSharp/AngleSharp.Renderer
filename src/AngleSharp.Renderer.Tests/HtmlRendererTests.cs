@@ -1,6 +1,11 @@
 using AngleSharp;
 using AngleSharp.Css;
+using AngleSharp.Dom;
+using AngleSharp.Io;
 using AngleSharp.Renderer.Rendering;
+
+using System.Net;
+using System.Threading;
 
 namespace AngleSharp.Renderer.Tests;
 
@@ -12,16 +17,239 @@ public sealed class HtmlRendererTests
         var document = await ParseAsync("<html><body><h1>Title</h1><p>Hello renderer world from AngleSharp.</p></body></html>");
         var renderer = new HtmlRenderer();
 
-        var displayList = renderer.BuildDisplayList(document, new HtmlRenderOptions
+        var displayList = renderer.BuildDisplayList(document, new DefaultRenderDevice
         {
-            Width = 360,
-            Height = 240,
+            ViewPortWidth = 360,
+            ViewPortHeight = 240,
             FontSize = 16f,
         });
 
         Assert.NotEmpty(displayList.Commands);
         Assert.IsType<FillRectCommand>(displayList.Commands[0]);
         Assert.Contains(displayList.Commands, command => command is DrawTextCommand);
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_PaintsImageElementsFromCurrentDownload()
+    {
+        var document = await ParseAsync("""
+            <html><body>
+                <img src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAACklEQVR4nGMAAQABAA4A4cQTmwAAAABJRU5ErkJggg==" style="width:40px; height:20px;" />
+            </body></html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, new DefaultRenderDevice
+        {
+            ViewPortWidth = 240,
+            ViewPortHeight = 160,
+            FontSize = 16f,
+        });
+
+        var imageCommand = Assert.Single(displayList.Commands.OfType<DrawImageCommand>());
+        Assert.Equal(40f, imageCommand.Rect.Width);
+        Assert.Equal(20f, imageCommand.Rect.Height);
+        Assert.NotEmpty(imageCommand.Image.Data);
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_CachesHttpImagePayloadPerDocument()
+    {
+        var requester = new SingleResponseImageRequester(Convert.FromBase64String("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAACklEQVR4nGMAAQABAA4A4cQTmwAAAABJRU5ErkJggg=="));
+        var configuration = Configuration.Default
+            .WithCss()
+            .With(requester)
+            .WithDefaultLoader(new LoaderOptions
+            {
+                IsResourceLoadingEnabled = true,
+            });
+
+        var document = await ParseAsync("""
+            <html><body>
+                <img src="http://assets.test/image.png" style="width:40px; height:20px;" />
+            </body></html>
+            """, configuration, "http://example.test/");
+
+        var renderer = new HtmlRenderer();
+
+        var first = renderer.BuildDisplayList(document, new DefaultRenderDevice
+        {
+            ViewPortWidth = 240,
+            ViewPortHeight = 160,
+            FontSize = 16f,
+        });
+
+        var second = renderer.BuildDisplayList(document, new DefaultRenderDevice
+        {
+            ViewPortWidth = 240,
+            ViewPortHeight = 160,
+            FontSize = 16f,
+        });
+
+        Assert.Single(first.Commands.OfType<DrawImageCommand>());
+        Assert.Single(second.Commands.OfType<DrawImageCommand>());
+        Assert.Equal(1, requester.ContentReadSessionCount);
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_PaintsSvgImageElementFromDataUri()
+    {
+        var document = await ParseAsync("""
+            <html><body>
+                <img src="data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHdpZHRoPSIxMCIgaGVpZ2h0PSIxMCI+PHJlY3Qgd2lkdGg9IjEwIiBoZWlnaHQ9IjEwIiBmaWxsPSJyZWQiLz48L3N2Zz4=" style="width:40px; height:40px;" />
+            </body></html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, new DefaultRenderDevice
+        {
+            ViewPortWidth = 240,
+            ViewPortHeight = 160,
+            FontSize = 16f,
+        });
+
+        var imageCommand = Assert.Single(displayList.Commands.OfType<DrawImageCommand>());
+        Assert.Equal(40f, imageCommand.Rect.Width);
+        Assert.Equal(40f, imageCommand.Rect.Height);
+        Assert.NotEmpty(imageCommand.Image.Data);
+        Assert.Equal("image/png", imageCommand.Image.MimeType);
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_PaintsInlineSvgAsReplacedElement()
+    {
+        var document = await ParseAsync("""
+            <html><body>
+                <svg width="10" height="10" viewBox="0 0 10 10">
+                    <circle cx="5" cy="5" r="4" fill="green"></circle>
+                </svg>
+            </body></html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, new DefaultRenderDevice
+        {
+            ViewPortWidth = 240,
+            ViewPortHeight = 160,
+            FontSize = 16f,
+        });
+
+        var imageCommand = Assert.Single(displayList.Commands.OfType<DrawImageCommand>());
+        Assert.Equal(10f, imageCommand.Rect.Width);
+        Assert.Equal(10f, imageCommand.Rect.Height);
+        Assert.NotEmpty(imageCommand.Image.Data);
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_IgnoresInlineSvgTitleTextContent()
+    {
+        var document = await ParseAsync("""
+            <html><body>
+                <svg width="10" height="10" viewBox="0 0 10 10">
+                    <title>This must not be painted as page text</title>
+                    <circle cx="5" cy="5" r="4" fill="green"></circle>
+                </svg>
+            </body></html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, new DefaultRenderDevice
+        {
+            ViewPortWidth = 240,
+            ViewPortHeight = 160,
+            FontSize = 16f,
+        });
+
+        Assert.Single(displayList.Commands.OfType<DrawImageCommand>());
+        Assert.DoesNotContain(displayList.Commands.OfType<DrawTextCommand>(), command => command.Text.Contains("must not be painted"));
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_ParsesLinearGradientBackgrounds()
+    {
+        var document = await ParseAsync("""
+            <html><body>
+                <div style="width:100px; height:50px; background-image:linear-gradient(#ff0000, #0000ff);"></div>
+            </body></html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, new DefaultRenderDevice
+        {
+            ViewPortWidth = 240,
+            ViewPortHeight = 160,
+            FontSize = 16f,
+        });
+
+        var gradientBackground = displayList.Commands
+            .OfType<FillRectCommand>()
+            .Single(command => command.Paint is RenderGradientPaint);
+
+        var gradient = Assert.IsType<RenderGradientPaint>(gradientBackground.Paint).Gradient;
+
+        Assert.Equal(RenderGradientKind.Linear, gradient.Kind);
+        Assert.Equal(2, gradient.Stops.Count);
+        Assert.Equal(new RenderColor(255, 0, 0), gradient.Stops[0].Color);
+        Assert.Equal(new RenderColor(0, 0, 255), gradient.Stops[1].Color);
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_ParsesRadialGradientBackgrounds()
+    {
+        var document = await ParseAsync("""
+            <html><body>
+                <div style="width:100px; height:50px; background-image:radial-gradient(circle, #ff0000 0%, #0000ff 100%);"></div>
+            </body></html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, new DefaultRenderDevice
+        {
+            ViewPortWidth = 240,
+            ViewPortHeight = 160,
+            FontSize = 16f,
+        });
+
+        var gradientBackground = displayList.Commands
+            .OfType<FillRectCommand>()
+            .Single(command => command.Paint is RenderGradientPaint);
+
+        var gradient = Assert.IsType<RenderGradientPaint>(gradientBackground.Paint).Gradient;
+
+        Assert.Equal(RenderGradientKind.Radial, gradient.Kind);
+        Assert.Equal(2, gradient.Stops.Count);
+        Assert.Equal(new RenderColor(255, 0, 0), gradient.Stops[0].Color);
+        Assert.Equal(new RenderColor(0, 0, 255), gradient.Stops[1].Color);
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_ParsesConicGradientBackgrounds()
+    {
+        var document = await ParseAsync("""
+            <html><body>
+                <div style="width:100px; height:50px; background-image:conic-gradient(from 45deg, #ff0000, #00ff00, #0000ff);"></div>
+            </body></html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, new DefaultRenderDevice
+        {
+            ViewPortWidth = 240,
+            ViewPortHeight = 160,
+            FontSize = 16f,
+        });
+
+        var gradientBackground = displayList.Commands
+            .OfType<FillRectCommand>()
+            .Single(command => command.Paint is RenderGradientPaint);
+
+        var gradient = Assert.IsType<RenderGradientPaint>(gradientBackground.Paint).Gradient;
+
+        Assert.Equal(RenderGradientKind.Conic, gradient.Kind);
+        Assert.Equal(3, gradient.Stops.Count);
+        Assert.Equal(new RenderColor(255, 0, 0), gradient.Stops[0].Color);
+        Assert.Equal(new RenderColor(0, 255, 0), gradient.Stops[1].Color);
+        Assert.Equal(new RenderColor(0, 0, 255), gradient.Stops[2].Color);
     }
 
     [Fact]
@@ -37,10 +265,10 @@ public sealed class HtmlRendererTests
             """);
 
         var renderer = new HtmlRenderer();
-        var displayList = renderer.BuildDisplayList(document, new HtmlRenderOptions
+        var displayList = renderer.BuildDisplayList(document, new DefaultRenderDevice
         {
-            Width = 360,
-            Height = 240,
+            ViewPortWidth = 360,
+            ViewPortHeight = 240,
             FontSize = 16f,
         });
 
@@ -74,10 +302,10 @@ public sealed class HtmlRendererTests
             """);
 
         var renderer = new HtmlRenderer();
-        var displayList = renderer.BuildDisplayList(document, new HtmlRenderOptions
+        var displayList = renderer.BuildDisplayList(document, new DefaultRenderDevice
         {
-            Width = 220,
-            Height = 180,
+            ViewPortWidth = 220,
+            ViewPortHeight = 180,
             FontSize = 10f,
         });
 
@@ -106,10 +334,10 @@ public sealed class HtmlRendererTests
             """);
 
         var renderer = new HtmlRenderer();
-        var displayList = renderer.BuildDisplayList(document, new HtmlRenderOptions
+        var displayList = renderer.BuildDisplayList(document, new DefaultRenderDevice
         {
-            Width = 240,
-            Height = 160,
+            ViewPortWidth = 240,
+            ViewPortHeight = 160,
             FontSize = 16f,
         });
 
@@ -124,9 +352,23 @@ public sealed class HtmlRendererTests
     [Fact]
     public async Task BuildDisplayList_CollapsesAdjacentCellBordersWhenRequested()
     {
-        var document = await ParseAsync("""
+        var collapsed = await CountCellBorderCommandsAsync("collapse");
+        var separate = await CountCellBorderCommandsAsync("separate");
+
+        Assert.True(collapsed.Total < separate.Total,
+            $"Expected collapsing to draw fewer borders than separate ones, got {collapsed.Total} against {separate.Total}.");
+
+        // The point of collapsing is that neighbours share an edge, so the rule between the two
+        // columns has to be painted exactly once.
+        Assert.Equal(1, collapsed.InteriorVerticalRules);
+        Assert.Equal(2, separate.InteriorVerticalRules);
+    }
+
+    private static async Task<(int Total, int InteriorVerticalRules)> CountCellBorderCommandsAsync(string borderCollapse)
+    {
+        var document = await ParseAsync($$"""
             <html><body>
-                <table style="border-collapse:collapse;">
+                <table style="border-collapse:{{borderCollapse}}; width:200px;">
                     <tr><td style="border:1px solid black;">A</td><td style="border:1px solid black;">B</td></tr>
                     <tr><td style="border:1px solid black;">C</td><td style="border:1px solid black;">D</td></tr>
                 </table>
@@ -134,18 +376,30 @@ public sealed class HtmlRendererTests
             """);
 
         var renderer = new HtmlRenderer();
-        var displayList = renderer.BuildDisplayList(document, new HtmlRenderOptions
+        var displayList = renderer.BuildDisplayList(document, new DefaultRenderDevice
         {
-            Width = 240,
-            Height = 160,
+            ViewPortWidth = 240,
+            ViewPortHeight = 160,
             FontSize = 16f,
         });
 
-        var borderCommands = displayList.Commands
+        var borders = displayList.Commands
             .OfType<FillRectCommand>()
-            .Count(command => command.Color == RenderColor.Black);
+            .Where(command => command.Color == RenderColor.Black)
+            .ToArray();
 
-        Assert.True(borderCommands < 10, $"Expected collapsed borders to reduce border commands, but found {borderCommands}.");
+        // Vertical rules that sit strictly inside the table, counted on the first row only.
+        var tableLeft = borders.Min(command => command.Rect.X);
+        var tableRight = borders.Max(command => command.Rect.X + command.Rect.Width);
+        var firstRowY = borders.Min(command => command.Rect.Y);
+
+        var interior = borders
+            .Where(command => command.Rect.Width <= 2f)
+            .Where(command => command.Rect.X > tableLeft + 0.5f && command.Rect.X + command.Rect.Width < tableRight - 0.5f)
+            .Where(command => command.Rect.Y <= firstRowY + 1f)
+            .Count();
+
+        return (borders.Length, interior);
     }
 
     [Fact]
@@ -165,10 +419,10 @@ public sealed class HtmlRendererTests
             """);
 
         var renderer = new HtmlRenderer();
-        var displayList = renderer.BuildDisplayList(document, new HtmlRenderOptions
+        var displayList = renderer.BuildDisplayList(document, new DefaultRenderDevice
         {
-            Width = 240,
-            Height = 160,
+            ViewPortWidth = 240,
+            ViewPortHeight = 160,
             FontSize = 16f,
         });
 
@@ -177,6 +431,504 @@ public sealed class HtmlRendererTests
 
         Assert.NotNull(cellBackground);
         Assert.True(cellBackground!.Rect.Width >= 100f, $"Expected the colgroup width to expand the cell geometry, but got {cellBackground.Rect.Width}.");
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_LaysOutFlexItemsInCenteredRow()
+    {
+        var document = await ParseAsync("""
+            <html><body>
+                <div style="display:flex; width:100px; height:40px; justify-content:center; align-items:center;">
+                    <div style="width:20px; height:10px; background-color:#ff0000;"></div>
+                    <div style="width:20px; height:10px; background-color:#0000ff;"></div>
+                </div>
+            </body></html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, new DefaultRenderDevice
+        {
+            ViewPortWidth = 200,
+            ViewPortHeight = 120,
+            FontSize = 16f,
+        });
+
+        var containerBackground = displayList.Commands
+            .OfType<FillRectCommand>()
+            .First(command => command.Rect.Width == 100f && command.Rect.Height == 40f);
+
+        var childBackgrounds = displayList.Commands
+            .OfType<FillRectCommand>()
+            .Where(command => command.Rect.Width == 20f && command.Rect.Height == 10f)
+            .OrderBy(command => command.Rect.X)
+            .ToArray();
+
+        Assert.Equal(2, childBackgrounds.Length);
+        Assert.Equal(containerBackground.Rect.X + 30f, childBackgrounds[0].Rect.X);
+        Assert.Equal(containerBackground.Rect.Y + 15f, childBackgrounds[0].Rect.Y);
+        Assert.Equal(containerBackground.Rect.X + 50f, childBackgrounds[1].Rect.X);
+        Assert.Equal(containerBackground.Rect.Y + 15f, childBackgrounds[1].Rect.Y);
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_LaysOutFlexItemsInColumnDirection()
+    {
+        var document = await ParseAsync("""
+            <html><body>
+                <div style="display:flex; flex-direction:column; width:100px; height:60px; align-items:center;">
+                    <div style="width:20px; height:10px; background-color:#ff0000;"></div>
+                    <div style="width:20px; height:10px; background-color:#0000ff;"></div>
+                </div>
+            </body></html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, new DefaultRenderDevice
+        {
+            ViewPortWidth = 200,
+            ViewPortHeight = 140,
+            FontSize = 16f,
+        });
+
+        var containerBackground = displayList.Commands
+            .OfType<FillRectCommand>()
+            .First(command => command.Rect.Width == 100f && command.Rect.Height == 60f);
+
+        var childBackgrounds = displayList.Commands
+            .OfType<FillRectCommand>()
+            .Where(command => command.Rect.Width == 20f && command.Rect.Height == 10f)
+            .OrderBy(command => command.Rect.Y)
+            .ToArray();
+
+        Assert.Equal(2, childBackgrounds.Length);
+        Assert.Equal(containerBackground.Rect.X + 40f, childBackgrounds[0].Rect.X);
+        Assert.Equal(containerBackground.Rect.Y, childBackgrounds[0].Rect.Y);
+        Assert.Equal(containerBackground.Rect.X + 40f, childBackgrounds[1].Rect.X);
+        Assert.Equal(containerBackground.Rect.Y + 10f, childBackgrounds[1].Rect.Y);
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_AppliesFlexGrowToItems()
+    {
+        var document = await ParseAsync("""
+            <html><body>
+                <div style="display:flex; width:100px; height:40px;">
+                    <div style="flex-grow:1; width:20px; height:10px; background-color:#ff0000;"></div>
+                    <div style="flex-grow:1; width:20px; height:10px; background-color:#0000ff;"></div>
+                </div>
+            </body></html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, new DefaultRenderDevice
+        {
+            ViewPortWidth = 200,
+            ViewPortHeight = 120,
+            FontSize = 16f,
+        });
+
+        var childBackgrounds = displayList.Commands
+            .OfType<FillRectCommand>()
+            .Where(command => command.Rect.Width == 50f && command.Rect.Height == 10f)
+            .OrderBy(command => command.Rect.X)
+            .ToArray();
+
+        Assert.Equal(2, childBackgrounds.Length);
+        Assert.Equal(childBackgrounds[0].Rect.X, childBackgrounds[0].Rect.X);
+        Assert.Equal(childBackgrounds[0].Rect.X + 50f, childBackgrounds[1].Rect.X);
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_WrapsItemsToNewLinesWhenNeeded()
+    {
+        var document = await ParseAsync("""
+            <html><body>
+                <div style="display:flex; flex-wrap:wrap; width:70px; height:40px;">
+                    <div style="width:40px; height:10px; background-color:#ff0000;"></div>
+                    <div style="width:40px; height:10px; background-color:#0000ff;"></div>
+                </div>
+            </body></html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, new DefaultRenderDevice
+        {
+            ViewPortWidth = 200,
+            ViewPortHeight = 120,
+            FontSize = 16f,
+        });
+
+        var childBackgrounds = displayList.Commands
+            .OfType<FillRectCommand>()
+            .Where(command => command.Rect.Width == 40f && command.Rect.Height == 10f)
+            .OrderBy(command => command.Rect.Y)
+            .ThenBy(command => command.Rect.X)
+            .ToArray();
+
+        Assert.Equal(2, childBackgrounds.Length);
+        Assert.True(childBackgrounds[1].Rect.Y > childBackgrounds[0].Rect.Y);
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_UsesAlignSelfForIndividualItems()
+    {
+        var document = await ParseAsync("""
+            <html><body>
+                <div style="display:flex; width:100px; height:40px; align-items:center;">
+                    <div style="align-self:flex-start; width:20px; height:10px; background-color:#ff0000;"></div>
+                    <div style="width:20px; height:10px; background-color:#0000ff;"></div>
+                </div>
+            </body></html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, new DefaultRenderDevice
+        {
+            ViewPortWidth = 200,
+            ViewPortHeight = 120,
+            FontSize = 16f,
+        });
+
+        var childBackgrounds = displayList.Commands
+            .OfType<FillRectCommand>()
+            .Where(command => command.Rect.Width == 20f && command.Rect.Height == 10f)
+            .OrderBy(command => command.Rect.X)
+            .ToArray();
+
+        Assert.Equal(2, childBackgrounds.Length);
+        Assert.True(childBackgrounds[0].Rect.Y < childBackgrounds[1].Rect.Y);
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_UsesFlexEndJustification()
+    {
+        var document = await ParseAsync("""
+            <html><body>
+                <div style="display:flex; justify-content:flex-end; width:100px; height:40px;">
+                    <div style="width:20px; height:10px; background-color:#ff0000;"></div>
+                    <div style="width:20px; height:10px; background-color:#0000ff;"></div>
+                </div>
+            </body></html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, new DefaultRenderDevice
+        {
+            ViewPortWidth = 200,
+            ViewPortHeight = 120,
+            FontSize = 16f,
+        });
+
+        var childBackgrounds = displayList.Commands
+            .OfType<FillRectCommand>()
+            .Where(command => command.Rect.Width == 20f && command.Rect.Height == 10f)
+            .OrderBy(command => command.Rect.X)
+            .ToArray();
+
+        Assert.Equal(2, childBackgrounds.Length);
+        Assert.Equal(60f, childBackgrounds[0].Rect.X);
+        Assert.Equal(80f, childBackgrounds[1].Rect.X);
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_UsesSpaceBetweenJustification()
+    {
+        var document = await ParseAsync("""
+            <html><body>
+                <div style="display:flex; justify-content:space-between; width:100px; height:40px;">
+                    <div style="width:20px; height:10px; background-color:#ff0000;"></div>
+                    <div style="width:20px; height:10px; background-color:#0000ff;"></div>
+                </div>
+            </body></html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, new DefaultRenderDevice
+        {
+            ViewPortWidth = 200,
+            ViewPortHeight = 120,
+            FontSize = 16f,
+        });
+
+        var childBackgrounds = displayList.Commands
+            .OfType<FillRectCommand>()
+            .Where(command => command.Rect.Width == 20f && command.Rect.Height == 10f)
+            .OrderBy(command => command.Rect.X)
+            .ToArray();
+
+        Assert.Equal(2, childBackgrounds.Length);
+        Assert.Equal(15f, childBackgrounds[0].Rect.X);
+        Assert.Equal(65f, childBackgrounds[1].Rect.X);
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_UsesRowReverseDirection()
+    {
+        var document = await ParseAsync("""
+            <html><body>
+                <div style="display:flex; flex-direction:row-reverse; width:100px; height:40px;">
+                    <div style="width:20px; height:10px; background-color:#ff0000;"></div>
+                    <div style="width:20px; height:10px; background-color:#0000ff;"></div>
+                </div>
+            </body></html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, new DefaultRenderDevice
+        {
+            ViewPortWidth = 200,
+            ViewPortHeight = 120,
+            FontSize = 16f,
+        });
+
+        var containerBackground = displayList.Commands
+            .OfType<FillRectCommand>()
+            .First(command => command.Rect.Width == 100f && command.Rect.Height == 40f);
+
+        var childBackgrounds = displayList.Commands
+            .OfType<FillRectCommand>()
+            .Where(command => command.Rect.Width == 20f && command.Rect.Height == 10f)
+            .OrderBy(command => command.Rect.X)
+            .ToArray();
+
+        Assert.Equal(2, childBackgrounds.Length);
+        Assert.Equal(containerBackground.Rect.X + 60f, childBackgrounds[0].Rect.X);
+        Assert.Equal(containerBackground.Rect.X + 80f, childBackgrounds[1].Rect.X);
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_UsesColumnReverseDirection()
+    {
+        var document = await ParseAsync("""
+            <html><body>
+                <div style="display:flex; flex-direction:column-reverse; width:100px; height:60px;">
+                    <div style="width:20px; height:10px; background-color:#ff0000;"></div>
+                    <div style="width:20px; height:10px; background-color:#0000ff;"></div>
+                </div>
+            </body></html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, new DefaultRenderDevice
+        {
+            ViewPortWidth = 200,
+            ViewPortHeight = 140,
+            FontSize = 16f,
+        });
+
+        var containerBackground = displayList.Commands
+            .OfType<FillRectCommand>()
+            .First(command => command.Rect.Width == 100f && command.Rect.Height == 60f);
+
+        var childBackgrounds = displayList.Commands
+            .OfType<FillRectCommand>()
+            .Where(command => command.Rect.Width == 20f && command.Rect.Height == 10f)
+            .OrderBy(command => command.Rect.Y)
+            .ToArray();
+
+        Assert.Equal(2, childBackgrounds.Length);
+        Assert.Equal(containerBackground.Rect.Y + 40f, childBackgrounds[0].Rect.Y);
+        Assert.Equal(containerBackground.Rect.Y + 50f, childBackgrounds[1].Rect.Y);
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_UsesFlexBasisForMainSize()
+    {
+        var document = await ParseAsync("""
+            <html><body>
+                <div style="display:flex; width:100px; height:40px;">
+                    <div style="flex-basis:40px; width:20px; height:10px; background-color:#ff0000;"></div>
+                    <div style="width:20px; height:10px; background-color:#0000ff;"></div>
+                </div>
+            </body></html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, new DefaultRenderDevice
+        {
+            ViewPortWidth = 200,
+            ViewPortHeight = 120,
+            FontSize = 16f,
+        });
+
+        var childBackgrounds = displayList.Commands
+            .OfType<FillRectCommand>()
+            .Where(command => command.Rect.Width == 40f && command.Rect.Height == 10f)
+            .OrderBy(command => command.Rect.X)
+            .ToArray();
+
+        Assert.Single(childBackgrounds);
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_LaysOutGridItemsInRowsAndColumns()
+    {
+        var document = await ParseAsync("""
+            <html><body>
+                <div style="display:grid; grid-template-columns:50px 50px; grid-template-rows:20px 20px; width:100px; height:40px;">
+                    <div style="width:20px; height:10px; background-color:#ff0000;"></div>
+                    <div style="width:20px; height:10px; background-color:#0000ff;"></div>
+                    <div style="width:20px; height:10px; background-color:#00ff00;"></div>
+                    <div style="width:20px; height:10px; background-color:#ffff00;"></div>
+                </div>
+            </body></html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, new DefaultRenderDevice
+        {
+            ViewPortWidth = 200,
+            ViewPortHeight = 120,
+            FontSize = 16f,
+        });
+
+        var childBackgrounds = displayList.Commands
+            .OfType<FillRectCommand>()
+            .Where(command => command.Rect.Width == 20f && command.Rect.Height == 10f)
+            .OrderBy(command => command.Rect.Y)
+            .ThenBy(command => command.Rect.X)
+            .ToArray();
+
+        Assert.Equal(4, childBackgrounds.Length);
+        Assert.Equal(0f, childBackgrounds[0].Rect.X);
+        Assert.Equal(0f, childBackgrounds[0].Rect.Y);
+        Assert.Equal(50f, childBackgrounds[1].Rect.X);
+        Assert.Equal(0f, childBackgrounds[1].Rect.Y);
+        Assert.Equal(0f, childBackgrounds[2].Rect.X);
+        Assert.Equal(20f, childBackgrounds[2].Rect.Y);
+        Assert.Equal(50f, childBackgrounds[3].Rect.X);
+        Assert.Equal(20f, childBackgrounds[3].Rect.Y);
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_AppliesGridGapsToTrackPlacement()
+    {
+        var document = await ParseAsync("""
+            <html><body>
+                <div style="display:grid; grid-template-columns:50px 50px; grid-template-rows:20px 20px; gap:10px 20px; width:120px; height:60px;">
+                    <div style="width:20px; height:10px; background-color:#ff0000;"></div>
+                    <div style="width:20px; height:10px; background-color:#0000ff;"></div>
+                    <div style="width:20px; height:10px; background-color:#00ff00;"></div>
+                    <div style="width:20px; height:10px; background-color:#ffff00;"></div>
+                </div>
+            </body></html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, new DefaultRenderDevice
+        {
+            ViewPortWidth = 200,
+            ViewPortHeight = 120,
+            FontSize = 16f,
+        });
+
+        var childBackgrounds = displayList.Commands
+            .OfType<FillRectCommand>()
+            .Where(command => command.Rect.Width == 20f && command.Rect.Height == 10f)
+            .OrderBy(command => command.Rect.Y)
+            .ThenBy(command => command.Rect.X)
+            .ToArray();
+
+        Assert.Equal(4, childBackgrounds.Length);
+        Assert.Equal(0f, childBackgrounds[0].Rect.X);
+        Assert.Equal(0f, childBackgrounds[0].Rect.Y);
+        Assert.Equal(60f, childBackgrounds[1].Rect.X);
+        Assert.Equal(0f, childBackgrounds[1].Rect.Y);
+        Assert.Equal(0f, childBackgrounds[2].Rect.X);
+        Assert.Equal(30f, childBackgrounds[2].Rect.Y);
+        Assert.Equal(60f, childBackgrounds[3].Rect.X);
+        Assert.Equal(30f, childBackgrounds[3].Rect.Y);
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_AppliesExplicitGridItemPlacement()
+    {
+        var document = await ParseAsync("""
+            <html><body>
+                <div style="display:grid; grid-template-columns:50px 50px; grid-template-rows:20px 20px; width:100px; height:40px;">
+                    <div style="width:20px; height:10px; background-color:#ff0000; grid-column:2; grid-row:2;"></div>
+                </div>
+            </body></html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, new DefaultRenderDevice
+        {
+            ViewPortWidth = 200,
+            ViewPortHeight = 120,
+            FontSize = 16f,
+        });
+
+        var childBackground = displayList.Commands
+            .OfType<FillRectCommand>()
+            .Single(command => command.Rect.Width == 20f && command.Rect.Height == 10f);
+
+        Assert.Equal(50f, childBackground.Rect.X);
+        Assert.Equal(20f, childBackground.Rect.Y);
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_AppliesSpanBasedGridItemPlacement()
+    {
+        var document = await ParseAsync("""
+            <html><body>
+                <div style="display:grid; grid-template-columns:50px 50px; grid-template-rows:20px 20px; width:100px; height:40px;">
+                    <div style="width:20px; height:10px; background-color:#ff0000; grid-column:1 / span 2;"></div>
+                </div>
+            </body></html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, new DefaultRenderDevice
+        {
+            ViewPortWidth = 200,
+            ViewPortHeight = 120,
+            FontSize = 16f,
+        });
+
+        var childBackground = displayList.Commands
+            .OfType<FillRectCommand>()
+            .Single(command => command.Rect.Width == 20f && command.Rect.Height == 10f);
+
+        Assert.Equal(0f, childBackground.Rect.X);
+        Assert.Equal(0f, childBackground.Rect.Y);
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_AppliesAutoPlacementAcrossImplicitTracks()
+    {
+        var document = await ParseAsync("""
+            <html><body>
+                <div style="display:grid; grid-template-columns:50px 50px; width:100px; height:40px;">
+                    <div style="width:20px; height:10px; background-color:#ff0000;"></div>
+                    <div style="width:20px; height:10px; background-color:#0000ff;"></div>
+                    <div style="width:20px; height:10px; background-color:#00ff00;"></div>
+                </div>
+            </body></html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, new DefaultRenderDevice
+        {
+            ViewPortWidth = 200,
+            ViewPortHeight = 120,
+            FontSize = 16f,
+        });
+
+        var childBackgrounds = displayList.Commands
+            .OfType<FillRectCommand>()
+            .Where(command => command.Rect.Width == 20f && command.Rect.Height == 10f)
+            .OrderBy(command => command.Rect.Y)
+            .ThenBy(command => command.Rect.X)
+            .ToArray();
+
+        Assert.Equal(3, childBackgrounds.Length);
+        Assert.Equal(0f, childBackgrounds[0].Rect.X);
+        Assert.Equal(0f, childBackgrounds[0].Rect.Y);
+        Assert.Equal(50f, childBackgrounds[1].Rect.X);
+        Assert.Equal(0f, childBackgrounds[1].Rect.Y);
+        Assert.Equal(0f, childBackgrounds[2].Rect.X);
+        Assert.Equal(20f, childBackgrounds[2].Rect.Y);
     }
 
     [Fact]
@@ -189,10 +941,10 @@ public sealed class HtmlRendererTests
             """);
 
         var renderer = new HtmlRenderer();
-        var displayList = renderer.BuildDisplayList(document, new HtmlRenderOptions
+        var displayList = renderer.BuildDisplayList(document, new DefaultRenderDevice
         {
-            Width = 200,
-            Height = 120,
+            ViewPortWidth = 200,
+            ViewPortHeight = 120,
             FontSize = 16f,
         });
 
@@ -213,10 +965,10 @@ public sealed class HtmlRendererTests
             """);
 
         var renderer = new HtmlRenderer();
-        var displayList = renderer.BuildDisplayList(document, new HtmlRenderOptions
+        var displayList = renderer.BuildDisplayList(document, new DefaultRenderDevice
         {
-            Width = 240,
-            Height = 120,
+            ViewPortWidth = 240,
+            ViewPortHeight = 120,
             FontSize = 16f,
         });
 
@@ -237,10 +989,10 @@ public sealed class HtmlRendererTests
             """);
 
         var renderer = new HtmlRenderer();
-        var displayList = renderer.BuildDisplayList(document, new HtmlRenderOptions
+        var displayList = renderer.BuildDisplayList(document, new DefaultRenderDevice
         {
-            Width = 240,
-            Height = 160,
+            ViewPortWidth = 240,
+            ViewPortHeight = 160,
             FontSize = 16f,
         });
 
@@ -263,10 +1015,10 @@ public sealed class HtmlRendererTests
             """);
 
         var renderer = new HtmlRenderer();
-        var displayList = renderer.BuildDisplayList(document, new HtmlRenderOptions
+        var displayList = renderer.BuildDisplayList(document, new DefaultRenderDevice
         {
-            Width = 240,
-            Height = 160,
+            ViewPortWidth = 240,
+            ViewPortHeight = 160,
             FontSize = 16f,
         });
 
@@ -288,10 +1040,10 @@ public sealed class HtmlRendererTests
             """);
 
         var renderer = new HtmlRenderer();
-        var image = renderer.RenderToPng(document, new HtmlRenderOptions
+        var image = renderer.RenderToPng(document, new DefaultRenderDevice
         {
-            Width = 240,
-            Height = 120,
+            ViewPortWidth = 240,
+            ViewPortHeight = 120,
             FontSize = 18f,
         });
 
@@ -305,10 +1057,10 @@ public sealed class HtmlRendererTests
         var document = await ParseAsync("<html><body><p>PNG smoke test output.</p></body></html>");
         var renderer = new HtmlRenderer();
 
-        var image = renderer.RenderToPng(document, new HtmlRenderOptions
+        var image = renderer.RenderToPng(document, new DefaultRenderDevice
         {
-            Width = 320,
-            Height = 180,
+            ViewPortWidth = 320,
+            ViewPortHeight = 180,
         });
 
         Assert.Equal("image/png", image.MimeType);
@@ -329,12 +1081,10 @@ public sealed class HtmlRendererTests
             """);
 
         var renderer = new HtmlRenderer();
-        var displayList = renderer.BuildDisplayList(document, new HtmlRenderOptions
+        var displayList = renderer.BuildDisplayList(document, new DefaultRenderDevice
         {
-            Width = 300,
-            Height = 200,
-            Padding = 0f,
-            ParagraphSpacing = 0f,
+            ViewPortWidth = 300,
+            ViewPortHeight = 200,
         });
 
         var backgrounds = displayList.Commands.OfType<FillRectCommand>().ToArray();
@@ -358,12 +1108,10 @@ public sealed class HtmlRendererTests
             """);
 
         var renderer = new HtmlRenderer();
-        var displayList = renderer.BuildDisplayList(document, new HtmlRenderOptions
+        var displayList = renderer.BuildDisplayList(document, new DefaultRenderDevice
         {
-            Width = 300,
-            Height = 200,
-            Padding = 0f,
-            ParagraphSpacing = 0f,
+            ViewPortWidth = 300,
+            ViewPortHeight = 200,
         });
 
         var fills = displayList.Commands.OfType<FillRectCommand>().ToArray();
@@ -395,12 +1143,10 @@ public sealed class HtmlRendererTests
             """);
 
         var renderer = new HtmlRenderer();
-        var displayList = renderer.BuildDisplayList(document, new HtmlRenderOptions
+        var displayList = renderer.BuildDisplayList(document, new DefaultRenderDevice
         {
-            Width = 300,
-            Height = 150,
-            Padding = 0f,
-            ParagraphSpacing = 0f,
+            ViewPortWidth = 300,
+            ViewPortHeight = 150,
         });
 
         var fills = displayList.Commands.OfType<FillRectCommand>().ToArray();
@@ -421,12 +1167,10 @@ public sealed class HtmlRendererTests
             """);
 
         var renderer = new HtmlRenderer();
-        var displayList = renderer.BuildDisplayList(document, new HtmlRenderOptions
+        var displayList = renderer.BuildDisplayList(document, new DefaultRenderDevice
         {
-            Width = 300,
-            Height = 150,
-            Padding = 0f,
-            ParagraphSpacing = 0f,
+            ViewPortWidth = 300,
+            ViewPortHeight = 150,
         });
 
         var fills = displayList.Commands.OfType<FillRectCommand>().ToArray();
@@ -448,12 +1192,10 @@ public sealed class HtmlRendererTests
             """);
 
         var renderer = new HtmlRenderer();
-        var displayList = renderer.BuildDisplayList(document, new HtmlRenderOptions
+        var displayList = renderer.BuildDisplayList(document, new DefaultRenderDevice
         {
-            Width = 300,
-            Height = 200,
-            Padding = 0f,
-            ParagraphSpacing = 0f,
+            ViewPortWidth = 300,
+            ViewPortHeight = 200,
         });
 
         var fills = displayList.Commands.OfType<FillRectCommand>().ToArray();
@@ -478,12 +1220,10 @@ public sealed class HtmlRendererTests
             """);
 
         var renderer = new HtmlRenderer();
-        var displayList = renderer.BuildDisplayList(document, new HtmlRenderOptions
+        var displayList = renderer.BuildDisplayList(document, new DefaultRenderDevice
         {
-            Width = 320,
-            Height = 240,
-            Padding = 0f,
-            ParagraphSpacing = 0f,
+            ViewPortWidth = 320,
+            ViewPortHeight = 240,
         });
 
         var fills = displayList.Commands.OfType<FillRectCommand>().ToArray();
@@ -508,12 +1248,10 @@ public sealed class HtmlRendererTests
             """);
 
         var renderer = new HtmlRenderer();
-        var displayList = renderer.BuildDisplayList(document, new HtmlRenderOptions
+        var displayList = renderer.BuildDisplayList(document, new DefaultRenderDevice
         {
-            Width = 320,
-            Height = 240,
-            Padding = 0f,
-            ParagraphSpacing = 0f,
+            ViewPortWidth = 320,
+            ViewPortHeight = 240,
         });
 
         var fills = displayList.Commands.OfType<FillRectCommand>().ToArray();
@@ -539,12 +1277,10 @@ public sealed class HtmlRendererTests
             """);
 
         var renderer = new HtmlRenderer();
-        var displayList = renderer.BuildDisplayList(document, new HtmlRenderOptions
+        var displayList = renderer.BuildDisplayList(document, new DefaultRenderDevice
         {
-            Width = 320,
-            Height = 260,
-            Padding = 0f,
-            ParagraphSpacing = 0f,
+            ViewPortWidth = 320,
+            ViewPortHeight = 260,
         });
 
         var fills = displayList.Commands.OfType<FillRectCommand>().ToArray();
@@ -563,12 +1299,10 @@ public sealed class HtmlRendererTests
             """);
 
         var renderer = new HtmlRenderer();
-        var displayList = renderer.BuildDisplayList(document, new HtmlRenderOptions
+        var displayList = renderer.BuildDisplayList(document, new DefaultRenderDevice
         {
-            Width = 300,
-            Height = 200,
-            Padding = 0f,
-            ParagraphSpacing = 0f,
+            ViewPortWidth = 300,
+            ViewPortHeight = 200,
         });
 
         var fills = displayList.Commands.OfType<FillRectCommand>().ToArray();
@@ -586,12 +1320,10 @@ public sealed class HtmlRendererTests
             """);
 
         var renderer = new HtmlRenderer();
-        var displayList = renderer.BuildDisplayList(document, new HtmlRenderOptions
+        var displayList = renderer.BuildDisplayList(document, new DefaultRenderDevice
         {
-            Width = 200,
-            Height = 120,
-            Padding = 0f,
-            ParagraphSpacing = 0f,
+            ViewPortWidth = 200,
+            ViewPortHeight = 120,
         });
 
         var fills = displayList.Commands.OfType<FillRectCommand>().ToArray();
@@ -608,12 +1340,10 @@ public sealed class HtmlRendererTests
             """);
 
         var renderer = new HtmlRenderer();
-        var displayList = renderer.BuildDisplayList(document, new HtmlRenderOptions
+        var displayList = renderer.BuildDisplayList(document, new DefaultRenderDevice
         {
-            Width = 200,
-            Height = 120,
-            Padding = 0f,
-            ParagraphSpacing = 0f,
+            ViewPortWidth = 200,
+            ViewPortHeight = 120,
         });
 
         var fills = displayList.Commands.OfType<FillRectCommand>().ToArray();
@@ -630,12 +1360,10 @@ public sealed class HtmlRendererTests
             """);
 
         var renderer = new HtmlRenderer();
-        var displayList = renderer.BuildDisplayList(document, new HtmlRenderOptions
+        var displayList = renderer.BuildDisplayList(document, new DefaultRenderDevice
         {
-            Width = 200,
-            Height = 120,
-            Padding = 0f,
-            ParagraphSpacing = 0f,
+            ViewPortWidth = 200,
+            ViewPortHeight = 120,
         });
 
         var redFill = displayList.Commands
@@ -657,12 +1385,10 @@ public sealed class HtmlRendererTests
             """);
 
         var renderer = new HtmlRenderer();
-        var displayList = renderer.BuildDisplayList(document, new HtmlRenderOptions
+        var displayList = renderer.BuildDisplayList(document, new DefaultRenderDevice
         {
-            Width = 200,
-            Height = 120,
-            Padding = 0f,
-            ParagraphSpacing = 0f,
+            ViewPortWidth = 200,
+            ViewPortHeight = 120,
         });
 
         var greenFill = displayList.Commands
@@ -683,12 +1409,10 @@ public sealed class HtmlRendererTests
             """);
 
         var renderer = new HtmlRenderer();
-        var displayList = renderer.BuildDisplayList(document, new HtmlRenderOptions
+        var displayList = renderer.BuildDisplayList(document, new DefaultRenderDevice
         {
-            Width = 180,
-            Height = 80,
-            Padding = 0f,
-            ParagraphSpacing = 0f,
+            ViewPortWidth = 180,
+            ViewPortHeight = 80,
         });
 
         var redFill = displayList.Commands
@@ -708,12 +1432,10 @@ public sealed class HtmlRendererTests
             """);
 
         var renderer = new HtmlRenderer();
-        var displayList = renderer.BuildDisplayList(document, new HtmlRenderOptions
+        var displayList = renderer.BuildDisplayList(document, new DefaultRenderDevice
         {
-            Width = 180,
-            Height = 80,
-            Padding = 0f,
-            ParagraphSpacing = 0f,
+            ViewPortWidth = 180,
+            ViewPortHeight = 80,
         });
 
         var blueFill = displayList.Commands
@@ -734,12 +1456,10 @@ public sealed class HtmlRendererTests
             """);
 
         var renderer = new HtmlRenderer();
-        var displayList = renderer.BuildDisplayList(document, new HtmlRenderOptions
+        var displayList = renderer.BuildDisplayList(document, new DefaultRenderDevice
         {
-            Width = 180,
-            Height = 100,
-            Padding = 0f,
-            ParagraphSpacing = 0f,
+            ViewPortWidth = 180,
+            ViewPortHeight = 100,
         });
 
         var fills = displayList.Commands.OfType<FillRectCommand>().ToArray();
@@ -767,12 +1487,10 @@ public sealed class HtmlRendererTests
             """);
 
         var renderer = new HtmlRenderer();
-        var displayList = renderer.BuildDisplayList(document, new HtmlRenderOptions
+        var displayList = renderer.BuildDisplayList(document, new DefaultRenderDevice
         {
-            Width = 200,
-            Height = 120,
-            Padding = 0f,
-            ParagraphSpacing = 0f,
+            ViewPortWidth = 200,
+            ViewPortHeight = 120,
         });
 
         var fills = displayList.Commands.OfType<FillRectCommand>().ToArray();
@@ -795,12 +1513,10 @@ public sealed class HtmlRendererTests
             """);
 
         var renderer = new HtmlRenderer();
-        var displayList = renderer.BuildDisplayList(document, new HtmlRenderOptions
+        var displayList = renderer.BuildDisplayList(document, new DefaultRenderDevice
         {
-            Width = 200,
-            Height = 120,
-            Padding = 0f,
-            ParagraphSpacing = 0f,
+            ViewPortWidth = 200,
+            ViewPortHeight = 120,
         });
 
         var fills = displayList.Commands.OfType<FillRectCommand>().ToArray();
@@ -822,12 +1538,10 @@ public sealed class HtmlRendererTests
             """);
 
         var renderer = new HtmlRenderer();
-        var displayList = renderer.BuildDisplayList(document, new HtmlRenderOptions
+        var displayList = renderer.BuildDisplayList(document, new DefaultRenderDevice
         {
-            Width = 220,
-            Height = 120,
-            Padding = 0f,
-            ParagraphSpacing = 0f,
+            ViewPortWidth = 220,
+            ViewPortHeight = 120,
         });
 
         var redFill = displayList.Commands
@@ -851,12 +1565,10 @@ public sealed class HtmlRendererTests
             """);
 
         var renderer = new HtmlRenderer();
-        var displayList = renderer.BuildDisplayList(document, new HtmlRenderOptions
+        var displayList = renderer.BuildDisplayList(document, new DefaultRenderDevice
         {
-            Width = 200,
-            Height = 120,
-            Padding = 0f,
-            ParagraphSpacing = 0f,
+            ViewPortWidth = 200,
+            ViewPortHeight = 120,
         });
 
         var fills = displayList.Commands.OfType<FillRectCommand>().ToArray();
@@ -885,12 +1597,10 @@ public sealed class HtmlRendererTests
             """);
 
         var renderer = new HtmlRenderer();
-        var displayList = renderer.BuildDisplayList(document, new HtmlRenderOptions
+        var displayList = renderer.BuildDisplayList(document, new DefaultRenderDevice
         {
-            Width = 240,
-            Height = 140,
-            Padding = 0f,
-            ParagraphSpacing = 0f,
+            ViewPortWidth = 240,
+            ViewPortHeight = 140,
         });
 
         var fills = displayList.Commands.OfType<FillRectCommand>().ToArray();
@@ -915,12 +1625,10 @@ public sealed class HtmlRendererTests
             """);
 
         var renderer = new HtmlRenderer();
-        var displayList = renderer.BuildDisplayList(document, new HtmlRenderOptions
+        var displayList = renderer.BuildDisplayList(document, new DefaultRenderDevice
         {
-            Width = 220,
-            Height = 120,
-            Padding = 0f,
-            ParagraphSpacing = 0f,
+            ViewPortWidth = 220,
+            ViewPortHeight = 120,
         });
 
         var fills = displayList.Commands.OfType<FillRectCommand>().ToArray();
@@ -944,12 +1652,10 @@ public sealed class HtmlRendererTests
             """);
 
         var renderer = new HtmlRenderer();
-        var displayList = renderer.BuildDisplayList(document, new HtmlRenderOptions
+        var displayList = renderer.BuildDisplayList(document, new DefaultRenderDevice
         {
-            Width = 220,
-            Height = 120,
-            Padding = 0f,
-            ParagraphSpacing = 0f,
+            ViewPortWidth = 220,
+            ViewPortHeight = 120,
         });
 
         var fills = displayList.Commands.OfType<FillRectCommand>().ToArray();
@@ -974,12 +1680,10 @@ public sealed class HtmlRendererTests
             """);
 
         var renderer = new HtmlRenderer();
-        var displayList = renderer.BuildDisplayList(document, new HtmlRenderOptions
+        var displayList = renderer.BuildDisplayList(document, new DefaultRenderDevice
         {
-            Width = 220,
-            Height = 120,
-            Padding = 0f,
-            ParagraphSpacing = 0f,
+            ViewPortWidth = 220,
+            ViewPortHeight = 120,
         });
 
         var fills = displayList.Commands.OfType<FillRectCommand>().ToArray();
@@ -991,9 +1695,87 @@ public sealed class HtmlRendererTests
         Assert.True(blueIndex > redIndex);
     }
 
-    private static async Task<AngleSharp.Dom.IDocument> ParseAsync(string html)
+    private static async Task<AngleSharp.Dom.IDocument> ParseAsync(string html, IConfiguration? configuration = null, string? address = null)
     {
-        var context = BrowsingContext.New(Configuration.Default.WithCss());
-        return await context.OpenAsync(request => request.Content(html));
+        var context = BrowsingContext.New(configuration ?? Configuration.Default.WithCss());
+
+        return await context.OpenAsync(request =>
+        {
+            if (!string.IsNullOrWhiteSpace(address))
+            {
+                request.Address(address);
+            }
+
+            request.Content(html);
+        });
+    }
+
+    private sealed class SingleResponseImageRequester : BaseRequester
+    {
+        private readonly ReadTrackingMemoryStream _stream;
+
+        public SingleResponseImageRequester(byte[] imageData)
+        {
+            _stream = new ReadTrackingMemoryStream(imageData);
+        }
+
+        public int ContentReadSessionCount => _stream.ReadSessionCount;
+
+        public override bool SupportsProtocol(string protocol)
+        {
+            return string.Equals(protocol, "http", StringComparison.OrdinalIgnoreCase) ||
+                   string.Equals(protocol, "https", StringComparison.OrdinalIgnoreCase);
+        }
+
+        protected override Task<IResponse?> PerformRequestAsync(Request request, CancellationToken cancel)
+        {
+            var response = new DefaultResponse
+            {
+                Address = request.Address,
+                StatusCode = HttpStatusCode.OK,
+                Headers = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+                {
+                    ["Content-Type"] = "image/png",
+                },
+                Content = _stream,
+            };
+
+            return Task.FromResult<IResponse?>(response);
+        }
+
+        private sealed class ReadTrackingMemoryStream : MemoryStream
+        {
+            public ReadTrackingMemoryStream(byte[] buffer)
+                : base(buffer)
+            {
+            }
+
+            public int ReadSessionCount { get; private set; }
+
+            public override int Read(byte[] buffer, int offset, int count)
+            {
+                if (Position == 0)
+                {
+                    ReadSessionCount++;
+                }
+
+                return base.Read(buffer, offset, count);
+            }
+
+            public override int Read(Span<byte> buffer)
+            {
+                if (Position == 0)
+                {
+                    ReadSessionCount++;
+                }
+
+                return base.Read(buffer);
+            }
+
+            protected override void Dispose(bool disposing)
+            {
+                // Keep the backing stream alive for deterministic test behavior.
+            }
+        }
     }
 }

@@ -26,8 +26,11 @@ class Build : FalloutBuild
     [Fallout.Common.Parameter("ReleaseNotesFilePath - To determine the SemanticVersion")]
     readonly AbsolutePath ReleaseNotesFilePath = RootDirectory / "CHANGELOG.md";
 
-    [Fallout.Common.Parameter("AngleSharp package version override (e.g. 1.0.0 for compatibility checks)")]
+    [Fallout.Common.Parameter("AngleSharp package version override (e.g. 1.8.0 for compatibility checks)")]
     readonly string AngleSharpVersion;
+
+    [Fallout.Common.Parameter("AngleSharp.Css package version override (e.g. 1.1.0 for compatibility checks)")]
+    readonly string AngleSharpCssVersion;
 
     [Solution]
     readonly Solution Solution;
@@ -118,6 +121,11 @@ class Build : FalloutBuild
                     settings = settings.SetProperty("AngleSharpVersion", AngleSharpVersion);
                 }
 
+                if (!String.IsNullOrEmpty(AngleSharpCssVersion))
+                {
+                    settings = settings.SetProperty("AngleSharpCssVersion", AngleSharpCssVersion);
+                }
+
                 return settings;
             });
         });
@@ -140,6 +148,11 @@ class Build : FalloutBuild
                     settings = settings.SetProperty("AngleSharpVersion", AngleSharpVersion);
                 }
 
+                if (!String.IsNullOrEmpty(AngleSharpCssVersion))
+                {
+                    settings = settings.SetProperty("AngleSharpCssVersion", AngleSharpCssVersion);
+                }
+
                 return settings;
             });
         });
@@ -160,6 +173,11 @@ class Build : FalloutBuild
                 if (!String.IsNullOrEmpty(AngleSharpVersion))
                 {
                     settings = settings.SetProperty("AngleSharpVersion", AngleSharpVersion);
+                }
+
+                if (!String.IsNullOrEmpty(AngleSharpCssVersion))
+                {
+                    settings = settings.SetProperty("AngleSharpCssVersion", AngleSharpCssVersion);
                 }
 
                 return settings;
@@ -186,6 +204,11 @@ class Build : FalloutBuild
                 if (!String.IsNullOrEmpty(AngleSharpVersion))
                 {
                     settings = settings.SetProperty("AngleSharpVersion", AngleSharpVersion);
+                }
+
+                if (!String.IsNullOrEmpty(AngleSharpCssVersion))
+                {
+                    settings = settings.SetProperty("AngleSharpCssVersion", AngleSharpCssVersion);
                 }
 
                 return settings;
