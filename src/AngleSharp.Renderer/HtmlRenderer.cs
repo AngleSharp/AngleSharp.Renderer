@@ -470,6 +470,16 @@ public sealed class HtmlRenderer
             return;
         }
 
+        var formControlKind = ResolveFormControlKind(element);
+
+        // input[type=hidden] never paints at all, matching the UA `display: none` browsers give
+        // it - AngleSharp.Css's own UA stylesheet does not special-case it (every <input> type
+        // computes to plain inline-block), so this renderer has to.
+        if (formControlKind == FormControlKind.Hidden)
+        {
+            return;
+        }
+
         var display = GetDisplay(styleMap);
 
         if (string.Equals(display, "table", StringComparison.OrdinalIgnoreCase))
@@ -481,6 +491,11 @@ public sealed class HtmlRenderer
         var renderAsBlock = ShouldRenderAsBlock(computedStyle) || IsReplacedElementTag(tagName);
         var isInlineBlock = IsInlineBlock(computedStyle);
         var currentTextStyle = ResolveTextStyle(styleMap, inheritedTextStyle);
+
+        if (formControlKind != FormControlKind.None)
+        {
+            ApplyFormControlDefaults(formControlKind, element, styleMap, currentTextStyle, context);
+        }
 
         if (cursorY >= activeFloatBottom)
         {
@@ -627,6 +642,29 @@ public sealed class HtmlRenderer
             currentTextStyle = PaintListItemMarker(displayList, element, styleMap, currentTextStyle, context, borderBoxX, contentX, contentY);
         }
 
+        if (formControlKind != FormControlKind.None)
+        {
+            // Children are suppressed or absent for every kind PaintFormControl actually paints
+            // content for (TextLike/Select/Button/Checkbox/Radio/Color), so their box never grows
+            // past its own specified height the way an ordinary auto-sized box can - the specified
+            // height (falling back to a single line, for an author-supplied "auto") is therefore
+            // also this box's final content height, safe to resolve here rather than waiting for
+            // the auto-height computation later in this method.
+            var formControlSpecifiedHeight = ResolveFlexibleContentDimension(
+                styleMap,
+                flowContainingWidth,
+                float.NaN,
+                isFlexItem,
+                isRowDirection,
+                flexMainSize,
+                flexCrossSize,
+                propertyName: "height");
+            var formControlContentHeight = float.IsNaN(formControlSpecifiedHeight)
+                ? currentTextStyle.FontSize * currentTextStyle.LineHeightMultiplier
+                : formControlSpecifiedHeight;
+            PaintFormControl(displayList, element, formControlKind, currentTextStyle, context, contentX, contentY, contentWidth, formControlContentHeight);
+        }
+
         var childCursorY = contentY;
         var childPreviousBlockMarginBottom = 0f;
         var childSuppressNextBlockTopMargin = collapseWithFirstChild && !float.Equals(effectiveMarginTop, marginTop);
@@ -640,14 +678,29 @@ public sealed class HtmlRenderer
 
         // An <svg> root's children are foreign-namespaced SVG elements (circle, text, title, ...),
         // not HTML flow content; it is rasterized as a single replaced element below, so its
-        // subtree must never be walked as if it were normal inline/block content.
-        var orderedChildren = string.Equals(tagName, "svg", StringComparison.OrdinalIgnoreCase)
+        // subtree must never be walked as if it were normal inline/block content. A <select>'s
+        // <option> children and a <button>'s label are painted directly by PaintFormControl above
+        // instead (a <select> shows only its selected option, never every option stacked; a
+        // <button>'s own label is measured up front to size the button, so it is painted the same
+        // self-contained way rather than through normal child text flow) - <textarea> is
+        // deliberately excluded from this list, since its child text node flowing normally through
+        // the ordinary block child-layout path below is exactly what a browser's own <textarea>
+        // content does, and needed no special-casing at all once the box itself got its default
+        // border/padding/background chrome.
+        var orderedChildren = string.Equals(tagName, "svg", StringComparison.OrdinalIgnoreCase) ||
+                               formControlKind is FormControlKind.Select or FormControlKind.Button
             ? []
             : OrderChildrenForPainting(node.Children).ToList();
+        // An inline-block child counts as inline content here too (not just plain inline/br) - it
+        // is a real, confirmed bug that it previously did not: a parent whose children were *only*
+        // inline-block elements (the common form-control case - two checkboxes with no other inline
+        // content between them) never took this "merge onto shared lines" path at all, so every one
+        // of its inline-block children fell through to the plain block-stacking path below and
+        // always started its own new line, identical to display:block. Confirmed independent of
+        // form controls with two plain `<span style="display:inline-block">` siblings.
         var hasInlineRun = orderedChildren.Any(child =>
             (child is ElementRenderNode childElement &&
-             !ShouldRenderAsBlock(childElement.ComputedStyle) &&
-             !IsInlineBlock(childElement.ComputedStyle)) ||
+             (!ShouldRenderAsBlock(childElement.ComputedStyle) || IsInlineBlock(childElement.ComputedStyle))) ||
             (child is ElementRenderNode childElementWithBr && string.Equals(childElementWithBr.Ref.LocalName, "br", StringComparison.OrdinalIgnoreCase)));
 
         if (IsFlexContainer(styleMap))
@@ -768,7 +821,24 @@ public sealed class HtmlRenderer
         {
             foreach (var child in orderedChildren)
             {
-                var childIsBlock = child is ElementRenderNode childElement && (ShouldRenderAsBlock(childElement.ComputedStyle) || IsInlineBlock(childElement.ComputedStyle));
+                // An inline-block child flows next to its siblings on the shared line (like a real
+                // browser) only when its own box size can be predicted up front without laying it
+                // out first - i.e. both width and height resolve to an explicit, non-auto value,
+                // which is guaranteed for every form control (ApplyFormControlDefaults always
+                // injects concrete pixel defaults) and for any inline-block given explicit
+                // width/height in CSS. An inline-block whose size genuinely depends on its own
+                // auto-flowing content (shrink-to-fit width, or height driven by wrapped children)
+                // cannot be predicted this cheaply without a full trial layout, so it deliberately
+                // falls back to the older, still-correct-if-visually-imperfect behavior below: its
+                // own line, exactly like display:block - a documented, deliberate scope cut rather
+                // than building genuine two-pass (shrink-to-fit) inline-block layout.
+                float ibWidth = 0f, ibHeight = 0f, ibMarginLeft = 0f, ibMarginRight = 0f, ibMarginTop = 0f, ibMarginBottom = 0f;
+                var canFlowAsInlineBlock = child is ElementRenderNode ibCandidate &&
+                    IsInlineBlock(ibCandidate.ComputedStyle) &&
+                    TryMeasureInlineBlockBoxSize(ibCandidate, contentWidth, currentTextStyle, context, out ibWidth, out ibHeight, out ibMarginLeft, out ibMarginRight, out ibMarginTop, out ibMarginBottom);
+                var childIsBlock = child is ElementRenderNode childElement &&
+                    ShouldRenderAsBlock(childElement.ComputedStyle) &&
+                    !canFlowAsInlineBlock;
 
                 if (childIsBlock)
                 {
@@ -818,6 +888,63 @@ public sealed class HtmlRenderer
                                 ref inlineLineHeight,
                                 ref textIndentConsumed);
                         }
+                    }
+                    else if (canFlowAsInlineBlock && child is ElementRenderNode inlineBlockElement)
+                    {
+                        // Wraps to a new line first if this item does not fit in what is left of
+                        // the current one - unless it is the very first thing being placed on this
+                        // line at all, so a single inline-block item wider than its container still
+                        // gets placed (on its own line) rather than looping forever.
+                        var totalAdvance = ibMarginLeft + ibWidth + ibMarginRight;
+
+                        // contentX/contentWidth (this element's own resolved content box), not
+                        // flowContainingX/flowContainingWidth (the wider box this *element itself*
+                        // was given to size *itself* within its own parent) - using the latter here
+                        // was a real bug caught by BuildDisplayList_InlineBlockSiblingsWrapToANewLineWhenTheyDoNotFit:
+                        // a narrower-than-parent container (e.g. width:50px) never wrapped its
+                        // inline-block children at all, since the wrap boundary was being measured
+                        // against the parent's own, much wider available width instead of this
+                        // element's own.
+                        if (inlineCursorX > contentX && inlineCursorX + totalAdvance > contentX + contentWidth)
+                        {
+                            childCursorY = Math.Max(childCursorY, inlineLineTop + inlineLineHeight);
+                            inlineLineTop = childCursorY;
+                            inlineCursorX = contentX;
+                            inlineLineHeight = 0f;
+                        }
+
+                        // containingX is the margin box's own left edge, not the border box's -
+                        // LayoutNode/LayoutElement apply this element's own margin-left internally
+                        // (flowBorderBoxX = flowContainingX + marginLeft) exactly as they would for
+                        // a block-level child, so the border box lands ibMarginLeft to the right of
+                        // what is passed here, matching totalAdvance's own accounting below.
+                        var itemStartX = inlineCursorX;
+                        var inlineBlockCursorY = inlineLineTop;
+                        var inlineBlockPreviousBlockMarginBottom = 0f;
+                        var inlineBlockSuppressNextBlockTopMargin = false;
+                        var inlineBlockActiveFloatLeftOffset = 0f;
+                        var inlineBlockActiveFloatBottom = 0f;
+                        var inlineBlockTextIndentConsumed = true;
+
+                        LayoutNode(
+                            node: inlineBlockElement,
+                            containingX: itemStartX,
+                            containingY: inlineLineTop,
+                            containingWidth: contentWidth,
+                            cursorY: ref inlineBlockCursorY,
+                            previousBlockMarginBottom: ref inlineBlockPreviousBlockMarginBottom,
+                            suppressNextBlockTopMargin: ref inlineBlockSuppressNextBlockTopMargin,
+                            activeFloatLeftOffset: ref inlineBlockActiveFloatLeftOffset,
+                            activeFloatBottom: ref inlineBlockActiveFloatBottom,
+                            textIndentConsumed: ref inlineBlockTextIndentConsumed,
+                            textStyle: currentTextStyle,
+                            context: context,
+                            displayList: displayList,
+                            maxY: maxY);
+
+                        inlineCursorX = itemStartX + totalAdvance;
+                        inlineLineHeight = Math.Max(inlineLineHeight, ibMarginTop + ibHeight + ibMarginBottom);
+                        textIndentConsumed = true;
                     }
                     else if (child is ElementRenderNode inlineElement)
                     {
@@ -1355,6 +1482,85 @@ public sealed class HtmlRenderer
         return isRowDirection
             ? (flexCrossSize.HasValue ? flexCrossSize.Value : ParseLength(styleMap, propertyName, relativeTo, defaultValue, allowAuto: true))
             : (flexMainSize.HasValue ? flexMainSize.Value : ParseLength(styleMap, propertyName, relativeTo, defaultValue, allowAuto: true));
+    }
+
+    /// <summary>
+    /// Predicts an inline-block element's own border-box width/height and all four margins without
+    /// actually laying it out, so its parent's inline-merging child loop can decide up front
+    /// whether it fits on the current line and exactly where to place it. <c>LayoutNode</c>/
+    /// <c>LayoutElement</c> have no "measure only" mode of their own - they only ever discover a
+    /// box's final size as a side effect of actually laying out (and painting) it - so this exists
+    /// purely to avoid needing one for the one case that can be predicted cheaply. It succeeds only
+    /// when both <c>width</c> and <c>height</c> resolve to an explicit, non-auto value: guaranteed
+    /// for every form control (<see cref="ApplyFormControlDefaults"/> always injects concrete pixel
+    /// defaults for both) and for any inline-block given explicit <c>width</c>/<c>height</c> in
+    /// CSS. It deliberately returns <see langword="false"/> for anything else - shrink-to-fit width
+    /// or auto/content-driven height would need a genuine trial layout to measure, which this does
+    /// not attempt (a documented scope cut, not an oversight: see the call site for what happens
+    /// instead, which is not a regression - it is exactly this renderer's pre-existing behavior for
+    /// every inline-block element, before shared-line flow existed for any of them).
+    /// </summary>
+    private static bool TryMeasureInlineBlockBoxSize(
+        ElementRenderNode elementNode,
+        float containingWidth,
+        RenderTextStyle inheritedTextStyle,
+        LayoutContext context,
+        out float width,
+        out float height,
+        out float marginLeft,
+        out float marginRight,
+        out float marginTop,
+        out float marginBottom)
+    {
+        width = 0f;
+        height = 0f;
+        marginLeft = 0f;
+        marginRight = 0f;
+        marginTop = 0f;
+        marginBottom = 0f;
+
+        var element = elementNode.Ref;
+        var styleMap = CreateStyleMap(elementNode.ComputedStyle, element);
+        var textStyle = ResolveTextStyle(styleMap, inheritedTextStyle);
+        var formControlKind = ResolveFormControlKind(element);
+
+        // A hidden input never lays out or paints at all (see LayoutElement's own early return for
+        // it) - it has no box to flow inline, so it is neither flowable nor block-stackable here.
+        if (formControlKind == FormControlKind.Hidden)
+        {
+            return false;
+        }
+
+        if (formControlKind != FormControlKind.None)
+        {
+            ApplyFormControlDefaults(formControlKind, element, styleMap, textStyle, context);
+        }
+
+        var specifiedContentWidth = ParseLength(styleMap, "width", containingWidth, float.NaN, allowAuto: true);
+        var specifiedContentHeight = ParseLength(styleMap, "height", containingWidth, float.NaN, allowAuto: true);
+
+        if (float.IsNaN(specifiedContentWidth) || float.IsNaN(specifiedContentHeight))
+        {
+            return false;
+        }
+
+        // Reuses the exact same box-model resolution LayoutElement itself calls for every other
+        // element, rather than re-deriving border/padding/margin independently, so this prediction
+        // can never quietly drift out of sync with what actually gets laid out.
+        var box = ResolveBoxStyle(styleMap, element);
+        width = box.BorderWidth.Left + box.Padding.Left + specifiedContentWidth + box.Padding.Right + box.BorderWidth.Right;
+        height = box.BorderWidth.Top + box.Padding.Top + specifiedContentHeight + box.Padding.Bottom + box.BorderWidth.Bottom;
+
+        // An auto horizontal margin resolves to NaN from ParseLength (mirroring width/height's own
+        // auto signal) - correct for a block-level box's own centering math, but a non-block box's
+        // auto margin simply computes to 0 per spec, since there is no "available space" to center
+        // within on an inline-formatting-context line the way there is for text-align:center.
+        marginLeft = float.IsNaN(box.Margin.Left) ? 0f : box.Margin.Left;
+        marginRight = float.IsNaN(box.Margin.Right) ? 0f : box.Margin.Right;
+        marginTop = box.Margin.Top;
+        marginBottom = box.Margin.Bottom;
+
+        return true;
     }
 
     private static IEnumerable<ElementRenderNode> CollectTableRows(ElementRenderNode tableNode)
@@ -3756,6 +3962,523 @@ public sealed class HtmlRenderer
         }
 
         return bytes.Length > 0;
+    }
+
+    /// <summary>
+    /// Identifies which kind of default styling/content-painting a form control needs. `None`
+    /// covers every non-form element, so callers can skip all of the form-control machinery with a
+    /// single check. `Hidden` (`input[type=hidden]`) never lays out or paints at all - handled by
+    /// an early return in <c>LayoutElement</c> rather than here, since AngleSharp.Css's UA
+    /// stylesheet does not give it `display: none` the way a real browser's does (every `&lt;input&gt;`
+    /// type computes to plain `inline-block` in this AngleSharp.Css version, verified empirically).
+    /// </summary>
+    private enum FormControlKind
+    {
+        /// <summary>Not a form control.</summary>
+        None,
+
+        /// <summary>
+        /// A single-line text value box: <c>text</c>, and every other textual `&lt;input&gt;` type this
+        /// renderer treats identically (`search`, `url`, `tel`, `email`, `number`, the date/time
+        /// family, and any unrecognized/absent type - matching the HTML spec's "unknown type falls
+        /// back to text" rule), plus `password` (masked with bullet characters).
+        /// </summary>
+        TextLike,
+
+        /// <summary>`input[type=checkbox]`.</summary>
+        Checkbox,
+
+        /// <summary>`input[type=radio]`.</summary>
+        Radio,
+
+        /// <summary>`input[type=color]`.</summary>
+        Color,
+
+        /// <summary>
+        /// A clickable, label-centered button box: `&lt;button&gt;` and
+        /// `input[type=button|submit|reset]`.
+        /// </summary>
+        Button,
+
+        /// <summary>`&lt;select&gt;` - shows only its selected `&lt;option&gt;`'s text, never every option.</summary>
+        Select,
+
+        /// <summary>`&lt;textarea&gt;` - gets the same box chrome as a text input, but keeps its real
+        /// child text node flowing through the ordinary block child-layout path for its content.</summary>
+        TextArea,
+
+        /// <summary>`input[type=hidden]` - never laid out or painted; see the type's own remarks.</summary>
+        Hidden,
+    }
+
+    /// <summary>
+    /// A common browser checkbox/radio accent color (Chrome/Edge's default `accent-color`),
+    /// approximated as a fixed constant - this renderer does not parse the CSS `accent-color`
+    /// property itself, a deliberate scope cut for a rarely-overridden value.
+    /// </summary>
+    private static readonly RenderColor FormControlAccentColor = new(26, 115, 232, 255);
+
+    /// <summary>
+    /// The bundled sans-serif font's own ascent, as a fraction of font-size, measured empirically
+    /// via <c>SKPaint.FontMetrics</c> (14.8515625px ascent at font-size 16 -> 0.928) - used to
+    /// center a form control's single-line text on its real visual ink rather than on the taller
+    /// CSS line-height box. See <see cref="PaintFormControl"/> for why: the "baseline at the bottom
+    /// of the line-height box" convention the rest of this renderer uses for stacked body text
+    /// leaves no room for descenders/leading below the baseline, which is invisible across many
+    /// stacked lines but visibly pushed single-line form-control text toward the bottom of its box.
+    /// </summary>
+    private const float FormControlTextAscentRatio = 0.928f;
+
+    /// <summary>Companion to <see cref="FormControlTextAscentRatio"/> - measured descent 3.7734375px at font-size 16 -> 0.236.</summary>
+    private const float FormControlTextDescentRatio = 0.236f;
+
+    /// <summary>
+    /// "⌄" (DOWNWARDS ARROWHEAD, a thin chevron) rather than a custom-drawn triangle - <c>
+    /// DisplayList</c> has no generic polygon-fill primitive, so any dropdown indicator has to come
+    /// from a real font glyph. A plain ASCII "v" (this constant's original value) is guaranteed to
+    /// exist in every bundled font but reads as a literal letter, not an icon; U+2304 was verified
+    /// - by rendering several candidate glyphs and inspecting the actual pixels, not assumed from a
+    /// coverage table - to exist in the bundled DejaVu Sans as a proper thin chevron shape close to
+    /// a real browser's own native indicator, unlike, for example, U+23D7 which the bundled font
+    /// has no glyph for at all (renders as a hollow "tofu" box). Shared between the default-width
+    /// measurement in <see cref="ApplyFormControlDefaults"/> and the actual paint in
+    /// <see cref="PaintFormControl"/> so the two can never disagree about how much room it needs.
+    /// </summary>
+    private const string FormControlSelectArrowGlyph = "⌄";
+
+    /// <summary>
+    /// A downward correction applied only to <see cref="FormControlSelectArrowGlyph"/>'s own
+    /// baseline, on top of the ordinary text baseline every other form-control label already
+    /// centers on via <see cref="FormControlTextAscentRatio"/>/<see cref="FormControlTextDescentRatio"/>.
+    /// Those two ratios approximate *ordinary latin text's* ink extents (built from measuring a
+    /// word like "Second"), but "⌄" is a short symbol glyph whose own ink sits much closer to the
+    /// baseline - measured via <c>SKPaint.MeasureText</c>'s tight bounding box at font-size 16:
+    /// "⌄" spans roughly 6px above the baseline to 1px below it (a 7px-tall glyph, vertical ink
+    /// center ~2.5px above baseline), while "Second" spans roughly 14px above to 2px below (a
+    /// 16px-tall run, vertical ink center ~6px above baseline). Painting both at the *same*
+    /// baseline - which is what correctly centers the text label - therefore left the arrow's own,
+    /// much shorter ink sitting visibly low in the box: a real, confirmed bug, not a hypothetical
+    /// one (caught from a direct visual report, not assumed). This ratio is the measured difference
+    /// between those two ink-centers as a fraction of font-size (~-3px at font-size 16, i.e.
+    /// -3/16), shifting the arrow's baseline up just enough that its own ink centers where the
+    /// text's ink already does.
+    /// </summary>
+    private const float FormControlSelectArrowVerticalOffsetRatio = -0.19f;
+
+    private static FormControlKind ResolveFormControlKind(IElement element)
+    {
+        var tagName = element.LocalName;
+
+        if (string.Equals(tagName, "textarea", StringComparison.OrdinalIgnoreCase))
+        {
+            return FormControlKind.TextArea;
+        }
+
+        if (string.Equals(tagName, "select", StringComparison.OrdinalIgnoreCase))
+        {
+            return FormControlKind.Select;
+        }
+
+        if (string.Equals(tagName, "button", StringComparison.OrdinalIgnoreCase))
+        {
+            return FormControlKind.Button;
+        }
+
+        if (!string.Equals(tagName, "input", StringComparison.OrdinalIgnoreCase))
+        {
+            return FormControlKind.None;
+        }
+
+        var type = element.GetAttribute("type")?.Trim().ToLowerInvariant();
+
+        return type switch
+        {
+            "checkbox" => FormControlKind.Checkbox,
+            "radio" => FormControlKind.Radio,
+            "color" => FormControlKind.Color,
+            "button" or "submit" or "reset" => FormControlKind.Button,
+            "hidden" => FormControlKind.Hidden,
+            _ => FormControlKind.TextLike,
+        };
+    }
+
+    /// <summary>
+    /// Fills in the browser-like default declarations a form control needs (border, padding,
+    /// background, and a natural size) directly into its style map, but only for whichever
+    /// individual properties the author has not already set - exactly the same "synthesize the UA
+    /// default only where the cascade left a gap" approach already used for
+    /// `list-style-type`/`list-style-position`, just for a much larger set of properties at once.
+    /// This is what makes the defaults "somewhat overridable, like in real browsers": setting
+    /// `border`, `background-color`, `padding`, or an explicit `width`/`height` in CSS pre-empts
+    /// the corresponding default below exactly as it would in a real browser's form-control
+    /// rendering, while every property the author leaves alone still gets a sensible UA look
+    /// instead of rendering as an invisible, zero-size box (this renderer's actual previous
+    /// behavior for every form control, since neither this renderer nor the AngleSharp.Css UA
+    /// stylesheet gave them any border/padding/background/size at all).
+    /// </summary>
+    private static void ApplyFormControlDefaults(
+        FormControlKind kind,
+        IElement element,
+        Dictionary<string, string> styleMap,
+        RenderTextStyle textStyle,
+        LayoutContext context)
+    {
+        void SetDefault(string property, string value)
+        {
+            if (!styleMap.TryGetValue(property, out var existing) || string.IsNullOrWhiteSpace(existing))
+            {
+                styleMap[property] = value;
+            }
+        }
+
+        // Unlike border-width/style/color (which GetPropertyValue reports as a genuinely empty
+        // string when nothing in the cascade set them, verified empirically), AngleSharp.Css always
+        // resolves a concrete border-*-radius computed value - "0px" - even for a plain, completely
+        // unstyled element. A bare SetDefault would see that "0px" as "the author already set this"
+        // and never apply the radio's circular default at all, so radius defaults specifically also
+        // treat the computed zero-length initial value as still-unset.
+        void SetDefaultRadius(string property, string value)
+        {
+            if (!styleMap.TryGetValue(property, out var existing) ||
+                string.IsNullOrWhiteSpace(existing) ||
+                existing.Trim() is "0px" or "0" or "0%")
+            {
+                styleMap[property] = value;
+            }
+        }
+
+        void SetDefaultBorder()
+        {
+            foreach (var side in new[] { "top", "right", "bottom", "left" })
+            {
+                SetDefault($"border-{side}-width", "1px");
+                SetDefault($"border-{side}-style", "solid");
+                SetDefault($"border-{side}-color", "#767676");
+            }
+        }
+
+        void SetDefaultTextPadding()
+        {
+            SetDefault("padding-top", "2px");
+            SetDefault("padding-bottom", "2px");
+            SetDefault("padding-left", "4px");
+            SetDefault("padding-right", "4px");
+        }
+
+        // A single line's worth of content height - the box's own vertical size, not to be
+        // confused with the ascent/descent-based metric PaintFormControl separately uses to place
+        // where the *baseline* sits within that box (see FormControlTextAscentRatio/DescentRatio).
+        // Sizing the box itself off the full CSS line-height (rather than an independent constant
+        // like the previous 1.2f) keeps a text-like control's default box roomy enough for
+        // normal text leading, matching a real browser's own default input height reasonably
+        // closely.
+        var lineHeight = textStyle.FontSize * textStyle.LineHeightMultiplier;
+
+        switch (kind)
+        {
+            case FormControlKind.TextLike:
+                SetDefaultBorder();
+                SetDefaultTextPadding();
+                SetDefault("background-color", "#ffffff");
+                SetDefault("width", "150px");
+                SetDefault("height", FormatPixelValue(lineHeight));
+                break;
+
+            case FormControlKind.Select:
+            {
+                SetDefaultBorder();
+                SetDefaultTextPadding();
+                // A light gray, button-like background (not the white a text-like input gets) -
+                // matching how a real browser's own native <select> chrome looks closer to a
+                // button than to a text box.
+                SetDefault("background-color", "#e8e8e8");
+                SetDefault("height", FormatPixelValue(lineHeight));
+
+                // Shrinks to fit its selected option's own label plus room for the dropdown arrow -
+                // the same shrink-to-fit idea a <button> uses for its own label - rather than a
+                // text-like input's fixed 150px default: a native <select> is never that wide
+                // unless its own content actually demands it.
+                var selectLabel = ResolveFormControlLabel(FormControlKind.Select, element);
+                var selectLabelWidth = MeasureTextWidth(context, selectLabel, textStyle);
+                var arrowWidth = MeasureTextWidth(context, FormControlSelectArrowGlyph, textStyle);
+                var arrowGap = textStyle.FontSize * 0.5f;
+                SetDefault("width", FormatPixelValue(Math.Max(30f, selectLabelWidth + arrowGap + arrowWidth)));
+                break;
+            }
+
+            case FormControlKind.TextArea:
+                SetDefaultBorder();
+                SetDefaultTextPadding();
+                SetDefault("background-color", "#ffffff");
+                SetDefault("width", "150px");
+                // Only a floor, not a cap: an auto-sized box's height is already
+                // Math.Max(specifiedHeight, autoContentHeight) throughout this renderer, so a
+                // <textarea> whose real content wraps past two lines still grows past this default
+                // rather than clipping it - this default only guarantees the common "empty or
+                // short" textarea still shows a multi-line box, like a browser's default 2 rows.
+                SetDefault("height", FormatPixelValue(lineHeight * 2f));
+                break;
+
+            case FormControlKind.Color:
+                SetDefaultBorder();
+                SetDefault("padding-top", "2px");
+                SetDefault("padding-bottom", "2px");
+                SetDefault("padding-left", "2px");
+                SetDefault("padding-right", "2px");
+                SetDefault("background-color", "#ffffff");
+                SetDefault("width", "36px");
+                SetDefault("height", FormatPixelValue(lineHeight));
+                break;
+
+            case FormControlKind.Checkbox:
+            case FormControlKind.Radio:
+            {
+                var boxSize = Math.Max(10f, textStyle.FontSize * 0.9f);
+                SetDefaultBorder();
+                SetDefault("background-color", "#ffffff");
+                SetDefault("width", FormatPixelValue(boxSize));
+                SetDefault("height", FormatPixelValue(boxSize));
+
+                // Real UA stylesheets give a checkbox/radio a small default margin (Chromium's
+                // html.css uses exactly these four values) that every other form control kind does
+                // not get - without it, two adjacent checkboxes/radios in markup with no whitespace
+                // between their tags (as this renderer's own gallery test and countless real forms
+                // both write them) render flush against each other with no gap at all. Unlike
+                // border/padding/background, AngleSharp.Css's UA stylesheet does not set any margin
+                // on these elements (verified empirically: GetPropertyValue("margin-*") comes back
+                // empty), so there is no upstream default to fall back to here.
+                SetDefault("margin-top", "3px");
+                SetDefault("margin-right", "3px");
+                SetDefault("margin-bottom", "3px");
+                SetDefault("margin-left", "4px");
+
+                if (kind == FormControlKind.Radio)
+                {
+                    // Two things ParseCornerRadius needs accounted for, neither obvious from
+                    // reading it in isolation: (1) it (and ResolveBoxStyle generally) only ever
+                    // reads the four longhand border-*-radius keys, matching how AngleSharp.Css's
+                    // own computed style populates the style map (see CreateStyleMap) - the
+                    // `border-radius` shorthand itself is never consulted, so it has to be expanded
+                    // here. (2) ParseCornerRadius's own ParseLengthValue call has no percentage
+                    // handling at all (unlike the general ParseLength used for width/padding/etc.,
+                    // which resolves a percentage against a containing dimension) - it only expects
+                    // a plain pixel value, because AngleSharp.Css itself always pre-resolves a
+                    // percentage border-radius to pixels before this renderer ever sees it. An
+                    // injected "50%" string here would silently parse to 0 rather than a circle, so
+                    // an already-resolved pixel value (half of this box's own default size) is
+                    // written instead.
+                    var cornerRadius = FormatPixelValue(boxSize / 2f);
+                    SetDefaultRadius("border-top-left-radius", cornerRadius);
+                    SetDefaultRadius("border-top-right-radius", cornerRadius);
+                    SetDefaultRadius("border-bottom-right-radius", cornerRadius);
+                    SetDefaultRadius("border-bottom-left-radius", cornerRadius);
+                }
+
+                break;
+            }
+
+            case FormControlKind.Button:
+            {
+                SetDefaultBorder();
+                SetDefault("padding-top", "2px");
+                SetDefault("padding-bottom", "2px");
+                SetDefault("padding-left", "10px");
+                SetDefault("padding-right", "10px");
+                SetDefault("background-color", "#e8e8e8");
+                SetDefault("height", FormatPixelValue(lineHeight));
+
+                // A button shrinks to fit its own label, unlike the fixed-width text-like controls
+                // above - measured now (rather than left to a general shrink-to-fit layout
+                // algorithm this renderer does not otherwise have) using the exact same
+                // ITextMeasurer layout already measures body text with.
+                var label = ResolveFormControlLabel(FormControlKind.Button, element);
+                var labelWidth = MeasureTextWidth(context, label, textStyle);
+                SetDefault("width", FormatPixelValue(Math.Max(20f, labelWidth)));
+                break;
+            }
+        }
+    }
+
+    private static string FormatPixelValue(float pixels) =>
+        string.Create(CultureInfo.InvariantCulture, $"{pixels:0.##}px");
+
+    /// <summary>
+    /// Resolves the text a form control shows as its own content - a typed `value`, a button's
+    /// label, or a select's currently-selected option - independently of normal child-text flow,
+    /// since <see cref="PaintFormControl"/> paints it directly rather than relying on any child
+    /// nodes being laid out (an `&lt;input&gt;` has none at all; a `&lt;select&gt;`'s/`&lt;button&gt;`'s are
+    /// deliberately excluded from `orderedChildren` in `LayoutElement`).
+    /// </summary>
+    private static string ResolveFormControlLabel(FormControlKind kind, IElement element)
+    {
+        switch (kind)
+        {
+            case FormControlKind.Button:
+            {
+                if (string.Equals(element.LocalName, "button", StringComparison.OrdinalIgnoreCase))
+                {
+                    var text = NormalizeWhitespace(element.TextContent ?? string.Empty);
+                    return text.Length > 0 ? text : "Button";
+                }
+
+                var value = element.GetAttribute("value");
+
+                if (!string.IsNullOrWhiteSpace(value))
+                {
+                    return value;
+                }
+
+                return element.GetAttribute("type")?.Trim().ToLowerInvariant() switch
+                {
+                    "submit" => "Submit",
+                    "reset" => "Reset",
+                    _ => "Button",
+                };
+            }
+
+            case FormControlKind.TextLike:
+            {
+                var value = element.GetAttribute("value") ?? string.Empty;
+
+                // A password field's own value never paints as plain text, matching the one
+                // input type where masking is part of the type's defining behavior rather than an
+                // optional/overridable styling choice.
+                return string.Equals(element.GetAttribute("type")?.Trim(), "password", StringComparison.OrdinalIgnoreCase) && value.Length > 0
+                    ? new string('•', value.Length)
+                    : value;
+            }
+
+            case FormControlKind.Select:
+            {
+                // The DOM's own last-`selected`-wins semantics (mirroring how a real <select>
+                // resolves multiple `selected` attributes) - falling back to the first <option> when
+                // none is marked selected, exactly like a browser's own initial-selection default.
+                var options = element.Children.Where(child => string.Equals(child.LocalName, "option", StringComparison.OrdinalIgnoreCase)).ToList();
+                var selected = options.LastOrDefault(option => option.HasAttribute("selected")) ?? options.FirstOrDefault();
+                return selected is not null ? NormalizeWhitespace(selected.TextContent ?? string.Empty) : string.Empty;
+            }
+
+            default:
+                return string.Empty;
+        }
+    }
+
+    /// <summary>
+    /// Paints a form control's own visible content - typed/selected text, or a checkbox/radio's
+    /// checked-state fill, or a color swatch - directly into <paramref name="displayList"/> at the
+    /// same point <see cref="PaintListItemMarker"/> paints a list marker, so it lands after the
+    /// box's own background/border (spliced in later at the already-captured
+    /// <c>boxPaintInsertIndex</c>) but is otherwise unaffected by however tall the box's children
+    /// end up making it - none of these controls have real children of their own to wait on.
+    /// </summary>
+    private static void PaintFormControl(
+        DisplayList displayList,
+        IElement element,
+        FormControlKind kind,
+        RenderTextStyle textStyle,
+        LayoutContext context,
+        float contentX,
+        float contentY,
+        float contentWidth,
+        float contentHeight)
+    {
+        switch (kind)
+        {
+            case FormControlKind.TextLike:
+            case FormControlKind.Select:
+            case FormControlKind.Button:
+            {
+                var label = ResolveFormControlLabel(kind, element);
+
+                if (label.Length == 0)
+                {
+                    break;
+                }
+
+                // Centers the glyphs' own visual ink, not the CSS line box: LayoutWrappedText's
+                // "content-box top plus one full line height" baseline convention places the
+                // baseline as if every pixel of the line-height were ascent, with none left over
+                // for descenders or leading - fine for stacked body-text lines (the next line's own
+                // top absorbs the difference), but for a single line centered in a form control's
+                // padded box it visibly pushed text toward the bottom. FormControlTextAscentRatio/
+                // DescentRatio approximate the bundled sans-serif font's real metrics at a
+                // representative size (measured via SKPaint.FontMetrics: ascent 14.85px, descent
+                // 3.77px at font-size 16, i.e. ~0.928/~0.236 of the em) the same way
+                // ParseVerticalAlign already approximates super/sub/middle offsets as fontSize
+                // fractions rather than querying per-font metrics through ITextMeasurer (which only
+                // ever exposes advance width, by design - see ITextMeasurer's own remarks).
+                var visualTextHeight = textStyle.FontSize * (FormControlTextAscentRatio + FormControlTextDescentRatio);
+                var verticalCenteringOffset = Math.Max(0f, (contentHeight - visualTextHeight) / 2f);
+                var baselineY = contentY + verticalCenteringOffset + (textStyle.FontSize * FormControlTextAscentRatio) + textStyle.VerticalAlignOffset;
+                var labelWidth = MeasureTextWidth(context, label, textStyle);
+
+                // A text input's typed value and a select's selected option are both left-aligned,
+                // matching how browsers show them; only a button's own label is centered in its box.
+                var labelX = kind == FormControlKind.Button
+                    ? contentX + Math.Max(0f, (contentWidth - labelWidth) / 2f)
+                    : contentX;
+
+                displayList.DrawText(label, labelX, baselineY, textStyle.Color, textStyle.FontSize, textStyle.FontFamily, textStyle.FontWeight, textStyle.IsItalic, letterSpacing: textStyle.LetterSpacing);
+
+                if (kind == FormControlKind.Select)
+                {
+                    var arrowWidth = MeasureTextWidth(context, FormControlSelectArrowGlyph, textStyle);
+                    var arrowX = contentX + Math.Max(labelWidth, contentWidth - arrowWidth);
+                    var arrowBaselineY = baselineY + (textStyle.FontSize * FormControlSelectArrowVerticalOffsetRatio);
+                    displayList.DrawText(FormControlSelectArrowGlyph, arrowX, arrowBaselineY, textStyle.Color, textStyle.FontSize, textStyle.FontFamily, textStyle.FontWeight, textStyle.IsItalic, letterSpacing: textStyle.LetterSpacing);
+                }
+
+                break;
+            }
+
+            case FormControlKind.Checkbox:
+            {
+                if (element.HasAttribute("checked"))
+                {
+                    // Sized off the box's own smaller dimension so a checkbox whose width and
+                    // height default to the same font-relative size (the common case) still gets a
+                    // perfectly square fill even if either is overridden asymmetrically, and inset
+                    // independently per axis so the fill is centered on both axes rather than only
+                    // assuming a square box.
+                    var size = Math.Max(0f, Math.Min(contentWidth, contentHeight) * 0.6f);
+                    var insetX = (contentWidth - size) / 2f;
+                    var insetY = (contentHeight - size) / 2f;
+                    displayList.FillRect(new RenderRect(contentX + insetX, contentY + insetY, size, size), FormControlAccentColor);
+                }
+
+                break;
+            }
+
+            case FormControlKind.Radio:
+            {
+                if (element.HasAttribute("checked"))
+                {
+                    var size = Math.Max(0f, Math.Min(contentWidth, contentHeight) * 0.5f);
+                    var insetX = (contentWidth - size) / 2f;
+                    var insetY = (contentHeight - size) / 2f;
+                    var radii = new RenderCornerRadii(
+                        size / 2f, size / 2f, size / 2f, size / 2f,
+                        size / 2f, size / 2f, size / 2f, size / 2f);
+                    displayList.FillRect(new RenderRect(contentX + insetX, contentY + insetY, size, size), FormControlAccentColor, radii);
+                }
+
+                break;
+            }
+
+            case FormControlKind.Color:
+            {
+                // The swatch is painted as its own fill, independent of the box's own
+                // background-color (already defaulted to white above, as the swatch's "frame") -
+                // deliberately not overridable via CSS background-color, matching how a real
+                // browser's native color swatch ignores it too; only the frame around it (border,
+                // padding, size) goes through the ordinarily-overridable box model. It fills the
+                // entire content box (rather than a fixed line-height-tall rect within it) so it is
+                // always centered regardless of how tall the box's own content height ends up being.
+                var color = ParseColor(element.GetAttribute("value"), RenderColor.Black);
+                displayList.FillRect(new RenderRect(contentX, contentY, contentWidth, contentHeight), color);
+                break;
+            }
+        }
     }
 
     /// <summary>

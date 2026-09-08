@@ -2259,6 +2259,81 @@ public sealed class VisualConformanceTests
           maxDifferentPixels: 0);
     }
 
+    [Fact]
+    public async Task RenderToPng_RendersFormControlGalleryWithDefaultStyling()
+    {
+        var document = await ParseAsync("""
+            <html>
+              <head><style>
+                html, body { margin: 0; padding: 0; }
+                div.row { margin-bottom: 6px; }
+              </style></head>
+              <body>
+                <div class="row"><input type="text" value="Hello" /></div>
+                <div class="row"><input type="number" value="42" /></div>
+                <div class="row"><input type="url" value="https://x.test" /></div>
+                <div class="row"><input type="color" value="#3388ff" /></div>
+                <div class="row"><input type="checkbox" /><input type="checkbox" checked /></div>
+                <div class="row"><input type="radio" /><input type="radio" checked /></div>
+                <div class="row">
+                  <select>
+                    <option>First</option>
+                    <option selected>Second</option>
+                  </select>
+                </div>
+                <div class="row"><textarea>Some notes</textarea></div>
+                <div class="row"><button>Click Me</button><input type="submit" value="Send" /></div>
+              </body>
+            </html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var image = renderer.RenderToPng(document, new DefaultRenderDevice
+        {
+            ViewPortWidth = 220,
+            ViewPortHeight = 340,
+            FontSize = 16,
+        });
+
+        VisualSnapshotVerifier.VerifyOrCreate(
+          snapshotName: "renders-form-control-gallery-with-default-styling.png",
+          actualPng: image.Data,
+          perChannelTolerance: TextRenderingToleranceChannel,
+          maxDifferentPixels: TextRenderingToleranceMaxPixels);
+    }
+
+    [Fact]
+    public async Task RenderToPng_FormControlDefaultsAreOverriddenByAuthorCss()
+    {
+        // Two otherwise-identical text inputs side by side - the left keeps every synthesized
+        // default, the right overrides border color/width, border-radius, background-color and
+        // width via ordinary CSS, exactly the way a real browser lets you restyle a form control's
+        // "somewhat overridable" native chrome without needing a `appearance: none` escape hatch.
+        var document = await ParseAsync("""
+            <html>
+              <head><style>html, body { margin: 0; padding: 0; }</style></head>
+              <body>
+                <input type="text" value="Default" style="display:block; margin-bottom:8px;" />
+                <input type="text" value="Custom" style="display:block; width:100px; background-color:#fff6d5; border:3px solid #cc6600; border-radius:8px;" />
+              </body>
+            </html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var image = renderer.RenderToPng(document, new DefaultRenderDevice
+        {
+            ViewPortWidth = 180,
+            ViewPortHeight = 80,
+            FontSize = 16,
+        });
+
+        VisualSnapshotVerifier.VerifyOrCreate(
+          snapshotName: "form-control-defaults-are-overridden-by-author-css.png",
+          actualPng: image.Data,
+          perChannelTolerance: TextRenderingToleranceChannel,
+          maxDifferentPixels: TextRenderingToleranceMaxPixels);
+    }
+
     private static async Task<AngleSharp.Dom.IDocument> ParseAsync(string html, IConfiguration? configuration = null)
     {
         var context = BrowsingContext.New(configuration ?? Configuration.Default.WithCss());

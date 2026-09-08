@@ -1,5 +1,6 @@
 using AngleSharp;
 using AngleSharp.Css;
+using AngleSharp.Css.Dom;
 using AngleSharp.Dom;
 using AngleSharp.Io;
 using AngleSharp.Renderer.Rendering;
@@ -1501,6 +1502,89 @@ public sealed class HtmlRendererTests
     }
 
     [Fact]
+    public async Task BuildDisplayList_InlineBlockSiblingsWithExplicitSizeFlowOnTheSameLine()
+    {
+        // A real, confirmed bug (not form-control-specific): two inline-block elements previously
+        // always stacked vertically, identical to display:block, regardless of whether they fit on
+        // one line - verified independently of any form control with two plain inline-block spans.
+        var document = await ParseAsync("""
+            <html><body>
+                <div><span style="display:inline-block; width:20px; height:20px; background-color:#ff0000;"></span><span style="display:inline-block; width:20px; height:20px; background-color:#00ff00;"></span></div>
+            </body></html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, new DefaultRenderDevice
+        {
+            ViewPortWidth = 300,
+            ViewPortHeight = 100,
+        });
+
+        var redFill = Assert.Single(displayList.Commands.OfType<FillRectCommand>().Where(f => f.Color.Equals(new RenderColor(255, 0, 0))));
+        var greenFill = Assert.Single(displayList.Commands.OfType<FillRectCommand>().Where(f => f.Color.Equals(new RenderColor(0, 255, 0))));
+
+        Assert.Equal(redFill.Rect.Y, greenFill.Rect.Y);
+        Assert.Equal(redFill.Rect.X + redFill.Rect.Width, greenFill.Rect.X);
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_InlineBlockSiblingsWrapToANewLineWhenTheyDoNotFit()
+    {
+        var document = await ParseAsync("""
+            <html><body>
+                <div style="width:50px;">
+                    <span style="display:inline-block; width:20px; height:20px; background-color:#ff0000;"></span><span style="display:inline-block; width:20px; height:20px; background-color:#00ff00;"></span><span style="display:inline-block; width:20px; height:20px; background-color:#0000ff;"></span>
+                </div>
+            </body></html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, new DefaultRenderDevice
+        {
+            ViewPortWidth = 300,
+            ViewPortHeight = 200,
+        });
+
+        var redFill = Assert.Single(displayList.Commands.OfType<FillRectCommand>().Where(f => f.Color.Equals(new RenderColor(255, 0, 0))));
+        var greenFill = Assert.Single(displayList.Commands.OfType<FillRectCommand>().Where(f => f.Color.Equals(new RenderColor(0, 255, 0))));
+        var blueFill = Assert.Single(displayList.Commands.OfType<FillRectCommand>().Where(f => f.Color.Equals(new RenderColor(0, 0, 255))));
+
+        // A 50px-wide container fits exactly two 20px items (40px) but not a third - the third
+        // wraps to its own new line rather than overflowing the container width.
+        Assert.Equal(redFill.Rect.Y, greenFill.Rect.Y);
+        Assert.True(blueFill.Rect.Y > redFill.Rect.Y);
+        Assert.Equal(redFill.Rect.X, blueFill.Rect.X);
+    }
+
+
+    [Fact]
+    public async Task BuildDisplayList_AutoSizedInlineBlockSiblingsStillEachGetTheirOwnLine()
+    {
+        // The one deliberate, documented scope cut: an inline-block whose own size is not known up
+        // front (auto width here) cannot be predicted without a full trial layout, so it keeps this
+        // renderer's older, pre-existing behavior (its own line) rather than flowing inline - not a
+        // regression, since this was already true for every inline-block element before shared-line
+        // flow existed for any of them.
+        var document = await ParseAsync("""
+            <html><body>
+                <div><span style="display:inline-block; height:20px; background-color:#ff0000;">A</span><span style="display:inline-block; height:20px; background-color:#00ff00;">B</span></div>
+            </body></html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, new DefaultRenderDevice
+        {
+            ViewPortWidth = 300,
+            ViewPortHeight = 100,
+        });
+
+        var redFill = Assert.Single(displayList.Commands.OfType<FillRectCommand>().Where(f => f.Color.Equals(new RenderColor(255, 0, 0))));
+        var greenFill = Assert.Single(displayList.Commands.OfType<FillRectCommand>().Where(f => f.Color.Equals(new RenderColor(0, 255, 0))));
+
+        Assert.True(greenFill.Rect.Y > redFill.Rect.Y);
+    }
+
+    [Fact]
     public async Task BuildDisplayList_RespectsDisplayBlock()
     {
         var document = await ParseAsync("""
@@ -2850,6 +2934,477 @@ public sealed class HtmlRendererTests
         var fill = Assert.Single(displayList.Commands.OfType<FillRectCommand>().Where(f => f.Color.Equals(new RenderColor(0, 255, 0))));
         Assert.Equal(0f, fill.Rect.Y);
     }
+
+    [Theory]
+    [InlineData("text")]
+    [InlineData("number")]
+    [InlineData("url")]
+    [InlineData("email")]
+    [InlineData("search")]
+    [InlineData("tel")]
+    [InlineData("date")]
+    public async Task BuildDisplayList_TextLikeInputGetsDefaultChromeAndShowsItsValue(string type)
+    {
+        var document = await ParseAsync($"""<html><body><input type="{type}" value="Hello" /></body></html>""");
+
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, new DefaultRenderDevice
+        {
+            ViewPortWidth = 300,
+            ViewPortHeight = 100,
+            FontSize = 16f,
+        });
+
+        // Default UA-like chrome: a white background box, sized to the built-in default content
+        // width (150px) plus the default 4px*2 padding and 1px*2 border (border-box width 160),
+        // since none was authored, and a plain 1px gray border (four straight edges, no
+        // border-radius, so PaintBorder falls back to four separate FillRectCommands). Filtered to
+        // width 160 because the page's own default background is also a full-viewport white fill.
+        var background = Assert.Single(displayList.Commands.OfType<FillRectCommand>().Where(f => f.Color.Equals(new RenderColor(255, 255, 255)) && f.Rect.Width == 160f));
+
+        var borderEdges = displayList.Commands.OfType<FillRectCommand>().Where(f => f.Color.Equals(new RenderColor(118, 118, 118))).ToList();
+        Assert.NotEmpty(borderEdges);
+
+        var valueText = Assert.Single(displayList.Commands.OfType<DrawTextCommand>().Where(t => t.Text == "Hello"));
+        // Left-aligned at the content box's own left edge (border + padding in from the box), not
+        // centered - matching how a browser shows typed input text.
+        Assert.Equal(background.Rect.X + 1f + 4f, valueText.X, precision: 3);
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_TextLikeInputCentersItsValueVerticallyWhenTallerThanOneLine()
+    {
+        // An explicit height taller than one line must still center the value vertically rather
+        // than hugging the bottom. Centering is done on the text's own real visual ink (an
+        // ascent/descent approximation of the bundled sans-serif font - see
+        // FormControlTextAscentRatio/DescentRatio), not on the taller CSS line-height box: the bug
+        // this guards against centered on the line-height box instead, which - because a
+        // line-height box always has room "below the ink" for descenders/leading that a caseless
+        // value like "Hi" never uses - left a visibly larger gap below the text than above it.
+        var document = await ParseAsync("""
+            <html><body>
+                <input type="text" value="Hi" style="height:60px;" />
+            </body></html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, new DefaultRenderDevice
+        {
+            ViewPortWidth = 300,
+            ViewPortHeight = 200,
+            FontSize = 20f,
+        });
+
+        var background = Assert.Single(displayList.Commands.OfType<FillRectCommand>().Where(f => f.Color.Equals(new RenderColor(255, 255, 255)) && f.Rect.Width < 300f));
+        var valueText = Assert.Single(displayList.Commands.OfType<DrawTextCommand>().Where(t => t.Text == "Hi"));
+
+        // border-top-width 1px + default padding-top 2px, and content height is the authored 60px.
+        var contentTop = background.Rect.Y + 1f + 2f;
+        // Mirrors FormControlTextAscentRatio/DescentRatio in HtmlRenderer.cs.
+        const float AscentRatio = 0.928f;
+        const float DescentRatio = 0.236f;
+        var topGap = (valueText.Y - (20f * AscentRatio)) - contentTop;
+        var bottomGap = (contentTop + 60f) - (valueText.Y + (20f * DescentRatio));
+        Assert.Equal(topGap, bottomGap, precision: 3);
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_PasswordInputMasksItsValue()
+    {
+        var document = await ParseAsync("""<html><body><input type="password" value="secret" /></body></html>""");
+
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, new DefaultRenderDevice
+        {
+            ViewPortWidth = 300,
+            ViewPortHeight = 100,
+            FontSize = 16f,
+        });
+
+        Assert.DoesNotContain(displayList.Commands, c => c is DrawTextCommand t && t.Text.Contains("secret"));
+        var masked = Assert.Single(displayList.Commands.OfType<DrawTextCommand>());
+        Assert.Equal(new string('•', 6), masked.Text);
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_TextInputDefaultsCanBeOverriddenByAuthorCss()
+    {
+        // Every one of the synthesized defaults - border color/width, background, width - has an
+        // authored equivalent here, and each authored value must win exactly like it does for any
+        // other element, proving the defaults are only gap-fillers and not a fixed native look.
+        var document = await ParseAsync("""
+            <html><body>
+                <input type="text" value="Hi" style="width:80px; background-color:#ff0000; border: 3px solid #0000ff;" />
+            </body></html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, new DefaultRenderDevice
+        {
+            ViewPortWidth = 300,
+            ViewPortHeight = 100,
+            FontSize = 16f,
+        });
+
+        var background = Assert.Single(displayList.Commands.OfType<FillRectCommand>().Where(f => f.Color.Equals(new RenderColor(255, 0, 0))));
+        // Border-box width, not the authored content-width in isolation: default content-box
+        // sizing (unchanged here) adds the border (3px * 2) and the still-default padding (4px * 2,
+        // since only border/background/width were overridden) on top of the authored 80px content
+        // width - 80 + 6 + 8 = 94, the same box-model arithmetic a real browser would apply.
+        Assert.Equal(94f, background.Rect.Width);
+
+        Assert.DoesNotContain(displayList.Commands, c => c is FillRectCommand f && f.Color.Equals(new RenderColor(255, 255, 255)) && f.Rect.Width < 300f);
+        Assert.DoesNotContain(displayList.Commands, c => c is FillRectCommand f && f.Color.Equals(new RenderColor(118, 118, 118)));
+
+        var borderEdges = displayList.Commands.OfType<FillRectCommand>().Where(f => f.Color.Equals(new RenderColor(0, 0, 255))).ToList();
+        Assert.NotEmpty(borderEdges);
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_UncheckedCheckboxPaintsOnlyItsBoxNoFill()
+    {
+        var document = await ParseAsync("""<html><body><input type="checkbox" /></body></html>""");
+
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, new DefaultRenderDevice
+        {
+            ViewPortWidth = 100,
+            ViewPortHeight = 100,
+            FontSize = 16f,
+        });
+
+        Assert.DoesNotContain(displayList.Commands, c => c is FillRectCommand f && f.Color.Equals(FormControlAccentColorForTests));
+    }
+
+    [Theory]
+    [InlineData("checkbox")]
+    [InlineData("radio")]
+    public async Task BuildDisplayList_AdjacentCheckboxesOrRadiosGetADefaultGapBetweenThem(string type)
+    {
+        // Real UA stylesheets give a checkbox/radio a small default margin that this renderer's
+        // own UA defaults previously omitted entirely - two controls written back-to-back with no
+        // whitespace between their tags (as real forms commonly do, and as this exact markup does)
+        // rendered flush against each other with no visible gap at all. Wrapped in a <div> so both
+        // controls flow through the same parent's ordinary inline-merging child layout, rather than
+        // being laid out as top-level document children (a separate, pre-existing renderer
+        // limitation unrelated to this margin default: direct children of <body> do not currently
+        // merge onto shared lines the way a wrapping block element's own children do).
+        var document = await ParseAsync($"""<html><body><div><input type="{type}" /><input type="{type}" /></div></body></html>""");
+
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, new DefaultRenderDevice
+        {
+            ViewPortWidth = 300,
+            ViewPortHeight = 100,
+            FontSize = 16f,
+        });
+
+        // Each control's own default white background fill covers its whole border box in one
+        // rect (unlike the border, which for a checkbox is four separate straight-edge strips) -
+        // the simplest, unambiguous way to identify each control's own horizontal extent.
+        var backgrounds = displayList.Commands.OfType<FillRectCommand>()
+            .Where(f => f.Color.Equals(new RenderColor(255, 255, 255)) && f.Rect.Width < 300f)
+            .OrderBy(f => f.Rect.X)
+            .ToList();
+
+        Assert.Equal(2, backgrounds.Count);
+        var firstBoxRight = backgrounds[0].Rect.X + backgrounds[0].Rect.Width;
+        var secondBoxLeft = backgrounds[1].Rect.X;
+        Assert.True(secondBoxLeft - firstBoxRight > 0f, $"expected a gap between adjacent {type} controls, got firstBoxRight={firstBoxRight}, secondBoxLeft={secondBoxLeft}");
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_CheckedCheckboxPaintsAccentFillInsideItsBox()
+    {
+        var document = await ParseAsync("""<html><body><input type="checkbox" checked /></body></html>""");
+
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, new DefaultRenderDevice
+        {
+            ViewPortWidth = 100,
+            ViewPortHeight = 100,
+            FontSize = 16f,
+        });
+
+        var fill = Assert.Single(displayList.Commands.OfType<FillRectCommand>().Where(f => f.Color.Equals(FormControlAccentColorForTests)));
+        // A perfectly square fill, inset within the (also square, default-sized) checkbox box.
+        Assert.Equal(fill.Rect.Width, fill.Rect.Height, precision: 3);
+        Assert.True(fill.Rect.Width > 0f);
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_CheckedCheckboxFillStaysCenteredWhenBoxIsOverriddenAsymmetrically()
+    {
+        // Width and height default to the same font-relative size, so the fill's inset used to be
+        // computed off contentWidth alone and simply reused for both axes - correct only as long as
+        // the box stays square. Overriding height independently of width must still center the fill
+        // on both axes rather than leaving it flush with the top (or bottom) edge.
+        var document = await ParseAsync("""
+            <html><body><input type="checkbox" checked style="width:20px; height:40px;" /></body></html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, new DefaultRenderDevice
+        {
+            ViewPortWidth = 100,
+            ViewPortHeight = 100,
+            FontSize = 16f,
+        });
+
+        var background = Assert.Single(displayList.Commands.OfType<FillRectCommand>().Where(f => f.Color.Equals(new RenderColor(255, 255, 255)) && f.Rect.Width < 100f));
+        var fill = Assert.Single(displayList.Commands.OfType<FillRectCommand>().Where(f => f.Color.Equals(FormControlAccentColorForTests)));
+
+        var topGap = fill.Rect.Y - background.Rect.Y;
+        var bottomGap = (background.Rect.Y + background.Rect.Height) - (fill.Rect.Y + fill.Rect.Height);
+        Assert.Equal(topGap, bottomGap, precision: 3);
+
+        var leftGap = fill.Rect.X - background.Rect.X;
+        var rightGap = (background.Rect.X + background.Rect.Width) - (fill.Rect.X + fill.Rect.Width);
+        Assert.Equal(leftGap, rightGap, precision: 3);
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_CheckedRadioPaintsCircularAccentFillAndCircularBorder()
+    {
+        var document = await ParseAsync("""<html><body><input type="radio" checked /></body></html>""");
+
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, new DefaultRenderDevice
+        {
+            ViewPortWidth = 100,
+            ViewPortHeight = 100,
+            FontSize = 16f,
+        });
+
+        // The box's own outline is circular (default border-radius: 50%, uniform 1px width) -
+        // painted as a single StrokeRoundedRectCommand rather than four straight edges.
+        var strokedBorder = Assert.Single(displayList.Commands.OfType<StrokeRoundedRectCommand>());
+        Assert.True(strokedBorder.Radii.TopLeftX > 0f);
+
+        var fill = Assert.Single(displayList.Commands.OfType<FillRectCommand>().Where(f => f.Color.Equals(FormControlAccentColorForTests)));
+        Assert.True(fill.Radii.TopLeftX > 0f);
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_ColorInputPaintsSwatchFromItsValue()
+    {
+        var document = await ParseAsync("""<html><body><input type="color" value="#ff8800" /></body></html>""");
+
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, new DefaultRenderDevice
+        {
+            ViewPortWidth = 100,
+            ViewPortHeight = 100,
+            FontSize = 16f,
+        });
+
+        Assert.Single(displayList.Commands.OfType<FillRectCommand>().Where(f => f.Color.Equals(new RenderColor(255, 136, 0))));
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_ColorInputSwatchFillsEntireContentBoxWhenTaller()
+    {
+        // The swatch previously used a fixed line-height-tall rect regardless of the box's actual
+        // content height, which for an explicitly taller box left it hugging the top with unfilled
+        // space below it - it must fill the whole content box instead, so it is centered (trivially,
+        // by filling everything) no matter how tall the box ends up.
+        var document = await ParseAsync("""
+            <html><body>
+                <input type="color" value="#ff8800" style="height:40px;" />
+            </body></html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, new DefaultRenderDevice
+        {
+            ViewPortWidth = 300,
+            ViewPortHeight = 200,
+            FontSize = 16f,
+        });
+
+        var swatch = Assert.Single(displayList.Commands.OfType<FillRectCommand>().Where(f => f.Color.Equals(new RenderColor(255, 136, 0))));
+        Assert.Equal(40f, swatch.Rect.Height, precision: 3);
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_SelectShowsOnlyItsSelectedOptionText()
+    {
+        var document = await ParseAsync("""
+            <html><body>
+                <select>
+                    <option>First</option>
+                    <option selected>Second</option>
+                    <option>Third</option>
+                </select>
+            </body></html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, new DefaultRenderDevice
+        {
+            ViewPortWidth = 300,
+            ViewPortHeight = 100,
+            FontSize = 16f,
+        });
+
+        // Only the selected option's text is ever drawn - a <select> never lays out every <option>
+        // stacked underneath it the way a plain container element would.
+        var texts = displayList.Commands.OfType<DrawTextCommand>().Select(t => t.Text).ToList();
+        Assert.Contains("Second", texts);
+        Assert.DoesNotContain("First", texts);
+        Assert.DoesNotContain("Third", texts);
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_SelectShrinksToFitItsLabelAndShowsItLeftAlignedNextToTheArrow()
+    {
+        // A native <select> is left-aligned and shrink-to-fit around its own selected option (plus
+        // room for the dropdown arrow), not centered inside a fixed-width box the way an early,
+        // incorrect implementation (reusing the <button>-centering branch) rendered it.
+        var document = await ParseAsync("""
+            <html><body>
+                <select>
+                    <option>First</option>
+                    <option selected>Second</option>
+                </select>
+            </body></html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, new DefaultRenderDevice
+        {
+            ViewPortWidth = 300,
+            ViewPortHeight = 100,
+            FontSize = 16f,
+        });
+
+        // Button-like gray background, not the white a text-like input gets.
+        var background = Assert.Single(displayList.Commands.OfType<FillRectCommand>().Where(f => f.Color.Equals(new RenderColor(232, 232, 232)) && f.Rect.Width < 300f));
+        var label = Assert.Single(displayList.Commands.OfType<DrawTextCommand>().Where(t => t.Text == "Second"));
+        var arrow = Assert.Single(displayList.Commands.OfType<DrawTextCommand>().Where(t => t.Text == "⌄"));
+
+        // Left-aligned at the content box's own left edge (border + padding in from the box), not
+        // centered.
+        Assert.Equal(background.Rect.X + 1f + 4f, label.X, precision: 3);
+
+        // Narrower than a text-like input's fixed 150px default width - shrunk to fit "Second" plus
+        // the arrow - and the arrow itself sits shortly after the label, not flush with a far-away
+        // right edge of an unnecessarily wide box.
+        Assert.True(background.Rect.Width < 150f);
+        Assert.True(arrow.X > label.X);
+        Assert.True(arrow.X < background.Rect.X + background.Rect.Width);
+
+        // The arrow glyph's own ink sits much closer to the baseline than ordinary text does (it
+        // is a short symbol, not a full-height letter run), so painting it on the exact same
+        // baseline as the label visibly pushed it toward the bottom of the box - a real, reported
+        // bug. Its baseline must sit strictly above the label's own to compensate.
+        Assert.True(arrow.Y < label.Y);
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_SelectWithNoSelectedOptionShowsTheFirstOne()
+    {
+        var document = await ParseAsync("""
+            <html><body>
+                <select>
+                    <option>Alpha</option>
+                    <option>Beta</option>
+                </select>
+            </body></html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, new DefaultRenderDevice
+        {
+            ViewPortWidth = 300,
+            ViewPortHeight = 100,
+            FontSize = 16f,
+        });
+
+        var texts = displayList.Commands.OfType<DrawTextCommand>().Select(t => t.Text).ToList();
+        Assert.Contains("Alpha", texts);
+        Assert.DoesNotContain("Beta", texts);
+    }
+
+    [Theory]
+    [InlineData("<button>Click Me</button>", "Click Me")]
+    [InlineData("""<input type="submit" value="Send" />""", "Send")]
+    [InlineData("""<input type="submit" />""", "Submit")]
+    [InlineData("""<input type="reset" />""", "Reset")]
+    public async Task BuildDisplayList_ButtonLikeControlShowsItsLabelShrunkToFitWithDefaultChrome(string markup, string expectedLabel)
+    {
+        var document = await ParseAsync($"<html><body>{markup}</body></html>");
+
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, new DefaultRenderDevice
+        {
+            ViewPortWidth = 300,
+            ViewPortHeight = 100,
+            FontSize = 16f,
+        });
+
+        var label = Assert.Single(displayList.Commands.OfType<DrawTextCommand>().Where(t => t.Text == expectedLabel));
+
+        var background = Assert.Single(displayList.Commands.OfType<FillRectCommand>().Where(f => f.Color.Equals(new RenderColor(232, 232, 232))));
+        // Shrink-to-fit: the button's own box is sized to its measured label, not a fixed default
+        // width the way a text-like input is - so it must be narrower than that 150px default while
+        // still being wide enough to actually contain the label text just drawn.
+        Assert.True(background.Rect.Width < 150f);
+        Assert.True(background.Rect.Width > 0f);
+        Assert.True(label.X >= background.Rect.X);
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_TextAreaGetsDefaultChromeAndStillFlowsItsOwnTextContent()
+    {
+        var document = await ParseAsync("""<html><body><textarea>hello world</textarea></body></html>""");
+
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, new DefaultRenderDevice
+        {
+            ViewPortWidth = 300,
+            ViewPortHeight = 100,
+            FontSize = 16f,
+        });
+
+        Assert.Single(displayList.Commands.OfType<FillRectCommand>().Where(f => f.Color.Equals(new RenderColor(255, 255, 255)) && f.Rect.Width == 160f));
+        // A textarea's own child text node still flows through the ordinary block child-layout
+        // path (unlike <select>/<button>, it is never excluded from it) - this is what actually
+        // paints its content, not any bespoke form-control content painting.
+        Assert.Contains(displayList.Commands, c => c is DrawTextCommand t && t.Text == "hello world");
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_HiddenInputPaintsNothingAtAll()
+    {
+        var document = await ParseAsync("""
+            <html><body>
+                <input type="hidden" value="secret-token" />
+                <div style="width:10px; height:10px; background-color:#00ff00;"></div>
+            </body></html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, new DefaultRenderDevice
+        {
+            ViewPortWidth = 300,
+            ViewPortHeight = 100,
+            FontSize = 16f,
+        });
+
+        Assert.DoesNotContain(displayList.Commands, c => c is DrawTextCommand t && t.Text.Contains("secret-token"));
+        // Filtered to width 150 (the form-control default) rather than a bare "no white fill at
+        // all", since the page's own default background is also a full-viewport white fill.
+        Assert.DoesNotContain(displayList.Commands, c => c is FillRectCommand f && f.Color.Equals(new RenderColor(255, 255, 255)) && f.Rect.Width == 160f);
+        // The visible sibling still renders normally - the hidden input contributes no box at all
+        // to disrupt the layout around it, not just an invisible one.
+        Assert.Single(displayList.Commands.OfType<FillRectCommand>().Where(f => f.Color.Equals(new RenderColor(0, 255, 0))));
+    }
+
+    // Mirrors the private HtmlRenderer.FormControlAccentColor constant (26, 115, 232) - kept as an
+    // independent literal here rather than reflecting into the private field, so a test failure
+    // reads as "the painted color changed" rather than needing reflection to even compile.
+    private static readonly RenderColor FormControlAccentColorForTests = new(26, 115, 232);
 
     private static async Task<AngleSharp.Dom.IDocument> ParseAsync(string html, IConfiguration? configuration = null, string? address = null)
     {

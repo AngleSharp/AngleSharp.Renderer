@@ -10,6 +10,7 @@ Released on Wednesday, September 9 2026.
 - Added support for `box-shadow` declarations
 - Added support for numeric sorted lists (e.g., using `ol`)
 - Added support for bullet point lists (e.g., using `ul`)
+- Added basic rendering of standard form controls
 
 # 0.3.0
 
