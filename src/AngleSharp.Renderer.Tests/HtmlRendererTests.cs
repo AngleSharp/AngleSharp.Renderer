@@ -3617,6 +3617,154 @@ public sealed class HtmlRendererTests
         Assert.Equal(3, displayList.Commands.OfType<PushTransformCommand>().Count());
     }
 
+    [Fact]
+    public async Task BuildDisplayList_NoFilterProducesNoPushOrPopFilterCommands()
+    {
+        var document = await ParseAsync("""
+            <html><body>
+                <div style="width:10px; height:10px;"></div>
+            </body></html>
+            """);
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, new DefaultRenderDevice { ViewPortWidth = 200, ViewPortHeight = 200 });
+        Assert.Empty(displayList.Commands.OfType<PushFilterCommand>());
+        Assert.Empty(displayList.Commands.OfType<PopFilterCommand>());
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_FilterNoneProducesNoPushOrPopFilterCommands()
+    {
+        var document = await ParseAsync("""
+            <html><body>
+                <div style="width:10px; height:10px; filter: none;"></div>
+            </body></html>
+            """);
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, new DefaultRenderDevice { ViewPortWidth = 200, ViewPortHeight = 200 });
+        Assert.Empty(displayList.Commands.OfType<PushFilterCommand>());
+        Assert.Empty(displayList.Commands.OfType<PopFilterCommand>());
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_GrayscaleFilterParsesFractionAndPercentageIdentically()
+    {
+        var document = await ParseAsync("""
+            <html><body>
+                <img src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=" style="width:10px; height:10px; filter: grayscale(0.9);">
+                <img src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=" style="width:10px; height:10px; filter: grayscale(90%);">
+            </body></html>
+            """);
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, new DefaultRenderDevice { ViewPortWidth = 200, ViewPortHeight = 200 });
+        var pushes = displayList.Commands.OfType<PushFilterCommand>().ToList();
+
+        Assert.Equal(2, pushes.Count);
+
+        foreach (var push in pushes)
+        {
+            var function = Assert.Single(push.Functions);
+            Assert.Equal(RenderFilterFunctionKind.Grayscale, function.Kind);
+            Assert.Equal(0.9f, function.Amount, precision: 3);
+        }
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_ChainedFilterFunctionsPreserveAuthoredOrder()
+    {
+        var document = await ParseAsync("""
+            <html><body>
+                <div style="width:10px; height:10px; filter: grayscale(0.9) blur(2px);"></div>
+            </body></html>
+            """);
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, new DefaultRenderDevice { ViewPortWidth = 200, ViewPortHeight = 200 });
+        var push = Assert.Single(displayList.Commands.OfType<PushFilterCommand>());
+
+        Assert.Equal(2, push.Functions.Count);
+        Assert.Equal(RenderFilterFunctionKind.Grayscale, push.Functions[0].Kind);
+        Assert.Equal(0.9f, push.Functions[0].Amount, precision: 3);
+        Assert.Equal(RenderFilterFunctionKind.Blur, push.Functions[1].Kind);
+        Assert.Equal(2f, push.Functions[1].Amount, precision: 3);
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_DropShadowFilterParsesOffsetsBlurAndColorRegardlessOfColorPosition()
+    {
+        var document = await ParseAsync("""
+            <html><body>
+                <div style="width:10px; height:10px; filter: drop-shadow(2px 4px 6px red);"></div>
+                <div style="width:10px; height:10px; filter: drop-shadow(red 2px 4px 6px);"></div>
+            </body></html>
+            """);
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, new DefaultRenderDevice { ViewPortWidth = 200, ViewPortHeight = 200 });
+        var pushes = displayList.Commands.OfType<PushFilterCommand>().ToList();
+
+        Assert.Equal(2, pushes.Count);
+
+        foreach (var push in pushes)
+        {
+            var function = Assert.Single(push.Functions);
+            Assert.Equal(RenderFilterFunctionKind.DropShadow, function.Kind);
+            Assert.Equal(2f, function.OffsetX, precision: 2);
+            Assert.Equal(4f, function.OffsetY, precision: 2);
+            Assert.Equal(6f, function.Amount, precision: 2);
+            Assert.Equal(new RenderColor(255, 0, 0), function.Color);
+        }
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_FilterWrapsBackgroundBorderAndChildrenTogether()
+    {
+        // A filter affects the *whole* element - its own background/border and every descendant -
+        // not just its content, the same "wraps everything" scope PushTransformCommand already has.
+        var document = await ParseAsync("""
+            <html><body>
+                <div style="width:40px; height:20px; background-color:#ff0000; border:2px solid #0000ff; filter: grayscale(1);">
+                    <span style="display:inline-block; width:4px; height:4px; background-color:#00ff00;"></span>
+                </div>
+            </body></html>
+            """);
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, new DefaultRenderDevice { ViewPortWidth = 200, ViewPortHeight = 200 });
+        var commands = displayList.Commands.ToList();
+
+        var pushIndex = commands.FindIndex(c => c is PushFilterCommand);
+        var popIndex = commands.FindIndex(c => c is PopFilterCommand);
+        var backgroundIndex = commands.FindIndex(c => c is FillRectCommand f && f.Color.Equals(new RenderColor(255, 0, 0)));
+        var childIndex = commands.FindIndex(c => c is FillRectCommand f && f.Color.Equals(new RenderColor(0, 255, 0)));
+
+        Assert.True(pushIndex >= 0 && popIndex > pushIndex);
+        Assert.True(backgroundIndex > pushIndex && backgroundIndex < popIndex);
+        Assert.True(childIndex > pushIndex && childIndex < popIndex);
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_TransformAndFilterNestFilterInsideTransform()
+    {
+        // Documents this renderer's own, deliberate choice of nesting order (see ParseCssFilter's
+        // remarks in HtmlRenderer.LayoutElement): the filter's own raster operates inside the
+        // element's already-transformed local space, so PushFilter has to appear *after*
+        // PushTransform, and PopFilter *before* PopTransform.
+        var document = await ParseAsync("""
+            <html><body>
+                <div style="width:10px; height:10px; transform: scale(1.5); filter: grayscale(1);"></div>
+            </body></html>
+            """);
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, new DefaultRenderDevice { ViewPortWidth = 200, ViewPortHeight = 200 });
+        var commands = displayList.Commands.ToList();
+
+        var pushTransformIndex = commands.FindIndex(c => c is PushTransformCommand);
+        var pushFilterIndex = commands.FindIndex(c => c is PushFilterCommand);
+        var popFilterIndex = commands.FindIndex(c => c is PopFilterCommand);
+        var popTransformIndex = commands.FindIndex(c => c is PopTransformCommand);
+
+        Assert.True(pushTransformIndex < pushFilterIndex);
+        Assert.True(pushFilterIndex < popFilterIndex);
+        Assert.True(popFilterIndex < popTransformIndex);
+    }
+
     // Mirrors the private HtmlRenderer.FormControlAccentColor constant (26, 115, 232) - kept as an
     // independent literal here rather than reflecting into the private field, so a test failure
     // reads as "the painted color changed" rather than needing reflection to even compile.

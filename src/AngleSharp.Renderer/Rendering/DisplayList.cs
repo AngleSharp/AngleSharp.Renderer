@@ -71,6 +71,20 @@ public sealed class DisplayList
     public void PopTransform() => Add(new PopTransformCommand());
 
     /// <summary>
+    /// Begins applying a CSS `filter` to every command up to the matching <see cref="PopFilter"/> -
+    /// background, border, outline, and children all render under it, since `filter` affects the
+    /// whole element it is set on, mirroring how <see cref="PushTransform"/> already wraps it.
+    /// Pairs must nest like a stack, matching how a backend implements this as a save-layer/restore
+    /// scope.
+    /// </summary>
+    public void PushFilter(IReadOnlyList<RenderFilterFunction> functions) => Add(new PushFilterCommand(functions));
+
+    /// <summary>
+    /// Ends the filter scope started by the matching <see cref="PushFilter"/>.
+    /// </summary>
+    public void PopFilter() => Add(new PopFilterCommand());
+
+    /// <summary>
     /// Adds a filled rectangle command.
     /// </summary>
     public void FillRect(RenderRect rect, RenderColor color) => Add(new FillRectCommand(rect, new RenderColorPaint(color)));
@@ -216,6 +230,18 @@ public sealed record PushTransformCommand(RenderTransform2D Transform) : RenderC
 /// Ends the transform scope started by the matching <see cref="PushTransformCommand"/>.
 /// </summary>
 public sealed record PopTransformCommand : RenderCommand;
+
+/// <summary>
+/// Begins applying a CSS `filter` to every following command, up to the matching
+/// <see cref="PopFilterCommand"/> - background, border, outline, and children all render under it,
+/// mirroring how <see cref="PushTransformCommand"/> wraps the whole element it is set on.
+/// </summary>
+public sealed record PushFilterCommand(IReadOnlyList<RenderFilterFunction> Functions) : RenderCommand;
+
+/// <summary>
+/// Ends the filter scope started by the matching <see cref="PushFilterCommand"/>.
+/// </summary>
+public sealed record PopFilterCommand : RenderCommand;
 
 /// <summary>
 /// Draws a single line of text at a baseline position.

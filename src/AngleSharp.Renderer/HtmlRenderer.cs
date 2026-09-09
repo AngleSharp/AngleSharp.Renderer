@@ -1034,6 +1034,8 @@ public sealed class HtmlRenderer
         var clipsOverflow = ShouldClipOverflow(styleMap);
         var transform = ParseCssTransform(styleMap, borderBoxX, borderBoxY, borderBoxWidth, borderBoxHeight, currentTextStyle.FontSize);
         var hasTransform = !transform.IsIdentity;
+        var filterFunctions = ParseCssFilter(styleMap);
+        var hasFilter = filterFunctions.Count > 0;
 
         var boxPaintBuffer = new DisplayList();
 
@@ -1044,6 +1046,15 @@ public sealed class HtmlRenderer
         if (hasTransform)
         {
             boxPaintBuffer.PushTransform(transform);
+        }
+
+        // `filter` wraps the whole element too, exactly like `transform` above - it is nested
+        // inside the transform scope (not outside it) so the filter's own raster operates in the
+        // element's already-transformed local space, matching how a scaled element's blur radius
+        // should scale along with it rather than staying a fixed screen-space size.
+        if (hasFilter)
+        {
+            boxPaintBuffer.PushFilter(filterFunctions);
         }
 
         PaintBackground(boxPaintBuffer, box.BackgroundPaint, borderBoxX, borderBoxY, borderBoxWidth, borderBoxHeight, box.BorderRadius);
@@ -1075,6 +1086,14 @@ public sealed class HtmlRenderer
         if (clipsOverflow)
         {
             displayList.PopClip();
+        }
+
+        // Closes the filter scope opened above, once children (and, for a replaced element, its
+        // image) have all been emitted - nested inside the transform scope, so it has to close
+        // before that one does.
+        if (hasFilter)
+        {
+            displayList.PopFilter();
         }
 
         // Closes the transform scope opened above, once children (and, for a replaced element, its
@@ -3214,6 +3233,12 @@ public sealed class HtmlRenderer
         var rawTransformValue = element?.GetAttribute("data-render-transform");
         AddIfPresent(map, "transform", rawTransformValue);
         AddIfPresent(map, "transform-origin", string.IsNullOrWhiteSpace(style.GetPropertyValue("transform-origin")) ? ParseStyleAttributeValue(inlineStyle, "transform-origin") : style.GetPropertyValue("transform-origin"));
+        // AngleSharp.Css has no structured `filter` support at all (confirmed empirically - its own
+        // computed style always reports an empty string for this property, unlike `transform`,
+        // which merely crashed on one function until fixed upstream), so this always falls through
+        // to the raw inline `style=""` attribute, exactly like `background-image`'s gradient-opaque
+        // fallback above.
+        AddIfPresent(map, "filter", string.IsNullOrWhiteSpace(style.GetPropertyValue("filter")) ? ParseStyleAttributeValue(inlineStyle, "filter") : style.GetPropertyValue("filter"));
         AddIfPresent(map, "font-size", style.GetFontSize());
         AddIfPresent(map, "font-family", style.GetFontFamily());
         AddIfPresent(map, "font-weight", style.GetPropertyValue("font-weight"));
@@ -5386,6 +5411,213 @@ public sealed class HtmlRenderer
         var x = (xComponent.Percentage * borderBoxWidth) + xComponent.OffsetPixels;
         var y = (yComponent.Percentage * borderBoxHeight) + yComponent.OffsetPixels;
         return (x, y);
+    }
+
+    /// <summary>
+    /// Parses `filter` into a list of <see cref="RenderFilterFunction"/>s, entirely by hand rather
+    /// than through AngleSharp.Css - unlike `transform`, AngleSharp.Css has no structured support
+    /// for `filter` at all (confirmed empirically: its computed style always reports an empty
+    /// string for this property, and reflecting over its assembly finds no `FilterParser`/
+    /// `ICssFilterFunctionValue` equivalent), so there is nothing to delegate to. This mirrors the
+    /// pre-existing CSS-gradient precedent (`ParseGradientPaint`, hand-parsed for the same reason)
+    /// rather than the `transform` precedent. `url(#filterId)` (an SVG filter reference) and any
+    /// other unrecognized function are silently skipped rather than aborting the whole chain,
+    /// mirroring how an unsupported SVG `&lt;filter&gt;` primitive passes its input through
+    /// unchanged in `SvgFilterBuilder` instead of breaking that chain.
+    /// </summary>
+    private static IReadOnlyList<RenderFilterFunction> ParseCssFilter(Dictionary<string, string> styleMap)
+    {
+        if (!styleMap.TryGetValue("filter", out var value) ||
+            string.IsNullOrWhiteSpace(value) ||
+            string.Equals(value.Trim(), "none", StringComparison.OrdinalIgnoreCase))
+        {
+            return [];
+        }
+
+        var functions = new List<RenderFilterFunction>();
+
+        foreach (var token in SplitTopLevelWhitespaceList(value.Trim()))
+        {
+            if (TryParseFilterFunction(token, out var function))
+            {
+                functions.Add(function);
+            }
+        }
+
+        return functions;
+    }
+
+    private static bool TryParseFilterFunction(string token, out RenderFilterFunction function)
+    {
+        function = null!;
+        var opening = token.IndexOf('(');
+        var closing = token.LastIndexOf(')');
+
+        if (opening < 0 || closing <= opening)
+        {
+            return false;
+        }
+
+        var name = token[..opening].Trim().ToLowerInvariant();
+        var argsText = token[(opening + 1)..closing].Trim();
+
+        switch (name)
+        {
+            case "blur":
+                function = RenderFilterFunction.Blur(Math.Max(0f, ParseLengthValue(argsText, defaultValue: 0f, allowAuto: false)));
+                return true;
+            case "brightness":
+                function = RenderFilterFunction.Brightness(Math.Max(0f, ParseFilterAmount(argsText, 1f)));
+                return true;
+            case "contrast":
+                function = RenderFilterFunction.Contrast(Math.Max(0f, ParseFilterAmount(argsText, 1f)));
+                return true;
+            case "grayscale":
+                function = RenderFilterFunction.Grayscale(Math.Clamp(ParseFilterAmount(argsText, 1f), 0f, 1f));
+                return true;
+            case "invert":
+                function = RenderFilterFunction.Invert(Math.Clamp(ParseFilterAmount(argsText, 1f), 0f, 1f));
+                return true;
+            case "opacity":
+                function = RenderFilterFunction.Opacity(Math.Clamp(ParseFilterAmount(argsText, 1f), 0f, 1f));
+                return true;
+            case "saturate":
+                function = RenderFilterFunction.Saturate(Math.Max(0f, ParseFilterAmount(argsText, 1f)));
+                return true;
+            case "sepia":
+                function = RenderFilterFunction.Sepia(Math.Clamp(ParseFilterAmount(argsText, 1f), 0f, 1f));
+                return true;
+            case "hue-rotate":
+                function = RenderFilterFunction.HueRotate(ParseAngle(argsText));
+                return true;
+            case "drop-shadow":
+                function = ParseDropShadowFilterFunction(argsText);
+                return true;
+            default:
+                return false;
+        }
+    }
+
+    // `grayscale(90%)` and `grayscale(0.9)` are equivalent per spec - a percentage argument is
+    // normalized to the same 0..1 fraction a bare number already is, so every downstream consumer
+    // (RenderFilterFunction.Amount) only ever has to handle one representation.
+    private static float ParseFilterAmount(string value, float defaultValue)
+    {
+        var trimmed = value.Trim();
+
+        if (trimmed.Length == 0)
+        {
+            return defaultValue;
+        }
+
+        if (trimmed.EndsWith('%') &&
+            float.TryParse(trimmed[..^1].Trim(), NumberStyles.Float, CultureInfo.InvariantCulture, out var percentage))
+        {
+            return percentage / 100f;
+        }
+
+        return float.TryParse(trimmed, NumberStyles.Float, CultureInfo.InvariantCulture, out var number) ? number : defaultValue;
+    }
+
+    // `drop-shadow(<offset-x> <offset-y> <blur-radius>? <color>?)` - CSS allows the color argument
+    // either first or last, so this classifies each whitespace-separated token by its own shape
+    // (a leading digit/sign/decimal point is a length, anything else is a color) rather than
+    // assuming a fixed position, then assigns lengths to offsetX/offsetY/blurRadius in the order
+    // they were seen.
+    private static RenderFilterFunction ParseDropShadowFilterFunction(string argsText)
+    {
+        var offsetX = 0f;
+        var offsetY = 0f;
+        var blurRadius = 0f;
+        var color = RenderColor.Black;
+        var lengthIndex = 0;
+
+        foreach (var token in SplitTopLevelWhitespaceList(argsText))
+        {
+            var trimmed = token.Trim();
+
+            if (trimmed.Length == 0)
+            {
+                continue;
+            }
+
+            var firstChar = trimmed[0];
+
+            if (char.IsDigit(firstChar) || firstChar is '-' or '+' or '.')
+            {
+                var length = ParseLengthValue(trimmed, 0f, allowAuto: false);
+
+                switch (lengthIndex)
+                {
+                    case 0:
+                        offsetX = length;
+                        break;
+                    case 1:
+                        offsetY = length;
+                        break;
+                    default:
+                        blurRadius = length;
+                        break;
+                }
+
+                lengthIndex++;
+            }
+            else
+            {
+                color = ParseColor(trimmed, color);
+            }
+        }
+
+        return RenderFilterFunction.DropShadow(offsetX, offsetY, Math.Max(0f, blurRadius), color);
+    }
+
+    // Splits a value on whitespace at paren-depth 0 only, so a function's own arguments (which may
+    // contain spaces, e.g. `rgb(255, 0, 0)` or `drop-shadow(2px 4px red)`) are never split apart.
+    // Shared by the top-level `filter` function list (`grayscale(0.9) blur(2px)`) and by
+    // `drop-shadow`'s own space-separated argument list.
+    private static string[] SplitTopLevelWhitespaceList(string value)
+    {
+        if (string.IsNullOrWhiteSpace(value))
+        {
+            return [];
+        }
+
+        var parts = new List<string>();
+        var current = new StringBuilder();
+        var depth = 0;
+
+        foreach (var character in value)
+        {
+            if (character == '(')
+            {
+                depth++;
+                current.Append(character);
+            }
+            else if (character == ')')
+            {
+                depth = Math.Max(0, depth - 1);
+                current.Append(character);
+            }
+            else if (char.IsWhiteSpace(character) && depth == 0)
+            {
+                if (current.Length > 0)
+                {
+                    parts.Add(current.ToString());
+                    current.Clear();
+                }
+            }
+            else
+            {
+                current.Append(character);
+            }
+        }
+
+        if (current.Length > 0)
+        {
+            parts.Add(current.ToString());
+        }
+
+        return [.. parts];
     }
 
     /// <summary>

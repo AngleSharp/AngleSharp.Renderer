@@ -82,6 +82,12 @@ public sealed class SkiaRenderBackend : IRenderBackend, ITextMeasurer
             case PopTransformCommand:
                 canvas.Restore();
                 break;
+            case PushFilterCommand pushFilter:
+                PushFilter(canvas, pushFilter);
+                break;
+            case PopFilterCommand:
+                canvas.Restore();
+                break;
         }
     }
 
@@ -97,6 +103,150 @@ public sealed class SkiaRenderBackend : IRenderBackend, ITextMeasurer
         var matrix = new SKMatrix(t.A, t.C, t.E, t.B, t.D, t.F, 0f, 0f, 1f);
         canvas.Concat(ref matrix);
     }
+
+    private static void PushFilter(SKCanvas canvas, PushFilterCommand command)
+    {
+        using var paint = new SKPaint { ImageFilter = BuildFilterChain(command.Functions) };
+        canvas.SaveLayer(paint);
+    }
+
+    private static SKImageFilter? BuildFilterChain(IReadOnlyList<RenderFilterFunction> functions)
+    {
+        SKImageFilter? chain = null;
+
+        foreach (var function in functions)
+        {
+            chain = function.Kind switch
+            {
+                RenderFilterFunctionKind.Blur =>
+                    SKImageFilter.CreateBlur(Math.Max(0f, function.Amount) / 2f, Math.Max(0f, function.Amount) / 2f, chain),
+                RenderFilterFunctionKind.DropShadow =>
+                    SKImageFilter.CreateDropShadow(function.OffsetX, function.OffsetY, Math.Max(0f, function.Amount) / 2f, Math.Max(0f, function.Amount) / 2f, ToSkColor(function.Color), chain),
+                _ => SKImageFilter.CreateColorFilter(SKColorFilter.CreateColorMatrix(BuildFilterColorMatrix(function)), chain),
+            };
+        }
+
+        return chain;
+    }
+
+    // The CSS Filter Effects spec's per-function color matrices, each a 4x5 row-major matrix
+    // operating on un-premultiplied 0..1 color components (SKColorFilter.CreateColorMatrix's own
+    // convention, already relied on by SvgFilterBuilder's independent feColorMatrix support - these
+    // two implementations deliberately do not share code, mirroring how SVG gradients do not share
+    // code with the CSS gradient path).
+    private static float[] BuildFilterColorMatrix(RenderFilterFunction function) => function.Kind switch
+    {
+        RenderFilterFunctionKind.Grayscale => Lerp(IdentityColorMatrix, GrayscaleColorMatrix, Math.Clamp(function.Amount, 0f, 1f)),
+        RenderFilterFunctionKind.Sepia => Lerp(IdentityColorMatrix, SepiaColorMatrix, Math.Clamp(function.Amount, 0f, 1f)),
+        RenderFilterFunctionKind.Saturate => CreateSaturateColorMatrix(Math.Max(0f, function.Amount)),
+        RenderFilterFunctionKind.HueRotate => CreateHueRotateColorMatrix(function.Amount),
+        RenderFilterFunctionKind.Invert => CreateInvertColorMatrix(Math.Clamp(function.Amount, 0f, 1f)),
+        RenderFilterFunctionKind.Brightness => CreateBrightnessColorMatrix(Math.Max(0f, function.Amount)),
+        RenderFilterFunctionKind.Contrast => CreateContrastColorMatrix(Math.Max(0f, function.Amount)),
+        RenderFilterFunctionKind.Opacity => CreateOpacityColorMatrix(Math.Clamp(function.Amount, 0f, 1f)),
+        _ => IdentityColorMatrix,
+    };
+
+    private static float[] Lerp(float[] from, float[] to, float t)
+    {
+        var result = new float[20];
+
+        for (var i = 0; i < 20; i++)
+        {
+            result[i] = from[i] + ((to[i] - from[i]) * t);
+        }
+
+        return result;
+    }
+
+    private static float[] CreateSaturateColorMatrix(float s) =>
+    [
+        0.213f + (0.787f * s), 0.715f - (0.715f * s), 0.072f - (0.072f * s), 0f, 0f,
+        0.213f - (0.213f * s), 0.715f + (0.285f * s), 0.072f - (0.072f * s), 0f, 0f,
+        0.213f - (0.213f * s), 0.715f - (0.715f * s), 0.072f + (0.928f * s), 0f, 0f,
+        0f, 0f, 0f, 1f, 0f,
+    ];
+
+    private static float[] CreateHueRotateColorMatrix(float angleDegrees)
+    {
+        var radians = angleDegrees * (float)Math.PI / 180f;
+        var cos = (float)Math.Cos(radians);
+        var sin = (float)Math.Sin(radians);
+
+        return
+        [
+            0.213f + (cos * 0.787f) - (sin * 0.213f), 0.715f - (cos * 0.715f) - (sin * 0.715f), 0.072f - (cos * 0.072f) + (sin * 0.928f), 0f, 0f,
+            0.213f - (cos * 0.213f) + (sin * 0.143f), 0.715f + (cos * 0.285f) + (sin * 0.140f), 0.072f - (cos * 0.072f) - (sin * 0.283f), 0f, 0f,
+            0.213f - (cos * 0.213f) - (sin * 0.787f), 0.715f - (cos * 0.715f) + (sin * 0.715f), 0.072f + (cos * 0.928f) + (sin * 0.072f), 0f, 0f,
+            0f, 0f, 0f, 1f, 0f,
+        ];
+    }
+
+    private static float[] CreateInvertColorMatrix(float amount)
+    {
+        var scale = 1f - (2f * amount);
+
+        return
+        [
+            scale, 0f, 0f, 0f, amount,
+            0f, scale, 0f, 0f, amount,
+            0f, 0f, scale, 0f, amount,
+            0f, 0f, 0f, 1f, 0f,
+        ];
+    }
+
+    private static float[] CreateBrightnessColorMatrix(float amount) =>
+    [
+        amount, 0f, 0f, 0f, 0f,
+        0f, amount, 0f, 0f, 0f,
+        0f, 0f, amount, 0f, 0f,
+        0f, 0f, 0f, 1f, 0f,
+    ];
+
+    private static float[] CreateContrastColorMatrix(float amount)
+    {
+        var offset = 0.5f * (1f - amount);
+
+        return
+        [
+            amount, 0f, 0f, 0f, offset,
+            0f, amount, 0f, 0f, offset,
+            0f, 0f, amount, 0f, offset,
+            0f, 0f, 0f, 1f, 0f,
+        ];
+    }
+
+    private static float[] CreateOpacityColorMatrix(float amount) =>
+    [
+        1f, 0f, 0f, 0f, 0f,
+        0f, 1f, 0f, 0f, 0f,
+        0f, 0f, 1f, 0f, 0f,
+        0f, 0f, 0f, amount, 0f,
+    ];
+
+    private static readonly float[] IdentityColorMatrix =
+    [
+        1f, 0f, 0f, 0f, 0f,
+        0f, 1f, 0f, 0f, 0f,
+        0f, 0f, 1f, 0f, 0f,
+        0f, 0f, 0f, 1f, 0f,
+    ];
+
+    private static readonly float[] GrayscaleColorMatrix =
+    [
+        0.2126f, 0.7152f, 0.0722f, 0f, 0f,
+        0.2126f, 0.7152f, 0.0722f, 0f, 0f,
+        0.2126f, 0.7152f, 0.0722f, 0f, 0f,
+        0f, 0f, 0f, 1f, 0f,
+    ];
+
+    private static readonly float[] SepiaColorMatrix =
+    [
+        0.393f, 0.769f, 0.189f, 0f, 0f,
+        0.349f, 0.686f, 0.168f, 0f, 0f,
+        0.272f, 0.534f, 0.131f, 0f, 0f,
+        0f, 0f, 0f, 1f, 0f,
+    ];
 
     private static void PushClip(SKCanvas canvas, PushClipCommand command)
     {
