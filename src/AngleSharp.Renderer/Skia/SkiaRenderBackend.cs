@@ -88,6 +88,12 @@ public sealed class SkiaRenderBackend : IRenderBackend, ITextMeasurer
             case PopFilterCommand:
                 canvas.Restore();
                 break;
+            case PushOpacityCommand pushOpacity:
+                PushOpacity(canvas, pushOpacity);
+                break;
+            case PopOpacityCommand:
+                canvas.Restore();
+                break;
         }
     }
 
@@ -102,6 +108,13 @@ public sealed class SkiaRenderBackend : IRenderBackend, ITextMeasurer
         // (and RenderTransform2D, matching it) uses.
         var matrix = new SKMatrix(t.A, t.C, t.E, t.B, t.D, t.F, 0f, 0f, 1f);
         canvas.Concat(ref matrix);
+    }
+
+    private static void PushOpacity(SKCanvas canvas, PushOpacityCommand command)
+    {
+        var alpha = (byte)Math.Round(Math.Clamp(command.Alpha, 0f, 1f) * 255f);
+        using var paint = new SKPaint { Color = new SKColor(255, 255, 255, alpha) };
+        canvas.SaveLayer(paint);
     }
 
     private static void PushFilter(SKCanvas canvas, PushFilterCommand command)
