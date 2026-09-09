@@ -15,6 +15,8 @@ internal sealed class InteractiveHtmlRendererState : IDomHarness
     private readonly HtmlRenderer _renderer;
     private readonly List<IElement> _forcedHoverChain = [];
     private readonly CssTransitionTracker _transitionTracker = new();
+    private readonly CssAnimationTracker _animationTracker = new();
+    private double _clockMs;
     private IElement? _hoveredElement;
     private (double X, double Y) _mousePosition;
 
@@ -244,6 +246,7 @@ internal sealed class InteractiveHtmlRendererState : IDomHarness
 
     public void AdvanceTime(TimeSpan delta)
     {
+        _clockMs += delta.TotalMilliseconds;
         _transitionTracker.AdvanceTime(delta);
         PaintInvalidated?.Invoke(this, EventArgs.Empty);
     }
@@ -254,6 +257,14 @@ internal sealed class InteractiveHtmlRendererState : IDomHarness
         ArgumentNullException.ThrowIfNull(property);
 
         return _transitionTracker.GetTransitioningValue(element, property);
+    }
+
+    public string? GetAnimatedValue(IElement element, string property)
+    {
+        ArgumentNullException.ThrowIfNull(element);
+        ArgumentNullException.ThrowIfNull(property);
+
+        return _animationTracker.GetAnimatedValue(element, property, _clockMs);
     }
 
     public RenderedImage PaintToPng()

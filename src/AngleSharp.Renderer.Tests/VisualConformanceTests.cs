@@ -2535,6 +2535,41 @@ public sealed class VisualConformanceTests
           maxDifferentPixels: 0);
     }
 
+    [Fact]
+    public async Task RenderToPng_AnimationShowsAnInterpolatedMidFlightFrame()
+    {
+        var renderDevice = new DefaultRenderDevice { ViewPortWidth = 120, ViewPortHeight = 100, FontSize = 16 };
+        var configuration = Configuration.Default.WithCss().WithRenderDevice(renderDevice);
+        var document = await ParseAsync("""
+            <html>
+              <head>
+                <style>
+                  html, body { margin: 0; padding: 0; background-color: white; }
+                  @keyframes slide {
+                    0% { left: 0px; }
+                    100% { left: 60px; }
+                  }
+                  #target { position: relative; background-color: rgb(0, 128, 255); animation: slide 2s linear; }
+                </style>
+              </head>
+              <body>
+                <div id="target" style="margin:20px; width:30px; height:40px;"></div>
+              </body>
+            </html>
+            """, configuration);
+
+        var harness = document.Context.GetDomHarness();
+        harness.AdvanceTime(TimeSpan.FromMilliseconds(1000));
+
+        var image = harness.PaintToPng();
+
+        VisualSnapshotVerifier.VerifyOrCreate(
+          snapshotName: "animation-shows-an-interpolated-mid-flight-frame.png",
+          actualPng: image.Data,
+          perChannelTolerance: 0,
+          maxDifferentPixels: 0);
+    }
+
     private static async Task<AngleSharp.Dom.IDocument> ParseAsync(string html, IConfiguration? configuration = null)
     {
         var context = BrowsingContext.New(configuration ?? Configuration.Default.WithCss());

@@ -3214,6 +3214,209 @@ public sealed class HtmlRendererTests
         Assert.Equal(80f, CurrentWidth(), precision: 2);
     }
 
+    [Fact]
+    public async Task BuildDisplayList_AnimationInterpolatesBetweenKeyframesOverTime()
+    {
+        var renderDevice = new DefaultRenderDevice { ViewPortWidth = 200, ViewPortHeight = 100, FontSize = 16 };
+        var configuration = Configuration.Default.WithCss().WithRenderDevice(renderDevice);
+        var document = await ParseAsync("""
+            <html><head><style>
+                html, body { margin: 0; padding: 0; }
+                @keyframes fade {
+                    0% { opacity: 0; }
+                    100% { opacity: 1; }
+                }
+                #target { width: 40px; height: 40px; background-color: rgb(0, 0, 255); animation: fade 2s linear; }
+            </style></head><body>
+                <div id="target"></div>
+            </body></html>
+            """, configuration);
+        var harness = document.Context.GetDomHarness();
+        var renderer = new HtmlRenderer();
+
+        float CurrentAlpha()
+        {
+            var displayList = renderer.BuildDisplayList(document, renderDevice);
+            var push = displayList.Commands.OfType<PushOpacityCommand>().SingleOrDefault();
+            return push?.Alpha ?? 1f;
+        }
+
+        // Registering the harness (via GetDomHarness) starts the virtual clock at 0 - the animation
+        // begins immediately, matching how a real animation starts playing on page load.
+        Assert.Equal(0f, CurrentAlpha(), precision: 2);
+
+        harness.AdvanceTime(TimeSpan.FromMilliseconds(1000));
+        Assert.Equal(0.5f, CurrentAlpha(), precision: 2);
+
+        harness.AdvanceTime(TimeSpan.FromMilliseconds(1000));
+        Assert.Equal(1f, CurrentAlpha(), precision: 2);
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_InfiniteAnimationLoopsBackToTheStart()
+    {
+        var renderDevice = new DefaultRenderDevice { ViewPortWidth = 200, ViewPortHeight = 100, FontSize = 16 };
+        var configuration = Configuration.Default.WithCss().WithRenderDevice(renderDevice);
+        var document = await ParseAsync("""
+            <html><head><style>
+                html, body { margin: 0; padding: 0; }
+                @keyframes fade {
+                    0% { opacity: 0; }
+                    100% { opacity: 1; }
+                }
+                #target { width: 40px; height: 40px; background-color: rgb(0, 0, 255); animation: fade 2s linear infinite; }
+            </style></head><body>
+                <div id="target"></div>
+            </body></html>
+            """, configuration);
+        var harness = document.Context.GetDomHarness();
+        var renderer = new HtmlRenderer();
+
+        float CurrentAlpha()
+        {
+            var displayList = renderer.BuildDisplayList(document, renderDevice);
+            var push = displayList.Commands.OfType<PushOpacityCommand>().SingleOrDefault();
+            return push?.Alpha ?? 1f;
+        }
+
+        harness.AdvanceTime(TimeSpan.FromMilliseconds(2500));
+
+        // 2500ms into a 2000ms duration is 500ms into the *second* iteration (25% through it),
+        // not "past the end" - infinite iteration count means it just keeps looping.
+        Assert.Equal(0.25f, CurrentAlpha(), precision: 2);
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_AlternateDirectionReversesOnOddIterations()
+    {
+        var renderDevice = new DefaultRenderDevice { ViewPortWidth = 200, ViewPortHeight = 100, FontSize = 16 };
+        var configuration = Configuration.Default.WithCss().WithRenderDevice(renderDevice);
+        var document = await ParseAsync("""
+            <html><head><style>
+                html, body { margin: 0; padding: 0; }
+                @keyframes fade {
+                    0% { opacity: 0; }
+                    100% { opacity: 1; }
+                }
+                #target { width: 40px; height: 40px; background-color: rgb(0, 0, 255); animation: fade 2s linear infinite alternate; }
+            </style></head><body>
+                <div id="target"></div>
+            </body></html>
+            """, configuration);
+        var harness = document.Context.GetDomHarness();
+        var renderer = new HtmlRenderer();
+
+        float CurrentAlpha()
+        {
+            var displayList = renderer.BuildDisplayList(document, renderDevice);
+            var push = displayList.Commands.OfType<PushOpacityCommand>().SingleOrDefault();
+            return push?.Alpha ?? 1f;
+        }
+
+        // 2500ms = 500ms into the second iteration (index 1, odd) - alternate makes odd iterations
+        // run backward, so this should read as 75% (1 - 0.25), not 25% like the "normal" test above.
+        harness.AdvanceTime(TimeSpan.FromMilliseconds(2500));
+        Assert.Equal(0.75f, CurrentAlpha(), precision: 2);
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_AnimationDelayPostponesTheStartOfInterpolation()
+    {
+        var renderDevice = new DefaultRenderDevice { ViewPortWidth = 200, ViewPortHeight = 100, FontSize = 16 };
+        var configuration = Configuration.Default.WithCss().WithRenderDevice(renderDevice);
+        var document = await ParseAsync("""
+            <html><head><style>
+                html, body { margin: 0; padding: 0; }
+                @keyframes fade {
+                    0% { opacity: 0; }
+                    100% { opacity: 1; }
+                }
+                #target { width: 40px; height: 40px; background-color: rgb(0, 0, 255); animation: fade 2s linear 1s; }
+            </style></head><body>
+                <div id="target"></div>
+            </body></html>
+            """, configuration);
+        var harness = document.Context.GetDomHarness();
+        var renderer = new HtmlRenderer();
+
+        float CurrentAlpha()
+        {
+            var displayList = renderer.BuildDisplayList(document, renderDevice);
+            var push = displayList.Commands.OfType<PushOpacityCommand>().SingleOrDefault();
+            return push?.Alpha ?? 1f;
+        }
+
+        // Still within the 1s delay - fill-mode defaults to "none", so no override applies yet and
+        // the base opacity (1, fully opaque - CSS's own initial value) shows instead of 0%'s value.
+        harness.AdvanceTime(TimeSpan.FromMilliseconds(500));
+        Assert.Equal(1f, CurrentAlpha(), precision: 2);
+
+        harness.AdvanceTime(TimeSpan.FromMilliseconds(1000));
+        Assert.Equal(0.25f, CurrentAlpha(), precision: 2);
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_FillModeForwardsFreezesAtTheEndingKeyframeAfterCompletion()
+    {
+        var renderDevice = new DefaultRenderDevice { ViewPortWidth = 200, ViewPortHeight = 100, FontSize = 16 };
+        var configuration = Configuration.Default.WithCss().WithRenderDevice(renderDevice);
+        var document = await ParseAsync("""
+            <html><head><style>
+                html, body { margin: 0; padding: 0; }
+                @keyframes fade {
+                    0% { opacity: 0; }
+                    100% { opacity: 0.3; }
+                }
+                #target { width: 40px; height: 40px; background-color: rgb(0, 0, 255); animation: fade 1s linear forwards; }
+            </style></head><body>
+                <div id="target"></div>
+            </body></html>
+            """, configuration);
+        var harness = document.Context.GetDomHarness();
+        var renderer = new HtmlRenderer();
+
+        float CurrentAlpha()
+        {
+            var displayList = renderer.BuildDisplayList(document, renderDevice);
+            var push = displayList.Commands.OfType<PushOpacityCommand>().SingleOrDefault();
+            return push?.Alpha ?? 1f;
+        }
+
+        harness.AdvanceTime(TimeSpan.FromMilliseconds(2000));
+
+        // The animation ended after 1s (iteration-count defaults to 1), but fill-mode: forwards
+        // keeps it frozen at the 100% keyframe's value (0.3) instead of reverting to the base
+        // opacity (1) the way the no-fill-mode case would.
+        Assert.Equal(0.3f, CurrentAlpha(), precision: 2);
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_AnimationEndsAndRevertsToNaturalValueWithoutFillModeForwards()
+    {
+        var renderDevice = new DefaultRenderDevice { ViewPortWidth = 200, ViewPortHeight = 100, FontSize = 16 };
+        var configuration = Configuration.Default.WithCss().WithRenderDevice(renderDevice);
+        var document = await ParseAsync("""
+            <html><head><style>
+                html, body { margin: 0; padding: 0; }
+                @keyframes fade {
+                    0% { opacity: 0; }
+                    100% { opacity: 0.3; }
+                }
+                #target { width: 40px; height: 40px; background-color: rgb(0, 0, 255); animation: fade 1s linear; }
+            </style></head><body>
+                <div id="target"></div>
+            </body></html>
+            """, configuration);
+        var harness = document.Context.GetDomHarness();
+        var renderer = new HtmlRenderer();
+
+        harness.AdvanceTime(TimeSpan.FromMilliseconds(2000));
+
+        var displayList = renderer.BuildDisplayList(document, renderDevice);
+        var push = displayList.Commands.OfType<PushOpacityCommand>().SingleOrDefault();
+        Assert.Null(push);
+    }
+
     [Theory]
     [InlineData("text")]
     [InlineData("number")]

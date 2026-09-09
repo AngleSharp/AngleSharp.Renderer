@@ -3273,26 +3273,42 @@ public sealed class HtmlRenderer
         AddIfPresent(map, "line-height", style.GetLineHeight());
         AddIfPresent(map, "color", style.GetColor());
 
-        ApplyActiveTransitionOverrides(map, element);
+        ApplyActiveTransitionAndAnimationOverrides(map, element);
 
         return map;
     }
 
-    // Overrides every style-map entry that is currently mid-`transition` with its interpolated
-    // value, so the rest of this renderer's normal per-property parsing (ParseLength, ParseColor,
-    // ...) never has to know a transition is even happening - it just sees whatever value would
-    // otherwise be in the map, substituted for the eased in-between one. A no-op (and effectively
-    // free - one ConditionalWeakTable lookup) for the overwhelming majority of documents, which
-    // were never wired up for interactive use via IBrowsingContext.GetDomHarness() at all.
-    private static void ApplyActiveTransitionOverrides(Dictionary<string, string> map, IElement? element)
+    // Overrides every style-map entry that is currently mid-`transition` or mid-`animation` with
+    // its interpolated value, so the rest of this renderer's normal per-property parsing
+    // (ParseLength, ParseColor, ...) never has to know either is even happening - it just sees
+    // whatever value would otherwise be in the map, substituted for the eased in-between one. A
+    // no-op (and effectively free - one ConditionalWeakTable lookup) for the overwhelming majority
+    // of documents, which were never wired up for interactive use via
+    // IBrowsingContext.GetDomHarness() at all. `animation` takes precedence over `transition` for a
+    // property both are currently affecting - a reasonable simplification of the CSS cascade's own
+    // "animations, then transitions" ordering (transitions technically animate on top of whatever
+    // the animation produces, which this renderer does not attempt to layer precisely).
+    private static void ApplyActiveTransitionAndAnimationOverrides(Dictionary<string, string> map, IElement? element)
     {
         if (element?.Owner is null || !element.Owner.Context.TryGetDomHarness(out var harness) || harness is null)
         {
             return;
         }
 
-        foreach (var property in map.Keys.ToArray())
+        // Iterates the full interpolatable whitelist, not just map.Keys - a property that only
+        // ever appears inside a @keyframes block (never as a base/inherited declaration, e.g.
+        // `opacity` set solely by an animation) would otherwise have no key in the map at all for
+        // this loop to find and override.
+        foreach (var property in CssValueInterpolation.InterpolatableProperties.Keys)
         {
+            var animatedValue = harness.GetAnimatedValue(element, property);
+
+            if (animatedValue is not null)
+            {
+                map[property] = animatedValue;
+                continue;
+            }
+
             var transitioningValue = harness.GetTransitioningValue(element, property);
 
             if (transitioningValue is not null)
