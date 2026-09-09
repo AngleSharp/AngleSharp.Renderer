@@ -1036,6 +1036,8 @@ public sealed class HtmlRenderer
         var hasTransform = !transform.IsIdentity;
         var filterFunctions = ParseCssFilter(styleMap);
         var hasFilter = filterFunctions.Count > 0;
+        var opacity = ParseCssOpacity(styleMap);
+        var hasOpacity = opacity < 1f;
 
         var boxPaintBuffer = new DisplayList();
 
@@ -1046,6 +1048,15 @@ public sealed class HtmlRenderer
         if (hasTransform)
         {
             boxPaintBuffer.PushTransform(transform);
+        }
+
+        // `opacity` nests inside `transform` (compositing does not care about coordinate space,
+        // only about *where* transform already placed the content) but outside `filter` (matching
+        // how a browser processes filter effects on the element's own content first, then
+        // composites the already-filtered result onto the backdrop at the element's opacity).
+        if (hasOpacity)
+        {
+            boxPaintBuffer.PushOpacity(opacity);
         }
 
         // `filter` wraps the whole element too, exactly like `transform` above - it is nested
@@ -1089,11 +1100,18 @@ public sealed class HtmlRenderer
         }
 
         // Closes the filter scope opened above, once children (and, for a replaced element, its
-        // image) have all been emitted - nested inside the transform scope, so it has to close
+        // image) have all been emitted - nested inside the opacity scope, so it has to close
         // before that one does.
         if (hasFilter)
         {
             displayList.PopFilter();
+        }
+
+        // Closes the opacity scope opened above - nested inside the transform scope, so it closes
+        // before that one does too.
+        if (hasOpacity)
+        {
+            displayList.PopOpacity();
         }
 
         // Closes the transform scope opened above, once children (and, for a replaced element, its
@@ -3239,6 +3257,7 @@ public sealed class HtmlRenderer
         // to the raw inline `style=""` attribute, exactly like `background-image`'s gradient-opaque
         // fallback above.
         AddIfPresent(map, "filter", string.IsNullOrWhiteSpace(style.GetPropertyValue("filter")) ? ParseStyleAttributeValue(inlineStyle, "filter") : style.GetPropertyValue("filter"));
+        AddIfPresent(map, "opacity", style.GetOpacity());
         AddIfPresent(map, "font-size", style.GetFontSize());
         AddIfPresent(map, "font-family", style.GetFontFamily());
         AddIfPresent(map, "font-weight", style.GetPropertyValue("font-weight"));
@@ -3254,7 +3273,33 @@ public sealed class HtmlRenderer
         AddIfPresent(map, "line-height", style.GetLineHeight());
         AddIfPresent(map, "color", style.GetColor());
 
+        ApplyActiveTransitionOverrides(map, element);
+
         return map;
+    }
+
+    // Overrides every style-map entry that is currently mid-`transition` with its interpolated
+    // value, so the rest of this renderer's normal per-property parsing (ParseLength, ParseColor,
+    // ...) never has to know a transition is even happening - it just sees whatever value would
+    // otherwise be in the map, substituted for the eased in-between one. A no-op (and effectively
+    // free - one ConditionalWeakTable lookup) for the overwhelming majority of documents, which
+    // were never wired up for interactive use via IBrowsingContext.GetDomHarness() at all.
+    private static void ApplyActiveTransitionOverrides(Dictionary<string, string> map, IElement? element)
+    {
+        if (element?.Owner is null || !element.Owner.Context.TryGetDomHarness(out var harness) || harness is null)
+        {
+            return;
+        }
+
+        foreach (var property in map.Keys.ToArray())
+        {
+            var transitioningValue = harness.GetTransitioningValue(element, property);
+
+            if (transitioningValue is not null)
+            {
+                map[property] = transitioningValue;
+            }
+        }
     }
 
     private static void AddIfPresent(Dictionary<string, string> map, string property, string? value)
@@ -5044,7 +5089,7 @@ public sealed class HtmlRenderer
         return ParseLengthValue(parsed, defaultValue, allowAuto: false);
     }
 
-    private static float ParseLengthValue(string value, float defaultValue, bool allowAuto = true)
+    internal static float ParseLengthValue(string value, float defaultValue, bool allowAuto = true)
     {
         if (allowAuto && string.Equals(value.Trim(), "auto", StringComparison.OrdinalIgnoreCase))
         {
@@ -5411,6 +5456,24 @@ public sealed class HtmlRenderer
         var x = (xComponent.Percentage * borderBoxWidth) + xComponent.OffsetPixels;
         var y = (yComponent.Percentage * borderBoxHeight) + yComponent.OffsetPixels;
         return (x, y);
+    }
+
+    /// <summary>
+    /// Parses CSS `opacity` via AngleSharp.Css's own typed `GetOpacity()` accessor - unlike
+    /// `filter`, this is an ordinary numeric property with no function-value syntax, so
+    /// AngleSharp.Css computes it normally with nothing for this renderer to work around. The CSS
+    /// initial value is `1` (fully opaque); a value outside `0..1` is clamped, per spec.
+    /// </summary>
+    private static float ParseCssOpacity(Dictionary<string, string> styleMap)
+    {
+        if (!styleMap.TryGetValue("opacity", out var value) || string.IsNullOrWhiteSpace(value))
+        {
+            return 1f;
+        }
+
+        return float.TryParse(value.Trim(), NumberStyles.Float, CultureInfo.InvariantCulture, out var opacity)
+            ? Math.Clamp(opacity, 0f, 1f)
+            : 1f;
     }
 
     /// <summary>
@@ -5978,7 +6041,7 @@ public sealed class HtmlRenderer
         return rawValue[(opening + 1)..closing].Trim();
     }
 
-    private static string[] SplitTopLevelCommaList(string value)
+    internal static string[] SplitTopLevelCommaList(string value)
     {
         if (string.IsNullOrWhiteSpace(value))
         {
@@ -6165,7 +6228,7 @@ public sealed class HtmlRenderer
         return TryParseAngle(value, out var angle) ? angle : 0f;
     }
 
-    private static RenderColor ParseColor(string? rawColor, RenderColor fallback)
+    internal static RenderColor ParseColor(string? rawColor, RenderColor fallback)
     {
         if (string.IsNullOrWhiteSpace(rawColor))
         {

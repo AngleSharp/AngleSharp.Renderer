@@ -13,6 +13,8 @@ internal sealed class InteractiveHtmlRendererState : IDomHarness
 {
     private readonly ConditionalWeakTable<IElement, ElementInteractionState> _elementStates = new();
     private readonly HtmlRenderer _renderer;
+    private readonly List<IElement> _forcedHoverChain = [];
+    private readonly CssTransitionTracker _transitionTracker = new();
     private IElement? _hoveredElement;
     private (double X, double Y) _mousePosition;
 
@@ -148,8 +150,62 @@ internal sealed class InteractiveHtmlRendererState : IDomHarness
         }
 
         _hoveredElement = nextHovered;
+        UpdateForcedHoverChain(nextHovered);
         PaintInvalidated?.Invoke(this, EventArgs.Empty);
         return true;
+    }
+
+    // AngleSharp.Css's `SetPseudoClass` forces `:hover` for exactly the element it is called on -
+    // it deliberately does not propagate to ancestors (see AngleSharp.Css's own
+    // PseudoClassForcingTests.ForcingIsExplicitAndDoesNotPropagateToAncestors), unlike how a real
+    // pointer device makes every ancestor of the physically-hovered element match `:hover` too
+    // (`.card:hover .title` relies on this). So this renderer has to walk the ancestor chain
+    // itself and force each element individually, then clear the previous chain when the hovered
+    // element changes - there is no document-wide "clear every forced :hover" API to lean on
+    // instead, so this class tracks exactly which elements it forced.
+    private void UpdateForcedHoverChain(IElement? nextHovered)
+    {
+        var previousChain = _forcedHoverChain.ToList();
+        var newChain = new List<IElement>();
+        var probe = nextHovered;
+
+        while (probe is not null)
+        {
+            newChain.Add(probe);
+            probe = probe.ParentElement;
+        }
+
+        var affectedElements = previousChain.Union(newChain).ToList();
+
+        // Snapshot each affected element's *current* (pre-change) natural value before the
+        // pseudo-class mutation below - once :hover is forced/removed, there is no way to ask
+        // AngleSharp.Css what the value used to be, so a freshly-starting transition (nothing
+        // already in flight for that element/property) would otherwise have no "from" value to
+        // animate away from and would jump straight to the new state instead.
+        _transitionTracker.CaptureNaturalValuesBeforeChange(affectedElements);
+
+        foreach (var element in _forcedHoverChain)
+        {
+            element.RemovePseudoClass("hover");
+        }
+
+        _forcedHoverChain.Clear();
+
+        var current = nextHovered;
+
+        while (current is not null)
+        {
+            current.SetPseudoClass("hover");
+            _forcedHoverChain.Add(current);
+            current = current.ParentElement;
+        }
+
+        // Every element that either lost or gained :hover may now have a different natural
+        // computed style than a moment ago - re-evaluate them all for CSS `transition`s that
+        // should start animating toward that new style (the union, since an element leaving
+        // :hover needs its own "fade back to resting" transition considered too, not just the
+        // newly-hovered chain's "fade in").
+        _transitionTracker.NotifyElementsMayHaveChanged(affectedElements);
     }
 
     private static IElement? FindTopMostElementAt(IReadOnlyDictionary<IElement, HtmlRenderer.ElementLayoutMetrics> metrics, double x, double y)
@@ -184,6 +240,20 @@ internal sealed class InteractiveHtmlRendererState : IDomHarness
         }
 
         return depth;
+    }
+
+    public void AdvanceTime(TimeSpan delta)
+    {
+        _transitionTracker.AdvanceTime(delta);
+        PaintInvalidated?.Invoke(this, EventArgs.Empty);
+    }
+
+    public string? GetTransitioningValue(IElement element, string property)
+    {
+        ArgumentNullException.ThrowIfNull(element);
+        ArgumentNullException.ThrowIfNull(property);
+
+        return _transitionTracker.GetTransitioningValue(element, property);
     }
 
     public RenderedImage PaintToPng()

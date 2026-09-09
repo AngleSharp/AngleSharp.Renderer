@@ -80,6 +80,21 @@ public sealed class DisplayList
     public void PushFilter(IReadOnlyList<RenderFilterFunction> functions) => Add(new PushFilterCommand(functions));
 
     /// <summary>
+    /// Begins compositing every command up to the matching <see cref="PopOpacity"/> as one
+    /// semi-transparent group (CSS `opacity`) - background, border, outline, and children all
+    /// blend together at <paramref name="alpha"/> as a unit, rather than each individually becoming
+    /// partly transparent (which would let overlapping children show through each other at the
+    /// seams). Pairs must nest like a stack, matching how a backend implements this as a
+    /// save-layer/restore scope.
+    /// </summary>
+    public void PushOpacity(float alpha) => Add(new PushOpacityCommand(alpha));
+
+    /// <summary>
+    /// Ends the opacity scope started by the matching <see cref="PushOpacity"/>.
+    /// </summary>
+    public void PopOpacity() => Add(new PopOpacityCommand());
+
+    /// <summary>
     /// Ends the filter scope started by the matching <see cref="PushFilter"/>.
     /// </summary>
     public void PopFilter() => Add(new PopFilterCommand());
@@ -242,6 +257,17 @@ public sealed record PushFilterCommand(IReadOnlyList<RenderFilterFunction> Funct
 /// Ends the filter scope started by the matching <see cref="PushFilterCommand"/>.
 /// </summary>
 public sealed record PopFilterCommand : RenderCommand;
+
+/// <summary>
+/// Begins compositing every following command, up to the matching <see cref="PopOpacityCommand"/>,
+/// as one semi-transparent group at <see cref="Alpha"/> (CSS `opacity`).
+/// </summary>
+public sealed record PushOpacityCommand(float Alpha) : RenderCommand;
+
+/// <summary>
+/// Ends the opacity scope started by the matching <see cref="PushOpacityCommand"/>.
+/// </summary>
+public sealed record PopOpacityCommand : RenderCommand;
 
 /// <summary>
 /// Draws a single line of text at a baseline position.

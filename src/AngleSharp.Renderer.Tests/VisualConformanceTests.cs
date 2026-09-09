@@ -2474,6 +2474,67 @@ public sealed class VisualConformanceTests
           maxDifferentPixels: 0);
     }
 
+    [Fact]
+    public async Task RenderToPng_OpacityFadesABoxOverAWhiteBackground()
+    {
+        var document = await ParseAsync("""
+            <html>
+              <head>
+                <style>html, body { margin: 0; padding: 0; background-color: white; }</style>
+              </head>
+              <body>
+                <div style="margin:20px; width:60px; height:40px; background-color:rgb(220,50,50); opacity: 0.4;"></div>
+              </body>
+            </html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var image = renderer.RenderToPng(document, new DefaultRenderDevice
+        {
+            ViewPortWidth = 120,
+            ViewPortHeight = 100,
+        });
+
+        VisualSnapshotVerifier.VerifyOrCreate(
+          snapshotName: "opacity-fades-a-box-over-a-white-background.png",
+          actualPng: image.Data,
+          perChannelTolerance: 0,
+          maxDifferentPixels: 0);
+    }
+
+    [Fact]
+    public async Task RenderToPng_HoverTransitionShowsAnInterpolatedMidFlightFrame()
+    {
+        var renderDevice = new DefaultRenderDevice { ViewPortWidth = 120, ViewPortHeight = 100, FontSize = 16 };
+        var configuration = Configuration.Default.WithCss().WithRenderDevice(renderDevice);
+        var document = await ParseAsync("""
+            <html>
+              <head>
+                <style>
+                  html, body { margin: 0; padding: 0; background-color: white; }
+                  #target { background-color: rgb(0, 0, 255); transition: background-color 1s linear; }
+                  #target:hover { background-color: rgb(255, 0, 0); }
+                </style>
+              </head>
+              <body>
+                <div id="target" style="margin:20px; width:60px; height:40px;"></div>
+              </body>
+            </html>
+            """, configuration);
+
+        var harness = document.Context.GetDomHarness();
+        harness.MousePosition = (50, 40);
+        harness.AdvanceTime(TimeSpan.FromMilliseconds(500));
+
+        var image = harness.PaintToPng();
+
+        VisualSnapshotVerifier.VerifyOrCreate(
+          snapshotName: "hover-transition-shows-an-interpolated-mid-flight-frame.png",
+          actualPng: image.Data,
+          perChannelTolerance: 0,
+          maxDifferentPixels: 0);
+    }
+
     private static async Task<AngleSharp.Dom.IDocument> ParseAsync(string html, IConfiguration? configuration = null)
     {
         var context = BrowsingContext.New(configuration ?? Configuration.Default.WithCss());

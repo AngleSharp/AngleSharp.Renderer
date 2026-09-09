@@ -2935,6 +2935,285 @@ public sealed class HtmlRendererTests
         Assert.Equal(0f, fill.Rect.Y);
     }
 
+    [Fact]
+    public async Task MousePosition_OverAnElementForcesItToMatchHover()
+    {
+        var renderDevice = new DefaultRenderDevice { ViewPortWidth = 200, ViewPortHeight = 100, FontSize = 16 };
+        var configuration = Configuration.Default.WithCss().WithRenderDevice(renderDevice);
+        var document = await ParseAsync("""
+            <html><head><style>html, body { margin: 0; padding: 0; }</style></head><body>
+                <div id="target" style="width:60px; height:40px;"></div>
+            </body></html>
+            """, configuration);
+        var target = document.GetElementById("target")!;
+        var harness = document.Context.GetDomHarness();
+
+        Assert.False(target.Matches(":hover"));
+
+        harness.MousePosition = (30, 20);
+
+        Assert.True(target.Matches(":hover"));
+
+        harness.MousePosition = (150, 80);
+
+        Assert.False(target.Matches(":hover"));
+    }
+
+    [Fact]
+    public async Task MousePosition_OverANestedElementForcesHoverOnTheWholeAncestorChain()
+    {
+        // A real pointer device makes every ancestor of the physically-hovered element match
+        // :hover too (`.card:hover .title` relies on this) - not just the innermost hit target.
+        var renderDevice = new DefaultRenderDevice { ViewPortWidth = 200, ViewPortHeight = 100, FontSize = 16 };
+        var configuration = Configuration.Default.WithCss().WithRenderDevice(renderDevice);
+        var document = await ParseAsync("""
+            <html><head><style>html, body { margin: 0; padding: 0; }</style></head><body>
+                <div id="parent" style="width:80px; height:60px;">
+                    <span id="child" style="display:inline-block; width:30px; height:20px;"></span>
+                </div>
+                <div id="sibling" style="width:80px; height:20px;"></div>
+            </body></html>
+            """, configuration);
+        var parent = document.GetElementById("parent")!;
+        var child = document.GetElementById("child")!;
+        var sibling = document.GetElementById("sibling")!;
+        var harness = document.Context.GetDomHarness();
+
+        harness.MousePosition = (10, 10);
+
+        Assert.True(child.Matches(":hover"));
+        Assert.True(parent.Matches(":hover"));
+        Assert.False(sibling.Matches(":hover"));
+    }
+
+    [Fact]
+    public async Task MousePosition_ChangingHoverTargetClearsThePreviousForcedChain()
+    {
+        var renderDevice = new DefaultRenderDevice { ViewPortWidth = 200, ViewPortHeight = 100, FontSize = 16 };
+        var configuration = Configuration.Default.WithCss().WithRenderDevice(renderDevice);
+        var document = await ParseAsync("""
+            <html><head><style>html, body { margin: 0; padding: 0; }</style></head><body>
+                <div id="first" style="width:60px; height:40px;"></div>
+                <div id="second" style="width:60px; height:40px;"></div>
+            </body></html>
+            """, configuration);
+        var first = document.GetElementById("first")!;
+        var second = document.GetElementById("second")!;
+        var harness = document.Context.GetDomHarness();
+
+        harness.MousePosition = (30, 20);
+        Assert.True(first.Matches(":hover"));
+
+        harness.MousePosition = (30, 60);
+
+        Assert.False(first.Matches(":hover"));
+        Assert.True(second.Matches(":hover"));
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_HoverStateChangesRenderedBackgroundColor()
+    {
+        var renderDevice = new DefaultRenderDevice { ViewPortWidth = 200, ViewPortHeight = 100, FontSize = 16 };
+        var configuration = Configuration.Default.WithCss().WithRenderDevice(renderDevice);
+        var document = await ParseAsync("""
+            <html><head><style>
+                html, body { margin: 0; padding: 0; }
+                #target { background-color: rgb(0, 0, 255); }
+                #target:hover { background-color: rgb(255, 0, 0); }
+            </style></head><body>
+                <div id="target" style="width:60px; height:40px;"></div>
+            </body></html>
+            """, configuration);
+        var harness = document.Context.GetDomHarness();
+        var renderer = new HtmlRenderer();
+
+        var restingDisplayList = renderer.BuildDisplayList(document, renderDevice);
+        Assert.Single(restingDisplayList.Commands.OfType<FillRectCommand>().Where(f => f.Color.Equals(new RenderColor(0, 0, 255))));
+
+        harness.MousePosition = (30, 20);
+
+        var hoveredDisplayList = renderer.BuildDisplayList(document, renderDevice);
+        Assert.Single(hoveredDisplayList.Commands.OfType<FillRectCommand>().Where(f => f.Color.Equals(new RenderColor(255, 0, 0))));
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_HoverTransitionInterpolatesBackgroundColorOverTime()
+    {
+        var renderDevice = new DefaultRenderDevice { ViewPortWidth = 200, ViewPortHeight = 100, FontSize = 16 };
+        var configuration = Configuration.Default.WithCss().WithRenderDevice(renderDevice);
+        var document = await ParseAsync("""
+            <html><head><style>
+                html, body { margin: 0; padding: 0; }
+                #target { background-color: rgb(0, 0, 255); transition: background-color 1s linear; }
+                #target:hover { background-color: rgb(255, 0, 0); }
+            </style></head><body>
+                <div id="target" style="width:60px; height:40px;"></div>
+            </body></html>
+            """, configuration);
+        var harness = document.Context.GetDomHarness();
+        var renderer = new HtmlRenderer();
+
+        RenderColor CurrentColor()
+        {
+            var displayList = renderer.BuildDisplayList(document, renderDevice);
+            var fill = Assert.Single(displayList.Commands.OfType<FillRectCommand>().Where(f => f.Rect.Width == 60f && f.Rect.Height == 40f));
+            return fill.Color;
+        }
+
+        harness.MousePosition = (30, 20);
+
+        // The very first frame after hover starts still shows the resting color - the transition
+        // has not advanced yet (no AdvanceTime call has happened), matching how a real transition
+        // never jumps straight to its end value on the same frame it started.
+        Assert.Equal(new RenderColor(0, 0, 255), CurrentColor());
+
+        harness.AdvanceTime(TimeSpan.FromMilliseconds(500));
+        Assert.Equal(new RenderColor(128, 0, 128), CurrentColor());
+
+        harness.AdvanceTime(TimeSpan.FromMilliseconds(500));
+        Assert.Equal(new RenderColor(255, 0, 0), CurrentColor());
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_TransitionReversesSmoothlyFromItsCurrentMidFlightValue()
+    {
+        var renderDevice = new DefaultRenderDevice { ViewPortWidth = 200, ViewPortHeight = 100, FontSize = 16 };
+        var configuration = Configuration.Default.WithCss().WithRenderDevice(renderDevice);
+        var document = await ParseAsync("""
+            <html><head><style>
+                html, body { margin: 0; padding: 0; }
+                #target { background-color: rgb(0, 0, 255); transition: background-color 1s linear; }
+                #target:hover { background-color: rgb(255, 0, 0); }
+            </style></head><body>
+                <div id="target" style="width:60px; height:40px;"></div>
+                <div id="elsewhere" style="width:60px; height:40px;"></div>
+            </body></html>
+            """, configuration);
+        var harness = document.Context.GetDomHarness();
+        var renderer = new HtmlRenderer();
+
+        RenderColor CurrentColor()
+        {
+            var displayList = renderer.BuildDisplayList(document, renderDevice);
+            var fill = Assert.Single(displayList.Commands.OfType<FillRectCommand>().Where(f => f.Rect.Width == 60f && f.Rect.Height == 40f && f.Rect.Y < 40f));
+            return fill.Color;
+        }
+
+        harness.MousePosition = (30, 20);
+        harness.AdvanceTime(TimeSpan.FromMilliseconds(500));
+        Assert.Equal(new RenderColor(128, 0, 128), CurrentColor());
+
+        // Move away mid-flight - the reverse transition (back toward blue) must start from the
+        // purple currently on screen, not jump back to blue and re-fade, and not jump straight to
+        // blue either.
+        harness.MousePosition = (30, 60);
+        var justReversed = CurrentColor();
+        Assert.Equal(new RenderColor(128, 0, 128), justReversed);
+
+        // The reversed transition restarts with its own full declared duration from the value
+        // currently on screen (purple), rather than "picking up" some remaining fraction of the
+        // original 1s - so it takes a full second from here, not just the 500ms that would have
+        // finished the original hover-in transition.
+        harness.AdvanceTime(TimeSpan.FromMilliseconds(1000));
+        Assert.Equal(new RenderColor(0, 0, 255), CurrentColor());
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_TransitionDelayPostponesTheStartOfInterpolation()
+    {
+        var renderDevice = new DefaultRenderDevice { ViewPortWidth = 200, ViewPortHeight = 100, FontSize = 16 };
+        var configuration = Configuration.Default.WithCss().WithRenderDevice(renderDevice);
+        var document = await ParseAsync("""
+            <html><head><style>
+                html, body { margin: 0; padding: 0; }
+                #target { background-color: rgb(0, 0, 255); transition: background-color 1s linear 0.5s; }
+                #target:hover { background-color: rgb(255, 0, 0); }
+            </style></head><body>
+                <div id="target" style="width:60px; height:40px;"></div>
+            </body></html>
+            """, configuration);
+        var harness = document.Context.GetDomHarness();
+        var renderer = new HtmlRenderer();
+
+        RenderColor CurrentColor()
+        {
+            var displayList = renderer.BuildDisplayList(document, renderDevice);
+            var fill = Assert.Single(displayList.Commands.OfType<FillRectCommand>().Where(f => f.Rect.Width == 60f && f.Rect.Height == 40f));
+            return fill.Color;
+        }
+
+        harness.MousePosition = (30, 20);
+        harness.AdvanceTime(TimeSpan.FromMilliseconds(400));
+
+        // Still within the 500ms delay - no interpolation has started yet.
+        Assert.Equal(new RenderColor(0, 0, 255), CurrentColor());
+
+        harness.AdvanceTime(TimeSpan.FromMilliseconds(600));
+
+        // 1000ms elapsed total, 500ms of which was delay - 500ms into the 1000ms duration = halfway.
+        Assert.Equal(new RenderColor(128, 0, 128), CurrentColor());
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_NoTransitionDeclaredJumpsStraightToTheHoverStyle()
+    {
+        var renderDevice = new DefaultRenderDevice { ViewPortWidth = 200, ViewPortHeight = 100, FontSize = 16 };
+        var configuration = Configuration.Default.WithCss().WithRenderDevice(renderDevice);
+        var document = await ParseAsync("""
+            <html><head><style>
+                html, body { margin: 0; padding: 0; }
+                #target { background-color: rgb(0, 0, 255); }
+                #target:hover { background-color: rgb(255, 0, 0); }
+            </style></head><body>
+                <div id="target" style="width:60px; height:40px;"></div>
+            </body></html>
+            """, configuration);
+        var harness = document.Context.GetDomHarness();
+        var renderer = new HtmlRenderer();
+
+        harness.MousePosition = (30, 20);
+
+        var displayList = renderer.BuildDisplayList(document, renderDevice);
+        var fill = Assert.Single(displayList.Commands.OfType<FillRectCommand>().Where(f => f.Rect.Width == 60f && f.Rect.Height == 40f));
+        Assert.Equal(new RenderColor(255, 0, 0), fill.Color);
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_HoverTransitionInterpolatesWidthAsANumericLength()
+    {
+        var renderDevice = new DefaultRenderDevice { ViewPortWidth = 200, ViewPortHeight = 100, FontSize = 16 };
+        var configuration = Configuration.Default.WithCss().WithRenderDevice(renderDevice);
+        var document = await ParseAsync("""
+            <html><head><style>
+                html, body { margin: 0; padding: 0; }
+                #target { width: 40px; height: 40px; background-color: rgb(0, 0, 255); transition: width 1s linear; }
+                #target:hover { width: 80px; }
+            </style></head><body>
+                <div id="target"></div>
+            </body></html>
+            """, configuration);
+        var harness = document.Context.GetDomHarness();
+        var renderer = new HtmlRenderer();
+
+        float CurrentWidth()
+        {
+            var displayList = renderer.BuildDisplayList(document, renderDevice);
+            var fill = Assert.Single(displayList.Commands.OfType<FillRectCommand>().Where(f => f.Color.Equals(new RenderColor(0, 0, 255))));
+            return fill.Rect.Width;
+        }
+
+        Assert.Equal(40f, CurrentWidth());
+
+        harness.MousePosition = (30, 20);
+        harness.AdvanceTime(TimeSpan.FromMilliseconds(500));
+
+        Assert.Equal(60f, CurrentWidth(), precision: 2);
+
+        harness.AdvanceTime(TimeSpan.FromMilliseconds(500));
+
+        Assert.Equal(80f, CurrentWidth(), precision: 2);
+    }
+
     [Theory]
     [InlineData("text")]
     [InlineData("number")]
@@ -3763,6 +4042,103 @@ public sealed class HtmlRendererTests
         Assert.True(pushTransformIndex < pushFilterIndex);
         Assert.True(pushFilterIndex < popFilterIndex);
         Assert.True(popFilterIndex < popTransformIndex);
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_FullyOpaqueProducesNoPushOrPopOpacityCommands()
+    {
+        var document = await ParseAsync("""
+            <html><body>
+                <div style="width:10px; height:10px; opacity: 1;"></div>
+                <div style="width:10px; height:10px;"></div>
+            </body></html>
+            """);
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, new DefaultRenderDevice { ViewPortWidth = 200, ViewPortHeight = 200 });
+        Assert.Empty(displayList.Commands.OfType<PushOpacityCommand>());
+        Assert.Empty(displayList.Commands.OfType<PopOpacityCommand>());
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_PartialOpacityProducesPushOpacityWithTheParsedAlpha()
+    {
+        var document = await ParseAsync("""
+            <html><body>
+                <div style="width:10px; height:10px; opacity: 0.4;"></div>
+            </body></html>
+            """);
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, new DefaultRenderDevice { ViewPortWidth = 200, ViewPortHeight = 200 });
+        var push = Assert.Single(displayList.Commands.OfType<PushOpacityCommand>());
+        Assert.Equal(0.4f, push.Alpha, precision: 3);
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_OpacityOutOfRangeIsClampedToZeroToOne()
+    {
+        var document = await ParseAsync("""
+            <html><body>
+                <div id="over" style="width:10px; height:10px; opacity: 2;"></div>
+                <div id="under" style="width:10px; height:10px; opacity: -1;"></div>
+            </body></html>
+            """);
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, new DefaultRenderDevice { ViewPortWidth = 200, ViewPortHeight = 200 });
+
+        // opacity: 2 clamps to 1 (fully opaque), which produces no push/pop at all (same as
+        // unspecified) - only opacity: -1 (clamped to 0) should push.
+        var push = Assert.Single(displayList.Commands.OfType<PushOpacityCommand>());
+        Assert.Equal(0f, push.Alpha, precision: 3);
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_OpacityWrapsBackgroundBorderAndChildrenTogether()
+    {
+        var document = await ParseAsync("""
+            <html><body>
+                <div style="width:40px; height:20px; background-color:#ff0000; border:2px solid #0000ff; opacity: 0.5;">
+                    <span style="display:inline-block; width:4px; height:4px; background-color:#00ff00;"></span>
+                </div>
+            </body></html>
+            """);
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, new DefaultRenderDevice { ViewPortWidth = 200, ViewPortHeight = 200 });
+        var commands = displayList.Commands.ToList();
+
+        var pushIndex = commands.FindIndex(c => c is PushOpacityCommand);
+        var popIndex = commands.FindIndex(c => c is PopOpacityCommand);
+        var backgroundIndex = commands.FindIndex(c => c is FillRectCommand f && f.Color.Equals(new RenderColor(255, 0, 0)));
+        var childIndex = commands.FindIndex(c => c is FillRectCommand f && f.Color.Equals(new RenderColor(0, 255, 0)));
+
+        Assert.True(pushIndex >= 0 && popIndex > pushIndex);
+        Assert.True(backgroundIndex > pushIndex && backgroundIndex < popIndex);
+        Assert.True(childIndex > pushIndex && childIndex < popIndex);
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_TransformOpacityAndFilterNestInOpacityBetweenTransformAndFilter()
+    {
+        var document = await ParseAsync("""
+            <html><body>
+                <div style="width:10px; height:10px; transform: scale(1.5); opacity: 0.5; filter: grayscale(1);"></div>
+            </body></html>
+            """);
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, new DefaultRenderDevice { ViewPortWidth = 200, ViewPortHeight = 200 });
+        var commands = displayList.Commands.ToList();
+
+        var pushTransformIndex = commands.FindIndex(c => c is PushTransformCommand);
+        var pushOpacityIndex = commands.FindIndex(c => c is PushOpacityCommand);
+        var pushFilterIndex = commands.FindIndex(c => c is PushFilterCommand);
+        var popFilterIndex = commands.FindIndex(c => c is PopFilterCommand);
+        var popOpacityIndex = commands.FindIndex(c => c is PopOpacityCommand);
+        var popTransformIndex = commands.FindIndex(c => c is PopTransformCommand);
+
+        Assert.True(pushTransformIndex < pushOpacityIndex);
+        Assert.True(pushOpacityIndex < pushFilterIndex);
+        Assert.True(pushFilterIndex < popFilterIndex);
+        Assert.True(popFilterIndex < popOpacityIndex);
+        Assert.True(popOpacityIndex < popTransformIndex);
     }
 
     // Mirrors the private HtmlRenderer.FormControlAccentColor constant (26, 115, 232) - kept as an
