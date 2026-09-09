@@ -10,11 +10,14 @@ using System.Threading;
 using AngleSharp;
 using AngleSharp.Css;
 using AngleSharp.Css.Dom;
+using AngleSharp.Css.Parser;
 using AngleSharp.Css.RenderTree;
+using AngleSharp.Css.Values;
 using AngleSharp.Dom;
 using AngleSharp.Io;
 using AngleSharp.Renderer.Rendering;
 using AngleSharp.Renderer.Skia;
+using AngleSharp.Text;
 
 using SkiaSharp;
 
@@ -1029,8 +1032,20 @@ public sealed class HtmlRenderer
             paddingBottom);
 
         var clipsOverflow = ShouldClipOverflow(styleMap);
+        var transform = ParseCssTransform(styleMap, borderBoxX, borderBoxY, borderBoxWidth, borderBoxHeight, currentTextStyle.FontSize);
+        var hasTransform = !transform.IsIdentity;
 
         var boxPaintBuffer = new DisplayList();
+
+        // A transform applies to the whole element - background, border, outline, and every
+        // descendant all paint under it - so its push has to be the very first thing in this
+        // element's own paint scope, wrapping even the background (unlike the overflow clip below,
+        // which per spec explicitly excludes the border/outline it is nested inside).
+        if (hasTransform)
+        {
+            boxPaintBuffer.PushTransform(transform);
+        }
+
         PaintBackground(boxPaintBuffer, box.BackgroundPaint, borderBoxX, borderBoxY, borderBoxWidth, borderBoxHeight, box.BorderRadius);
         PaintBoxShadows(boxPaintBuffer, box.BoxShadows, borderBoxX, borderBoxY, borderBoxWidth, borderBoxHeight, box.BorderRadius);
         PaintBorder(boxPaintBuffer, box.BorderColor, borderBoxX, borderBoxY, borderBoxWidth, borderBoxHeight, box.BorderWidth, box.BorderRadius);
@@ -1060,6 +1075,13 @@ public sealed class HtmlRenderer
         if (clipsOverflow)
         {
             displayList.PopClip();
+        }
+
+        // Closes the transform scope opened above, once children (and, for a replaced element, its
+        // image) have all been emitted - the outermost scope, since it was also the first pushed.
+        if (hasTransform)
+        {
+            displayList.PopTransform();
         }
 
         if (isFloatLeft)
@@ -2849,6 +2871,13 @@ public sealed class HtmlRenderer
                 element.SetAttribute("data-render-gradient", gradientValue);
             }
 
+            if (TryExtractTransformDeclaration(currentStyle, out var transformValue, out updatedStyle))
+            {
+                currentStyle = updatedStyle;
+                changed = true;
+                element.SetAttribute("data-render-transform", transformValue);
+            }
+
             if (TryExtractGridDeclarations(currentStyle, out var gridValues, out updatedStyle))
             {
                 currentStyle = updatedStyle;
@@ -2907,6 +2936,66 @@ public sealed class HtmlRenderer
         }
 
         if (string.IsNullOrWhiteSpace(gradientValue))
+        {
+            return false;
+        }
+
+        updatedStyle = string.Join(";", remaining);
+        return true;
+    }
+
+    /// <summary>
+    /// Extracts a `transform` declaration out of an inline `style` attribute before AngleSharp.Css
+    /// ever sees it, the same "extract to a data-render-* attribute" workaround
+    /// <see cref="TryExtractGradientBackground"/> already established for gradient
+    /// `background-image` values - except here the workaround is for a genuine upstream crash, not
+    /// an unsupported-value gap: AngleSharp.Css 1.1.0's own `CssTranslateValue.Compute()` throws a
+    /// `NullReferenceException` - confirmed via a failing test with a minimal repro, not assumed -
+    /// for *any* `translate`/`translateX`/`translateY` function, and that crash happens eagerly
+    /// while building the render tree (`RenderTreeBuilder.RenderElement` computing the *entire*
+    /// style declaration at once), before this renderer's own code ever runs. Extraction therefore
+    /// has to happen unconditionally for every `transform` declaration - not only ones containing
+    /// `translate` - both to keep this single code path simple and because relying on exactly
+    /// which other functions are crash-free would be fragile against a future AngleSharp.Css
+    /// version. `rotate()`/`scale()` were separately confirmed *not* to crash, but are extracted
+    /// the same way regardless, for that same reason.
+    /// </summary>
+    private static bool TryExtractTransformDeclaration(string styleAttribute, out string transformValue, out string updatedStyle)
+    {
+        transformValue = string.Empty;
+        updatedStyle = styleAttribute;
+
+        if (!styleAttribute.Contains("transform", StringComparison.OrdinalIgnoreCase))
+        {
+            return false;
+        }
+
+        var declarations = styleAttribute.Split(';', StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries);
+        var remaining = new List<string>();
+
+        foreach (var declaration in declarations)
+        {
+            var separator = declaration.IndexOf(':');
+            if (separator <= 0)
+            {
+                continue;
+            }
+
+            var property = declaration[..separator].Trim();
+            var value = declaration[(separator + 1)..].Trim();
+
+            // Exact match only - "transform" must not also swallow "transform-origin", which is
+            // safe to leave for AngleSharp.Css's own (uncrashing) computation.
+            if (string.Equals(property, "transform", StringComparison.OrdinalIgnoreCase))
+            {
+                transformValue = value;
+                continue;
+            }
+
+            remaining.Add(declaration);
+        }
+
+        if (string.IsNullOrWhiteSpace(transformValue))
         {
             return false;
         }
@@ -3117,6 +3206,14 @@ public sealed class HtmlRenderer
         AddIfPresent(map, "background-repeat", string.IsNullOrWhiteSpace(style.GetPropertyValue("background-repeat")) ? ParseStyleAttributeValue(inlineStyle, "background-repeat") : style.GetPropertyValue("background-repeat"));
         AddIfPresent(map, "background-position", string.IsNullOrWhiteSpace(style.GetPropertyValue("background-position")) ? ParseStyleAttributeValue(inlineStyle, "background-position") : style.GetPropertyValue("background-position"));
         AddIfPresent(map, "background-size", string.IsNullOrWhiteSpace(style.GetPropertyValue("background-size")) ? ParseStyleAttributeValue(inlineStyle, "background-size") : style.GetPropertyValue("background-size"));
+        // Never read from AngleSharp.Css's own computed `transform` (nor even the raw inline style,
+        // since PrepareDocumentForRendering has already stripped it out by this point) -
+        // TryExtractTransformDeclaration moves the raw value to `data-render-transform` before
+        // AngleSharp.Css ever computes anything, working around a confirmed upstream crash in its
+        // `CssTranslateValue.Compute()`. See TryExtractTransformDeclaration's own remarks.
+        var rawTransformValue = element?.GetAttribute("data-render-transform");
+        AddIfPresent(map, "transform", rawTransformValue);
+        AddIfPresent(map, "transform-origin", string.IsNullOrWhiteSpace(style.GetPropertyValue("transform-origin")) ? ParseStyleAttributeValue(inlineStyle, "transform-origin") : style.GetPropertyValue("transform-origin"));
         AddIfPresent(map, "font-size", style.GetFontSize());
         AddIfPresent(map, "font-family", style.GetFontFamily());
         AddIfPresent(map, "font-weight", style.GetPropertyValue("font-weight"));
@@ -5107,6 +5204,188 @@ public sealed class HtmlRenderer
         }
 
         return RenderBackgroundPositionComponent.Zero;
+    }
+
+    /// <summary>
+    /// Parses the CSS `transform` property plus `transform-origin` into a single, fully-resolved
+    /// <see cref="RenderTransform2D"/> - delegating each individual transform function's own
+    /// parsing and matrix computation entirely to AngleSharp.Css's own
+    /// <see cref="TransformParser"/>/<see cref="ICssTransformFunctionValue.ComputeMatrix"/>,
+    /// rather than re-implementing CSS transform function parsing, length/percentage/angle
+    /// resolution, or the underlying trigonometry in this renderer. This method's own
+    /// responsibility is limited to: looping <see cref="TransformParser.ParseTransform"/> across
+    /// the space-separated function list (it parses one function per call and advances the source
+    /// itself - including skipping the whitespace between calls, confirmed empirically rather than
+    /// assumed - returning <see langword="null"/> cleanly once the source is exhausted, which is
+    /// what ends the loop), multiplying the resulting per-function matrices together in CSS's own
+    /// left-to-right composition order (see <see cref="RenderTransform2D.Multiply"/>), converting
+    /// AngleSharp.Css's own <see cref="TransformMatrix"/> into this renderer's flat 2D `a,b,c,d,e,f`
+    /// representation (see <see cref="ConvertToRenderTransform"/> for the exact field mapping,
+    /// which is not the naive one), and wrapping the composed result around `transform-origin` -
+    /// AngleSharp.Css's own `ComputeMatrix` takes no origin parameter, so that translate/apply/
+    /// translate-back is this renderer's to do regardless of how the individual functions resolve.
+    ///
+    /// Resolved eagerly here (unlike a gradient's or background-image's own paint-time-deferred
+    /// geometry) because a transform's inputs - percentage `translate()` values, the default
+    /// `transform-origin` - only ever need the element's own already-known border-box dimensions,
+    /// never anything (like an image's natural size) that is not available until paint time.
+    ///
+    /// This renderer never special-cases individual transform functions or guards against
+    /// AngleSharp.Css bugs locally - `ConvertToRenderTransform` always trusts whatever
+    /// <see cref="ICssTransformFunctionValue.ComputeMatrix"/> returns, unconditionally. A
+    /// `TransformMatrix` is a genuinely general matrix regardless of which function produced it;
+    /// for a function whose own effect is entirely 2D, the third dimension simply stays at its own
+    /// identity value, so there is nothing to specialize for a "2D case" - the same six components
+    /// (M11/M12/M21/M22/Tx/Ty) are read the same way for every function. Any bug in what
+    /// AngleSharp.Css itself computes for a given function is AngleSharp.Css's own bug to fix -
+    /// this renderer reports and reproduces it there (with a failing test in that project's own
+    /// suite) rather than working around it here, matching this project's own "we do not touch the
+    /// CSS ourselves" policy. `translate`/`translateX`/`translateY` need one exception to "just call
+    /// AngleSharp.Css normally", though: the raw value is parsed directly here rather than through
+    /// AngleSharp.Css's own computed-style cascade, because that cascade path has a separate,
+    /// confirmed crash for exactly those three functions - see `TryExtractTransformDeclaration`'s
+    /// own remarks for why that cascade path has to be avoided entirely, independent of this method.
+    ///
+    /// `TransformParser` is AngleSharp.Css's own general-purpose transform-function parser and
+    /// recognizes 3D functions (`translate3d`, `rotate3d`, `matrix3d`, `perspective`, ...) too -
+    /// this method does not filter them out before parsing. For one of them, `translateZ`,
+    /// `ComputeMatrix`'s 2D component (M11/M12/M21/M22/Tx/Ty) happens to come back as pure identity
+    /// (only its Z-only shift is non-zero, which this renderer never reads), so it is harmlessly a
+    /// no-op through the exact same path real 2D functions use - confirmed with a structural test,
+    /// not assumed. A 3D function whose effect genuinely depends on a Z axis this renderer has no
+    /// projection for at all (`rotate3d`, `perspective`, ...) would not be meaningfully
+    /// representable even with a bug-free `ComputeMatrix`; this renderer's flat, backend-agnostic
+    /// display list simply has no camera/projection concept to give such a function real meaning -
+    /// a deliberate, permanent scope cut, unrelated to any upstream bug.
+    /// </summary>
+    private static RenderTransform2D ParseCssTransform(Dictionary<string, string> styleMap, float borderBoxX, float borderBoxY, float borderBoxWidth, float borderBoxHeight, float fontSize)
+    {
+        if (!styleMap.TryGetValue("transform", out var value) ||
+            string.IsNullOrWhiteSpace(value) ||
+            string.Equals(value.Trim(), "none", StringComparison.OrdinalIgnoreCase))
+        {
+            return RenderTransform2D.Identity;
+        }
+
+        var dimensions = new CssTransformRenderDimensions(borderBoxWidth, borderBoxHeight, fontSize);
+        var source = new StringSource(value);
+        var functionsMatrix = RenderTransform2D.Identity;
+
+        while (TransformParser.ParseTransform(source) is { } functionValue)
+        {
+            var next = ConvertToRenderTransform(functionValue, dimensions);
+            functionsMatrix = RenderTransform2D.Multiply(functionsMatrix, next);
+        }
+
+        if (functionsMatrix.IsIdentity)
+        {
+            return RenderTransform2D.Identity;
+        }
+
+        // transform-origin shifts the whole composed function chain to pivot around a point other
+        // than the box's own top-left corner (the origin every individual function's matrix
+        // otherwise implicitly pivots/scales/skews around): translate to the origin, apply the
+        // functions, translate back. The origin itself is resolved relative to the box (a fraction/
+        // offset of its own width/height), but PushTransformCommand's matrix is concatenated onto
+        // the canvas *before* any of this element's own commands run - which still carry their
+        // ordinary absolute page coordinates (borderBoxX/Y, not box-local 0..width/0..height) - so
+        // the pivot point has to be expressed in that same absolute space (borderBoxX/Y + the
+        // relative origin), not just the relative offset within the box. Getting this wrong was a
+        // real bug caught while building this feature: verified by hand-checking the resulting
+        // matrix against a box positioned away from the page origin, where a box-relative-only
+        // pivot rotated the box around the wrong point entirely (only appearing correct for a box
+        // that happened to sit at page position (0, 0), where relative and absolute coincide).
+        var (originOffsetX, originOffsetY) = ParseTransformOrigin(styleMap, borderBoxWidth, borderBoxHeight);
+        var originX = borderBoxX + originOffsetX;
+        var originY = borderBoxY + originOffsetY;
+        var toOrigin = RenderTransform2D.Translate(originX, originY);
+        var fromOrigin = RenderTransform2D.Translate(-originX, -originY);
+        return RenderTransform2D.Multiply(toOrigin, RenderTransform2D.Multiply(functionsMatrix, fromOrigin));
+    }
+
+    /// <summary>
+    /// Converts one already-parsed CSS transform function's own <see cref="TransformMatrix"/> into
+    /// this renderer's flat 2D <see cref="RenderTransform2D"/>, unconditionally - this renderer
+    /// always trusts the matrix AngleSharp.Css computes directly, with no NaN/exception guarding
+    /// and no 2D-vs-3D special-casing of its own. A <see cref="TransformMatrix"/> is a genuinely
+    /// general matrix regardless of which CSS function produced it; for a function whose own effect
+    /// is entirely 2D, the third dimension simply stays at its own identity value, so reading off
+    /// the same six 2D-relevant components (M11/M12/M21/M22/Tx/Ty) works uniformly for every
+    /// function - there is nothing here for this renderer to specialize. Any bug in what
+    /// AngleSharp.Css itself computes belongs to AngleSharp.Css, not to a defensive workaround in
+    /// this method - report and fix it there (with a reproducing test in its own suite) instead.
+    /// </summary>
+    private static RenderTransform2D ConvertToRenderTransform(ICssTransformFunctionValue functionValue, IRenderDimensions dimensions)
+    {
+        var matrix = functionValue.ComputeMatrix(dimensions);
+
+        // AngleSharp.Css's TransformMatrix uses a row-vector convention -
+        // x' = M11*x + M12*y + Tx, y' = M21*x + M22*y + Ty - which is *not* the naive mapping onto
+        // CSS's own column-vector matrix(a,b,c,d,e,f) (x' = a*x + c*y + e, y' = b*x + d*y + f) a
+        // reader might expect. Verified empirically (not assumed) against a known skew(10deg,5deg)
+        // result: M12 came back as tan(10deg) - the coefficient of y in the x' equation, i.e. CSS's
+        // "c" - and M21 came back as tan(5deg) - the coefficient of x in the y' equation, i.e. CSS's
+        // "b" - the opposite of what matching M12 to "b" and M21 to "c" by position would give.
+        return new RenderTransform2D(
+            (float)matrix.M11,
+            (float)matrix.M21,
+            (float)matrix.M12,
+            (float)matrix.M22,
+            (float)matrix.Tx,
+            (float)matrix.Ty);
+    }
+
+    private readonly struct CssTransformRenderDimensions(double renderWidth, double renderHeight, double fontSize) : IRenderDimensions
+    {
+        public double RenderWidth { get; } = renderWidth;
+
+        public double RenderHeight { get; } = renderHeight;
+
+        public double FontSize { get; } = fontSize;
+    }
+
+    /// <summary>
+    /// Parses `transform-origin` into pixel coordinates relative to the element's own border box -
+    /// the CSS initial value, "50% 50%", is the box's own center. Reuses `ParsePositionComponent`'s
+    /// keyword/percentage/length tokenizing (the identical single-axis grammar `background-position`
+    /// already uses: `left`/`center`/`right`/`top`/`bottom`, a percentage, or a length) rather than
+    /// re-deriving it, but resolves its `Percentage`/`OffsetPixels` breakdown with
+    /// `transform-origin`'s own formula (a position *within* the box) instead of
+    /// `background-position`'s (a position within the *remaining* space after subtracting the
+    /// image's own size) - the two properties share a grammar but not a resolution formula.
+    /// </summary>
+    private static (float X, float Y) ParseTransformOrigin(Dictionary<string, string> styleMap, float borderBoxWidth, float borderBoxHeight)
+    {
+        var xComponent = new RenderBackgroundPositionComponent(0.5f, 0f);
+        var yComponent = new RenderBackgroundPositionComponent(0.5f, 0f);
+
+        if (styleMap.TryGetValue("transform-origin", out var value) && !string.IsNullOrWhiteSpace(value))
+        {
+            var tokens = value.Trim().Split(' ', StringSplitOptions.RemoveEmptyEntries);
+
+            if (tokens.Length == 1)
+            {
+                var only = tokens[0].ToLowerInvariant();
+
+                if (only is "top" or "bottom")
+                {
+                    yComponent = ParsePositionComponent(only);
+                }
+                else
+                {
+                    xComponent = ParsePositionComponent(only);
+                }
+            }
+            else if (tokens.Length >= 2)
+            {
+                xComponent = ParsePositionComponent(tokens[0]);
+                yComponent = ParsePositionComponent(tokens[1]);
+            }
+        }
+
+        var x = (xComponent.Percentage * borderBoxWidth) + xComponent.OffsetPixels;
+        var y = (yComponent.Percentage * borderBoxHeight) + yComponent.OffsetPixels;
+        return (x, y);
     }
 
     /// <summary>

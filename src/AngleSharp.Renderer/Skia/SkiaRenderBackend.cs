@@ -76,7 +76,26 @@ public sealed class SkiaRenderBackend : IRenderBackend, ITextMeasurer
             case PopClipCommand:
                 canvas.Restore();
                 break;
+            case PushTransformCommand pushTransform:
+                PushTransform(canvas, pushTransform);
+                break;
+            case PopTransformCommand:
+                canvas.Restore();
+                break;
         }
+    }
+
+    private static void PushTransform(SKCanvas canvas, PushTransformCommand command)
+    {
+        canvas.Save();
+
+        var t = command.Transform;
+        // SKMatrix's constructor takes (scaleX, skewX, transX, skewY, scaleY, transY, ...) - the
+        // same field reordering already used everywhere else in this file that builds an SKMatrix
+        // from an a/b/c/d/e/f-style source, not the a/b/c/d/e/f order CSS's own matrix() function
+        // (and RenderTransform2D, matching it) uses.
+        var matrix = new SKMatrix(t.A, t.C, t.E, t.B, t.D, t.F, 0f, 0f, 1f);
+        canvas.Concat(ref matrix);
     }
 
     private static void PushClip(SKCanvas canvas, PushClipCommand command)

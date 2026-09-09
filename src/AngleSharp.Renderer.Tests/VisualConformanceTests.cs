@@ -2334,6 +2334,90 @@ public sealed class VisualConformanceTests
           maxDifferentPixels: TextRenderingToleranceMaxPixels);
     }
 
+    [Fact]
+    public async Task RenderToPng_TranslatesAndScalesAChainedTransformedBox()
+    {
+        var document = await ParseAsync("""
+            <html>
+              <head>
+                <style>html, body { margin: 0; padding: 0; }</style>
+              </head>
+              <body>
+                <div style="margin:10px; width:30px; height:15px; background-color:rgb(0,128,255); transform: translate(20px, 10px) scale(1.5);"></div>
+              </body>
+            </html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var image = renderer.RenderToPng(document, new DefaultRenderDevice
+        {
+            ViewPortWidth = 150,
+            ViewPortHeight = 100,
+        });
+
+        VisualSnapshotVerifier.VerifyOrCreate(
+          snapshotName: "translates-and-scales-a-chained-transformed-box.png",
+          actualPng: image.Data,
+          perChannelTolerance: 0,
+          maxDifferentPixels: 0);
+    }
+
+    [Fact]
+    public async Task RenderToPng_RotatesABoxAroundItsDefaultCenter()
+    {
+        var document = await ParseAsync("""
+            <html>
+              <head>
+                <style>html, body { margin: 0; padding: 0; }</style>
+              </head>
+              <body>
+                <div style="margin:30px; width:60px; height:30px; background-color:rgb(220,50,50); transform: rotate(45deg);"></div>
+              </body>
+            </html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var image = renderer.RenderToPng(document, new DefaultRenderDevice
+        {
+            ViewPortWidth = 150,
+            ViewPortHeight = 120,
+        });
+
+        VisualSnapshotVerifier.VerifyOrCreate(
+          snapshotName: "rotates-a-box-around-its-default-center.png",
+          actualPng: image.Data,
+          perChannelTolerance: 0,
+          maxDifferentPixels: 0);
+    }
+
+    [Fact]
+    public async Task RenderToPng_ScalesABoxAroundACustomTransformOrigin()
+    {
+        var document = await ParseAsync("""
+            <html>
+              <head>
+                <style>html, body { margin: 0; padding: 0; }</style>
+              </head>
+              <body>
+                <div style="margin:10px; width:40px; height:40px; background-color:rgb(200,60,0); transform: scale(1.5); transform-origin: top left;"></div>
+              </body>
+            </html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var image = renderer.RenderToPng(document, new DefaultRenderDevice
+        {
+            ViewPortWidth = 120,
+            ViewPortHeight = 100,
+        });
+
+        VisualSnapshotVerifier.VerifyOrCreate(
+          snapshotName: "scales-a-box-around-a-custom-transform-origin.png",
+          actualPng: image.Data,
+          perChannelTolerance: 0,
+          maxDifferentPixels: 0);
+    }
+
     private static async Task<AngleSharp.Dom.IDocument> ParseAsync(string html, IConfiguration? configuration = null)
     {
         var context = BrowsingContext.New(configuration ?? Configuration.Default.WithCss());

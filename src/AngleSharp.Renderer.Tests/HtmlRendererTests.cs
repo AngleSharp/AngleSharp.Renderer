@@ -3401,6 +3401,222 @@ public sealed class HtmlRendererTests
         Assert.Single(displayList.Commands.OfType<FillRectCommand>().Where(f => f.Color.Equals(new RenderColor(0, 255, 0))));
     }
 
+    [Fact]
+    public async Task BuildDisplayList_NoTransformProducesNoPushOrPopTransformCommands()
+    {
+        var document = await ParseAsync("""<html><body><div style="width:10px;height:10px;"></div></body></html>""");
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, new DefaultRenderDevice { ViewPortWidth = 100, ViewPortHeight = 100 });
+        Assert.DoesNotContain(displayList.Commands, c => c is PushTransformCommand or PopTransformCommand);
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_TransformNoneProducesNoPushOrPopTransformCommands()
+    {
+        var document = await ParseAsync("""<html><body><div style="width:10px;height:10px; transform:none;"></div></body></html>""");
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, new DefaultRenderDevice { ViewPortWidth = 100, ViewPortHeight = 100 });
+        Assert.DoesNotContain(displayList.Commands, c => c is PushTransformCommand or PopTransformCommand);
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_TranslateTransformProducesExactPixelOffsetRegardlessOfOrigin()
+    {
+        // Pure translation is origin-invariant - the origin shift cancels out exactly for a pure
+        // translate - so this holds for the default center origin too, not just an explicit one.
+        var document = await ParseAsync("""
+            <html><body>
+                <div style="width:40px; height:20px; transform: translate(15px, 8px);"></div>
+            </body></html>
+            """);
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, new DefaultRenderDevice { ViewPortWidth = 200, ViewPortHeight = 200 });
+        var push = Assert.Single(displayList.Commands.OfType<PushTransformCommand>());
+        Assert.Equal(new RenderTransform2D(1f, 0f, 0f, 1f, 15f, 8f), push.Transform);
+        Assert.Single(displayList.Commands.OfType<PopTransformCommand>());
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_PercentageTranslateResolvesAgainstOwnBorderBox()
+    {
+        var document = await ParseAsync("""
+            <html><body>
+                <div style="width:40px; height:20px; transform: translate(50%, 50%);"></div>
+            </body></html>
+            """);
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, new DefaultRenderDevice { ViewPortWidth = 200, ViewPortHeight = 200 });
+        var push = Assert.Single(displayList.Commands.OfType<PushTransformCommand>());
+        Assert.Equal(20f, push.Transform.E, precision: 3);
+        Assert.Equal(10f, push.Transform.F, precision: 3);
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_RotateTransformProducesCorrectMatrixAroundDefaultCenter()
+    {
+        // AngleSharp.Css's own rotate() ComputeMatrix was previously confirmed broken (always NaN)
+        // and this renderer used to work around it with a temporary no-op guard - now fixed
+        // upstream, this test asserts the actual rotation matrix directly, matching this renderer's
+        // policy of always trusting AngleSharp.Css's own computed matrix rather than special-casing
+        // individual functions locally (see ParseCssTransform/ConvertToRenderTransform's remarks).
+        var document = await ParseAsync("""
+            <html><body>
+                <div style="width:40px; height:20px; transform: rotate(180deg);"></div>
+            </body></html>
+            """);
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, new DefaultRenderDevice { ViewPortWidth = 200, ViewPortHeight = 200 });
+        var push = Assert.Single(displayList.Commands.OfType<PushTransformCommand>());
+        var t = push.Transform;
+
+        // A 180-degree rotation around the box's own default center (20, 10) maps the box's own
+        // top-left corner (0, 0) exactly to its own bottom-right corner (40, 20).
+        Assert.Equal(-1f, t.A, precision: 3);
+        Assert.Equal(0f, t.B, precision: 3);
+        Assert.Equal(0f, t.C, precision: 3);
+        Assert.Equal(-1f, t.D, precision: 3);
+        Assert.Equal(40f, t.E, precision: 2);
+        Assert.Equal(20f, t.F, precision: 2);
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_ChainedTransformFunctionsComposeLeftToRightPerCssSpec()
+    {
+        // "translate then scale" applies scale to the point first (it is listed last/rightmost),
+        // then translate; "scale then translate" is the reverse - order changes the visual result,
+        // and this pins down the exact direction CSS defines, not just "some" composition. Uses
+        // scale() (translate/rotate would work equally well now) simply because it was the function
+        // originally used to build this test before rotate() got fixed upstream.
+        var translateThenScale = await ParseAsync("""
+            <html><body><div style="width:1px; height:1px; transform-origin: 0 0; transform: translate(100px, 0) scale(2);"></div></body></html>
+            """);
+        var scaleThenTranslate = await ParseAsync("""
+            <html><body><div style="width:1px; height:1px; transform-origin: 0 0; transform: scale(2) translate(100px, 0);"></div></body></html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var device = new DefaultRenderDevice { ViewPortWidth = 200, ViewPortHeight = 200 };
+
+        var pushA = Assert.Single(renderer.BuildDisplayList(translateThenScale, device).Commands.OfType<PushTransformCommand>());
+        var pushB = Assert.Single(renderer.BuildDisplayList(scaleThenTranslate, device).Commands.OfType<PushTransformCommand>());
+
+        Assert.Equal(100f, pushA.Transform.E, precision: 2);
+        Assert.Equal(200f, pushB.Transform.E, precision: 2);
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_ScaleTransformExpandsSymmetricallyAroundDefaultCenter()
+    {
+        var document = await ParseAsync("""
+            <html><body>
+                <div style="width:40px; height:20px; transform: scale(2);"></div>
+            </body></html>
+            """);
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, new DefaultRenderDevice { ViewPortWidth = 200, ViewPortHeight = 200 });
+        var push = Assert.Single(displayList.Commands.OfType<PushTransformCommand>());
+        var t = push.Transform;
+
+        Assert.Equal(-20f, t.E, precision: 2);
+        Assert.Equal(-10f, t.F, precision: 2);
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_MatrixFunctionPreservesAllSixComponents()
+    {
+        // The plain 6-value 2D matrix() form was previously confirmed to compute *wrong* values in
+        // AngleSharp.Css itself (a column-major-vs-row-major mismatch in how it padded the array
+        // passed to TransformMatrix's constructor) - now fixed upstream, with a reproducing test in
+        // AngleSharp.Css's own suite (TransformFunctionsTests.PlainSixValueMatrixFunctionPreservesAllSixComponents)
+        // confirming it. This renderer never guarded against that bug locally to begin with - per
+        // its own policy (see ParseCssTransform/ConvertToRenderTransform's remarks), it always
+        // trusts whatever AngleSharp.Css computes - so once AngleSharp.Css's own bug was fixed,
+        // matrix() started working correctly here automatically, with no change needed in this
+        // renderer at all. This test asserts the actual, now-correct values directly, using the
+        // same non-symmetric coefficients as AngleSharp.Css's own regression test specifically so a
+        // symmetric input could never mask a b/c transposition or an e/f loss the way it did before.
+        var document = await ParseAsync("""
+            <html><body>
+                <div style="width:10px; height:10px; transform-origin: 0 0; transform: matrix(2, 3, 4, 5, 6, 7);"></div>
+            </body></html>
+            """);
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, new DefaultRenderDevice { ViewPortWidth = 200, ViewPortHeight = 200 });
+        var push = Assert.Single(displayList.Commands.OfType<PushTransformCommand>());
+        var t = push.Transform;
+
+        Assert.Equal(2f, t.A, precision: 2);
+        Assert.Equal(3f, t.B, precision: 2);
+        Assert.Equal(4f, t.C, precision: 2);
+        Assert.Equal(5f, t.D, precision: 2);
+        Assert.Equal(6f, t.E, precision: 2);
+        Assert.Equal(7f, t.F, precision: 2);
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_TranslateZDoesNotPerturbA2DTransformChain()
+    {
+        // translateZ() is a 3D function this renderer never filters out before asking
+        // AngleSharp.Css to parse/compute it (see ParseCssTransform's own remarks) - its own effect
+        // is Z-only, so its 2D projection (M11/M12/M21/M22/Tx/Ty) comes back as pure identity and
+        // composing it into the chain leaves the following, genuinely 2D translate() untouched.
+        var document = await ParseAsync("""
+            <html><body>
+                <div style="width:10px; height:10px; transform: translateZ(50px) translate(12px, 0px);"></div>
+            </body></html>
+            """);
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, new DefaultRenderDevice { ViewPortWidth = 200, ViewPortHeight = 200 });
+        var push = Assert.Single(displayList.Commands.OfType<PushTransformCommand>());
+        Assert.Equal(12f, push.Transform.E, precision: 2);
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_TransformWrapsBackgroundBorderAndChildrenTogether()
+    {
+        // A transform affects the *whole* element - its own background/border and every descendant
+        // - not just its content, unlike overflow clipping (which excludes border/outline).
+        var document = await ParseAsync("""
+            <html><body>
+                <div style="width:40px; height:20px; background-color:#ff0000; border:2px solid #0000ff; transform: scale(1.5);">
+                    <span style="display:inline-block; width:4px; height:4px; background-color:#00ff00;"></span>
+                </div>
+            </body></html>
+            """);
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, new DefaultRenderDevice { ViewPortWidth = 200, ViewPortHeight = 200 });
+        var commands = displayList.Commands.ToList();
+
+        var pushIndex = commands.FindIndex(c => c is PushTransformCommand);
+        var popIndex = commands.FindIndex(c => c is PopTransformCommand);
+        var backgroundIndex = commands.FindIndex(c => c is FillRectCommand f && f.Color.Equals(new RenderColor(255, 0, 0)));
+        var childIndex = commands.FindIndex(c => c is FillRectCommand f && f.Color.Equals(new RenderColor(0, 255, 0)));
+
+        Assert.True(pushIndex >= 0 && popIndex > pushIndex);
+        Assert.True(backgroundIndex > pushIndex && backgroundIndex < popIndex);
+        Assert.True(childIndex > pushIndex && childIndex < popIndex);
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_AuthoredTransformDoesNotCrashAngleSharpCssComputation()
+    {
+        // A real, confirmed AngleSharp.Css 1.1.0 bug: computing *any* declared `transform`
+        // containing a translate/translateX/translateY function throws a NullReferenceException
+        // from inside its own CssTranslateValue.Compute() during render-tree construction, before
+        // this renderer's own code even runs - this regression test's only job is to keep
+        // succeeding (not throwing) for exactly the functions confirmed to trigger it.
+        var document = await ParseAsync("""
+            <html><body>
+                <div style="width:10px; height:10px; transform: translate(1px, 1px);"></div>
+                <div style="width:10px; height:10px; transform: translateX(1px);"></div>
+                <div style="width:10px; height:10px; transform: translateY(1px);"></div>
+            </body></html>
+            """);
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, new DefaultRenderDevice { ViewPortWidth = 200, ViewPortHeight = 200 });
+        Assert.Equal(3, displayList.Commands.OfType<PushTransformCommand>().Count());
+    }
+
     // Mirrors the private HtmlRenderer.FormControlAccentColor constant (26, 115, 232) - kept as an
     // independent literal here rather than reflecting into the private field, so a test failure
     // reads as "the painted color changed" rather than needing reflection to even compile.

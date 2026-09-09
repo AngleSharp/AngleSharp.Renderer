@@ -57,6 +57,20 @@ public sealed class DisplayList
     public void PopClip() => Add(new PopClipCommand());
 
     /// <summary>
+    /// Begins applying a CSS `transform` to every command up to the matching <see cref="PopTransform"/>
+    /// - background, border, outline, and children all paint under it, since `transform` affects
+    /// the whole element it is set on, not just its content (unlike `overflow` clipping, which
+    /// explicitly excludes the border/outline it is layered under). Pairs must nest like a stack,
+    /// matching how a backend implements this as a save/concat/restore scope.
+    /// </summary>
+    public void PushTransform(RenderTransform2D transform) => Add(new PushTransformCommand(transform));
+
+    /// <summary>
+    /// Ends the transform scope started by the matching <see cref="PushTransform"/>.
+    /// </summary>
+    public void PopTransform() => Add(new PopTransformCommand());
+
+    /// <summary>
     /// Adds a filled rectangle command.
     /// </summary>
     public void FillRect(RenderRect rect, RenderColor color) => Add(new FillRectCommand(rect, new RenderColorPaint(color)));
@@ -191,6 +205,17 @@ public sealed record PushClipCommand(RenderRect Rect, RenderCornerRadii Radii) :
 /// Ends the clip scope started by the matching <see cref="PushClipCommand"/>.
 /// </summary>
 public sealed record PopClipCommand : RenderCommand;
+
+/// <summary>
+/// Begins applying a CSS `transform` to every following command, up to the matching
+/// <see cref="PopTransformCommand"/>.
+/// </summary>
+public sealed record PushTransformCommand(RenderTransform2D Transform) : RenderCommand;
+
+/// <summary>
+/// Ends the transform scope started by the matching <see cref="PushTransformCommand"/>.
+/// </summary>
+public sealed record PopTransformCommand : RenderCommand;
 
 /// <summary>
 /// Draws a single line of text at a baseline position.
