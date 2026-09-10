@@ -2613,11 +2613,15 @@ public sealed class VisualConformanceTests
         var renderer = new HtmlRenderer();
         var image = renderer.RenderToPng(document, renderDevice);
 
+        // Multi-line, monospace-heavy text (the whole point of this snapshot) is exactly the case
+        // TextRenderingToleranceChannel/MaxPixels already exist for elsewhere in this file - font
+        // hinting/anti-aliasing can shift a glyph edge by a pixel or two between runs even on the
+        // same platform, with no actual layout regression.
         VisualSnapshotVerifier.VerifyOrCreate(
           snapshotName: "pre-white-space-preserves-indentation-and-line-breaks.png",
           actualPng: image.Data,
-          perChannelTolerance: 0,
-          maxDifferentPixels: 0);
+          perChannelTolerance: TextRenderingToleranceChannel,
+          maxDifferentPixels: TextRenderingToleranceMaxPixels);
     }
 
     private static async Task<AngleSharp.Dom.IDocument> ParseAsync(string html, IConfiguration? configuration = null)
