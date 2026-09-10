@@ -4854,6 +4854,116 @@ public sealed class HtmlRendererTests
     // Mirrors the private HtmlRenderer.FormControlAccentColor constant (26, 115, 232) - kept as an
     // independent literal here rather than reflecting into the private field, so a test failure
     // reads as "the painted color changed" rather than needing reflection to even compile.
+    [Fact]
+    public async Task BuildDisplayList_TextOverflowEllipsisTruncatesOverflowingSingleLine()
+    {
+        var document = await ParseAsync("""
+            <html><body>
+                <div style="width:80px; overflow:hidden; white-space:nowrap; text-overflow:ellipsis;">This is a long line of text</div>
+            </body></html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, new DefaultRenderDevice
+        {
+            ViewPortWidth = 200,
+            ViewPortHeight = 120,
+            FontSize = 16f,
+        });
+
+        var text = Assert.Single(displayList.Commands.OfType<DrawTextCommand>());
+        Assert.EndsWith("…", text.Text);
+        Assert.True(text.Text.Length < "This is a long line of text".Length);
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_TextOverflowEllipsisHasNoEffectWithoutClipping()
+    {
+        var document = await ParseAsync("""
+            <html><body>
+                <div style="width:80px; white-space:nowrap; text-overflow:ellipsis;">This is a long line of text</div>
+            </body></html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, new DefaultRenderDevice
+        {
+            ViewPortWidth = 200,
+            ViewPortHeight = 120,
+            FontSize = 16f,
+        });
+
+        var text = Assert.Single(displayList.Commands.OfType<DrawTextCommand>());
+        Assert.Equal("This is a long line of text", text.Text);
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_WordBreakAllWrapsAnOverlongWordAcrossMultipleLines()
+    {
+        var document = await ParseAsync("""
+            <html><body>
+                <div style="width:40px; word-break:break-all;">aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa</div>
+            </body></html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, new DefaultRenderDevice
+        {
+            ViewPortWidth = 200,
+            ViewPortHeight = 200,
+            FontSize = 16f,
+        });
+
+        var lines = displayList.Commands.OfType<DrawTextCommand>().ToArray();
+
+        Assert.True(lines.Length > 1);
+        Assert.Equal("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", string.Concat(lines.Select(line => line.Text)));
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_OverflowWrapBreakWordBreaksAnOverlongWordAsLastResort()
+    {
+        var document = await ParseAsync("""
+            <html><body>
+                <div style="width:40px; overflow-wrap:break-word;">aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa</div>
+            </body></html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, new DefaultRenderDevice
+        {
+            ViewPortWidth = 200,
+            ViewPortHeight = 200,
+            FontSize = 16f,
+        });
+
+        var lines = displayList.Commands.OfType<DrawTextCommand>().ToArray();
+
+        Assert.True(lines.Length > 1);
+        Assert.Equal("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", string.Concat(lines.Select(line => line.Text)));
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_OverflowWrapNormalLeavesAnOverlongWordOnOneOverflowingLine()
+    {
+        var document = await ParseAsync("""
+            <html><body>
+                <div style="width:40px;">aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa</div>
+            </body></html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, new DefaultRenderDevice
+        {
+            ViewPortWidth = 200,
+            ViewPortHeight = 200,
+            FontSize = 16f,
+        });
+
+        var text = Assert.Single(displayList.Commands.OfType<DrawTextCommand>());
+        Assert.Equal("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", text.Text);
+    }
+
     private static readonly RenderColor FormControlAccentColorForTests = new(26, 115, 232);
 
     private static async Task<AngleSharp.Dom.IDocument> ParseAsync(string html, IConfiguration? configuration = null, string? address = null)

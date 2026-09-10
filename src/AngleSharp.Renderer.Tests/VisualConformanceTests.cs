@@ -2656,6 +2656,36 @@ public sealed class VisualConformanceTests
           maxDifferentPixels: 0);
     }
 
+    [Fact]
+    public async Task RenderToPng_TruncatesAndBreaksOverflowingText()
+    {
+        var document = await ParseAsync("""
+            <html>
+              <head>
+                <style>html, body { margin: 0; padding: 0; background-color: white; }</style>
+              </head>
+              <body>
+                <div style="width:120px; margin:8px; padding:4px; overflow:hidden; white-space:nowrap; text-overflow:ellipsis; border:1px solid #333333;">This text is much too long to fit</div>
+                <div style="width:70px; margin:8px; padding:4px; border:1px solid #333333; word-break:break-all;">Supercalifragilisticexpialidocious</div>
+              </body>
+            </html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var image = renderer.RenderToPng(document, new DefaultRenderDevice
+        {
+            ViewPortWidth = 160,
+            ViewPortHeight = 160,
+            FontSize = 16f,
+        });
+
+        VisualSnapshotVerifier.VerifyOrCreate(
+          snapshotName: "truncates-and-breaks-overflowing-text.png",
+          actualPng: image.Data,
+          perChannelTolerance: TextRenderingToleranceChannel,
+          maxDifferentPixels: TextRenderingToleranceMaxPixels);
+    }
+
     private static async Task<AngleSharp.Dom.IDocument> ParseAsync(string html, IConfiguration? configuration = null)
     {
         var context = BrowsingContext.New(configuration ?? Configuration.Default.WithCss());

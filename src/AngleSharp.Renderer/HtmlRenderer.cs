@@ -330,7 +330,7 @@ public sealed class HtmlRenderer
             return displayList;
         }
 
-        var textStyle = new RenderTextStyle(context.FontSize, context.TextColor, context.FontFamily, context.LineHeightMultiplier, 400f, false, false, false, context.TextColor, global::AngleSharp.Renderer.Rendering.RenderTextDecorationStyle.Solid, TextAlign.Left, 0f, 0f, 0f, [], WhiteSpaceMode.Normal);
+        var textStyle = new RenderTextStyle(context.FontSize, context.TextColor, context.FontFamily, context.LineHeightMultiplier, 400f, false, false, false, context.TextColor, global::AngleSharp.Renderer.Rendering.RenderTextDecorationStyle.Solid, TextAlign.Left, 0f, 0f, 0f, [], WhiteSpaceMode.Normal, WordBreakMode.Normal, OverflowWrapMode.Normal, TextOverflowMode.Clip);
         var cursorY = contentY;
         var previousBlockMarginBottom = 0f;
         var suppressNextBlockTopMargin = false;
@@ -2734,6 +2734,18 @@ public sealed class HtmlRenderer
 
             var lineWidth = MeasureTextWidth(context, line, textStyle);
             var lineMaxWidth = index == 0 ? Math.Max(0f, maxWidth - firstLineIndent) : maxWidth;
+
+            // `text-overflow: ellipsis` is scoped to the single-line case - by far the dominant
+            // real-world usage (`overflow: hidden; white-space: nowrap; text-overflow: ellipsis`) -
+            // rather than truncating the last of several wrapped lines, which the CSS spec itself
+            // does not define without a non-standard extension (`-webkit-line-clamp`); a genuinely
+            // multi-line result here (`lines.Count > 1`) is left as-is, matching that scope cut.
+            if (textStyle.TextOverflow == TextOverflowMode.Ellipsis && lines.Count == 1 && lineWidth > lineMaxWidth)
+            {
+                line = TruncateWithEllipsis(context, line, lineMaxWidth, textStyle);
+                lineWidth = MeasureTextWidth(context, line, textStyle);
+            }
+
             var lineX = x + (index == 0 ? firstLineIndent : 0f) + ResolveTextAlignmentOffset(textStyle.TextAlign, lineMaxWidth, lineWidth);
             var baselineY = cursorY + textStyle.VerticalAlignOffset;
 
@@ -2816,7 +2828,11 @@ public sealed class HtmlRenderer
         // multi-space preservation and explicit forced breaks are not supported at this level (a
         // deliberate scope cut: the caller already collapsed any literal '\n' in `text` to a plain
         // space before it ever reaches here, since this word-by-word model has no way to represent
-        // one - see the two LayoutNode call sites that build `inlineText`).
+        // one - see the two LayoutNode call sites that build `inlineText`). `word-break: break-all`/
+        // `overflow-wrap: break-word` are the same kind of scope cut, for the same reason: this
+        // model paints one whole word per DrawText call with no sub-word split point, unlike
+        // WrapText's line-based model where a broken chunk can simply become its own line - an
+        // overlong word here still overflows its line whole, exactly like `overflow-wrap: normal`.
         var noWrap = IsNoWrapWhiteSpace(textStyle.WhiteSpace);
 
         foreach (var word in words)
@@ -3042,8 +3058,70 @@ public sealed class HtmlRenderer
         var verticalAlignOffset = ParseVerticalAlign(styleMap, fontSize);
         var textShadows = ParseTextShadows(styleMap.TryGetValue("text-shadow", out var textShadowValue) ? textShadowValue : null, inherited.TextShadows);
         var whiteSpace = ParseWhiteSpace(styleMap, inherited.WhiteSpace);
+        var wordBreak = ParseWordBreak(styleMap, inherited.WordBreak);
+        var overflowWrap = ParseOverflowWrap(styleMap, inherited.OverflowWrap);
+        var textOverflow = ParseTextOverflow(styleMap);
 
-        return new RenderTextStyle(fontSize, color, fontFamily, lineHeight, fontWeight, isItalic, underline, strikeThrough, decorationColor, decorationStyle, textAlign, letterSpacing, textIndent, verticalAlignOffset, textShadows, whiteSpace);
+        return new RenderTextStyle(fontSize, color, fontFamily, lineHeight, fontWeight, isItalic, underline, strikeThrough, decorationColor, decorationStyle, textAlign, letterSpacing, textIndent, verticalAlignOffset, textShadows, whiteSpace, wordBreak, overflowWrap, textOverflow);
+    }
+
+    /// <summary>
+    /// <c>word-break</c> is inherited, the same as <c>white-space</c> above.
+    /// </summary>
+    private static WordBreakMode ParseWordBreak(Dictionary<string, string> styleMap, WordBreakMode inherited)
+    {
+        if (!styleMap.TryGetValue("word-break", out var value) || string.IsNullOrWhiteSpace(value))
+        {
+            return inherited;
+        }
+
+        return string.Equals(value.Trim(), "break-all", StringComparison.OrdinalIgnoreCase)
+            ? WordBreakMode.BreakAll
+            : WordBreakMode.Normal;
+    }
+
+    /// <summary>
+    /// <c>overflow-wrap</c>, falling back to its legacy <c>word-wrap</c> alias when the modern
+    /// property was not itself authored - both are inherited, the same as <c>white-space</c> above.
+    /// </summary>
+    private static OverflowWrapMode ParseOverflowWrap(Dictionary<string, string> styleMap, OverflowWrapMode inherited)
+    {
+        var raw = styleMap.TryGetValue("overflow-wrap", out var value) && !string.IsNullOrWhiteSpace(value)
+            ? value
+            : (styleMap.TryGetValue("word-wrap", out var legacyValue) ? legacyValue : null);
+
+        if (string.IsNullOrWhiteSpace(raw))
+        {
+            return inherited;
+        }
+
+        return raw.Trim().ToLowerInvariant() switch
+        {
+            "break-word" or "anywhere" => OverflowWrapMode.BreakWord,
+            _ => OverflowWrapMode.Normal,
+        };
+    }
+
+    /// <summary>
+    /// <c>text-overflow</c>, unlike every other property resolved in <see cref="ResolveTextStyle"/>,
+    /// is deliberately never inherited - every element re-derives it fresh from its own style map,
+    /// defaulting to <see cref="TextOverflowMode.Clip"/> even when an ancestor set
+    /// `text-overflow: ellipsis`, mirroring the same non-inheritance <see cref="RenderTextStyle.TextIndent"/>
+    /// already establishes for itself. It also has no effect unless this element's own `overflow`
+    /// clips (per spec, and matching <see cref="ShouldClipOverflow"/>'s existing "either axis"
+    /// simplification) - `ellipsis` on a box that does not clip is simply ignored, same as a real
+    /// browser.
+    /// </summary>
+    private static TextOverflowMode ParseTextOverflow(Dictionary<string, string> styleMap)
+    {
+        if (!ShouldClipOverflow(styleMap))
+        {
+            return TextOverflowMode.Clip;
+        }
+
+        return styleMap.TryGetValue("text-overflow", out var value) && string.Equals(value.Trim(), "ellipsis", StringComparison.OrdinalIgnoreCase)
+            ? TextOverflowMode.Ellipsis
+            : TextOverflowMode.Clip;
     }
 
     /// <summary>
@@ -3524,6 +3602,10 @@ public sealed class HtmlRenderer
         AddIfPresent(map, "line-height", style.GetLineHeight());
         AddIfPresent(map, "color", style.GetColor());
         AddIfPresent(map, "white-space", style.GetPropertyValue("white-space"));
+        AddIfPresent(map, "text-overflow", style.GetPropertyValue("text-overflow"));
+        AddIfPresent(map, "word-break", style.GetPropertyValue("word-break"));
+        AddIfPresent(map, "overflow-wrap", style.GetPropertyValue("overflow-wrap"));
+        AddIfPresent(map, "word-wrap", style.GetPropertyValue("word-wrap"));
 
         ApplyActiveTransitionAndAnimationOverrides(map, element);
 
@@ -6747,8 +6829,26 @@ public sealed class HtmlRenderer
         return Math.Max(20f, contentHeight + placement.PaddingTop + placement.PaddingBottom + placement.BorderTopWidth + placement.BorderBottomWidth);
     }
 
+    /// <summary>
+    /// Greedy word-wrapping, extended with `word-break: break-all`/`overflow-wrap: break-word`
+    /// support - both read straight off <paramref name="textStyle"/> rather than as separate
+    /// parameters, since every caller already carries a fully-resolved <see cref="RenderTextStyle"/>.
+    /// `break-all` (<see cref="WrapTextCharacterWise"/>) breaks at any character boundary
+    /// everywhere, matching spec precedence over `overflow-wrap` (a word-break-all element ignores
+    /// `overflow-wrap` entirely, since breaking is already unrestricted). Otherwise, the ordinary
+    /// word-based algorithm below only reaches for character-level breaking (<see cref="SplitOverlongWord"/>)
+    /// as the spec's own "last resort": a single word wider than the *entire* line (not just what is
+    /// left of the current line) that `overflow-wrap: break-word`/`anywhere` explicitly permits
+    /// breaking - a word that merely doesn't fit what's left of the current line still simply wraps
+    /// to a new line whole, exactly like `overflow-wrap: normal`.
+    /// </summary>
     private static IReadOnlyList<string> WrapText(LayoutContext context, string text, float maxWidth, RenderTextStyle textStyle)
     {
+        if (textStyle.WordBreak == WordBreakMode.BreakAll)
+        {
+            return WrapTextCharacterWise(context, text, maxWidth, textStyle);
+        }
+
         var words = text.Split(' ', StringSplitOptions.RemoveEmptyEntries);
 
         if (words.Length == 0)
@@ -6760,16 +6860,24 @@ public sealed class HtmlRenderer
         var current = new StringBuilder();
         var currentWidth = 0f;
 
-        foreach (var word in words)
+        void FlushCurrentLine()
         {
-            var wordWidth = MeasureTextWidth(context, word, textStyle);
-            var separatorWidth = current.Length == 0 ? 0f : MeasureTextWidth(context, " ", textStyle);
-
-            if (current.Length > 0 && currentWidth + separatorWidth + wordWidth > maxWidth)
+            if (current.Length > 0)
             {
                 lines.Add(current.ToString());
                 current.Clear();
                 currentWidth = 0f;
+            }
+        }
+
+        void AppendToken(string token, float tokenWidth)
+        {
+            var separatorWidth = current.Length == 0 ? 0f : MeasureTextWidth(context, " ", textStyle);
+
+            if (current.Length > 0 && currentWidth + separatorWidth + tokenWidth > maxWidth)
+            {
+                FlushCurrentLine();
+                separatorWidth = 0f;
             }
 
             if (current.Length > 0)
@@ -6778,8 +6886,111 @@ public sealed class HtmlRenderer
                 currentWidth += separatorWidth;
             }
 
-            current.Append(word);
-            currentWidth += wordWidth;
+            current.Append(token);
+            currentWidth += tokenWidth;
+        }
+
+        foreach (var word in words)
+        {
+            var wordWidth = MeasureTextWidth(context, word, textStyle);
+
+            if (wordWidth > maxWidth && textStyle.OverflowWrap == OverflowWrapMode.BreakWord)
+            {
+                var chunks = SplitOverlongWord(context, word, maxWidth, textStyle);
+
+                for (var i = 0; i < chunks.Count; i++)
+                {
+                    if (i == 0)
+                    {
+                        // The first chunk of a broken word is still an ordinary word boundary -
+                        // it gets ordinary inter-word wrapping/spacing against the current line.
+                        AppendToken(chunks[i], MeasureTextWidth(context, chunks[i], textStyle));
+                    }
+                    else
+                    {
+                        // A mid-word break always continues on a fresh line - there is no space to
+                        // share the previous chunk's remaining room with.
+                        FlushCurrentLine();
+                        current.Append(chunks[i]);
+                        currentWidth = MeasureTextWidth(context, chunks[i], textStyle);
+                    }
+                }
+
+                continue;
+            }
+
+            AppendToken(word, wordWidth);
+        }
+
+        FlushCurrentLine();
+
+        return lines;
+    }
+
+    /// <summary>
+    /// Splits one overlong word into the largest chunks that each fit within <paramref name="maxWidth"/>,
+    /// for <c>overflow-wrap: break-word</c>/<c>anywhere</c>'s "last resort" mid-word break. Always
+    /// makes progress (appends at least one character per chunk) even if a single character alone
+    /// exceeds <paramref name="maxWidth"/>, so an extreme case (a huge font size in a tiny box) still
+    /// terminates rather than looping.
+    /// </summary>
+    private static List<string> SplitOverlongWord(LayoutContext context, string word, float maxWidth, RenderTextStyle textStyle)
+    {
+        var chunks = new List<string>();
+        var current = new StringBuilder();
+        var currentWidth = 0f;
+
+        foreach (var rune in word.EnumerateRunes())
+        {
+            var chStr = rune.ToString();
+            var chWidth = MeasureTextWidth(context, chStr, textStyle);
+
+            if (current.Length > 0 && currentWidth + chWidth > maxWidth)
+            {
+                chunks.Add(current.ToString());
+                current.Clear();
+                currentWidth = 0f;
+            }
+
+            current.Append(chStr);
+            currentWidth += chWidth;
+        }
+
+        if (current.Length > 0)
+        {
+            chunks.Add(current.ToString());
+        }
+
+        return chunks;
+    }
+
+    /// <summary>
+    /// `word-break: break-all` wrapping: every character (not just every word) is a potential break
+    /// point, so this greedily fills each line character-by-character instead of word-by-word - a
+    /// space is simply a character like any other here (no separator width added around it), which
+    /// reproduces ordinary space-based wrapping for free wherever a line happens to break at one,
+    /// while still allowing a break mid-word wherever it does not.
+    /// </summary>
+    private static IReadOnlyList<string> WrapTextCharacterWise(LayoutContext context, string text, float maxWidth, RenderTextStyle textStyle)
+    {
+        var lines = new List<string>();
+        var current = new StringBuilder();
+        var currentWidth = 0f;
+
+        foreach (var rune in text.EnumerateRunes())
+        {
+            var chStr = rune.ToString();
+            var chWidth = MeasureTextWidth(context, chStr, textStyle);
+
+            if (current.Length > 0 && currentWidth + chWidth > maxWidth)
+            {
+                lines.Add(current.ToString());
+                current.Clear();
+                currentWidth = 0f;
+            }
+
+            current.Append(chStr);
+            currentWidth += chWidth;
         }
 
         if (current.Length > 0)
@@ -6788,6 +6999,48 @@ public sealed class HtmlRenderer
         }
 
         return lines;
+    }
+
+    private const string EllipsisCharacter = "…";
+
+    /// <summary>
+    /// Truncates <paramref name="text"/> to the longest prefix (by rune, not raw UTF-16 char, so a
+    /// truncation point never lands inside a surrogate pair) whose width plus the ellipsis
+    /// character's own width still fits within <paramref name="maxWidth"/>, then appends it - the
+    /// approach every real browser's own `text-overflow: ellipsis` uses (truncate, do not scale or
+    /// reflow). Binary search over rune count, not a linear scan, since <see cref="MeasureTextWidth"/>
+    /// goes through the backend's own font shaping and this runs on already-overflowing text on the
+    /// hot layout path.
+    /// </summary>
+    private static string TruncateWithEllipsis(LayoutContext context, string text, float maxWidth, RenderTextStyle textStyle)
+    {
+        var ellipsisWidth = MeasureTextWidth(context, EllipsisCharacter, textStyle);
+
+        if (ellipsisWidth > maxWidth || text.Length == 0)
+        {
+            return EllipsisCharacter;
+        }
+
+        var runes = text.EnumerateRunes().ToArray();
+        var low = 0;
+        var high = runes.Length;
+
+        while (low < high)
+        {
+            var mid = (low + high + 1) / 2;
+            var prefixWidth = MeasureTextWidth(context, string.Concat(runes.Take(mid).Select(r => r.ToString())), textStyle);
+
+            if (prefixWidth + ellipsisWidth <= maxWidth)
+            {
+                low = mid;
+            }
+            else
+            {
+                high = mid - 1;
+            }
+        }
+
+        return string.Concat(runes.Take(low).Select(r => r.ToString())) + EllipsisCharacter;
     }
 
     private static RenderFont ToRenderFont(RenderTextStyle textStyle, FontFaceSet fonts) => new(
@@ -6953,7 +7206,10 @@ public sealed class HtmlRenderer
         float TextIndent,
         float VerticalAlignOffset,
         IReadOnlyList<global::AngleSharp.Renderer.Rendering.RenderTextShadow> TextShadows,
-        WhiteSpaceMode WhiteSpace);
+        WhiteSpaceMode WhiteSpace,
+        WordBreakMode WordBreak,
+        OverflowWrapMode OverflowWrap,
+        TextOverflowMode TextOverflow);
 
     private enum TextAlign
     {
@@ -6975,6 +7231,43 @@ public sealed class HtmlRenderer
         PreWrap,
         PreLine,
         BreakSpaces,
+    }
+
+    /// <summary>
+    /// <c>word-break</c>. <c>KeepAll</c> (meant for CJK text, suppressing breaks between ideographic
+    /// characters that <c>Normal</c> would otherwise allow) is folded into <c>Normal</c> - this
+    /// renderer has no CJK-aware line-breaking of any kind to differentiate the two, a deliberate,
+    /// documented scope cut rather than an oversight.
+    /// </summary>
+    private enum WordBreakMode
+    {
+        Normal,
+        BreakAll,
+    }
+
+    /// <summary>
+    /// <c>overflow-wrap</c> (and its legacy <c>word-wrap</c> alias). <c>Anywhere</c> is folded into
+    /// <c>BreakWord</c> - the two keywords only differ in how they affect *intrinsic* (min-content)
+    /// sizing, a concept this renderer's already-approximate, non-intrinsic text layout does not
+    /// model, so both simply mean "break an otherwise-unbreakable word as a last resort" here.
+    /// </summary>
+    private enum OverflowWrapMode
+    {
+        Normal,
+        BreakWord,
+    }
+
+    /// <summary>
+    /// <c>text-overflow</c>. Unlike <see cref="WhiteSpaceMode"/>/<see cref="WordBreakMode"/>/
+    /// <see cref="OverflowWrapMode"/>, this is deliberately never inherited - see
+    /// <see cref="ParseTextOverflow"/>, which mirrors <see cref="RenderTextStyle.TextIndent"/>'s own
+    /// existing non-inheritance for the same reason (it targets this element's own line box, not a
+    /// descendant's).
+    /// </summary>
+    private enum TextOverflowMode
+    {
+        Clip,
+        Ellipsis,
     }
 
     private readonly record struct EdgeSizes(float Top, float Right, float Bottom, float Left);
