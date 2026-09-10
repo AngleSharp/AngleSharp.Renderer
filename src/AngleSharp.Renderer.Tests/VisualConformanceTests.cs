@@ -2,6 +2,7 @@ namespace AngleSharp.Renderer.Tests;
 
 using AngleSharp;
 using AngleSharp.Css;
+using AngleSharp.Dom;
 using AngleSharp.Html.Dom;
 
 [Trait("Category", "Visual")]
@@ -1391,6 +1392,673 @@ public sealed class VisualConformanceTests
             maxDifferentPixels: TextRenderingToleranceMaxPixels);
       }
 
+    [Fact]
+    public async Task RenderToPng_PaintsUniformRoundedBoxBackgroundAndBorder()
+    {
+        var document = await ParseAsync("""
+            <html>
+              <head>
+                <style>html, body { margin: 0; padding: 0; }</style>
+              </head>
+              <body>
+                <div style="margin:10px; width:80px; height:50px; border:4px solid rgb(0,0,255); background-color:rgb(255,0,0); border-radius:12px;"></div>
+              </body>
+            </html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var image = renderer.RenderToPng(document, new DefaultRenderDevice
+        {
+            ViewPortWidth = 120,
+            ViewPortHeight = 90,
+        });
+
+        VisualSnapshotVerifier.VerifyOrCreate(
+          snapshotName: "paints-uniform-rounded-box-background-and-border.png",
+          actualPng: image.Data,
+          perChannelTolerance: 0,
+          maxDifferentPixels: 0);
+    }
+
+    [Fact]
+    public async Task RenderToPng_PaintsPillShapeFromClampedBorderRadius()
+    {
+        var document = await ParseAsync("""
+            <html>
+              <head>
+                <style>html, body { margin: 0; padding: 0; }</style>
+              </head>
+              <body>
+                <div style="margin:10px; width:100px; height:30px; background-color:rgb(0,128,255); border-radius:100px;"></div>
+              </body>
+            </html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var image = renderer.RenderToPng(document, new DefaultRenderDevice
+        {
+            ViewPortWidth = 120,
+            ViewPortHeight = 50,
+        });
+
+        VisualSnapshotVerifier.VerifyOrCreate(
+          snapshotName: "paints-pill-shape-from-clamped-border-radius.png",
+          actualPng: image.Data,
+          perChannelTolerance: 0,
+          maxDifferentPixels: 0);
+    }
+
+    [Fact]
+    public async Task RenderToPng_PaintsEllipticalBorderRadiusCorners()
+    {
+        var document = await ParseAsync("""
+            <html>
+              <head>
+                <style>html, body { margin: 0; padding: 0; }</style>
+              </head>
+              <body>
+                <div style="margin:10px; width:100px; height:60px; background-color:rgb(0,180,0); border-radius:40px / 20px;"></div>
+              </body>
+            </html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var image = renderer.RenderToPng(document, new DefaultRenderDevice
+        {
+            ViewPortWidth = 120,
+            ViewPortHeight = 80,
+        });
+
+        VisualSnapshotVerifier.VerifyOrCreate(
+          snapshotName: "paints-elliptical-border-radius-corners.png",
+          actualPng: image.Data,
+          perChannelTolerance: 0,
+          maxDifferentPixels: 0);
+    }
+
+    [Fact]
+    public async Task RenderToPng_PaintsPerCornerDifferentBorderRadii()
+    {
+        var document = await ParseAsync("""
+            <html>
+              <head>
+                <style>html, body { margin: 0; padding: 0; }</style>
+              </head>
+              <body>
+                <div style="margin:10px; width:100px; height:60px; background-color:rgb(255,128,0); border-top-left-radius:0; border-top-right-radius:24px; border-bottom-right-radius:0; border-bottom-left-radius:24px;"></div>
+              </body>
+            </html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var image = renderer.RenderToPng(document, new DefaultRenderDevice
+        {
+            ViewPortWidth = 120,
+            ViewPortHeight = 80,
+        });
+
+        VisualSnapshotVerifier.VerifyOrCreate(
+          snapshotName: "paints-per-corner-different-border-radii.png",
+          actualPng: image.Data,
+          perChannelTolerance: 0,
+          maxDifferentPixels: 0);
+    }
+
+    [Fact]
+    public async Task RenderToPng_FallsBackToStraightEdgesForMixedWidthRoundedBorder()
+    {
+        var document = await ParseAsync("""
+            <html>
+              <head>
+                <style>html, body { margin: 0; padding: 0; }</style>
+              </head>
+              <body>
+                <div style="margin:10px; width:80px; height:50px; border-top-width:2px; border-right-width:10px; border-bottom-width:2px; border-left-width:2px; border-style:solid; border-color:rgb(0,0,255); background-color:rgb(255,0,0); border-radius:12px;"></div>
+              </body>
+            </html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var image = renderer.RenderToPng(document, new DefaultRenderDevice
+        {
+            ViewPortWidth = 120,
+            ViewPortHeight = 90,
+        });
+
+        VisualSnapshotVerifier.VerifyOrCreate(
+          snapshotName: "falls-back-to-straight-edges-for-mixed-width-rounded-border.png",
+          actualPng: image.Data,
+          perChannelTolerance: 0,
+          maxDifferentPixels: 0);
+    }
+
+    [Fact]
+    public async Task RenderToPng_PaintsOutsetBoxShadow()
+    {
+        var document = await ParseAsync("""
+            <html>
+              <head>
+                <style>html, body { margin: 0; padding: 0; }</style>
+              </head>
+              <body>
+                <div style="margin:20px; width:60px; height:40px; background-color:rgb(0,128,255); box-shadow: 6px 6px 8px rgba(0,0,0,0.6);"></div>
+              </body>
+            </html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var image = renderer.RenderToPng(document, new DefaultRenderDevice
+        {
+            ViewPortWidth = 130,
+            ViewPortHeight = 110,
+        });
+
+        VisualSnapshotVerifier.VerifyOrCreate(
+          snapshotName: "paints-outset-box-shadow.png",
+          actualPng: image.Data,
+          perChannelTolerance: 0,
+          maxDifferentPixels: 0);
+    }
+
+    [Fact]
+    public async Task RenderToPng_PaintsInsetBoxShadow()
+    {
+        var document = await ParseAsync("""
+            <html>
+              <head>
+                <style>html, body { margin: 0; padding: 0; }</style>
+              </head>
+              <body>
+                <div style="margin:20px; width:80px; height:50px; background-color:rgb(255,255,0); box-shadow: inset 0 0 0 8px rgba(0,0,0,0.7);"></div>
+              </body>
+            </html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var image = renderer.RenderToPng(document, new DefaultRenderDevice
+        {
+            ViewPortWidth = 130,
+            ViewPortHeight = 100,
+        });
+
+        VisualSnapshotVerifier.VerifyOrCreate(
+          snapshotName: "paints-inset-box-shadow.png",
+          actualPng: image.Data,
+          perChannelTolerance: 0,
+          maxDifferentPixels: 0);
+    }
+
+    [Fact]
+    public async Task RenderToPng_PaintsBoxShadowFollowingBorderRadius()
+    {
+        var document = await ParseAsync("""
+            <html>
+              <head>
+                <style>html, body { margin: 0; padding: 0; }</style>
+              </head>
+              <body>
+                <div style="margin:20px; width:70px; height:40px; border-radius:16px; background-color:rgb(0,200,0); box-shadow: 4px 4px 0 rgba(0,0,0,0.8);"></div>
+              </body>
+            </html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var image = renderer.RenderToPng(document, new DefaultRenderDevice
+        {
+            ViewPortWidth = 130,
+            ViewPortHeight = 100,
+        });
+
+        VisualSnapshotVerifier.VerifyOrCreate(
+          snapshotName: "paints-box-shadow-following-border-radius.png",
+          actualPng: image.Data,
+          perChannelTolerance: 0,
+          maxDifferentPixels: 0);
+    }
+
+    [Fact]
+    public async Task RenderToPng_PaintsMultipleBoxShadowsLayered()
+    {
+        var document = await ParseAsync("""
+            <html>
+              <head>
+                <style>html, body { margin: 0; padding: 0; }</style>
+              </head>
+              <body>
+                <div style="margin:20px; width:50px; height:30px; background-color:rgb(220,220,220); box-shadow: 3px 3px 0 rgba(255,0,0,1), 6px 6px 0 rgba(0,0,255,1);"></div>
+              </body>
+            </html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var image = renderer.RenderToPng(document, new DefaultRenderDevice
+        {
+            ViewPortWidth = 110,
+            ViewPortHeight = 90,
+        });
+
+        VisualSnapshotVerifier.VerifyOrCreate(
+          snapshotName: "paints-multiple-box-shadows-layered.png",
+          actualPng: image.Data,
+          perChannelTolerance: 0,
+          maxDifferentPixels: 0);
+    }
+
+    [Fact]
+    public async Task RenderToPng_PaintsTextShadow()
+    {
+        var document = await ParseAsync("""
+            <html>
+              <head>
+                <style>html, body { margin: 0; padding: 0; background-color: rgb(60,60,60); }</style>
+              </head>
+              <body>
+                <p style="margin:10px; font-family:sans-serif; font-size:28px; color:rgb(255,255,255); text-shadow: 2px 2px 3px rgba(0,0,0,0.9);">Hi</p>
+              </body>
+            </html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var image = renderer.RenderToPng(document, new DefaultRenderDevice
+        {
+            ViewPortWidth = 120,
+            ViewPortHeight = 70,
+            FontSize = 16f,
+        });
+
+        VisualSnapshotVerifier.VerifyOrCreate(
+          snapshotName: "paints-text-shadow.png",
+          actualPng: image.Data,
+          perChannelTolerance: TextRenderingToleranceChannel,
+          maxDifferentPixels: TextRenderingToleranceMaxPixels);
+    }
+
+    [Fact]
+    public async Task RenderToPng_PaintsMultipleTextShadowsLayered()
+    {
+        var document = await ParseAsync("""
+            <html>
+              <head>
+                <style>html, body { margin: 0; padding: 0; }</style>
+              </head>
+              <body>
+                <p style="margin:10px; font-family:sans-serif; font-size:28px; color:rgb(0,0,0); text-shadow: 2px 2px 0 rgba(255,0,0,1), 4px 4px 0 rgba(0,0,255,1);">Hi</p>
+              </body>
+            </html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var image = renderer.RenderToPng(document, new DefaultRenderDevice
+        {
+            ViewPortWidth = 120,
+            ViewPortHeight = 70,
+            FontSize = 16f,
+        });
+
+        VisualSnapshotVerifier.VerifyOrCreate(
+          snapshotName: "paints-multiple-text-shadows-layered.png",
+          actualPng: image.Data,
+          perChannelTolerance: TextRenderingToleranceChannel,
+          maxDifferentPixels: TextRenderingToleranceMaxPixels);
+    }
+
+    [Fact]
+    public async Task RenderToPng_PaintsOwnBackgroundBehindOwnDirectTextContent()
+    {
+        var document = await ParseAsync("""
+            <html>
+              <head>
+                <style>html, body { margin: 0; padding: 0; }</style>
+              </head>
+              <body>
+                <div style="width:100px; height:40px; background-color:rgb(255,0,0); color:rgb(0,0,0); font-size:24px;">Hi</div>
+              </body>
+            </html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var image = renderer.RenderToPng(document, new DefaultRenderDevice
+        {
+            ViewPortWidth = 120,
+            ViewPortHeight = 60,
+            FontSize = 16f,
+        });
+
+        VisualSnapshotVerifier.VerifyOrCreate(
+          snapshotName: "paints-own-background-behind-own-text.png",
+          actualPng: image.Data,
+          perChannelTolerance: TextRenderingToleranceChannel,
+          maxDifferentPixels: TextRenderingToleranceMaxPixels);
+    }
+
+    [Fact]
+    public async Task RenderToPng_RendersUnorderedListWithDiscBullets()
+    {
+        var document = await ParseAsync("""
+            <html>
+              <head>
+                <style>html, body { margin: 0; padding: 0; }</style>
+              </head>
+              <body>
+                <ul style="font-family:sans-serif; font-size:18px; color:rgb(0,0,0); margin-top:10px; margin-right:10px; margin-bottom:10px;">
+                    <li>One</li>
+                    <li>Two</li>
+                </ul>
+              </body>
+            </html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var image = renderer.RenderToPng(document, new DefaultRenderDevice
+        {
+            ViewPortWidth = 160,
+            ViewPortHeight = 90,
+            FontSize = 16f,
+        });
+
+        VisualSnapshotVerifier.VerifyOrCreate(
+          snapshotName: "renders-unordered-list-with-disc-bullets.png",
+          actualPng: image.Data,
+          perChannelTolerance: TextRenderingToleranceChannel,
+          maxDifferentPixels: TextRenderingToleranceMaxPixels);
+    }
+
+    [Fact]
+    public async Task RenderToPng_RendersOrderedListWithDecimalMarkers()
+    {
+        var document = await ParseAsync("""
+            <html>
+              <head>
+                <style>html, body { margin: 0; padding: 0; }</style>
+              </head>
+              <body>
+                <ol style="font-family:sans-serif; font-size:18px; color:rgb(0,0,0); margin-top:10px; margin-right:10px; margin-bottom:10px;">
+                    <li>First</li>
+                    <li>Second</li>
+                    <li>Third</li>
+                </ol>
+              </body>
+            </html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var image = renderer.RenderToPng(document, new DefaultRenderDevice
+        {
+            ViewPortWidth = 160,
+            ViewPortHeight = 110,
+            FontSize = 16f,
+        });
+
+        VisualSnapshotVerifier.VerifyOrCreate(
+          snapshotName: "renders-ordered-list-with-decimal-markers.png",
+          actualPng: image.Data,
+          perChannelTolerance: TextRenderingToleranceChannel,
+          maxDifferentPixels: TextRenderingToleranceMaxPixels);
+    }
+
+    [Fact]
+    public async Task RenderToPng_RendersSquareAndCircleListStyleTypes()
+    {
+        var document = await ParseAsync("""
+            <html>
+              <head>
+                <style>html, body { margin: 0; padding: 0; }</style>
+              </head>
+              <body>
+                <ul style="font-family:sans-serif; font-size:18px; color:rgb(0,0,0); margin-top:10px; margin-right:10px; margin-bottom:10px; list-style-type:square;">
+                    <li>Square</li>
+                </ul>
+                <ul style="font-family:sans-serif; font-size:18px; color:rgb(0,0,0); margin-top:0; margin-right:10px; margin-bottom:10px; list-style-type:circle;">
+                    <li>Circle</li>
+                </ul>
+              </body>
+            </html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var image = renderer.RenderToPng(document, new DefaultRenderDevice
+        {
+            ViewPortWidth = 160,
+            ViewPortHeight = 90,
+            FontSize = 16f,
+        });
+
+        VisualSnapshotVerifier.VerifyOrCreate(
+          snapshotName: "renders-square-and-circle-list-style-types.png",
+          actualPng: image.Data,
+          perChannelTolerance: TextRenderingToleranceChannel,
+          maxDifferentPixels: TextRenderingToleranceMaxPixels);
+    }
+
+    [Fact]
+    public async Task RenderToPng_RendersNestedListWithIndependentNumbering()
+    {
+        var document = await ParseAsync("""
+            <html>
+              <head>
+                <style>html, body { margin: 0; padding: 0; }</style>
+              </head>
+              <body>
+                <ol style="font-family:sans-serif; font-size:16px; color:rgb(0,0,0); margin-top:10px; margin-right:10px; margin-bottom:10px;">
+                    <li>Parent
+                        <ol style="margin-top:0; margin-bottom:0;">
+                            <li>Child</li>
+                        </ol>
+                    </li>
+                    <li>Sibling</li>
+                </ol>
+              </body>
+            </html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var image = renderer.RenderToPng(document, new DefaultRenderDevice
+        {
+            ViewPortWidth = 180,
+            ViewPortHeight = 130,
+            FontSize = 16f,
+        });
+
+        VisualSnapshotVerifier.VerifyOrCreate(
+          snapshotName: "renders-nested-list-with-independent-numbering.png",
+          actualPng: image.Data,
+          perChannelTolerance: TextRenderingToleranceChannel,
+          maxDifferentPixels: TextRenderingToleranceMaxPixels);
+    }
+
+    [Fact]
+    public async Task RenderToPng_RendersStyledListItemsWithBackgroundColor()
+    {
+        var document = await ParseAsync("""
+            <html>
+              <head>
+                <style>html, body { margin: 0; padding: 0; }</style>
+              </head>
+              <body>
+                <ul style="font-family:sans-serif; font-size:16px; color:rgb(255,255,255); margin-top:10px; margin-right:10px; margin-bottom:10px; list-style-type:none;">
+                    <li style="background-color:rgb(0,120,215); padding:4px; margin-bottom:4px;">Styled item one</li>
+                    <li style="background-color:rgb(0,150,80); padding:4px;">Styled item two</li>
+                </ul>
+              </body>
+            </html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var image = renderer.RenderToPng(document, new DefaultRenderDevice
+        {
+            ViewPortWidth = 220,
+            ViewPortHeight = 100,
+            FontSize = 16f,
+        });
+
+        VisualSnapshotVerifier.VerifyOrCreate(
+          snapshotName: "renders-styled-list-items-with-background-color.png",
+          actualPng: image.Data,
+          perChannelTolerance: TextRenderingToleranceChannel,
+          maxDifferentPixels: TextRenderingToleranceMaxPixels);
+    }
+
+    [Fact]
+    public async Task RenderToPng_ComparesListStylePositionInsideAndOutside()
+    {
+        var document = await ParseAsync("""
+            <html>
+              <head>
+                <style>html, body { margin: 0; padding: 0; }</style>
+              </head>
+              <body>
+                <ul style="font-family:sans-serif; font-size:16px; color:rgb(0,0,0); width:90px; margin-top:10px; margin-right:10px; margin-bottom:10px; list-style-position:outside;">
+                    <li>Outside position keeps the marker in the gutter</li>
+                </ul>
+                <ul style="font-family:sans-serif; font-size:16px; color:rgb(0,0,0); width:90px; margin-top:0; margin-right:10px; margin-bottom:10px; list-style-position:inside;">
+                    <li>Inside position puts the marker on the first line</li>
+                </ul>
+              </body>
+            </html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var image = renderer.RenderToPng(document, new DefaultRenderDevice
+        {
+            ViewPortWidth = 160,
+            ViewPortHeight = 280,
+            FontSize = 16f,
+        });
+
+        VisualSnapshotVerifier.VerifyOrCreate(
+          snapshotName: "compares-list-style-position-inside-and-outside.png",
+          actualPng: image.Data,
+          perChannelTolerance: TextRenderingToleranceChannel,
+          maxDifferentPixels: TextRenderingToleranceMaxPixels);
+    }
+
+    [Fact]
+    public async Task RenderToPng_ClipsOverflowHiddenContentToBox()
+    {
+        var document = await ParseAsync("""
+            <html>
+              <head>
+                <style>html, body { margin: 0; padding: 0; }</style>
+              </head>
+              <body>
+                <div style="margin:10px; width:50px; height:30px; overflow:hidden; background-color:rgb(230,230,230); position:relative;">
+                    <div style="position:absolute; left:20px; top:10px; width:60px; height:60px; background-color:rgb(255,0,0);"></div>
+                </div>
+              </body>
+            </html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var image = renderer.RenderToPng(document, new DefaultRenderDevice
+        {
+            ViewPortWidth = 100,
+            ViewPortHeight = 80,
+        });
+
+        VisualSnapshotVerifier.VerifyOrCreate(
+          snapshotName: "clips-overflow-hidden-content-to-box.png",
+          actualPng: image.Data,
+          perChannelTolerance: 0,
+          maxDifferentPixels: 0);
+    }
+
+    [Fact]
+    public async Task RenderToPng_DoesNotClipOverflowVisibleContent()
+    {
+        var document = await ParseAsync("""
+            <html>
+              <head>
+                <style>html, body { margin: 0; padding: 0; }</style>
+              </head>
+              <body>
+                <div style="margin:10px; width:50px; height:30px; background-color:rgb(230,230,230); position:relative;">
+                    <div style="position:absolute; left:20px; top:10px; width:60px; height:60px; background-color:rgb(255,0,0);"></div>
+                </div>
+              </body>
+            </html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var image = renderer.RenderToPng(document, new DefaultRenderDevice
+        {
+            ViewPortWidth = 100,
+            ViewPortHeight = 80,
+        });
+
+        VisualSnapshotVerifier.VerifyOrCreate(
+          snapshotName: "does-not-clip-overflow-visible-content.png",
+          actualPng: image.Data,
+          perChannelTolerance: 0,
+          maxDifferentPixels: 0);
+    }
+
+    [Fact]
+    public async Task RenderToPng_ClipsToRoundedShapeWithBorderRadius()
+    {
+        var document = await ParseAsync("""
+            <html>
+              <head>
+                <style>html, body { margin: 0; padding: 0; }</style>
+              </head>
+              <body>
+                <div style="margin:10px; width:60px; height:60px; border-radius:16px; overflow:hidden; position:relative;">
+                    <div style="position:absolute; left:-10px; top:-10px; width:100px; height:100px; background-color:rgb(0,120,215);"></div>
+                </div>
+              </body>
+            </html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var image = renderer.RenderToPng(document, new DefaultRenderDevice
+        {
+            ViewPortWidth = 100,
+            ViewPortHeight = 100,
+        });
+
+        VisualSnapshotVerifier.VerifyOrCreate(
+          snapshotName: "clips-to-rounded-shape-with-border-radius.png",
+          actualPng: image.Data,
+          perChannelTolerance: 0,
+          maxDifferentPixels: 0);
+    }
+
+    [Fact]
+    public async Task RenderToPng_ClipsOversizedNormalFlowChildToBox()
+    {
+        // A child's own explicit width is not constrained by its parent's - a plain, normal-flow
+        // (non-absolute) child can be wider than its container, which is a common real-world
+        // overflow trigger (an oversized image, a wide table, ...), distinct from the
+        // position:absolute escape the other tests here use. The child is deliberately no taller
+        // than the parent's own height, since this renderer's auto content height always grows to
+        // fit a normal-flow child vertically (height behaves like a floor, not a cap) - so a
+        // taller child would just grow the parent instead of overflowing it.
+        var document = await ParseAsync("""
+            <html>
+              <head>
+                <style>html, body { margin: 0; padding: 0; }</style>
+              </head>
+              <body>
+                <div style="margin:10px; width:40px; height:30px; overflow:hidden; background-color:rgb(230,230,230);">
+                    <div style="width:80px; height:20px; background-color:rgb(255,0,0);"></div>
+                </div>
+              </body>
+            </html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var image = renderer.RenderToPng(document, new DefaultRenderDevice
+        {
+            ViewPortWidth = 100,
+            ViewPortHeight = 100,
+        });
+
+        VisualSnapshotVerifier.VerifyOrCreate(
+          snapshotName: "clips-oversized-normal-flow-child-to-box.png",
+          actualPng: image.Data,
+          perChannelTolerance: 0,
+          maxDifferentPixels: 0);
+    }
+
     private static async Task<byte[]> RenderCanvasSnapshotAsync(string html, Action<Canvas2DRenderingContext> draw)
     {
         var context = BrowsingContext.New(Configuration.Default.WithCss().WithRendering());
@@ -1406,9 +2074,559 @@ public sealed class VisualConformanceTests
         return canvasContext.ToImage("image/png");
     }
 
-    private static async Task<AngleSharp.Dom.IDocument> ParseAsync(string html)
+    [Fact]
+    public async Task RenderToPng_PaintsTopOfTallPageWhenUnscrolled()
     {
-        var context = BrowsingContext.New(Configuration.Default.WithCss());
+        var image = await RenderScrolledTallPageAsync(scrollTop: null, viewportHeight: 80);
+
+        VisualSnapshotVerifier.VerifyOrCreate(
+          snapshotName: "paints-top-of-tall-page-when-unscrolled.png",
+          actualPng: image.Data,
+          perChannelTolerance: 0,
+          maxDifferentPixels: 0);
+    }
+
+    [Fact]
+    public async Task RenderToPng_PaintsOnlyBottomOfTallPageWhenScrollOffsetIsLargeEnough()
+    {
+        // The page is 5 stacked 40px bands (200px total) in an 80px-tall viewport - scrolling by
+        // 120px moves past the first three bands entirely, so only the last two (green, blue)
+        // should paint, shifted up to fill the viewport exactly as the unscrolled page's first two
+        // bands (red, orange) do in the sibling test above.
+        var image = await RenderScrolledTallPageAsync(scrollTop: 120, viewportHeight: 80);
+
+        VisualSnapshotVerifier.VerifyOrCreate(
+          snapshotName: "paints-only-bottom-of-tall-page-when-scroll-offset-is-large-enough.png",
+          actualPng: image.Data,
+          perChannelTolerance: 0,
+          maxDifferentPixels: 0);
+    }
+
+    [Fact]
+    public async Task RenderToPng_PaintsMiddleOfTallPageAtAnArbitrarySettableScrollOffset()
+    {
+        // A scroll offset that isn't aligned to a band boundary (100px lands 20px into the third
+        // band, yellow) proves the offset is a continuously "settable" pixel value, not just a
+        // switch between a fixed top/bottom view - the viewport should show the bottom 20px of
+        // yellow, all 40px of green, then the top 20px of blue. 100px is also comfortably within
+        // the page's actual 120px max scroll (200px content - 80px viewport), unlike a larger
+        // value that would just clamp to the same view as the "scrolled past the top" test above.
+        var image = await RenderScrolledTallPageAsync(scrollTop: 100, viewportHeight: 80);
+
+        VisualSnapshotVerifier.VerifyOrCreate(
+          snapshotName: "paints-middle-of-tall-page-at-an-arbitrary-settable-scroll-offset.png",
+          actualPng: image.Data,
+          perChannelTolerance: 0,
+          maxDifferentPixels: 0);
+    }
+
+    private static async Task<AngleSharp.Renderer.Rendering.RenderedImage> RenderScrolledTallPageAsync(double? scrollTop, int viewportHeight)
+    {
+        var renderDevice = new DefaultRenderDevice
+        {
+            ViewPortWidth = 80,
+            ViewPortHeight = viewportHeight,
+            DeviceWidth = 80,
+            DeviceHeight = viewportHeight,
+            FontSize = 16,
+        };
+        var configuration = Configuration.Default.WithCss().WithRenderDevice(renderDevice);
+        var document = await ParseAsync("""
+            <html>
+              <head><style>html, body { margin: 0; padding: 0; }</style></head>
+              <body>
+                <div style="width:80px; height:40px; background-color:rgb(255,0,0);"></div>
+                <div style="width:80px; height:40px; background-color:rgb(255,165,0);"></div>
+                <div style="width:80px; height:40px; background-color:rgb(255,255,0);"></div>
+                <div style="width:80px; height:40px; background-color:rgb(0,180,0);"></div>
+                <div style="width:80px; height:40px; background-color:rgb(0,0,255);"></div>
+              </body>
+            </html>
+            """, configuration);
+
+        if (scrollTop.HasValue)
+        {
+            document.Context.GetDomHarness();
+            document.DocumentElement.SetScrollTop(scrollTop.Value);
+        }
+
+        var renderer = new HtmlRenderer();
+        return renderer.RenderToPng(document, renderDevice);
+    }
+
+    // A hand-built 2x2 RGB PNG (no palette, filter 0), one red pixel diagonal from one blue pixel -
+    // a tiny, unambiguous checkerboard tile that makes tiling/scaling/positioning visually obvious
+    // even at very small sizes, unlike a solid-color 1x1 pixel (which would look identical whether
+    // or not tiling/positioning code actually ran).
+    private const string CheckerboardTileDataUri =
+        "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAIAAAD91JpzAAAAE0lEQVR42mO4IycnZ3OHAYiBLAAgUgSdATw7NgAAAABJRU5ErkJggg==";
+
+    // A larger (20x20, four 10x10 quadrants) checkerboard PNG built the same way as
+    // CheckerboardTileDataUri, used specifically for the default-repeat tiling test below - tiling
+    // a 2x2 tile at 1:1 scale produces a genuinely correct but single-pixel-period checkerboard,
+    // which is indistinguishable from a rendering bug under any kind of downsampled visual
+    // inspection (verified: a raw per-pixel dump of that render confirmed it actually alternates
+    // correctly, but it is not a useful baseline for a human - or a diff image - to eyeball).
+    private const string CoarseCheckerboardTileDataUri =
+        "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABQAAAAUCAIAAAAC64paAAAAJUlEQVR42mO4IyeHB8nZ3MGDGEY1j2omqBm/NH6jRzWPaiaoGQCY+s0A5fuwxQAAAABJRU5ErkJggg==";
+
+    [Fact]
+    public async Task RenderToPng_TilesBackgroundImageAcrossBoxByDefault()
+    {
+        // No background-repeat/position/size given at all - the CSS initial values (`repeat repeat`,
+        // `0% 0%`, `auto`) tile the 20x20 tile at its own natural size across the whole box, so a
+        // 60x60 box shows a clean 3x3 grid of the tile's four quadrants.
+        var document = await ParseAsync($$"""
+            <html>
+              <head><style>html, body { margin: 0; padding: 0; }</style></head>
+              <body>
+                <div style="width:60px; height:60px; background-image: url({{CoarseCheckerboardTileDataUri}});"></div>
+              </body>
+            </html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var image = renderer.RenderToPng(document, new DefaultRenderDevice
+        {
+            ViewPortWidth = 60,
+            ViewPortHeight = 60,
+        });
+
+        VisualSnapshotVerifier.VerifyOrCreate(
+          snapshotName: "tiles-background-image-across-box-by-default.png",
+          actualPng: image.Data,
+          perChannelTolerance: 0,
+          maxDifferentPixels: 0);
+    }
+
+    [Fact]
+    public async Task RenderToPng_PositionsAndSizesNoRepeatBackgroundImage()
+    {
+        // An explicit background-size, background-repeat: no-repeat and background-position: right
+        // bottom together place a single, scaled-up copy of the tile in the box's bottom-right
+        // corner - the rest of the box shows the plain background-color underneath, since a
+        // non-repeating axis paints transparent (Decal), not a smeared/clamped edge color.
+        var document = await ParseAsync($$"""
+            <html>
+              <head><style>html, body { margin: 0; padding: 0; }</style></head>
+              <body>
+                <div style="width:60px; height:60px; background-color:#ffffff; background-image: url({{CheckerboardTileDataUri}}); background-repeat: no-repeat; background-size: 20px 20px; background-position: right bottom;"></div>
+              </body>
+            </html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var image = renderer.RenderToPng(document, new DefaultRenderDevice
+        {
+            ViewPortWidth = 60,
+            ViewPortHeight = 60,
+        });
+
+        VisualSnapshotVerifier.VerifyOrCreate(
+          snapshotName: "positions-and-sizes-no-repeat-background-image.png",
+          actualPng: image.Data,
+          perChannelTolerance: 0,
+          maxDifferentPixels: 0);
+    }
+
+    [Fact]
+    public async Task RenderToPng_ScalesBackgroundImageToCoverBox()
+    {
+        // background-size: cover scales the (square) tile up until it fills a non-square box
+        // entirely, cropping whichever axis overflows - here the box is wider than it is tall, so
+        // the tile is scaled to the box's width and its vertical overflow is cropped symmetrically
+        // (background-position: center, the CSS default for a single "center" keyword).
+        var document = await ParseAsync($$"""
+            <html>
+              <head><style>html, body { margin: 0; padding: 0; }</style></head>
+              <body>
+                <div style="width:80px; height:40px; background-image: url({{CheckerboardTileDataUri}}); background-repeat: no-repeat; background-size: cover; background-position: center;"></div>
+              </body>
+            </html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var image = renderer.RenderToPng(document, new DefaultRenderDevice
+        {
+            ViewPortWidth = 80,
+            ViewPortHeight = 40,
+        });
+
+        VisualSnapshotVerifier.VerifyOrCreate(
+          snapshotName: "scales-background-image-to-cover-box.png",
+          actualPng: image.Data,
+          perChannelTolerance: 0,
+          maxDifferentPixels: 0);
+    }
+
+    [Fact]
+    public async Task RenderToPng_RendersFormControlGalleryWithDefaultStyling()
+    {
+        var document = await ParseAsync("""
+            <html>
+              <head><style>
+                html, body { margin: 0; padding: 0; }
+                div.row { margin-bottom: 6px; }
+              </style></head>
+              <body>
+                <div class="row"><input type="text" value="Hello" /></div>
+                <div class="row"><input type="number" value="42" /></div>
+                <div class="row"><input type="url" value="https://x.test" /></div>
+                <div class="row"><input type="color" value="#3388ff" /></div>
+                <div class="row"><input type="checkbox" /><input type="checkbox" checked /></div>
+                <div class="row"><input type="radio" /><input type="radio" checked /></div>
+                <div class="row">
+                  <select>
+                    <option>First</option>
+                    <option selected>Second</option>
+                  </select>
+                </div>
+                <div class="row"><textarea>Some notes</textarea></div>
+                <div class="row"><button>Click Me</button><input type="submit" value="Send" /></div>
+              </body>
+            </html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var image = renderer.RenderToPng(document, new DefaultRenderDevice
+        {
+            ViewPortWidth = 220,
+            ViewPortHeight = 340,
+            FontSize = 16,
+        });
+
+        VisualSnapshotVerifier.VerifyOrCreate(
+          snapshotName: "renders-form-control-gallery-with-default-styling.png",
+          actualPng: image.Data,
+          perChannelTolerance: TextRenderingToleranceChannel,
+          maxDifferentPixels: TextRenderingToleranceMaxPixels);
+    }
+
+    [Fact]
+    public async Task RenderToPng_FormControlDefaultsAreOverriddenByAuthorCss()
+    {
+        // Two otherwise-identical text inputs side by side - the left keeps every synthesized
+        // default, the right overrides border color/width, border-radius, background-color and
+        // width via ordinary CSS, exactly the way a real browser lets you restyle a form control's
+        // "somewhat overridable" native chrome without needing a `appearance: none` escape hatch.
+        var document = await ParseAsync("""
+            <html>
+              <head><style>html, body { margin: 0; padding: 0; }</style></head>
+              <body>
+                <input type="text" value="Default" style="display:block; margin-bottom:8px;" />
+                <input type="text" value="Custom" style="display:block; width:100px; background-color:#fff6d5; border:3px solid #cc6600; border-radius:8px;" />
+              </body>
+            </html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var image = renderer.RenderToPng(document, new DefaultRenderDevice
+        {
+            ViewPortWidth = 180,
+            ViewPortHeight = 80,
+            FontSize = 16,
+        });
+
+        VisualSnapshotVerifier.VerifyOrCreate(
+          snapshotName: "form-control-defaults-are-overridden-by-author-css.png",
+          actualPng: image.Data,
+          perChannelTolerance: TextRenderingToleranceChannel,
+          maxDifferentPixels: TextRenderingToleranceMaxPixels);
+    }
+
+    [Fact]
+    public async Task RenderToPng_TranslatesAndScalesAChainedTransformedBox()
+    {
+        var document = await ParseAsync("""
+            <html>
+              <head>
+                <style>html, body { margin: 0; padding: 0; }</style>
+              </head>
+              <body>
+                <div style="margin:10px; width:30px; height:15px; background-color:rgb(0,128,255); transform: translate(20px, 10px) scale(1.5);"></div>
+              </body>
+            </html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var image = renderer.RenderToPng(document, new DefaultRenderDevice
+        {
+            ViewPortWidth = 150,
+            ViewPortHeight = 100,
+        });
+
+        VisualSnapshotVerifier.VerifyOrCreate(
+          snapshotName: "translates-and-scales-a-chained-transformed-box.png",
+          actualPng: image.Data,
+          perChannelTolerance: 0,
+          maxDifferentPixels: 0);
+    }
+
+    [Fact]
+    public async Task RenderToPng_RotatesABoxAroundItsDefaultCenter()
+    {
+        var document = await ParseAsync("""
+            <html>
+              <head>
+                <style>html, body { margin: 0; padding: 0; }</style>
+              </head>
+              <body>
+                <div style="margin:30px; width:60px; height:30px; background-color:rgb(220,50,50); transform: rotate(45deg);"></div>
+              </body>
+            </html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var image = renderer.RenderToPng(document, new DefaultRenderDevice
+        {
+            ViewPortWidth = 150,
+            ViewPortHeight = 120,
+        });
+
+        VisualSnapshotVerifier.VerifyOrCreate(
+          snapshotName: "rotates-a-box-around-its-default-center.png",
+          actualPng: image.Data,
+          perChannelTolerance: 0,
+          maxDifferentPixels: 0);
+    }
+
+    [Fact]
+    public async Task RenderToPng_ScalesABoxAroundACustomTransformOrigin()
+    {
+        var document = await ParseAsync("""
+            <html>
+              <head>
+                <style>html, body { margin: 0; padding: 0; }</style>
+              </head>
+              <body>
+                <div style="margin:10px; width:40px; height:40px; background-color:rgb(200,60,0); transform: scale(1.5); transform-origin: top left;"></div>
+              </body>
+            </html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var image = renderer.RenderToPng(document, new DefaultRenderDevice
+        {
+            ViewPortWidth = 120,
+            ViewPortHeight = 100,
+        });
+
+        VisualSnapshotVerifier.VerifyOrCreate(
+          snapshotName: "scales-a-box-around-a-custom-transform-origin.png",
+          actualPng: image.Data,
+          perChannelTolerance: 0,
+          maxDifferentPixels: 0);
+    }
+
+    [Fact]
+    public async Task RenderToPng_GrayscaleFilterDesaturatesABox()
+    {
+        var document = await ParseAsync("""
+            <html>
+              <head>
+                <style>html, body { margin: 0; padding: 0; }</style>
+              </head>
+              <body>
+                <div style="margin:20px; width:60px; height:40px; background-color:rgb(220,50,50); filter: grayscale(1);"></div>
+              </body>
+            </html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var image = renderer.RenderToPng(document, new DefaultRenderDevice
+        {
+            ViewPortWidth = 120,
+            ViewPortHeight = 100,
+        });
+
+        VisualSnapshotVerifier.VerifyOrCreate(
+          snapshotName: "grayscale-filter-desaturates-a-box.png",
+          actualPng: image.Data,
+          perChannelTolerance: 0,
+          maxDifferentPixels: 0);
+    }
+
+    [Fact]
+    public async Task RenderToPng_BlurFilterSoftensABoxEdge()
+    {
+        var document = await ParseAsync("""
+            <html>
+              <head>
+                <style>html, body { margin: 0; padding: 0; }</style>
+              </head>
+              <body>
+                <div style="margin:30px; width:40px; height:40px; background-color:rgb(0,128,255); filter: blur(6px);"></div>
+              </body>
+            </html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var image = renderer.RenderToPng(document, new DefaultRenderDevice
+        {
+            ViewPortWidth = 120,
+            ViewPortHeight = 100,
+        });
+
+        VisualSnapshotVerifier.VerifyOrCreate(
+          snapshotName: "blur-filter-softens-a-box-edge.png",
+          actualPng: image.Data,
+          perChannelTolerance: 0,
+          maxDifferentPixels: 0);
+    }
+
+    [Fact]
+    public async Task RenderToPng_OpacityFadesABoxOverAWhiteBackground()
+    {
+        var document = await ParseAsync("""
+            <html>
+              <head>
+                <style>html, body { margin: 0; padding: 0; background-color: white; }</style>
+              </head>
+              <body>
+                <div style="margin:20px; width:60px; height:40px; background-color:rgb(220,50,50); opacity: 0.4;"></div>
+              </body>
+            </html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var image = renderer.RenderToPng(document, new DefaultRenderDevice
+        {
+            ViewPortWidth = 120,
+            ViewPortHeight = 100,
+        });
+
+        VisualSnapshotVerifier.VerifyOrCreate(
+          snapshotName: "opacity-fades-a-box-over-a-white-background.png",
+          actualPng: image.Data,
+          perChannelTolerance: 0,
+          maxDifferentPixels: 0);
+    }
+
+    [Fact]
+    public async Task RenderToPng_HoverTransitionShowsAnInterpolatedMidFlightFrame()
+    {
+        var renderDevice = new DefaultRenderDevice { ViewPortWidth = 120, ViewPortHeight = 100, FontSize = 16 };
+        var configuration = Configuration.Default.WithCss().WithRenderDevice(renderDevice);
+        var document = await ParseAsync("""
+            <html>
+              <head>
+                <style>
+                  html, body { margin: 0; padding: 0; background-color: white; }
+                  #target { background-color: rgb(0, 0, 255); transition: background-color 1s linear; }
+                  #target:hover { background-color: rgb(255, 0, 0); }
+                </style>
+              </head>
+              <body>
+                <div id="target" style="margin:20px; width:60px; height:40px;"></div>
+              </body>
+            </html>
+            """, configuration);
+
+        var harness = document.Context.GetDomHarness();
+        harness.MousePosition = (50, 40);
+        harness.AdvanceTime(TimeSpan.FromMilliseconds(500));
+
+        var image = harness.PaintToPng();
+
+        VisualSnapshotVerifier.VerifyOrCreate(
+          snapshotName: "hover-transition-shows-an-interpolated-mid-flight-frame.png",
+          actualPng: image.Data,
+          perChannelTolerance: 0,
+          maxDifferentPixels: 0);
+    }
+
+    [Fact]
+    public async Task RenderToPng_AnimationShowsAnInterpolatedMidFlightFrame()
+    {
+        var renderDevice = new DefaultRenderDevice { ViewPortWidth = 120, ViewPortHeight = 100, FontSize = 16 };
+        var configuration = Configuration.Default.WithCss().WithRenderDevice(renderDevice);
+        var document = await ParseAsync("""
+            <html>
+              <head>
+                <style>
+                  html, body { margin: 0; padding: 0; background-color: white; }
+                  @keyframes slide {
+                    0% { left: 0px; }
+                    100% { left: 60px; }
+                  }
+                  #target { position: relative; background-color: rgb(0, 128, 255); animation: slide 2s linear; }
+                </style>
+              </head>
+              <body>
+                <div id="target" style="margin:20px; width:30px; height:40px;"></div>
+              </body>
+            </html>
+            """, configuration);
+
+        var harness = document.Context.GetDomHarness();
+        harness.AdvanceTime(TimeSpan.FromMilliseconds(1000));
+
+        var image = harness.PaintToPng();
+
+        VisualSnapshotVerifier.VerifyOrCreate(
+          snapshotName: "animation-shows-an-interpolated-mid-flight-frame.png",
+          actualPng: image.Data,
+          perChannelTolerance: 0,
+          maxDifferentPixels: 0);
+    }
+
+    [Fact]
+    public async Task RenderToPng_FocusedTextInputShowsAnOpaqueCaret()
+    {
+        var renderDevice = new DefaultRenderDevice { ViewPortWidth = 120, ViewPortHeight = 60, FontSize = 16 };
+        var configuration = Configuration.Default.WithCss().WithRenderDevice(renderDevice);
+        var document = await ParseAsync("""
+            <html>
+              <head>
+                <style>html, body { margin: 0; padding: 0; background-color: white; }</style>
+              </head>
+              <body>
+                <input id="target" type="text" value="Hi" style="margin:10px;" />
+              </body>
+            </html>
+            """, configuration);
+
+        var target = (IHtmlElement)document.GetElementById("target")!;
+        target.DoFocus();
+
+        // Registering the harness starts the virtual clock at 0, where the caret's cosine "breathe"
+        // is at its peak (see FormControlCaretBlinkPeriodMs) - a deterministic, fully-opaque frame.
+        var harness = document.Context.GetDomHarness();
+        var image = harness.PaintToPng();
+
+        VisualSnapshotVerifier.VerifyOrCreate(
+          snapshotName: "focused-text-input-shows-an-opaque-caret.png",
+          actualPng: image.Data,
+          perChannelTolerance: 0,
+          maxDifferentPixels: 0);
+    }
+
+    [Fact]
+    public async Task RenderToPng_PreWhiteSpacePreservesIndentationAndLineBreaks()
+    {
+        var renderDevice = new DefaultRenderDevice { ViewPortWidth = 260, ViewPortHeight = 120, FontSize = 16 };
+        var configuration = Configuration.Default.WithCss().WithRenderDevice(renderDevice);
+        var html = "<html><head><style>html, body { margin: 0; padding: 0; background-color: white; }</style></head>"
+            + "<body><pre>function f() {\n    return 1;\n}</pre></body></html>";
+        var document = await ParseAsync(html, configuration);
+
+        var renderer = new HtmlRenderer();
+        var image = renderer.RenderToPng(document, renderDevice);
+
+        // Multi-line, monospace-heavy text (the whole point of this snapshot) is exactly the case
+        // TextRenderingToleranceChannel/MaxPixels already exist for elsewhere in this file - font
+        // hinting/anti-aliasing can shift a glyph edge by a pixel or two between runs even on the
+        // same platform, with no actual layout regression.
+        VisualSnapshotVerifier.VerifyOrCreate(
+          snapshotName: "pre-white-space-preserves-indentation-and-line-breaks.png",
+          actualPng: image.Data,
+          perChannelTolerance: TextRenderingToleranceChannel,
+          maxDifferentPixels: TextRenderingToleranceMaxPixels);
+    }
+
+    private static async Task<AngleSharp.Dom.IDocument> ParseAsync(string html, IConfiguration? configuration = null)
+    {
+        var context = BrowsingContext.New(configuration ?? Configuration.Default.WithCss());
         return await context.OpenAsync(request => request.Content(html));
     }
 }

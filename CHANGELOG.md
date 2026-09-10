@@ -1,3 +1,20 @@
+# 0.4.0
+
+Released on Thursday, September 10 2026.
+
+- Improved support for clipping and `overflow` declarations
+- Improved whitespace handling for rendering
+- Fixed painting of scrolled content
+- Fixed handling of background images
+- Added support for rounded corners
+- Added support for transformations and filters
+- Added transitions and animations with a virtual clock
+- Added support for `text-shadow` declarations
+- Added support for `box-shadow` declarations
+- Added support for numeric sorted lists (e.g., using `ol`)
+- Added support for bullet point lists (e.g., using `ul`)
+- Added basic rendering of standard form controls
+
 # 0.3.0
 
 Released on Monday, September 7 2026.

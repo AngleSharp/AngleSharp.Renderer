@@ -55,14 +55,325 @@ public sealed class SkiaRenderBackend : IRenderBackend, ITextMeasurer
             case FillRectCommand fill:
                 DrawFillRect(canvas, fill);
                 break;
+            case StrokeRoundedRectCommand strokeRoundedRect:
+                DrawStrokeRoundedRect(canvas, strokeRoundedRect);
+                break;
+            case DrawBoxShadowCommand boxShadow:
+                DrawBoxShadow(canvas, boxShadow);
+                break;
             case DrawImageCommand image:
                 DrawImage(canvas, image);
                 break;
             case DrawTextCommand text:
                 DrawText(canvas, text, fonts);
                 break;
+            case DrawTextShadowCommand textShadow:
+                DrawTextShadow(canvas, textShadow, fonts);
+                break;
+            case PushClipCommand pushClip:
+                PushClip(canvas, pushClip);
+                break;
+            case PopClipCommand:
+                canvas.Restore();
+                break;
+            case PushTransformCommand pushTransform:
+                PushTransform(canvas, pushTransform);
+                break;
+            case PopTransformCommand:
+                canvas.Restore();
+                break;
+            case PushFilterCommand pushFilter:
+                PushFilter(canvas, pushFilter);
+                break;
+            case PopFilterCommand:
+                canvas.Restore();
+                break;
+            case PushOpacityCommand pushOpacity:
+                PushOpacity(canvas, pushOpacity);
+                break;
+            case PopOpacityCommand:
+                canvas.Restore();
+                break;
         }
     }
+
+    private static void PushTransform(SKCanvas canvas, PushTransformCommand command)
+    {
+        canvas.Save();
+
+        var t = command.Transform;
+        // SKMatrix's constructor takes (scaleX, skewX, transX, skewY, scaleY, transY, ...) - the
+        // same field reordering already used everywhere else in this file that builds an SKMatrix
+        // from an a/b/c/d/e/f-style source, not the a/b/c/d/e/f order CSS's own matrix() function
+        // (and RenderTransform2D, matching it) uses.
+        var matrix = new SKMatrix(t.A, t.C, t.E, t.B, t.D, t.F, 0f, 0f, 1f);
+        canvas.Concat(ref matrix);
+    }
+
+    private static void PushOpacity(SKCanvas canvas, PushOpacityCommand command)
+    {
+        var alpha = (byte)Math.Round(Math.Clamp(command.Alpha, 0f, 1f) * 255f);
+        using var paint = new SKPaint { Color = new SKColor(255, 255, 255, alpha) };
+        canvas.SaveLayer(paint);
+    }
+
+    private static void PushFilter(SKCanvas canvas, PushFilterCommand command)
+    {
+        using var paint = new SKPaint { ImageFilter = BuildFilterChain(command.Functions) };
+        canvas.SaveLayer(paint);
+    }
+
+    private static SKImageFilter? BuildFilterChain(IReadOnlyList<RenderFilterFunction> functions)
+    {
+        SKImageFilter? chain = null;
+
+        foreach (var function in functions)
+        {
+            chain = function.Kind switch
+            {
+                RenderFilterFunctionKind.Blur =>
+                    SKImageFilter.CreateBlur(Math.Max(0f, function.Amount) / 2f, Math.Max(0f, function.Amount) / 2f, chain),
+                RenderFilterFunctionKind.DropShadow =>
+                    SKImageFilter.CreateDropShadow(function.OffsetX, function.OffsetY, Math.Max(0f, function.Amount) / 2f, Math.Max(0f, function.Amount) / 2f, ToSkColor(function.Color), chain),
+                _ => SKImageFilter.CreateColorFilter(SKColorFilter.CreateColorMatrix(BuildFilterColorMatrix(function)), chain),
+            };
+        }
+
+        return chain;
+    }
+
+    // The CSS Filter Effects spec's per-function color matrices, each a 4x5 row-major matrix
+    // operating on un-premultiplied 0..1 color components (SKColorFilter.CreateColorMatrix's own
+    // convention, already relied on by SvgFilterBuilder's independent feColorMatrix support - these
+    // two implementations deliberately do not share code, mirroring how SVG gradients do not share
+    // code with the CSS gradient path).
+    private static float[] BuildFilterColorMatrix(RenderFilterFunction function) => function.Kind switch
+    {
+        RenderFilterFunctionKind.Grayscale => Lerp(IdentityColorMatrix, GrayscaleColorMatrix, Math.Clamp(function.Amount, 0f, 1f)),
+        RenderFilterFunctionKind.Sepia => Lerp(IdentityColorMatrix, SepiaColorMatrix, Math.Clamp(function.Amount, 0f, 1f)),
+        RenderFilterFunctionKind.Saturate => CreateSaturateColorMatrix(Math.Max(0f, function.Amount)),
+        RenderFilterFunctionKind.HueRotate => CreateHueRotateColorMatrix(function.Amount),
+        RenderFilterFunctionKind.Invert => CreateInvertColorMatrix(Math.Clamp(function.Amount, 0f, 1f)),
+        RenderFilterFunctionKind.Brightness => CreateBrightnessColorMatrix(Math.Max(0f, function.Amount)),
+        RenderFilterFunctionKind.Contrast => CreateContrastColorMatrix(Math.Max(0f, function.Amount)),
+        RenderFilterFunctionKind.Opacity => CreateOpacityColorMatrix(Math.Clamp(function.Amount, 0f, 1f)),
+        _ => IdentityColorMatrix,
+    };
+
+    private static float[] Lerp(float[] from, float[] to, float t)
+    {
+        var result = new float[20];
+
+        for (var i = 0; i < 20; i++)
+        {
+            result[i] = from[i] + ((to[i] - from[i]) * t);
+        }
+
+        return result;
+    }
+
+    private static float[] CreateSaturateColorMatrix(float s) =>
+    [
+        0.213f + (0.787f * s), 0.715f - (0.715f * s), 0.072f - (0.072f * s), 0f, 0f,
+        0.213f - (0.213f * s), 0.715f + (0.285f * s), 0.072f - (0.072f * s), 0f, 0f,
+        0.213f - (0.213f * s), 0.715f - (0.715f * s), 0.072f + (0.928f * s), 0f, 0f,
+        0f, 0f, 0f, 1f, 0f,
+    ];
+
+    private static float[] CreateHueRotateColorMatrix(float angleDegrees)
+    {
+        var radians = angleDegrees * (float)Math.PI / 180f;
+        var cos = (float)Math.Cos(radians);
+        var sin = (float)Math.Sin(radians);
+
+        return
+        [
+            0.213f + (cos * 0.787f) - (sin * 0.213f), 0.715f - (cos * 0.715f) - (sin * 0.715f), 0.072f - (cos * 0.072f) + (sin * 0.928f), 0f, 0f,
+            0.213f - (cos * 0.213f) + (sin * 0.143f), 0.715f + (cos * 0.285f) + (sin * 0.140f), 0.072f - (cos * 0.072f) - (sin * 0.283f), 0f, 0f,
+            0.213f - (cos * 0.213f) - (sin * 0.787f), 0.715f - (cos * 0.715f) + (sin * 0.715f), 0.072f + (cos * 0.928f) + (sin * 0.072f), 0f, 0f,
+            0f, 0f, 0f, 1f, 0f,
+        ];
+    }
+
+    private static float[] CreateInvertColorMatrix(float amount)
+    {
+        var scale = 1f - (2f * amount);
+
+        return
+        [
+            scale, 0f, 0f, 0f, amount,
+            0f, scale, 0f, 0f, amount,
+            0f, 0f, scale, 0f, amount,
+            0f, 0f, 0f, 1f, 0f,
+        ];
+    }
+
+    private static float[] CreateBrightnessColorMatrix(float amount) =>
+    [
+        amount, 0f, 0f, 0f, 0f,
+        0f, amount, 0f, 0f, 0f,
+        0f, 0f, amount, 0f, 0f,
+        0f, 0f, 0f, 1f, 0f,
+    ];
+
+    private static float[] CreateContrastColorMatrix(float amount)
+    {
+        var offset = 0.5f * (1f - amount);
+
+        return
+        [
+            amount, 0f, 0f, 0f, offset,
+            0f, amount, 0f, 0f, offset,
+            0f, 0f, amount, 0f, offset,
+            0f, 0f, 0f, 1f, 0f,
+        ];
+    }
+
+    private static float[] CreateOpacityColorMatrix(float amount) =>
+    [
+        1f, 0f, 0f, 0f, 0f,
+        0f, 1f, 0f, 0f, 0f,
+        0f, 0f, 1f, 0f, 0f,
+        0f, 0f, 0f, amount, 0f,
+    ];
+
+    private static readonly float[] IdentityColorMatrix =
+    [
+        1f, 0f, 0f, 0f, 0f,
+        0f, 1f, 0f, 0f, 0f,
+        0f, 0f, 1f, 0f, 0f,
+        0f, 0f, 0f, 1f, 0f,
+    ];
+
+    private static readonly float[] GrayscaleColorMatrix =
+    [
+        0.2126f, 0.7152f, 0.0722f, 0f, 0f,
+        0.2126f, 0.7152f, 0.0722f, 0f, 0f,
+        0.2126f, 0.7152f, 0.0722f, 0f, 0f,
+        0f, 0f, 0f, 1f, 0f,
+    ];
+
+    private static readonly float[] SepiaColorMatrix =
+    [
+        0.393f, 0.769f, 0.189f, 0f, 0f,
+        0.349f, 0.686f, 0.168f, 0f, 0f,
+        0.272f, 0.534f, 0.131f, 0f, 0f,
+        0f, 0f, 0f, 1f, 0f,
+    ];
+
+    private static void PushClip(SKCanvas canvas, PushClipCommand command)
+    {
+        canvas.Save();
+
+        var rect = new SKRect(
+            command.Rect.X,
+            command.Rect.Y,
+            command.Rect.X + command.Rect.Width,
+            command.Rect.Y + command.Rect.Height);
+
+        if (command.Radii.IsZero)
+        {
+            canvas.ClipRect(rect, SKClipOperation.Intersect, antialias: true);
+        }
+        else
+        {
+            using var roundRect = new SKRoundRect();
+            roundRect.SetRectRadii(rect, ToSkPoints(command.Radii));
+            canvas.ClipRoundRect(roundRect, SKClipOperation.Intersect, antialias: true);
+        }
+    }
+
+    private static void DrawBoxShadow(SKCanvas canvas, DrawBoxShadowCommand command)
+    {
+        var shadow = command.Shadow;
+
+        if (command.BorderBoxRect.IsEmpty || shadow.Color.A == 0)
+        {
+            return;
+        }
+
+        var borderBoxRect = new SKRect(
+            command.BorderBoxRect.X,
+            command.BorderBoxRect.Y,
+            command.BorderBoxRect.X + command.BorderBoxRect.Width,
+            command.BorderBoxRect.Y + command.BorderBoxRect.Height);
+
+        using var borderBoxRRect = new SKRoundRect();
+        borderBoxRRect.SetRectRadii(borderBoxRect, ToSkPoints(command.BorderBoxRadii));
+
+        using var paint = new SKPaint
+        {
+            Color = ToSkColor(shadow.Color),
+            IsAntialias = true,
+            Style = SKPaintStyle.Fill,
+        };
+
+        if (shadow.BlurRadius > 0f)
+        {
+            // Browsers commonly derive the Gaussian sigma as half the CSS blur radius.
+            paint.MaskFilter = SKMaskFilter.CreateBlur(SKBlurStyle.Normal, shadow.BlurRadius / 2f);
+        }
+
+        canvas.Save();
+
+        if (shadow.Inset)
+        {
+            // Per spec, an inset shadow is clipped to the border box, then painted as the area
+            // between a rect well outside the box and the spread/offset inner rect - i.e. the
+            // "ring" that is inside the border box but outside the (shrunk, moved) inner shape.
+            canvas.ClipRoundRect(borderBoxRRect, SKClipOperation.Intersect, antialias: true);
+
+            using var innerRRect = new SKRoundRect(borderBoxRRect);
+            ApplySpread(innerRRect, -shadow.SpreadRadius);
+            innerRRect.SetRectRadii(OffsetRect(innerRRect.Rect, shadow.OffsetX, shadow.OffsetY), innerRRect.Radii);
+
+            // A generous fixed outset keeps the even-odd path's outer boundary outside the
+            // blurred region in every direction, regardless of blur radius, spread, or offset.
+            var outerPadding = Math.Abs(shadow.OffsetX) + Math.Abs(shadow.OffsetY) + shadow.BlurRadius + Math.Abs(shadow.SpreadRadius) + 32f;
+            var outerRect = SKRect.Inflate(borderBoxRect, outerPadding, outerPadding);
+
+            using var path = new SKPath { FillType = SKPathFillType.EvenOdd };
+            path.AddRect(outerRect, SKPathDirection.Clockwise);
+            path.AddRoundRect(innerRRect, SKPathDirection.Clockwise);
+
+            canvas.DrawPath(path, paint);
+        }
+        else
+        {
+            // Clip OUT the border box's own shape so a transparent-background box does not show
+            // the shadow bleeding through its own interior, per spec.
+            canvas.ClipRoundRect(borderBoxRRect, SKClipOperation.Difference, antialias: true);
+
+            using var shadowRRect = new SKRoundRect(borderBoxRRect);
+            ApplySpread(shadowRRect, shadow.SpreadRadius);
+            shadowRRect.SetRectRadii(OffsetRect(shadowRRect.Rect, shadow.OffsetX, shadow.OffsetY), shadowRRect.Radii);
+
+            canvas.DrawRoundRect(shadowRRect, paint);
+        }
+
+        canvas.Restore();
+    }
+
+    /// <summary>
+    /// Grows or shrinks a rounded rect by a `box-shadow` spread amount, which may be negative
+    /// (shrink) - routed to <see cref="SKRoundRect.Inflate(float, float)"/> or
+    /// <see cref="SKRoundRect.Deflate(float, float)"/> explicitly, since neither is verified to
+    /// accept a negative argument as "the other operation".
+    /// </summary>
+    private static void ApplySpread(SKRoundRect rrect, float spread)
+    {
+        if (spread >= 0f)
+        {
+            rrect.Inflate(spread, spread);
+        }
+        else
+        {
+            rrect.Deflate(-spread, -spread);
+        }
+    }
+
+    private static SKRect OffsetRect(SKRect rect, float dx, float dy) =>
+        new(rect.Left + dx, rect.Top + dy, rect.Right + dx, rect.Bottom + dy);
 
     private static void DrawFillRect(SKCanvas canvas, FillRectCommand command)
     {
@@ -79,8 +390,52 @@ public sealed class SkiaRenderBackend : IRenderBackend, ITextMeasurer
             command.Rect.X + command.Rect.Width,
             command.Rect.Y + command.Rect.Height);
 
-        canvas.DrawRect(rect, paint);
+        if (command.Radii.IsZero)
+        {
+            canvas.DrawRect(rect, paint);
+        }
+        else
+        {
+            using var roundRect = new SKRoundRect();
+            roundRect.SetRectRadii(rect, ToSkPoints(command.Radii));
+            canvas.DrawRoundRect(roundRect, paint);
+        }
     }
+
+    private static void DrawStrokeRoundedRect(SKCanvas canvas, StrokeRoundedRectCommand command)
+    {
+        if (command.Rect.IsEmpty || command.Color.A == 0 || command.StrokeWidth <= 0f)
+        {
+            return;
+        }
+
+        var rect = new SKRect(
+            command.Rect.X,
+            command.Rect.Y,
+            command.Rect.X + command.Rect.Width,
+            command.Rect.Y + command.Rect.Height);
+
+        using var roundRect = new SKRoundRect();
+        roundRect.SetRectRadii(rect, ToSkPoints(command.Radii));
+
+        using var paint = new SKPaint
+        {
+            Color = ToSkColor(command.Color),
+            IsAntialias = true,
+            Style = SKPaintStyle.Stroke,
+            StrokeWidth = command.StrokeWidth,
+        };
+
+        canvas.DrawRoundRect(roundRect, paint);
+    }
+
+    private static SKPoint[] ToSkPoints(RenderCornerRadii radii) =>
+    [
+        new SKPoint(radii.TopLeftX, radii.TopLeftY),
+        new SKPoint(radii.TopRightX, radii.TopRightY),
+        new SKPoint(radii.BottomRightX, radii.BottomRightY),
+        new SKPoint(radii.BottomLeftX, radii.BottomLeftY),
+    ];
 
     private static SKPaint CreateFillPaint(RenderPaint paint, RenderRect rect)
     {
@@ -93,8 +448,104 @@ public sealed class SkiaRenderBackend : IRenderBackend, ITextMeasurer
                 Style = SKPaintStyle.Fill,
             },
             RenderGradientPaint gradientPaint => CreateGradientPaint(gradientPaint.Gradient, rect),
+            RenderImagePaint imagePaint => CreateImagePaint(imagePaint, rect),
             _ => throw new NotSupportedException($"Unsupported paint type: {paint.GetType().Name}"),
         };
+    }
+
+    /// <summary>
+    /// Builds a `background-image: url(...)` paint as a tiled/positioned image shader, resolving
+    /// <see cref="RenderImagePaint.Size"/> and the position components against <paramref name="rect"/>
+    /// - the box's own final geometry, not known when the paint was constructed (see
+    /// <see cref="RenderImagePaint"/>'s own remarks). This mirrors <c>SvgPatternBuilder</c>'s
+    /// tile-to-user-space matrix technique: build the shader in the image's own natural pixel space,
+    /// then let a constructor-time <see cref="SKMatrix"/> position and scale it - not the inverse
+    /// (the same "local space maps directly into world space" behavior already verified for the
+    /// gradient shaders above).
+    /// </summary>
+    private static SKPaint CreateImagePaint(RenderImagePaint imagePaint, RenderRect rect)
+    {
+        var paint = new SKPaint
+        {
+            IsAntialias = true,
+            Style = SKPaintStyle.Fill,
+        };
+
+        if (rect.Width <= 0f || rect.Height <= 0f)
+        {
+            return paint;
+        }
+
+        using var data = SKData.CreateCopy(imagePaint.Image.Data);
+        using var image = SKImage.FromEncodedData(data);
+
+        if (image is null || image.Width <= 0 || image.Height <= 0)
+        {
+            return paint;
+        }
+
+        var (drawWidth, drawHeight) = ResolveBackgroundImageSize(imagePaint.Size, image.Width, image.Height, rect.Width, rect.Height);
+
+        if (drawWidth <= 0f || drawHeight <= 0f)
+        {
+            return paint;
+        }
+
+        var originX = rect.X + (imagePaint.PositionX.Percentage * (rect.Width - drawWidth)) + imagePaint.PositionX.OffsetPixels;
+        var originY = rect.Y + (imagePaint.PositionY.Percentage * (rect.Height - drawHeight)) + imagePaint.PositionY.OffsetPixels;
+
+        var localMatrix = new SKMatrix(
+            drawWidth / image.Width, 0f, originX,
+            0f, drawHeight / image.Height, originY,
+            0f, 0f, 1f);
+
+        // `no-repeat` uses Decal (transparent outside the single placed tile), not Clamp - Clamp
+        // would smear the image's edge pixels across the rest of the box instead of leaving it
+        // uncovered, which is what CSS actually specifies for a non-repeating axis.
+        var tileX = imagePaint.RepeatX ? SKShaderTileMode.Repeat : SKShaderTileMode.Decal;
+        var tileY = imagePaint.RepeatY ? SKShaderTileMode.Repeat : SKShaderTileMode.Decal;
+
+        paint.Shader = SKShader.CreateImage(image, tileX, tileY, localMatrix);
+        return paint;
+    }
+
+    /// <summary>
+    /// Resolves a `background-size` value against the image's natural pixel size and the box's
+    /// rendered rect, matching the CSS `cover`/`contain`/explicit-axis sizing algorithms.
+    /// </summary>
+    private static (float Width, float Height) ResolveBackgroundImageSize(RenderBackgroundSize size, int naturalWidth, int naturalHeight, float boxWidth, float boxHeight)
+    {
+        switch (size.Kind)
+        {
+            case RenderBackgroundSizeKind.Cover:
+            {
+                var scale = Math.Max(boxWidth / naturalWidth, boxHeight / naturalHeight);
+                return (naturalWidth * scale, naturalHeight * scale);
+            }
+            case RenderBackgroundSizeKind.Contain:
+            {
+                var scale = Math.Min(boxWidth / naturalWidth, boxHeight / naturalHeight);
+                return (naturalWidth * scale, naturalHeight * scale);
+            }
+            case RenderBackgroundSizeKind.Explicit:
+            {
+                var aspect = (float)naturalWidth / naturalHeight;
+                float? width = size.Width.IsAuto ? null : size.Width.IsPercentage ? size.Width.Value * boxWidth : size.Width.Value;
+                float? height = size.Height.IsAuto ? null : size.Height.IsPercentage ? size.Height.Value * boxHeight : size.Height.Value;
+
+                if (width is null && height is null)
+                {
+                    return (naturalWidth, naturalHeight);
+                }
+
+                width ??= height!.Value * aspect;
+                height ??= width.Value / aspect;
+
+                return (width.Value, height.Value);
+            }
+            default:
+                return (naturalWidth, naturalHeight);
+        }
     }
 
     private static SKPaint CreateGradientPaint(RenderGradient gradient, RenderRect rect)
@@ -337,6 +788,28 @@ public sealed class SkiaRenderBackend : IRenderBackend, ITextMeasurer
                 DrawDecorationLine(canvas, decorationPaint, command.X, strikeY, textWidth, command.DecorationStyle);
             }
         }
+    }
+
+    private static void DrawTextShadow(SKCanvas canvas, DrawTextShadowCommand command, FontFaceSet fonts)
+    {
+        var font = new RenderFont(
+            command.FontFamily,
+            command.FontSize,
+            command.FontWeight,
+            command.IsItalic,
+            command.LetterSpacing,
+            fonts);
+
+        using var paint = SkiaTextShaping.CreateTextPaint(font);
+        paint.Color = ToSkColor(command.Color);
+
+        if (command.BlurRadius > 0f)
+        {
+            // Matches the same CSS-blur-radius-to-Gaussian-sigma approximation used for box-shadow.
+            paint.MaskFilter = SKMaskFilter.CreateBlur(SKBlurStyle.Normal, command.BlurRadius / 2f);
+        }
+
+        DrawTextWithLetterSpacing(canvas, paint, command.Text, command.X, command.Y, command.LetterSpacing);
     }
 
     private static void DrawDecorationLine(SKCanvas canvas, SKPaint paint, float x, float y, float width, RenderTextDecorationStyle style)

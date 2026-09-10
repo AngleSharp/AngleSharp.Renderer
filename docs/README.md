@@ -5,6 +5,7 @@ We have more detailed information regarding the following subjects:
 ## General
 
 - [Getting Started](general/01-Basics.md)
+- [Interactivity, Transitions & Animations](general/02-Interactivity.md)
 
 ## Tutorials
 

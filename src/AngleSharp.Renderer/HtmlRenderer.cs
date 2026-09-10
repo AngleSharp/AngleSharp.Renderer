@@ -7,13 +7,17 @@ using System.Runtime.CompilerServices;
 using System.Text;
 using System.Threading;
 
+using AngleSharp;
 using AngleSharp.Css;
 using AngleSharp.Css.Dom;
+using AngleSharp.Css.Parser;
 using AngleSharp.Css.RenderTree;
+using AngleSharp.Css.Values;
 using AngleSharp.Dom;
 using AngleSharp.Io;
 using AngleSharp.Renderer.Rendering;
 using AngleSharp.Renderer.Skia;
+using AngleSharp.Text;
 
 using SkiaSharp;
 
@@ -96,7 +100,7 @@ public sealed class HtmlRenderer
 
         try
         {
-            _ = BuildDisplayList(document, viewport, context, renderDevice);
+            _ = BuildDisplayList(document, viewport, context, renderDevice, measureFullExtent: true);
             return capture.Snapshot();
         }
         finally
@@ -234,7 +238,7 @@ public sealed class HtmlRenderer
 
         var context = CreateLayoutContext(document, renderDevice, _textMeasurer);
         var viewport = new RenderViewport(context.Width, context.Height);
-        var displayList = BuildDisplayList(document, viewport, context, renderDevice);
+        var displayList = BuildDisplayList(document, viewport, context, renderDevice, ResolveRootScrollOffsetY(document));
 
         return _backend.RenderToPng(displayList, viewport);
     }
@@ -264,10 +268,38 @@ public sealed class HtmlRenderer
 
         var context = CreateLayoutContext(document, renderDevice, _textMeasurer);
         var viewport = new RenderViewport(context.Width, context.Height);
-        return BuildDisplayList(document, viewport, context, renderDevice);
+        return BuildDisplayList(document, viewport, context, renderDevice, ResolveRootScrollOffsetY(document));
     }
 
-    private static DisplayList BuildDisplayList(IDocument document, RenderViewport viewport, LayoutContext context, IRenderDevice renderDevice)
+    /// <summary>
+    /// Resolves the page's vertical scroll offset from the interactive DOM harness, if one has
+    /// been created for the document's browsing context (via <c>IBrowsingContext.GetDomHarness()</c>
+    /// - typically through <see cref="IDomHarness.PaintToPng"/> or direct use of the CSSOM-view
+    /// scroll APIs). Returns 0 for the overwhelmingly common case of a document that was never
+    /// wired up for interactive use, so rendering stays unaffected unless a caller has actually
+    /// opted into scroll state existing at all. <see cref="CaptureLayoutMetrics"/> deliberately
+    /// does not call this - <c>getBoundingClientRect</c>/<c>scrollHeight</c>/max-scroll
+    /// calculations need the document's true, unscrolled layout to stay correct (and clamping a
+    /// newly-set scroll position depends on exactly that), so metrics capture always lays out at
+    /// scroll offset 0 regardless of whatever is currently scrolled into view for painting.
+    /// </summary>
+    private static float ResolveRootScrollOffsetY(IDocument document)
+    {
+        var scrollingElement = document.DocumentElement;
+
+        if (scrollingElement is null || !document.Context.TryGetDomHarness(out var harness) || harness is null)
+        {
+            return 0f;
+        }
+
+        // double.MaxValue as the clamp ceiling means this only floors at 0, never re-clamps to an
+        // upper bound - the stored value was already correctly clamped against the document's
+        // true scrollable extent when it was set via the public scrollTop/scrollTo DOM APIs
+        // (which measure with CaptureLayoutMetrics, unaffected by this method).
+        return (float)harness.GetScrollTop(scrollingElement, double.MaxValue);
+    }
+
+    private static DisplayList BuildDisplayList(IDocument document, RenderViewport viewport, LayoutContext context, IRenderDevice renderDevice, float scrollOffsetY = 0f, bool measureFullExtent = false)
     {
         var displayList = new DisplayList { Fonts = context.Fonts };
         displayList.FillRect(new RenderRect(0f, 0f, viewport.Width, viewport.Height), context.BackgroundColor);
@@ -285,7 +317,12 @@ public sealed class HtmlRenderer
         var root = body is null ? renderTree : renderTree.Find(body) ?? renderTree;
 
         var contentX = context.Padding;
-        var contentY = context.Padding;
+        // A positive scroll offset moves the page's content up relative to the fixed viewport
+        // surface - painted the same way as an unscrolled page, just starting from a Y position
+        // that can be negative. Content scrolled above or below the surface's fixed pixel bounds
+        // simply falls outside what a raster surface of that size can hold; no explicit clip is
+        // needed to hide it; Skia only ever writes pixels that exist within the surface itself.
+        var contentY = context.Padding - scrollOffsetY;
         var contentWidth = viewport.Width - (2f * context.Padding);
 
         if (contentWidth <= 0f)
@@ -293,13 +330,19 @@ public sealed class HtmlRenderer
             return displayList;
         }
 
-        var textStyle = new RenderTextStyle(context.FontSize, context.TextColor, context.FontFamily, context.LineHeightMultiplier, 400f, false, false, false, context.TextColor, global::AngleSharp.Renderer.Rendering.RenderTextDecorationStyle.Solid, TextAlign.Left, 0f, 0f, 0f);
+        var textStyle = new RenderTextStyle(context.FontSize, context.TextColor, context.FontFamily, context.LineHeightMultiplier, 400f, false, false, false, context.TextColor, global::AngleSharp.Renderer.Rendering.RenderTextDecorationStyle.Solid, TextAlign.Left, 0f, 0f, 0f, [], WhiteSpaceMode.Normal);
         var cursorY = contentY;
         var previousBlockMarginBottom = 0f;
         var suppressNextBlockTopMargin = false;
         var activeFloatLeftOffset = 0f;
         var activeFloatBottom = 0f;
         var textIndentConsumed = false;
+
+        // Normal painting stops laying out content once it has gone past the visible viewport -
+        // there is no need to spend time measuring what will never be rasterized. Measuring the
+        // page's true scrollable extent (for scrollTop/scrollHeight/max-scroll purposes) needs the
+        // opposite: the full page, regardless of how tall it is relative to the viewport.
+        var maxY = measureFullExtent ? float.MaxValue : viewport.Height - context.Padding;
 
         foreach (var child in OrderChildrenForPainting(root.Children))
         {
@@ -317,11 +360,37 @@ public sealed class HtmlRenderer
                 textStyle: textStyle,
                 context: context,
                 displayList: displayList,
-                maxY: viewport.Height - context.Padding);
+                maxY: maxY);
 
-            if (cursorY > viewport.Height - context.Padding)
+            if (cursorY > maxY)
             {
                 break;
+            }
+        }
+
+        // The page's own scrolling elements (<html>/<body>) are never laid out as boxes of their
+        // own - the loop above only ever lays out *their children* directly onto the page canvas -
+        // so neither ever gets an ordinary RecordLayoutMetrics call the way a normal descendant
+        // does. Synthesizing one here, sized to the full stacked content height, is what lets
+        // GetScrollHeight()/GetMaxScrollTop() (via ElementCssomViewExtensions.GetScrollExtents,
+        // which reads exactly this metrics map) treat the document as scrollable at all. This is a
+        // no-op outside of CaptureLayoutMetrics, since RecordLayoutMetrics itself only does
+        // anything while that capture is active.
+        if (body is not null)
+        {
+            // The synthesized box represents the *client* (viewport) area, not the total content
+            // height - GetScrollExtents (ElementCssomViewExtensions) separately walks this map for
+            // every actual descendant (each already carrying its own, normally-recorded metrics)
+            // to work out how far content actually extends past this box, exactly the way it
+            // already does for any other scrollable element. Recording the full content height
+            // here instead would make the client and scroll heights identical, so nothing would
+            // ever look scrollable.
+            var clientHeight = Math.Max(0f, viewport.Height - (2f * context.Padding));
+            RecordLayoutMetrics(body, contentX, contentY, contentWidth, clientHeight, 0f, 0f, 0f, 0f, 0f, 0f, 0f, 0f);
+
+            if (document.DocumentElement is not null)
+            {
+                RecordLayoutMetrics(document.DocumentElement, contentX, contentY, contentWidth, clientHeight, 0f, 0f, 0f, 0f, 0f, 0f, 0f, 0f);
             }
         }
 
@@ -404,6 +473,16 @@ public sealed class HtmlRenderer
             return;
         }
 
+        var formControlKind = ResolveFormControlKind(element);
+
+        // input[type=hidden] never paints at all, matching the UA `display: none` browsers give
+        // it - AngleSharp.Css's own UA stylesheet does not special-case it (every <input> type
+        // computes to plain inline-block), so this renderer has to.
+        if (formControlKind == FormControlKind.Hidden)
+        {
+            return;
+        }
+
         var display = GetDisplay(styleMap);
 
         if (string.Equals(display, "table", StringComparison.OrdinalIgnoreCase))
@@ -415,6 +494,11 @@ public sealed class HtmlRenderer
         var renderAsBlock = ShouldRenderAsBlock(computedStyle) || IsReplacedElementTag(tagName);
         var isInlineBlock = IsInlineBlock(computedStyle);
         var currentTextStyle = ResolveTextStyle(styleMap, inheritedTextStyle);
+
+        if (formControlKind != FormControlKind.None)
+        {
+            ApplyFormControlDefaults(formControlKind, element, styleMap, currentTextStyle, context);
+        }
 
         if (cursorY >= activeFloatBottom)
         {
@@ -434,7 +518,7 @@ public sealed class HtmlRenderer
             }
             else
             {
-            var inlineText = NormalizeWhitespace(element.TextContent ?? string.Empty);
+            var inlineText = NormalizeWhitespace(element.TextContent ?? string.Empty, currentTextStyle.WhiteSpace);
             if (inlineText.Length > 0)
             {
                     LayoutWrappedText(inlineText, flowContainingX, flowContainingWidth, ref cursorY, currentTextStyle, context, displayList, maxY, textIndentConsumed ? 0f : currentTextStyle.TextIndent);
@@ -453,7 +537,7 @@ public sealed class HtmlRenderer
             return;
         }
 
-        var box = ResolveBoxStyle(styleMap);
+        var box = ResolveBoxStyle(styleMap, element);
         var marginTop = ParseLength(styleMap, "margin-top", flowContainingWidth, box.Margin.Top, allowAuto: false);
         var marginBottom = ParseLength(styleMap, "margin-bottom", flowContainingWidth, box.Margin.Bottom, allowAuto: false);
         var marginLeft = ParseLength(styleMap, "margin-left", flowContainingWidth, box.Margin.Left, allowAuto: true);
@@ -549,6 +633,41 @@ public sealed class HtmlRenderer
         var contentX = borderBoxX + borderLeft + paddingLeft;
         var contentY = borderBoxY + borderTop + paddingTop;
 
+        // The box's own background/border/shadow/outline must paint behind its children, but an
+        // auto-sized box's height is only known after its children are laid out (and therefore
+        // appended to the display list) - so their commands are built into a scratch buffer here
+        // and spliced in before this index once the box's final size is known, rather than simply
+        // appended (which would paint them on top of - and hide - the children).
+        var boxPaintInsertIndex = displayList.Commands.Count;
+
+        if (string.Equals(display, "list-item", StringComparison.OrdinalIgnoreCase))
+        {
+            currentTextStyle = PaintListItemMarker(displayList, element, styleMap, currentTextStyle, context, borderBoxX, contentX, contentY);
+        }
+
+        if (formControlKind != FormControlKind.None)
+        {
+            // Children are suppressed or absent for every kind PaintFormControl actually paints
+            // content for (TextLike/Select/Button/Checkbox/Radio/Color), so their box never grows
+            // past its own specified height the way an ordinary auto-sized box can - the specified
+            // height (falling back to a single line, for an author-supplied "auto") is therefore
+            // also this box's final content height, safe to resolve here rather than waiting for
+            // the auto-height computation later in this method.
+            var formControlSpecifiedHeight = ResolveFlexibleContentDimension(
+                styleMap,
+                flowContainingWidth,
+                float.NaN,
+                isFlexItem,
+                isRowDirection,
+                flexMainSize,
+                flexCrossSize,
+                propertyName: "height");
+            var formControlContentHeight = float.IsNaN(formControlSpecifiedHeight)
+                ? currentTextStyle.FontSize * currentTextStyle.LineHeightMultiplier
+                : formControlSpecifiedHeight;
+            PaintFormControl(displayList, element, formControlKind, currentTextStyle, context, contentX, contentY, contentWidth, formControlContentHeight);
+        }
+
         var childCursorY = contentY;
         var childPreviousBlockMarginBottom = 0f;
         var childSuppressNextBlockTopMargin = collapseWithFirstChild && !float.Equals(effectiveMarginTop, marginTop);
@@ -562,14 +681,29 @@ public sealed class HtmlRenderer
 
         // An <svg> root's children are foreign-namespaced SVG elements (circle, text, title, ...),
         // not HTML flow content; it is rasterized as a single replaced element below, so its
-        // subtree must never be walked as if it were normal inline/block content.
-        var orderedChildren = string.Equals(tagName, "svg", StringComparison.OrdinalIgnoreCase)
+        // subtree must never be walked as if it were normal inline/block content. A <select>'s
+        // <option> children and a <button>'s label are painted directly by PaintFormControl above
+        // instead (a <select> shows only its selected option, never every option stacked; a
+        // <button>'s own label is measured up front to size the button, so it is painted the same
+        // self-contained way rather than through normal child text flow) - <textarea> is
+        // deliberately excluded from this list, since its child text node flowing normally through
+        // the ordinary block child-layout path below is exactly what a browser's own <textarea>
+        // content does, and needed no special-casing at all once the box itself got its default
+        // border/padding/background chrome.
+        var orderedChildren = string.Equals(tagName, "svg", StringComparison.OrdinalIgnoreCase) ||
+                               formControlKind is FormControlKind.Select or FormControlKind.Button
             ? []
             : OrderChildrenForPainting(node.Children).ToList();
+        // An inline-block child counts as inline content here too (not just plain inline/br) - it
+        // is a real, confirmed bug that it previously did not: a parent whose children were *only*
+        // inline-block elements (the common form-control case - two checkboxes with no other inline
+        // content between them) never took this "merge onto shared lines" path at all, so every one
+        // of its inline-block children fell through to the plain block-stacking path below and
+        // always started its own new line, identical to display:block. Confirmed independent of
+        // form controls with two plain `<span style="display:inline-block">` siblings.
         var hasInlineRun = orderedChildren.Any(child =>
             (child is ElementRenderNode childElement &&
-             !ShouldRenderAsBlock(childElement.ComputedStyle) &&
-             !IsInlineBlock(childElement.ComputedStyle)) ||
+             (!ShouldRenderAsBlock(childElement.ComputedStyle) || IsInlineBlock(childElement.ComputedStyle))) ||
             (child is ElementRenderNode childElementWithBr && string.Equals(childElementWithBr.Ref.LocalName, "br", StringComparison.OrdinalIgnoreCase)));
 
         if (IsFlexContainer(styleMap))
@@ -690,7 +824,24 @@ public sealed class HtmlRenderer
         {
             foreach (var child in orderedChildren)
             {
-                var childIsBlock = child is ElementRenderNode childElement && (ShouldRenderAsBlock(childElement.ComputedStyle) || IsInlineBlock(childElement.ComputedStyle));
+                // An inline-block child flows next to its siblings on the shared line (like a real
+                // browser) only when its own box size can be predicted up front without laying it
+                // out first - i.e. both width and height resolve to an explicit, non-auto value,
+                // which is guaranteed for every form control (ApplyFormControlDefaults always
+                // injects concrete pixel defaults) and for any inline-block given explicit
+                // width/height in CSS. An inline-block whose size genuinely depends on its own
+                // auto-flowing content (shrink-to-fit width, or height driven by wrapped children)
+                // cannot be predicted this cheaply without a full trial layout, so it deliberately
+                // falls back to the older, still-correct-if-visually-imperfect behavior below: its
+                // own line, exactly like display:block - a documented, deliberate scope cut rather
+                // than building genuine two-pass (shrink-to-fit) inline-block layout.
+                float ibWidth = 0f, ibHeight = 0f, ibMarginLeft = 0f, ibMarginRight = 0f, ibMarginTop = 0f, ibMarginBottom = 0f;
+                var canFlowAsInlineBlock = child is ElementRenderNode ibCandidate &&
+                    IsInlineBlock(ibCandidate.ComputedStyle) &&
+                    TryMeasureInlineBlockBoxSize(ibCandidate, contentWidth, currentTextStyle, context, out ibWidth, out ibHeight, out ibMarginLeft, out ibMarginRight, out ibMarginTop, out ibMarginBottom);
+                var childIsBlock = child is ElementRenderNode childElement &&
+                    ShouldRenderAsBlock(childElement.ComputedStyle) &&
+                    !canFlowAsInlineBlock;
 
                 if (childIsBlock)
                 {
@@ -724,7 +875,7 @@ public sealed class HtmlRenderer
 
                     if (child is TextRenderNode textNode)
                     {
-                        var inlineText = NormalizeWhitespace(textNode.Ref.Data);
+                        var inlineText = NormalizeWhitespaceForInlineRun(textNode.Ref.Data, currentTextStyle.WhiteSpace);
 
                         if (inlineText.Length > 0)
                         {
@@ -741,6 +892,63 @@ public sealed class HtmlRenderer
                                 ref textIndentConsumed);
                         }
                     }
+                    else if (canFlowAsInlineBlock && child is ElementRenderNode inlineBlockElement)
+                    {
+                        // Wraps to a new line first if this item does not fit in what is left of
+                        // the current one - unless it is the very first thing being placed on this
+                        // line at all, so a single inline-block item wider than its container still
+                        // gets placed (on its own line) rather than looping forever.
+                        var totalAdvance = ibMarginLeft + ibWidth + ibMarginRight;
+
+                        // contentX/contentWidth (this element's own resolved content box), not
+                        // flowContainingX/flowContainingWidth (the wider box this *element itself*
+                        // was given to size *itself* within its own parent) - using the latter here
+                        // was a real bug caught by BuildDisplayList_InlineBlockSiblingsWrapToANewLineWhenTheyDoNotFit:
+                        // a narrower-than-parent container (e.g. width:50px) never wrapped its
+                        // inline-block children at all, since the wrap boundary was being measured
+                        // against the parent's own, much wider available width instead of this
+                        // element's own.
+                        if (inlineCursorX > contentX && inlineCursorX + totalAdvance > contentX + contentWidth)
+                        {
+                            childCursorY = Math.Max(childCursorY, inlineLineTop + inlineLineHeight);
+                            inlineLineTop = childCursorY;
+                            inlineCursorX = contentX;
+                            inlineLineHeight = 0f;
+                        }
+
+                        // containingX is the margin box's own left edge, not the border box's -
+                        // LayoutNode/LayoutElement apply this element's own margin-left internally
+                        // (flowBorderBoxX = flowContainingX + marginLeft) exactly as they would for
+                        // a block-level child, so the border box lands ibMarginLeft to the right of
+                        // what is passed here, matching totalAdvance's own accounting below.
+                        var itemStartX = inlineCursorX;
+                        var inlineBlockCursorY = inlineLineTop;
+                        var inlineBlockPreviousBlockMarginBottom = 0f;
+                        var inlineBlockSuppressNextBlockTopMargin = false;
+                        var inlineBlockActiveFloatLeftOffset = 0f;
+                        var inlineBlockActiveFloatBottom = 0f;
+                        var inlineBlockTextIndentConsumed = true;
+
+                        LayoutNode(
+                            node: inlineBlockElement,
+                            containingX: itemStartX,
+                            containingY: inlineLineTop,
+                            containingWidth: contentWidth,
+                            cursorY: ref inlineBlockCursorY,
+                            previousBlockMarginBottom: ref inlineBlockPreviousBlockMarginBottom,
+                            suppressNextBlockTopMargin: ref inlineBlockSuppressNextBlockTopMargin,
+                            activeFloatLeftOffset: ref inlineBlockActiveFloatLeftOffset,
+                            activeFloatBottom: ref inlineBlockActiveFloatBottom,
+                            textIndentConsumed: ref inlineBlockTextIndentConsumed,
+                            textStyle: currentTextStyle,
+                            context: context,
+                            displayList: displayList,
+                            maxY: maxY);
+
+                        inlineCursorX = itemStartX + totalAdvance;
+                        inlineLineHeight = Math.Max(inlineLineHeight, ibMarginTop + ibHeight + ibMarginBottom);
+                        textIndentConsumed = true;
+                    }
                     else if (child is ElementRenderNode inlineElement)
                     {
                         var childTagName = inlineElement.Ref.LocalName;
@@ -755,7 +963,7 @@ public sealed class HtmlRenderer
                         else
                         {
                             var childTextStyle = ResolveTextStyle(CreateStyleMap(inlineElement.ComputedStyle), currentTextStyle);
-                            var inlineText = NormalizeWhitespace(inlineElement.Ref.TextContent ?? string.Empty);
+                            var inlineText = NormalizeWhitespaceForInlineRun(inlineElement.Ref.TextContent ?? string.Empty, childTextStyle.WhiteSpace);
 
                             if (inlineText.Length > 0)
                             {
@@ -823,13 +1031,94 @@ public sealed class HtmlRenderer
             paddingTop,
             paddingBottom);
 
-        PaintBackground(displayList, box.BackgroundPaint, borderBoxX, borderBoxY, borderBoxWidth, borderBoxHeight);
-        PaintBorder(displayList, box.BorderColor, borderBoxX, borderBoxY, borderBoxWidth, borderBoxHeight, box.BorderWidth);
-        PaintOutline(displayList, styleMap, borderBoxX, borderBoxY, borderBoxWidth, borderBoxHeight);
+        var clipsOverflow = ShouldClipOverflow(styleMap);
+        var transform = ParseCssTransform(styleMap, borderBoxX, borderBoxY, borderBoxWidth, borderBoxHeight, currentTextStyle.FontSize);
+        var hasTransform = !transform.IsIdentity;
+        var filterFunctions = ParseCssFilter(styleMap);
+        var hasFilter = filterFunctions.Count > 0;
+        var opacity = ParseCssOpacity(styleMap);
+        var hasOpacity = opacity < 1f;
+
+        var boxPaintBuffer = new DisplayList();
+
+        // A transform applies to the whole element - background, border, outline, and every
+        // descendant all paint under it - so its push has to be the very first thing in this
+        // element's own paint scope, wrapping even the background (unlike the overflow clip below,
+        // which per spec explicitly excludes the border/outline it is nested inside).
+        if (hasTransform)
+        {
+            boxPaintBuffer.PushTransform(transform);
+        }
+
+        // `opacity` nests inside `transform` (compositing does not care about coordinate space,
+        // only about *where* transform already placed the content) but outside `filter` (matching
+        // how a browser processes filter effects on the element's own content first, then
+        // composites the already-filtered result onto the backdrop at the element's opacity).
+        if (hasOpacity)
+        {
+            boxPaintBuffer.PushOpacity(opacity);
+        }
+
+        // `filter` wraps the whole element too, exactly like `transform` above - it is nested
+        // inside the transform scope (not outside it) so the filter's own raster operates in the
+        // element's already-transformed local space, matching how a scaled element's blur radius
+        // should scale along with it rather than staying a fixed screen-space size.
+        if (hasFilter)
+        {
+            boxPaintBuffer.PushFilter(filterFunctions);
+        }
+
+        PaintBackground(boxPaintBuffer, box.BackgroundPaint, borderBoxX, borderBoxY, borderBoxWidth, borderBoxHeight, box.BorderRadius);
+        PaintBoxShadows(boxPaintBuffer, box.BoxShadows, borderBoxX, borderBoxY, borderBoxWidth, borderBoxHeight, box.BorderRadius);
+        PaintBorder(boxPaintBuffer, box.BorderColor, borderBoxX, borderBoxY, borderBoxWidth, borderBoxHeight, box.BorderWidth, box.BorderRadius);
+        PaintOutline(boxPaintBuffer, styleMap, borderBoxX, borderBoxY, borderBoxWidth, borderBoxHeight);
+
+        if (clipsOverflow)
+        {
+            // Per spec, overflow clips at the padding edge - content can extend into the padding
+            // but not past it - so the clip rect is the padding box, not the border box. Border
+            // and outline are unaffected because they were already appended above, outside this
+            // clip scope's push.
+            var clipRect = new RenderRect(
+                borderBoxX + borderLeft,
+                borderBoxY + borderTop,
+                Math.Max(0f, borderBoxWidth - borderLeft - borderRight),
+                Math.Max(0f, borderBoxHeight - borderTop - borderBottom));
+            boxPaintBuffer.PushClip(clipRect, box.BorderRadius.ClampToBox(borderBoxWidth, borderBoxHeight));
+        }
+
+        displayList.InsertRange(boxPaintInsertIndex, boxPaintBuffer.Commands);
 
         if (TryResolveReplacedElementImage(node, styleMap, flowContainingWidth, borderBoxX + borderLeft + paddingLeft, borderBoxY + borderTop + paddingTop, out var image, out var imageRect))
         {
             displayList.DrawImage(imageRect, image!);
+        }
+
+        if (clipsOverflow)
+        {
+            displayList.PopClip();
+        }
+
+        // Closes the filter scope opened above, once children (and, for a replaced element, its
+        // image) have all been emitted - nested inside the opacity scope, so it has to close
+        // before that one does.
+        if (hasFilter)
+        {
+            displayList.PopFilter();
+        }
+
+        // Closes the opacity scope opened above - nested inside the transform scope, so it closes
+        // before that one does too.
+        if (hasOpacity)
+        {
+            displayList.PopOpacity();
+        }
+
+        // Closes the transform scope opened above, once children (and, for a replaced element, its
+        // image) have all been emitted - the outermost scope, since it was also the first pushed.
+        if (hasTransform)
+        {
+            displayList.PopTransform();
         }
 
         if (isFloatLeft)
@@ -895,6 +1184,11 @@ public sealed class HtmlRenderer
         float borderBoxX,
         float borderBoxY)
     {
+        // See the matching comment in LayoutElement: the container's own background/border must
+        // paint behind its items, but its auto-sized height is only known after they are laid out
+        // (and appended), so their paint commands are spliced in before this index instead.
+        var boxPaintInsertIndex = displayList.Commands.Count;
+
         var flexDirection = GetFlexDirection(styleMap);
         var isRowDirection = !string.Equals(flexDirection, "column", StringComparison.OrdinalIgnoreCase) && !string.Equals(flexDirection, "column-reverse", StringComparison.OrdinalIgnoreCase);
         var isReverseDirection = string.Equals(flexDirection, "row-reverse", StringComparison.OrdinalIgnoreCase) || string.Equals(flexDirection, "column-reverse", StringComparison.OrdinalIgnoreCase);
@@ -1162,14 +1456,18 @@ public sealed class HtmlRenderer
             effectiveMarginBottom = CollapseMargins(effectiveMarginBottom, childPreviousBlockMarginBottom);
         }
 
+        var boxPaintBuffer = new DisplayList();
+
         if (box.BackgroundPaint is RenderColorPaint colorPaint && colorPaint.Color.A == 0)
         {
-            displayList.FillRect(new RenderRect(borderBoxX, borderBoxY, borderBoxWidth, borderBoxHeight), RenderColor.Transparent);
+            boxPaintBuffer.FillRect(new RenderRect(borderBoxX, borderBoxY, borderBoxWidth, borderBoxHeight), RenderColor.Transparent);
         }
         else
         {
-            PaintBackground(displayList, box.BackgroundPaint, borderBoxX, borderBoxY, borderBoxWidth, borderBoxHeight);
+            PaintBackground(boxPaintBuffer, box.BackgroundPaint, borderBoxX, borderBoxY, borderBoxWidth, borderBoxHeight, box.BorderRadius);
         }
+
+        PaintBoxShadows(boxPaintBuffer, box.BoxShadows, borderBoxX, borderBoxY, borderBoxWidth, borderBoxHeight, box.BorderRadius);
 
         RecordLayoutMetrics(
             node.Ref,
@@ -1186,12 +1484,31 @@ public sealed class HtmlRenderer
             paddingTop,
             paddingBottom);
 
-        PaintBorder(displayList, box.BorderColor, borderBoxX, borderBoxY, borderBoxWidth, borderBoxHeight, box.BorderWidth);
-        PaintOutline(displayList, styleMap, borderBoxX, borderBoxY, borderBoxWidth, borderBoxHeight);
+        PaintBorder(boxPaintBuffer, box.BorderColor, borderBoxX, borderBoxY, borderBoxWidth, borderBoxHeight, box.BorderWidth, box.BorderRadius);
+        PaintOutline(boxPaintBuffer, styleMap, borderBoxX, borderBoxY, borderBoxWidth, borderBoxHeight);
+
+        var clipsOverflow = ShouldClipOverflow(styleMap);
+
+        if (clipsOverflow)
+        {
+            var clipRect = new RenderRect(
+                borderBoxX + borderLeft,
+                borderBoxY + borderTop,
+                Math.Max(0f, borderBoxWidth - borderLeft - borderRight),
+                Math.Max(0f, borderBoxHeight - borderTop - borderBottom));
+            boxPaintBuffer.PushClip(clipRect, box.BorderRadius.ClampToBox(borderBoxWidth, borderBoxHeight));
+        }
+
+        displayList.InsertRange(boxPaintInsertIndex, boxPaintBuffer.Commands);
 
         if (TryResolveReplacedElementImage(node, styleMap, containingWidth, borderBoxX + borderLeft + paddingLeft, borderBoxY + borderTop + paddingTop, out var image, out var imageRect))
         {
             displayList.DrawImage(imageRect, image!);
+        }
+
+        if (clipsOverflow)
+        {
+            displayList.PopClip();
         }
 
         cursorY = flowBorderBoxY + borderBoxHeight;
@@ -1224,6 +1541,85 @@ public sealed class HtmlRenderer
         return isRowDirection
             ? (flexCrossSize.HasValue ? flexCrossSize.Value : ParseLength(styleMap, propertyName, relativeTo, defaultValue, allowAuto: true))
             : (flexMainSize.HasValue ? flexMainSize.Value : ParseLength(styleMap, propertyName, relativeTo, defaultValue, allowAuto: true));
+    }
+
+    /// <summary>
+    /// Predicts an inline-block element's own border-box width/height and all four margins without
+    /// actually laying it out, so its parent's inline-merging child loop can decide up front
+    /// whether it fits on the current line and exactly where to place it. <c>LayoutNode</c>/
+    /// <c>LayoutElement</c> have no "measure only" mode of their own - they only ever discover a
+    /// box's final size as a side effect of actually laying out (and painting) it - so this exists
+    /// purely to avoid needing one for the one case that can be predicted cheaply. It succeeds only
+    /// when both <c>width</c> and <c>height</c> resolve to an explicit, non-auto value: guaranteed
+    /// for every form control (<see cref="ApplyFormControlDefaults"/> always injects concrete pixel
+    /// defaults for both) and for any inline-block given explicit <c>width</c>/<c>height</c> in
+    /// CSS. It deliberately returns <see langword="false"/> for anything else - shrink-to-fit width
+    /// or auto/content-driven height would need a genuine trial layout to measure, which this does
+    /// not attempt (a documented scope cut, not an oversight: see the call site for what happens
+    /// instead, which is not a regression - it is exactly this renderer's pre-existing behavior for
+    /// every inline-block element, before shared-line flow existed for any of them).
+    /// </summary>
+    private static bool TryMeasureInlineBlockBoxSize(
+        ElementRenderNode elementNode,
+        float containingWidth,
+        RenderTextStyle inheritedTextStyle,
+        LayoutContext context,
+        out float width,
+        out float height,
+        out float marginLeft,
+        out float marginRight,
+        out float marginTop,
+        out float marginBottom)
+    {
+        width = 0f;
+        height = 0f;
+        marginLeft = 0f;
+        marginRight = 0f;
+        marginTop = 0f;
+        marginBottom = 0f;
+
+        var element = elementNode.Ref;
+        var styleMap = CreateStyleMap(elementNode.ComputedStyle, element);
+        var textStyle = ResolveTextStyle(styleMap, inheritedTextStyle);
+        var formControlKind = ResolveFormControlKind(element);
+
+        // A hidden input never lays out or paints at all (see LayoutElement's own early return for
+        // it) - it has no box to flow inline, so it is neither flowable nor block-stackable here.
+        if (formControlKind == FormControlKind.Hidden)
+        {
+            return false;
+        }
+
+        if (formControlKind != FormControlKind.None)
+        {
+            ApplyFormControlDefaults(formControlKind, element, styleMap, textStyle, context);
+        }
+
+        var specifiedContentWidth = ParseLength(styleMap, "width", containingWidth, float.NaN, allowAuto: true);
+        var specifiedContentHeight = ParseLength(styleMap, "height", containingWidth, float.NaN, allowAuto: true);
+
+        if (float.IsNaN(specifiedContentWidth) || float.IsNaN(specifiedContentHeight))
+        {
+            return false;
+        }
+
+        // Reuses the exact same box-model resolution LayoutElement itself calls for every other
+        // element, rather than re-deriving border/padding/margin independently, so this prediction
+        // can never quietly drift out of sync with what actually gets laid out.
+        var box = ResolveBoxStyle(styleMap, element);
+        width = box.BorderWidth.Left + box.Padding.Left + specifiedContentWidth + box.Padding.Right + box.BorderWidth.Right;
+        height = box.BorderWidth.Top + box.Padding.Top + specifiedContentHeight + box.Padding.Bottom + box.BorderWidth.Bottom;
+
+        // An auto horizontal margin resolves to NaN from ParseLength (mirroring width/height's own
+        // auto signal) - correct for a block-level box's own centering math, but a non-block box's
+        // auto margin simply computes to 0 per spec, since there is no "available space" to center
+        // within on an inline-formatting-context line the way there is for text-align:center.
+        marginLeft = float.IsNaN(box.Margin.Left) ? 0f : box.Margin.Left;
+        marginRight = float.IsNaN(box.Margin.Right) ? 0f : box.Margin.Right;
+        marginTop = box.Margin.Top;
+        marginBottom = box.Margin.Bottom;
+
+        return true;
     }
 
     private static IEnumerable<ElementRenderNode> CollectTableRows(ElementRenderNode tableNode)
@@ -1585,7 +1981,9 @@ public sealed class HtmlRenderer
                 for (var lineIndex = 0; lineIndex < wrappedLines.Count; lineIndex++)
                 {
                     var line = wrappedLines[lineIndex];
-                    displayList.DrawText(line, lineX, lineY + (lineIndex * lineHeight), placement.CellTextStyle.Color, placement.CellTextStyle.FontSize, placement.CellTextStyle.FontFamily, placement.CellTextStyle.FontWeight, placement.CellTextStyle.IsItalic, placement.CellTextStyle.Underline, placement.CellTextStyle.StrikeThrough, placement.CellTextStyle.DecorationColor, placement.CellTextStyle.DecorationStyle, placement.CellTextStyle.LetterSpacing);
+                    var cellLineY = lineY + (lineIndex * lineHeight);
+                    PaintTextShadows(displayList, placement.CellTextStyle.TextShadows, line, lineX, cellLineY, placement.CellTextStyle);
+                    displayList.DrawText(line, lineX, cellLineY, placement.CellTextStyle.Color, placement.CellTextStyle.FontSize, placement.CellTextStyle.FontFamily, placement.CellTextStyle.FontWeight, placement.CellTextStyle.IsItalic, placement.CellTextStyle.Underline, placement.CellTextStyle.StrikeThrough, placement.CellTextStyle.DecorationColor, placement.CellTextStyle.DecorationStyle, placement.CellTextStyle.LetterSpacing);
                 }
             }
         }
@@ -1651,6 +2049,11 @@ public sealed class HtmlRenderer
         float borderBoxX,
         float borderBoxY)
     {
+        // See the matching comment in LayoutElement: the container's own background/border must
+        // paint behind its items, but its auto-sized height is only known after they are laid out
+        // (and appended), so their paint commands are spliced in before this index instead.
+        var boxPaintInsertIndex = displayList.Commands.Count;
+
         var columns = ParseGridTrackList(styleMap, "grid-template-columns", containingWidth, 1);
         var columnGap = ParseGridGap(styleMap, "column-gap", containingWidth, 0)
             ?? ParseGridGap(styleMap, "gap", containingWidth, 0);
@@ -1774,14 +2177,18 @@ public sealed class HtmlRenderer
             effectiveMarginBottom = CollapseMargins(effectiveMarginBottom, previousBlockMarginBottom);
         }
 
+        var boxPaintBuffer = new DisplayList();
+
         if (box.BackgroundPaint is RenderColorPaint colorPaint && colorPaint.Color.A == 0)
         {
-            displayList.FillRect(new RenderRect(borderBoxX, borderBoxY, borderBoxWidth, borderBoxHeight), RenderColor.Transparent);
+            boxPaintBuffer.FillRect(new RenderRect(borderBoxX, borderBoxY, borderBoxWidth, borderBoxHeight), RenderColor.Transparent);
         }
         else
         {
-            PaintBackground(displayList, box.BackgroundPaint, borderBoxX, borderBoxY, borderBoxWidth, borderBoxHeight);
+            PaintBackground(boxPaintBuffer, box.BackgroundPaint, borderBoxX, borderBoxY, borderBoxWidth, borderBoxHeight, box.BorderRadius);
         }
+
+        PaintBoxShadows(boxPaintBuffer, box.BoxShadows, borderBoxX, borderBoxY, borderBoxWidth, borderBoxHeight, box.BorderRadius);
 
         RecordLayoutMetrics(
             node.Ref,
@@ -1798,8 +2205,27 @@ public sealed class HtmlRenderer
             paddingTop,
             paddingBottom);
 
-        PaintBorder(displayList, box.BorderColor, borderBoxX, borderBoxY, borderBoxWidth, borderBoxHeight, box.BorderWidth);
-        PaintOutline(displayList, styleMap, borderBoxX, borderBoxY, borderBoxWidth, borderBoxHeight);
+        PaintBorder(boxPaintBuffer, box.BorderColor, borderBoxX, borderBoxY, borderBoxWidth, borderBoxHeight, box.BorderWidth, box.BorderRadius);
+        PaintOutline(boxPaintBuffer, styleMap, borderBoxX, borderBoxY, borderBoxWidth, borderBoxHeight);
+
+        var clipsOverflow = ShouldClipOverflow(styleMap);
+
+        if (clipsOverflow)
+        {
+            var clipRect = new RenderRect(
+                borderBoxX + borderLeft,
+                borderBoxY + borderTop,
+                Math.Max(0f, borderBoxWidth - borderLeft - borderRight),
+                Math.Max(0f, borderBoxHeight - borderTop - borderBottom));
+            boxPaintBuffer.PushClip(clipRect, box.BorderRadius.ClampToBox(borderBoxWidth, borderBoxHeight));
+        }
+
+        displayList.InsertRange(boxPaintInsertIndex, boxPaintBuffer.Commands);
+
+        if (clipsOverflow)
+        {
+            displayList.PopClip();
+        }
 
         cursorY = flowBorderBoxY + borderBoxHeight;
         previousBlockMarginBottom = effectiveMarginBottom + context.ParagraphSpacing;
@@ -1986,7 +2412,7 @@ public sealed class HtmlRenderer
         DisplayList displayList,
         float maxY)
     {
-        var text = NormalizeWhitespace(textNode.Data);
+        var text = NormalizeWhitespace(textNode.Data, textStyle.WhiteSpace);
 
         if (text.Length == 0)
         {
@@ -2019,7 +2445,7 @@ public sealed class HtmlRenderer
         float firstLineIndent)
     {
         var lineHeight = textStyle.FontSize * textStyle.LineHeightMultiplier;
-        var lines = WrapText(context, text, maxWidth, textStyle);
+        var lines = WrapTextRespectingWhiteSpace(context, text, maxWidth, textStyle);
 
         for (var index = 0; index < lines.Count; index++)
         {
@@ -2031,11 +2457,19 @@ public sealed class HtmlRenderer
                 return;
             }
 
+            // An empty line (a blank `pre`/`pre-wrap`/`pre-line` row from a run of consecutive
+            // forced breaks) still needs to advance cursorY above, but has nothing to measure/paint.
+            if (line.Length == 0)
+            {
+                continue;
+            }
+
             var lineWidth = MeasureTextWidth(context, line, textStyle);
             var lineMaxWidth = index == 0 ? Math.Max(0f, maxWidth - firstLineIndent) : maxWidth;
             var lineX = x + (index == 0 ? firstLineIndent : 0f) + ResolveTextAlignmentOffset(textStyle.TextAlign, lineMaxWidth, lineWidth);
             var baselineY = cursorY + textStyle.VerticalAlignOffset;
 
+            PaintTextShadows(displayList, textStyle.TextShadows, line, lineX, baselineY, textStyle);
             displayList.DrawText(
                 line,
                 lineX,
@@ -2053,6 +2487,47 @@ public sealed class HtmlRenderer
         }
     }
 
+    /// <summary>
+    /// Splits <paramref name="text"/> into display lines, honoring <c>white-space</c>'s two layout-
+    /// relevant effects <see cref="NormalizeWhitespace(string, WhiteSpaceMode)"/> itself cannot: an
+    /// explicit `\n` (only ever present in the input at all under <c>pre</c>/<c>pre-wrap</c>/
+    /// <c>pre-line</c>/<c>break-spaces</c> - every other mode already collapsed it away) is always a
+    /// forced break, laid out as its own paragraph rather than merely a wrappable space; and
+    /// <c>nowrap</c>/<c>pre</c> never word-wrap at all, so each paragraph becomes exactly one
+    /// (possibly overflowing) line regardless of <paramref name="maxWidth"/> - the box's own
+    /// `overflow` clipping, if any, still applies to whatever ends up painted past its edge, since
+    /// this only changes layout, not painting.
+    /// </summary>
+    private static IReadOnlyList<string> WrapTextRespectingWhiteSpace(LayoutContext context, string text, float maxWidth, RenderTextStyle textStyle)
+    {
+        var noWrap = IsNoWrapWhiteSpace(textStyle.WhiteSpace);
+        var paragraphs = text.Split('\n');
+
+        if (paragraphs.Length == 1)
+        {
+            return noWrap ? [text] : WrapText(context, text, maxWidth, textStyle);
+        }
+
+        var lines = new List<string>();
+
+        foreach (var paragraph in paragraphs)
+        {
+            if (noWrap || paragraph.Length == 0)
+            {
+                lines.Add(paragraph);
+            }
+            else
+            {
+                lines.AddRange(WrapText(context, paragraph, maxWidth, textStyle));
+            }
+        }
+
+        return lines;
+    }
+
+    private static bool IsNoWrapWhiteSpace(WhiteSpaceMode whiteSpace) =>
+        whiteSpace is WhiteSpaceMode.Nowrap or WhiteSpaceMode.Pre;
+
     private static void LayoutInlineTextRun(
         DisplayList displayList,
         string text,
@@ -2068,12 +2543,19 @@ public sealed class HtmlRenderer
         var words = text.Split(' ', StringSplitOptions.RemoveEmptyEntries);
         var rightEdge = flowX + flowWidth;
         var spaceWidth = MeasureTextWidth(context, " ", textStyle);
+        // `nowrap`/`pre` on mixed inline content (a <span> sharing a line with sibling text/elements)
+        // still suppresses width-driven wrapping, same as the block-level LayoutWrappedText path -
+        // multi-space preservation and explicit forced breaks are not supported at this level (a
+        // deliberate scope cut: the caller already collapsed any literal '\n' in `text` to a plain
+        // space before it ever reaches here, since this word-by-word model has no way to represent
+        // one - see the two LayoutNode call sites that build `inlineText`).
+        var noWrap = IsNoWrapWhiteSpace(textStyle.WhiteSpace);
 
         foreach (var word in words)
         {
             var wordWidth = MeasureTextWidth(context, word, textStyle);
 
-            if (inlineCursorX > flowX && inlineCursorX + spaceWidth + wordWidth > rightEdge)
+            if (!noWrap && inlineCursorX > flowX && inlineCursorX + spaceWidth + wordWidth > rightEdge)
             {
                 inlineLineTop += inlineLineHeight;
                 inlineCursorX = flowX;
@@ -2085,10 +2567,13 @@ public sealed class HtmlRenderer
                 inlineCursorX += spaceWidth;
             }
 
+            var wordBaselineY = inlineLineTop + textStyle.VerticalAlignOffset;
+
+            PaintTextShadows(displayList, textStyle.TextShadows, word, inlineCursorX, wordBaselineY, textStyle);
             displayList.DrawText(
                 word,
                 inlineCursorX,
-                inlineLineTop + textStyle.VerticalAlignOffset,
+                wordBaselineY,
                 textStyle.Color,
                 textStyle.FontSize,
                 textStyle.FontFamily,
@@ -2287,8 +2772,34 @@ public sealed class HtmlRenderer
         var letterSpacing = ParseLength(styleMap, "letter-spacing", inherited.FontSize, inherited.LetterSpacing, allowAuto: false);
         var textIndent = ParseLength(styleMap, "text-indent", inherited.FontSize, 0f, allowAuto: false);
         var verticalAlignOffset = ParseVerticalAlign(styleMap, fontSize);
+        var textShadows = ParseTextShadows(styleMap.TryGetValue("text-shadow", out var textShadowValue) ? textShadowValue : null, inherited.TextShadows);
+        var whiteSpace = ParseWhiteSpace(styleMap, inherited.WhiteSpace);
 
-        return new RenderTextStyle(fontSize, color, fontFamily, lineHeight, fontWeight, isItalic, underline, strikeThrough, decorationColor, decorationStyle, textAlign, letterSpacing, textIndent, verticalAlignOffset);
+        return new RenderTextStyle(fontSize, color, fontFamily, lineHeight, fontWeight, isItalic, underline, strikeThrough, decorationColor, decorationStyle, textAlign, letterSpacing, textIndent, verticalAlignOffset, textShadows, whiteSpace);
+    }
+
+    /// <summary>
+    /// <c>white-space</c> is inherited (confirmed empirically - an unset value on a child reports
+    /// empty, not the CSS initial <c>normal</c>, the same "never serialized when nothing in the
+    /// cascade set it explicitly" behavior already documented for <c>list-style-type</c> - so
+    /// <paramref name="inherited"/> is the correct fallback, not a hardcoded <c>Normal</c>).
+    /// </summary>
+    private static WhiteSpaceMode ParseWhiteSpace(Dictionary<string, string> styleMap, WhiteSpaceMode inherited)
+    {
+        if (!styleMap.TryGetValue("white-space", out var value) || string.IsNullOrWhiteSpace(value))
+        {
+            return inherited;
+        }
+
+        return value.Trim().ToLowerInvariant() switch
+        {
+            "nowrap" => WhiteSpaceMode.Nowrap,
+            "pre" => WhiteSpaceMode.Pre,
+            "pre-wrap" => WhiteSpaceMode.PreWrap,
+            "pre-line" => WhiteSpaceMode.PreLine,
+            "break-spaces" => WhiteSpaceMode.BreakSpaces,
+            _ => WhiteSpaceMode.Normal,
+        };
     }
 
     /// <summary>
@@ -2477,6 +2988,13 @@ public sealed class HtmlRenderer
                 element.SetAttribute("data-render-gradient", gradientValue);
             }
 
+            if (TryExtractTransformDeclaration(currentStyle, out var transformValue, out updatedStyle))
+            {
+                currentStyle = updatedStyle;
+                changed = true;
+                element.SetAttribute("data-render-transform", transformValue);
+            }
+
             if (TryExtractGridDeclarations(currentStyle, out var gridValues, out updatedStyle))
             {
                 currentStyle = updatedStyle;
@@ -2535,6 +3053,66 @@ public sealed class HtmlRenderer
         }
 
         if (string.IsNullOrWhiteSpace(gradientValue))
+        {
+            return false;
+        }
+
+        updatedStyle = string.Join(";", remaining);
+        return true;
+    }
+
+    /// <summary>
+    /// Extracts a `transform` declaration out of an inline `style` attribute before AngleSharp.Css
+    /// ever sees it, the same "extract to a data-render-* attribute" workaround
+    /// <see cref="TryExtractGradientBackground"/> already established for gradient
+    /// `background-image` values - except here the workaround is for a genuine upstream crash, not
+    /// an unsupported-value gap: AngleSharp.Css's own `CssTranslateValue.Compute()` throws a
+    /// `NullReferenceException` - confirmed via a failing test with a minimal repro, not assumed -
+    /// for *any* `translate`/`translateX`/`translateY` function, and that crash happens eagerly
+    /// while building the render tree (`RenderTreeBuilder.RenderElement` computing the *entire*
+    /// style declaration at once), before this renderer's own code ever runs. Extraction therefore
+    /// has to happen unconditionally for every `transform` declaration - not only ones containing
+    /// `translate` - both to keep this single code path simple and because relying on exactly
+    /// which other functions are crash-free would be fragile against a future AngleSharp.Css
+    /// version. `rotate()`/`scale()` were separately confirmed *not* to crash, but are extracted
+    /// the same way regardless, for that same reason.
+    /// </summary>
+    private static bool TryExtractTransformDeclaration(string styleAttribute, out string transformValue, out string updatedStyle)
+    {
+        transformValue = string.Empty;
+        updatedStyle = styleAttribute;
+
+        if (!styleAttribute.Contains("transform", StringComparison.OrdinalIgnoreCase))
+        {
+            return false;
+        }
+
+        var declarations = styleAttribute.Split(';', StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries);
+        var remaining = new List<string>();
+
+        foreach (var declaration in declarations)
+        {
+            var separator = declaration.IndexOf(':');
+            if (separator <= 0)
+            {
+                continue;
+            }
+
+            var property = declaration[..separator].Trim();
+            var value = declaration[(separator + 1)..].Trim();
+
+            // Exact match only - "transform" must not also swallow "transform-origin", which is
+            // safe to leave for AngleSharp.Css's own (uncrashing) computation.
+            if (string.Equals(property, "transform", StringComparison.OrdinalIgnoreCase))
+            {
+                transformValue = value;
+                continue;
+            }
+
+            remaining.Add(declaration);
+        }
+
+        if (string.IsNullOrWhiteSpace(transformValue))
         {
             return false;
         }
@@ -2683,6 +3261,20 @@ public sealed class HtmlRenderer
         AddIfPresent(map, "border-bottom-color", style.GetBorderBottomColor());
         AddIfPresent(map, "border-left-color", style.GetBorderLeftColor());
 
+        AddIfPresent(map, "border-top-left-radius", style.GetBorderTopLeftRadius());
+        AddIfPresent(map, "border-top-right-radius", style.GetBorderTopRightRadius());
+        AddIfPresent(map, "border-bottom-right-radius", style.GetBorderBottomRightRadius());
+        AddIfPresent(map, "border-bottom-left-radius", style.GetBorderBottomLeftRadius());
+
+        AddIfPresent(map, "box-shadow", style.GetBoxShadow());
+        AddIfPresent(map, "text-shadow", style.GetTextShadow());
+
+        AddIfPresent(map, "list-style-type", style.GetPropertyValue("list-style-type"));
+        AddIfPresent(map, "list-style-position", style.GetPropertyValue("list-style-position"));
+
+        AddIfPresent(map, "overflow-x", style.GetPropertyValue("overflow-x"));
+        AddIfPresent(map, "overflow-y", style.GetPropertyValue("overflow-y"));
+
         AddIfPresent(map, "outline-width", style.GetPropertyValue("outline-width"));
         AddIfPresent(map, "outline-style", style.GetPropertyValue("outline-style"));
         AddIfPresent(map, "outline-color", style.GetPropertyValue("outline-color"));
@@ -2716,8 +3308,34 @@ public sealed class HtmlRenderer
         }
         else
         {
-            AddIfPresent(map, "background-image", style.GetPropertyValue("background-image"));
+            // AngleSharp.Css does compute a `url(...)` background-image (unlike the `overflow`
+            // shorthand quirk documented elsewhere), but as a normalized, quoted `url("...")` - the
+            // raw inline `style=""` fallback below matches the pattern the grid/flex properties
+            // above already use for their own AngleSharp.Css computation gaps, kept here as the
+            // same defensive fallback for the rare case computation reports nothing at all.
+            var computedBackgroundImage = style.GetPropertyValue("background-image");
+            AddIfPresent(map, "background-image", string.IsNullOrWhiteSpace(computedBackgroundImage)
+                ? ParseStyleAttributeValue(inlineStyle, "background-image")
+                : computedBackgroundImage);
         }
+
+        AddIfPresent(map, "background-repeat", string.IsNullOrWhiteSpace(style.GetPropertyValue("background-repeat")) ? ParseStyleAttributeValue(inlineStyle, "background-repeat") : style.GetPropertyValue("background-repeat"));
+        AddIfPresent(map, "background-position", string.IsNullOrWhiteSpace(style.GetPropertyValue("background-position")) ? ParseStyleAttributeValue(inlineStyle, "background-position") : style.GetPropertyValue("background-position"));
+        AddIfPresent(map, "background-size", string.IsNullOrWhiteSpace(style.GetPropertyValue("background-size")) ? ParseStyleAttributeValue(inlineStyle, "background-size") : style.GetPropertyValue("background-size"));
+        // Never read from AngleSharp.Css's own computed `transform` (nor even the raw inline style,
+        // since PrepareDocumentForRendering has already stripped it out by this point) -
+        // TryExtractTransformDeclaration moves the raw value to `data-render-transform` before
+        // AngleSharp.Css ever computes anything, working around a confirmed upstream crash in its
+        // `CssTranslateValue.Compute()`. See TryExtractTransformDeclaration's own remarks.
+        var rawTransformValue = element?.GetAttribute("data-render-transform");
+        AddIfPresent(map, "transform", rawTransformValue);
+        AddIfPresent(map, "transform-origin", string.IsNullOrWhiteSpace(style.GetPropertyValue("transform-origin")) ? ParseStyleAttributeValue(inlineStyle, "transform-origin") : style.GetPropertyValue("transform-origin"));
+        // AngleSharp.Css now parses `filter` into a structured CssFilterValue and preserves it
+        // through computed style (fixed upstream - it used to always report an empty string here),
+        // so this can now read the ordinary computed-style value directly, the same as any other
+        // property.
+        AddIfPresent(map, "filter", style.GetPropertyValue("filter"));
+        AddIfPresent(map, "opacity", style.GetOpacity());
         AddIfPresent(map, "font-size", style.GetFontSize());
         AddIfPresent(map, "font-family", style.GetFontFamily());
         AddIfPresent(map, "font-weight", style.GetPropertyValue("font-weight"));
@@ -2732,8 +3350,51 @@ public sealed class HtmlRenderer
         AddIfPresent(map, "letter-spacing", style.GetPropertyValue("letter-spacing"));
         AddIfPresent(map, "line-height", style.GetLineHeight());
         AddIfPresent(map, "color", style.GetColor());
+        AddIfPresent(map, "white-space", style.GetPropertyValue("white-space"));
+
+        ApplyActiveTransitionAndAnimationOverrides(map, element);
 
         return map;
+    }
+
+    // Overrides every style-map entry that is currently mid-`transition` or mid-`animation` with
+    // its interpolated value, so the rest of this renderer's normal per-property parsing
+    // (ParseLength, ParseColor, ...) never has to know either is even happening - it just sees
+    // whatever value would otherwise be in the map, substituted for the eased in-between one. A
+    // no-op (and effectively free - one ConditionalWeakTable lookup) for the overwhelming majority
+    // of documents, which were never wired up for interactive use via
+    // IBrowsingContext.GetDomHarness() at all. `animation` takes precedence over `transition` for a
+    // property both are currently affecting - a reasonable simplification of the CSS cascade's own
+    // "animations, then transitions" ordering (transitions technically animate on top of whatever
+    // the animation produces, which this renderer does not attempt to layer precisely).
+    private static void ApplyActiveTransitionAndAnimationOverrides(Dictionary<string, string> map, IElement? element)
+    {
+        if (element?.Owner is null || !element.Owner.Context.TryGetDomHarness(out var harness) || harness is null)
+        {
+            return;
+        }
+
+        // Iterates the full interpolatable whitelist, not just map.Keys - a property that only
+        // ever appears inside a @keyframes block (never as a base/inherited declaration, e.g.
+        // `opacity` set solely by an animation) would otherwise have no key in the map at all for
+        // this loop to find and override.
+        foreach (var property in CssValueInterpolation.InterpolatableProperties.Keys)
+        {
+            var animatedValue = harness.GetAnimatedValue(element, property);
+
+            if (animatedValue is not null)
+            {
+                map[property] = animatedValue;
+                continue;
+            }
+
+            var transitioningValue = harness.GetTransitioningValue(element, property);
+
+            if (transitioningValue is not null)
+            {
+                map[property] = transitioningValue;
+            }
+        }
     }
 
     private static void AddIfPresent(Dictionary<string, string> map, string property, string? value)
@@ -2895,7 +3556,7 @@ public sealed class HtmlRenderer
             : 0;
     }
 
-    private static BoxStyle ResolveBoxStyle(Dictionary<string, string> styleMap)
+    private static BoxStyle ResolveBoxStyle(Dictionary<string, string> styleMap, IElement element)
     {
         var margin = new EdgeSizes(
             Top: ParseLength(styleMap, "margin-top", 0f, 0f, allowAuto: false),
@@ -2920,7 +3581,7 @@ public sealed class HtmlRenderer
         borderWidth = ApplyBorderStyleToWidths(borderWidth, borderStyle);
 
         var backgroundColor = ParseColor(styleMap.TryGetValue("background-color", out var background) ? background : null, RenderColor.Transparent);
-        var backgroundPaint = ParseBackgroundPaint(styleMap, backgroundColor);
+        var backgroundPaint = ParseBackgroundPaint(styleMap, backgroundColor, element);
         var borderColor = ParseColor(
             styleMap.TryGetValue("border-top-color", out var topColor) ? topColor :
             styleMap.TryGetValue("border-right-color", out var rightColor) ? rightColor :
@@ -2929,7 +3590,187 @@ public sealed class HtmlRenderer
             null,
             RenderColor.Black);
 
-        return new BoxStyle(margin, padding, borderWidth, backgroundPaint, borderColor);
+        var (topLeftX, topLeftY) = ParseCornerRadius(styleMap, "border-top-left-radius");
+        var (topRightX, topRightY) = ParseCornerRadius(styleMap, "border-top-right-radius");
+        var (bottomRightX, bottomRightY) = ParseCornerRadius(styleMap, "border-bottom-right-radius");
+        var (bottomLeftX, bottomLeftY) = ParseCornerRadius(styleMap, "border-bottom-left-radius");
+        var borderRadius = new RenderCornerRadii(
+            topLeftX, topLeftY,
+            topRightX, topRightY,
+            bottomRightX, bottomRightY,
+            bottomLeftX, bottomLeftY);
+
+        var boxShadows = ParseBoxShadows(styleMap.TryGetValue("box-shadow", out var boxShadowValue) ? boxShadowValue : null);
+
+        return new BoxStyle(margin, padding, borderWidth, backgroundPaint, borderColor, borderRadius, boxShadows);
+    }
+
+    /// <summary>
+    /// Parses a `box-shadow` value into its comma-separated layers, in CSS authoring order
+    /// (first-listed shadow paints topmost among shadows). AngleSharp.Css's computed style
+    /// normalizes every layer's color to `rgba(r, g, b, a)` regardless of how it was authored
+    /// (`red`, `#f00`, ...), which <see cref="ExtractColorToken"/> relies on to split a layer's
+    /// color from its lengths without being confused by the commas inside `rgba(...)`.
+    /// </summary>
+    private static IReadOnlyList<RenderBoxShadow> ParseBoxShadows(string? value)
+    {
+        if (string.IsNullOrWhiteSpace(value) || string.Equals(value.Trim(), "none", StringComparison.OrdinalIgnoreCase))
+        {
+            return [];
+        }
+
+        var layers = SplitTopLevelCommaList(value);
+        var shadows = new List<RenderBoxShadow>(layers.Length);
+
+        foreach (var layer in layers)
+        {
+            if (ParseSingleBoxShadow(layer) is { } shadow)
+            {
+                shadows.Add(shadow);
+            }
+        }
+
+        return shadows;
+    }
+
+    private static RenderBoxShadow? ParseSingleBoxShadow(string layer)
+    {
+        var trimmed = layer.Trim();
+        var inset = false;
+
+        if (trimmed.StartsWith("inset", StringComparison.OrdinalIgnoreCase) && (trimmed.Length == 5 || char.IsWhiteSpace(trimmed[5])))
+        {
+            inset = true;
+            trimmed = trimmed[5..].TrimStart();
+        }
+        else if (trimmed.EndsWith("inset", StringComparison.OrdinalIgnoreCase) && (trimmed.Length == 5 || char.IsWhiteSpace(trimmed[^6])))
+        {
+            inset = true;
+            trimmed = trimmed[..^5].TrimEnd();
+        }
+
+        var (colorToken, remainder) = ExtractColorToken(trimmed);
+        var color = ParseColor(colorToken, RenderColor.Black);
+        var tokens = remainder.Split(' ', StringSplitOptions.RemoveEmptyEntries);
+
+        if (tokens.Length < 2)
+        {
+            return null;
+        }
+
+        var offsetX = ParseLengthValue(tokens[0], 0f, allowAuto: false);
+        var offsetY = ParseLengthValue(tokens[1], 0f, allowAuto: false);
+        var blurRadius = tokens.Length > 2 ? Math.Max(0f, ParseLengthValue(tokens[2], 0f, allowAuto: false)) : 0f;
+        var spreadRadius = tokens.Length > 3 ? ParseLengthValue(tokens[3], 0f, allowAuto: false) : 0f;
+
+        return new RenderBoxShadow(offsetX, offsetY, blurRadius, spreadRadius, color, inset);
+    }
+
+    /// <summary>
+    /// Parses a `text-shadow` value into its comma-separated layers, in CSS authoring order
+    /// (first-listed shadow paints topmost among shadows). Unlike `box-shadow`, a layer has no
+    /// `inset` keyword and no spread component.
+    /// </summary>
+    private static IReadOnlyList<RenderTextShadow> ParseTextShadows(string? value, IReadOnlyList<RenderTextShadow> inherited)
+    {
+        if (string.IsNullOrWhiteSpace(value))
+        {
+            return inherited;
+        }
+
+        if (string.Equals(value.Trim(), "none", StringComparison.OrdinalIgnoreCase))
+        {
+            return [];
+        }
+
+        var layers = SplitTopLevelCommaList(value);
+        var shadows = new List<RenderTextShadow>(layers.Length);
+
+        foreach (var layer in layers)
+        {
+            if (ParseSingleTextShadow(layer) is { } shadow)
+            {
+                shadows.Add(shadow);
+            }
+        }
+
+        return shadows;
+    }
+
+    private static RenderTextShadow? ParseSingleTextShadow(string layer)
+    {
+        var (colorToken, remainder) = ExtractColorToken(layer.Trim());
+        var color = ParseColor(colorToken, RenderColor.Black);
+        var tokens = remainder.Split(' ', StringSplitOptions.RemoveEmptyEntries);
+
+        if (tokens.Length < 2)
+        {
+            return null;
+        }
+
+        var offsetX = ParseLengthValue(tokens[0], 0f, allowAuto: false);
+        var offsetY = ParseLengthValue(tokens[1], 0f, allowAuto: false);
+        var blurRadius = tokens.Length > 2 ? Math.Max(0f, ParseLengthValue(tokens[2], 0f, allowAuto: false)) : 0f;
+
+        return new RenderTextShadow(offsetX, offsetY, blurRadius, color);
+    }
+
+    /// <summary>
+    /// Splits a shadow layer's color from its offset/blur/spread lengths. AngleSharp.Css always
+    /// normalizes a shadow's color to `rgba(r, g, b, a)`, so the color is located by its
+    /// parenthesized function call rather than by naive whitespace splitting, which would
+    /// otherwise be misled by the spaces after the commas inside `rgba(...)`. Falls back to
+    /// treating the last whitespace-separated token as the color for any value that reaches this
+    /// parser without going through AngleSharp.Css's own normalization.
+    /// </summary>
+    private static (string? ColorToken, string Remainder) ExtractColorToken(string value)
+    {
+        var functionStart = value.IndexOf("rgba(", StringComparison.OrdinalIgnoreCase);
+
+        if (functionStart < 0)
+        {
+            var lastSpace = value.TrimEnd().LastIndexOf(' ');
+            return lastSpace < 0
+                ? (value.Length > 0 ? value.Trim() : null, string.Empty)
+                : (value[(lastSpace + 1)..].Trim(), value[..lastSpace]);
+        }
+
+        var functionEnd = value.IndexOf(')', functionStart);
+
+        if (functionEnd < 0)
+        {
+            return (value[functionStart..].Trim(), value[..functionStart]);
+        }
+
+        var colorToken = value[functionStart..(functionEnd + 1)];
+        var remainder = value[..functionStart] + value[(functionEnd + 1)..];
+        return (colorToken, remainder);
+    }
+
+    /// <summary>
+    /// Parses a `border-*-radius` longhand value, which AngleSharp.Css reports as one length
+    /// ("8px", for a circular corner) or two space-separated lengths ("8px 4px", horizontal then
+    /// vertical, for an elliptical corner). Percentages arrive already resolved to pixels by
+    /// AngleSharp.Css's computed style engine.
+    /// </summary>
+    private static (float X, float Y) ParseCornerRadius(Dictionary<string, string> styleMap, string propertyName)
+    {
+        if (!styleMap.TryGetValue(propertyName, out var value) || string.IsNullOrWhiteSpace(value))
+        {
+            return (0f, 0f);
+        }
+
+        var parts = value.Trim().Split(' ', StringSplitOptions.RemoveEmptyEntries);
+
+        if (parts.Length == 0)
+        {
+            return (0f, 0f);
+        }
+
+        var x = ParseLengthValue(parts[0], 0f, allowAuto: false);
+        var y = parts.Length > 1 ? ParseLengthValue(parts[1], 0f, allowAuto: false) : x;
+
+        return (x, y);
     }
 
     private static EdgeBorderStyle ResolveBorderStyles(Dictionary<string, string> styleMap)
@@ -3149,12 +3990,30 @@ public sealed class HtmlRenderer
     private static bool TryGetOrLoadImageResource(IElement element, string? source, out CachedImageResource? imageResource)
     {
         imageResource = null;
-        if (string.IsNullOrWhiteSpace(source))
-        {
-            return false;
-        }
 
-        var cacheKey = source.Trim();
+        return !string.IsNullOrWhiteSpace(source) &&
+               TryGetOrLoadCachedResource(element, source.Trim(), TryLoadImageResource, out imageResource);
+    }
+
+    /// <summary>
+    /// Resolves a `background-image: url(...)` reference to a decoded, cached image, sharing the
+    /// same per-document <see cref="DocumentImageCache"/> (keyed by the same trimmed URL string) as
+    /// an `&lt;img src&gt;` reference to the exact same URL - one fetch serves both. Unlike
+    /// <see cref="TryGetOrLoadImageResource"/>, there is no <see cref="ILoadableElement"/> download
+    /// already in flight to consult first: a CSS property value has no DOM-level load of its own,
+    /// so <see cref="TryLoadBackgroundImageResource"/> always resolves the URL itself (data URI, or
+    /// the network - and only the network - when the browsing context has an
+    /// <see cref="IDocumentLoader"/> configured), mirroring how <c>@font-face url()</c> sources are
+    /// handled in <c>FontFaceLoader</c>.
+    /// </summary>
+    private static bool TryGetOrLoadBackgroundImageResource(IElement element, string url, out CachedImageResource? imageResource) =>
+        TryGetOrLoadCachedResource(element, url.Trim(), TryLoadBackgroundImageResource, out imageResource);
+
+    private delegate bool ImageResourceLoader(IElement element, string source, out CachedImageResource? imageResource);
+
+    private static bool TryGetOrLoadCachedResource(IElement element, string cacheKey, ImageResourceLoader loader, out CachedImageResource? imageResource)
+    {
+        imageResource = null;
         var cache = GetImageCache(element);
 
         if (cache is not null)
@@ -3168,28 +4027,17 @@ public sealed class HtmlRenderer
             }
         }
 
-        if (!TryLoadImageResource(element, source, out imageResource))
-        {
-            if (cache is not null)
-            {
-                lock (cache.Resources)
-                {
-                    cache.Resources[cacheKey] = null;
-                }
-            }
-
-            return false;
-        }
+        var loaded = loader(element, cacheKey, out imageResource);
 
         if (cache is not null)
         {
             lock (cache.Resources)
             {
-                cache.Resources[cacheKey] = imageResource;
+                cache.Resources[cacheKey] = loaded ? imageResource : null;
             }
         }
 
-        return true;
+        return loaded;
     }
 
     private static DocumentImageCache? GetImageCache(IElement element)
@@ -3236,7 +4084,74 @@ public sealed class HtmlRenderer
             mimeType = dataUriMimeType;
         }
 
-        if (bytes is null || bytes.Length == 0)
+        return bytes is not null && TryDecodeImageBytes(bytes, mimeType, out imageResource);
+    }
+
+    /// <summary>
+    /// Resolves a `background-image: url(...)` value: a data URI decodes inline, exactly like an
+    /// `&lt;img src&gt;` data URI; anything else is only ever fetched when the browsing context was
+    /// configured with an <see cref="IDocumentLoader"/> - matching how images and `@font-face`
+    /// sources are already handled, a renderer should not silently reach out to the network. The
+    /// fetch is synchronous (blocking on the download's Task) so the resource is
+    /// available - loaded and decoded - within the very same <c>BuildDisplayList</c> call that
+    /// requested it, the same way an `&lt;img&gt;`'s already-in-flight <c>CurrentDownload</c> is
+    /// awaited: this renderer has no separate "repaint later once loaded" pass to defer to.
+    /// </summary>
+    private static bool TryLoadBackgroundImageResource(IElement element, string url, out CachedImageResource? imageResource)
+    {
+        imageResource = null;
+
+        if (TryParseDataUri(url, out var dataUriBytes, out var dataUriMimeType))
+        {
+            return dataUriBytes is not null && TryDecodeImageBytes(dataUriBytes, dataUriMimeType, out imageResource);
+        }
+
+        var document = element.Owner;
+        var loader = document?.Context.GetService<IDocumentLoader>();
+
+        if (document is null || loader is null)
+        {
+            return false;
+        }
+
+        try
+        {
+            var target = new Url(document.BaseUrl, url);
+            var download = loader.FetchAsync(DocumentRequest.Get(target, source: document, referer: document.BaseUri));
+            var response = download.Task.GetAwaiter().GetResult();
+
+            if (response?.Content is null)
+            {
+                return false;
+            }
+
+            using var content = response.Content;
+            using var buffer = new MemoryStream();
+            content.CopyTo(buffer);
+            var bytes = buffer.ToArray();
+
+            if (bytes.Length == 0)
+            {
+                return false;
+            }
+
+            var mimeType = response.Headers?.TryGetValue("Content-Type", out var contentType) == true && !string.IsNullOrWhiteSpace(contentType)
+                ? contentType
+                : "image/unknown";
+
+            return TryDecodeImageBytes(bytes, mimeType, out imageResource);
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    private static bool TryDecodeImageBytes(byte[] bytes, string? mimeType, out CachedImageResource? imageResource)
+    {
+        imageResource = null;
+
+        if (bytes.Length == 0)
         {
             return false;
         }
@@ -3258,10 +4173,7 @@ public sealed class HtmlRenderer
             return false;
         }
 
-        var naturalWidth = skImage.Width;
-        var naturalHeight = skImage.Height;
-
-        imageResource = new CachedImageResource(bytes, mimeType ?? "image/unknown", naturalWidth, naturalHeight);
+        imageResource = new CachedImageResource(bytes, mimeType ?? "image/unknown", skImage.Width, skImage.Height);
         return true;
     }
 
@@ -3314,12 +4226,867 @@ public sealed class HtmlRenderer
         return bytes.Length > 0;
     }
 
-    private static void PaintBackground(DisplayList displayList, RenderPaint paint, float x, float y, float width, float height)
+    /// <summary>
+    /// Identifies which kind of default styling/content-painting a form control needs. `None`
+    /// covers every non-form element, so callers can skip all of the form-control machinery with a
+    /// single check. `Hidden` (`input[type=hidden]`) never lays out or paints at all - handled by
+    /// an early return in <c>LayoutElement</c> rather than here, since AngleSharp.Css's UA
+    /// stylesheet does not give it `display: none` the way a real browser's does (every `&lt;input&gt;`
+    /// type computes to plain `inline-block` in this AngleSharp.Css version, verified empirically).
+    /// </summary>
+    private enum FormControlKind
+    {
+        /// <summary>Not a form control.</summary>
+        None,
+
+        /// <summary>
+        /// A single-line text value box: <c>text</c>, and every other textual `&lt;input&gt;` type this
+        /// renderer treats identically (`search`, `url`, `tel`, `email`, `number`, the date/time
+        /// family, and any unrecognized/absent type - matching the HTML spec's "unknown type falls
+        /// back to text" rule), plus `password` (masked with bullet characters).
+        /// </summary>
+        TextLike,
+
+        /// <summary>`input[type=checkbox]`.</summary>
+        Checkbox,
+
+        /// <summary>`input[type=radio]`.</summary>
+        Radio,
+
+        /// <summary>`input[type=color]`.</summary>
+        Color,
+
+        /// <summary>
+        /// A clickable, label-centered button box: `&lt;button&gt;` and
+        /// `input[type=button|submit|reset]`.
+        /// </summary>
+        Button,
+
+        /// <summary>`&lt;select&gt;` - shows only its selected `&lt;option&gt;`'s text, never every option.</summary>
+        Select,
+
+        /// <summary>`&lt;textarea&gt;` - gets the same box chrome as a text input, but keeps its real
+        /// child text node flowing through the ordinary block child-layout path for its content.</summary>
+        TextArea,
+
+        /// <summary>`input[type=hidden]` - never laid out or painted; see the type's own remarks.</summary>
+        Hidden,
+    }
+
+    /// <summary>
+    /// A common browser checkbox/radio accent color (Chrome/Edge's default `accent-color`),
+    /// approximated as a fixed constant - this renderer does not parse the CSS `accent-color`
+    /// property itself, a deliberate scope cut for a rarely-overridden value.
+    /// </summary>
+    private static readonly RenderColor FormControlAccentColor = new(26, 115, 232, 255);
+
+    /// <summary>
+    /// The bundled sans-serif font's own ascent, as a fraction of font-size, measured empirically
+    /// via <c>SKPaint.FontMetrics</c> (14.8515625px ascent at font-size 16 -> 0.928) - used to
+    /// center a form control's single-line text on its real visual ink rather than on the taller
+    /// CSS line-height box. See <see cref="PaintFormControl"/> for why: the "baseline at the bottom
+    /// of the line-height box" convention the rest of this renderer uses for stacked body text
+    /// leaves no room for descenders/leading below the baseline, which is invisible across many
+    /// stacked lines but visibly pushed single-line form-control text toward the bottom of its box.
+    /// </summary>
+    private const float FormControlTextAscentRatio = 0.928f;
+
+    /// <summary>Companion to <see cref="FormControlTextAscentRatio"/> - measured descent 3.7734375px at font-size 16 -> 0.236.</summary>
+    private const float FormControlTextDescentRatio = 0.236f;
+
+    /// <summary>
+    /// "⌄" (DOWNWARDS ARROWHEAD, a thin chevron) rather than a custom-drawn triangle - <c>
+    /// DisplayList</c> has no generic polygon-fill primitive, so any dropdown indicator has to come
+    /// from a real font glyph. A plain ASCII "v" (this constant's original value) is guaranteed to
+    /// exist in every bundled font but reads as a literal letter, not an icon; U+2304 was verified
+    /// - by rendering several candidate glyphs and inspecting the actual pixels, not assumed from a
+    /// coverage table - to exist in the bundled DejaVu Sans as a proper thin chevron shape close to
+    /// a real browser's own native indicator, unlike, for example, U+23D7 which the bundled font
+    /// has no glyph for at all (renders as a hollow "tofu" box). Shared between the default-width
+    /// measurement in <see cref="ApplyFormControlDefaults"/> and the actual paint in
+    /// <see cref="PaintFormControl"/> so the two can never disagree about how much room it needs.
+    /// </summary>
+    private const string FormControlSelectArrowGlyph = "⌄";
+
+    /// <summary>
+    /// A downward correction applied only to <see cref="FormControlSelectArrowGlyph"/>'s own
+    /// baseline, on top of the ordinary text baseline every other form-control label already
+    /// centers on via <see cref="FormControlTextAscentRatio"/>/<see cref="FormControlTextDescentRatio"/>.
+    /// Those two ratios approximate *ordinary latin text's* ink extents (built from measuring a
+    /// word like "Second"), but "⌄" is a short symbol glyph whose own ink sits much closer to the
+    /// baseline - measured via <c>SKPaint.MeasureText</c>'s tight bounding box at font-size 16:
+    /// "⌄" spans roughly 6px above the baseline to 1px below it (a 7px-tall glyph, vertical ink
+    /// center ~2.5px above baseline), while "Second" spans roughly 14px above to 2px below (a
+    /// 16px-tall run, vertical ink center ~6px above baseline). Painting both at the *same*
+    /// baseline - which is what correctly centers the text label - therefore left the arrow's own,
+    /// much shorter ink sitting visibly low in the box: a real, confirmed bug, not a hypothetical
+    /// one (caught from a direct visual report, not assumed). This ratio is the measured difference
+    /// between those two ink-centers as a fraction of font-size (~-3px at font-size 16, i.e.
+    /// -3/16), shifting the arrow's baseline up just enough that its own ink centers where the
+    /// text's ink already does.
+    /// </summary>
+    private const float FormControlSelectArrowVerticalOffsetRatio = -0.19f;
+
+    /// <summary>
+    /// The width, in pixels, of a focused text-like input's caret - a fixed value rather than a
+    /// font-size fraction, matching how a real browser's own caret stays a thin ~1-2px line
+    /// regardless of font size rather than scaling with it.
+    /// </summary>
+    private const float FormControlCaretWidth = 1.5f;
+
+    /// <summary>
+    /// One full fade cycle of the caret's blink animation, in milliseconds - see
+    /// <see cref="PaintFormControlCaret"/> for how this is used.
+    /// </summary>
+    private const double FormControlCaretBlinkPeriodMs = 1000d;
+
+    private static FormControlKind ResolveFormControlKind(IElement element)
+    {
+        var tagName = element.LocalName;
+
+        if (string.Equals(tagName, "textarea", StringComparison.OrdinalIgnoreCase))
+        {
+            return FormControlKind.TextArea;
+        }
+
+        if (string.Equals(tagName, "select", StringComparison.OrdinalIgnoreCase))
+        {
+            return FormControlKind.Select;
+        }
+
+        if (string.Equals(tagName, "button", StringComparison.OrdinalIgnoreCase))
+        {
+            return FormControlKind.Button;
+        }
+
+        if (!string.Equals(tagName, "input", StringComparison.OrdinalIgnoreCase))
+        {
+            return FormControlKind.None;
+        }
+
+        var type = element.GetAttribute("type")?.Trim().ToLowerInvariant();
+
+        return type switch
+        {
+            "checkbox" => FormControlKind.Checkbox,
+            "radio" => FormControlKind.Radio,
+            "color" => FormControlKind.Color,
+            "button" or "submit" or "reset" => FormControlKind.Button,
+            "hidden" => FormControlKind.Hidden,
+            _ => FormControlKind.TextLike,
+        };
+    }
+
+    /// <summary>
+    /// Fills in the browser-like default declarations a form control needs (border, padding,
+    /// background, and a natural size) directly into its style map, but only for whichever
+    /// individual properties the author has not already set - exactly the same "synthesize the UA
+    /// default only where the cascade left a gap" approach already used for
+    /// `list-style-type`/`list-style-position`, just for a much larger set of properties at once.
+    /// This is what makes the defaults "somewhat overridable, like in real browsers": setting
+    /// `border`, `background-color`, `padding`, or an explicit `width`/`height` in CSS pre-empts
+    /// the corresponding default below exactly as it would in a real browser's form-control
+    /// rendering, while every property the author leaves alone still gets a sensible UA look
+    /// instead of rendering as an invisible, zero-size box (this renderer's actual previous
+    /// behavior for every form control, since neither this renderer nor the AngleSharp.Css UA
+    /// stylesheet gave them any border/padding/background/size at all).
+    /// </summary>
+    private static void ApplyFormControlDefaults(
+        FormControlKind kind,
+        IElement element,
+        Dictionary<string, string> styleMap,
+        RenderTextStyle textStyle,
+        LayoutContext context)
+    {
+        void SetDefault(string property, string value)
+        {
+            if (!styleMap.TryGetValue(property, out var existing) || string.IsNullOrWhiteSpace(existing))
+            {
+                styleMap[property] = value;
+            }
+        }
+
+        // Unlike border-width/style/color (which GetPropertyValue reports as a genuinely empty
+        // string when nothing in the cascade set them, verified empirically), AngleSharp.Css always
+        // resolves a concrete border-*-radius computed value - "0px" - even for a plain, completely
+        // unstyled element. A bare SetDefault would see that "0px" as "the author already set this"
+        // and never apply the radio's circular default at all, so radius defaults specifically also
+        // treat the computed zero-length initial value as still-unset.
+        void SetDefaultRadius(string property, string value)
+        {
+            if (!styleMap.TryGetValue(property, out var existing) ||
+                string.IsNullOrWhiteSpace(existing) ||
+                existing.Trim() is "0px" or "0" or "0%")
+            {
+                styleMap[property] = value;
+            }
+        }
+
+        void SetDefaultBorder()
+        {
+            foreach (var side in new[] { "top", "right", "bottom", "left" })
+            {
+                SetDefault($"border-{side}-width", "1px");
+                SetDefault($"border-{side}-style", "solid");
+                SetDefault($"border-{side}-color", "#767676");
+            }
+        }
+
+        void SetDefaultTextPadding()
+        {
+            SetDefault("padding-top", "2px");
+            SetDefault("padding-bottom", "2px");
+            SetDefault("padding-left", "4px");
+            SetDefault("padding-right", "4px");
+        }
+
+        // A single line's worth of content height - the box's own vertical size, not to be
+        // confused with the ascent/descent-based metric PaintFormControl separately uses to place
+        // where the *baseline* sits within that box (see FormControlTextAscentRatio/DescentRatio).
+        // Sizing the box itself off the full CSS line-height (rather than an independent constant
+        // like the previous 1.2f) keeps a text-like control's default box roomy enough for
+        // normal text leading, matching a real browser's own default input height reasonably
+        // closely.
+        var lineHeight = textStyle.FontSize * textStyle.LineHeightMultiplier;
+
+        switch (kind)
+        {
+            case FormControlKind.TextLike:
+                SetDefaultBorder();
+                SetDefaultTextPadding();
+                SetDefault("background-color", "#ffffff");
+                SetDefault("width", "150px");
+                SetDefault("height", FormatPixelValue(lineHeight));
+                break;
+
+            case FormControlKind.Select:
+            {
+                SetDefaultBorder();
+                SetDefaultTextPadding();
+                // A light gray, button-like background (not the white a text-like input gets) -
+                // matching how a real browser's own native <select> chrome looks closer to a
+                // button than to a text box.
+                SetDefault("background-color", "#e8e8e8");
+                SetDefault("height", FormatPixelValue(lineHeight));
+
+                // Shrinks to fit its selected option's own label plus room for the dropdown arrow -
+                // the same shrink-to-fit idea a <button> uses for its own label - rather than a
+                // text-like input's fixed 150px default: a native <select> is never that wide
+                // unless its own content actually demands it.
+                var selectLabel = ResolveFormControlLabel(FormControlKind.Select, element);
+                var selectLabelWidth = MeasureTextWidth(context, selectLabel, textStyle);
+                var arrowWidth = MeasureTextWidth(context, FormControlSelectArrowGlyph, textStyle);
+                var arrowGap = textStyle.FontSize * 0.5f;
+                SetDefault("width", FormatPixelValue(Math.Max(30f, selectLabelWidth + arrowGap + arrowWidth)));
+                break;
+            }
+
+            case FormControlKind.TextArea:
+                SetDefaultBorder();
+                SetDefaultTextPadding();
+                SetDefault("background-color", "#ffffff");
+                SetDefault("width", "150px");
+                // Only a floor, not a cap: an auto-sized box's height is already
+                // Math.Max(specifiedHeight, autoContentHeight) throughout this renderer, so a
+                // <textarea> whose real content wraps past two lines still grows past this default
+                // rather than clipping it - this default only guarantees the common "empty or
+                // short" textarea still shows a multi-line box, like a browser's default 2 rows.
+                SetDefault("height", FormatPixelValue(lineHeight * 2f));
+                break;
+
+            case FormControlKind.Color:
+                SetDefaultBorder();
+                SetDefault("padding-top", "2px");
+                SetDefault("padding-bottom", "2px");
+                SetDefault("padding-left", "2px");
+                SetDefault("padding-right", "2px");
+                SetDefault("background-color", "#ffffff");
+                SetDefault("width", "36px");
+                SetDefault("height", FormatPixelValue(lineHeight));
+                break;
+
+            case FormControlKind.Checkbox:
+            case FormControlKind.Radio:
+            {
+                var boxSize = Math.Max(10f, textStyle.FontSize * 0.9f);
+                SetDefaultBorder();
+                SetDefault("background-color", "#ffffff");
+                SetDefault("width", FormatPixelValue(boxSize));
+                SetDefault("height", FormatPixelValue(boxSize));
+
+                // Real UA stylesheets give a checkbox/radio a small default margin (Chromium's
+                // html.css uses exactly these four values) that every other form control kind does
+                // not get - without it, two adjacent checkboxes/radios in markup with no whitespace
+                // between their tags (as this renderer's own gallery test and countless real forms
+                // both write them) render flush against each other with no gap at all. Unlike
+                // border/padding/background, AngleSharp.Css's UA stylesheet does not set any margin
+                // on these elements (verified empirically: GetPropertyValue("margin-*") comes back
+                // empty), so there is no upstream default to fall back to here.
+                SetDefault("margin-top", "3px");
+                SetDefault("margin-right", "3px");
+                SetDefault("margin-bottom", "3px");
+                SetDefault("margin-left", "4px");
+
+                if (kind == FormControlKind.Radio)
+                {
+                    // Two things ParseCornerRadius needs accounted for, neither obvious from
+                    // reading it in isolation: (1) it (and ResolveBoxStyle generally) only ever
+                    // reads the four longhand border-*-radius keys, matching how AngleSharp.Css's
+                    // own computed style populates the style map (see CreateStyleMap) - the
+                    // `border-radius` shorthand itself is never consulted, so it has to be expanded
+                    // here. (2) ParseCornerRadius's own ParseLengthValue call has no percentage
+                    // handling at all (unlike the general ParseLength used for width/padding/etc.,
+                    // which resolves a percentage against a containing dimension) - it only expects
+                    // a plain pixel value, because AngleSharp.Css itself always pre-resolves a
+                    // percentage border-radius to pixels before this renderer ever sees it. An
+                    // injected "50%" string here would silently parse to 0 rather than a circle, so
+                    // an already-resolved pixel value (half of this box's own default size) is
+                    // written instead.
+                    var cornerRadius = FormatPixelValue(boxSize / 2f);
+                    SetDefaultRadius("border-top-left-radius", cornerRadius);
+                    SetDefaultRadius("border-top-right-radius", cornerRadius);
+                    SetDefaultRadius("border-bottom-right-radius", cornerRadius);
+                    SetDefaultRadius("border-bottom-left-radius", cornerRadius);
+                }
+
+                break;
+            }
+
+            case FormControlKind.Button:
+            {
+                SetDefaultBorder();
+                SetDefault("padding-top", "2px");
+                SetDefault("padding-bottom", "2px");
+                SetDefault("padding-left", "10px");
+                SetDefault("padding-right", "10px");
+                SetDefault("background-color", "#e8e8e8");
+                SetDefault("height", FormatPixelValue(lineHeight));
+
+                // A button shrinks to fit its own label, unlike the fixed-width text-like controls
+                // above - measured now (rather than left to a general shrink-to-fit layout
+                // algorithm this renderer does not otherwise have) using the exact same
+                // ITextMeasurer layout already measures body text with.
+                var label = ResolveFormControlLabel(FormControlKind.Button, element);
+                var labelWidth = MeasureTextWidth(context, label, textStyle);
+                SetDefault("width", FormatPixelValue(Math.Max(20f, labelWidth)));
+                break;
+            }
+        }
+    }
+
+    private static string FormatPixelValue(float pixels) =>
+        string.Create(CultureInfo.InvariantCulture, $"{pixels:0.##}px");
+
+    /// <summary>
+    /// Resolves the text a form control shows as its own content - a typed `value`, a button's
+    /// label, or a select's currently-selected option - independently of normal child-text flow,
+    /// since <see cref="PaintFormControl"/> paints it directly rather than relying on any child
+    /// nodes being laid out (an `&lt;input&gt;` has none at all; a `&lt;select&gt;`'s/`&lt;button&gt;`'s are
+    /// deliberately excluded from `orderedChildren` in `LayoutElement`).
+    /// </summary>
+    private static string ResolveFormControlLabel(FormControlKind kind, IElement element)
+    {
+        switch (kind)
+        {
+            case FormControlKind.Button:
+            {
+                if (string.Equals(element.LocalName, "button", StringComparison.OrdinalIgnoreCase))
+                {
+                    var text = NormalizeWhitespace(element.TextContent ?? string.Empty);
+                    return text.Length > 0 ? text : "Button";
+                }
+
+                var value = element.GetAttribute("value");
+
+                if (!string.IsNullOrWhiteSpace(value))
+                {
+                    return value;
+                }
+
+                return element.GetAttribute("type")?.Trim().ToLowerInvariant() switch
+                {
+                    "submit" => "Submit",
+                    "reset" => "Reset",
+                    _ => "Button",
+                };
+            }
+
+            case FormControlKind.TextLike:
+            {
+                var value = element.GetAttribute("value") ?? string.Empty;
+
+                // A password field's own value never paints as plain text, matching the one
+                // input type where masking is part of the type's defining behavior rather than an
+                // optional/overridable styling choice.
+                return string.Equals(element.GetAttribute("type")?.Trim(), "password", StringComparison.OrdinalIgnoreCase) && value.Length > 0
+                    ? new string('•', value.Length)
+                    : value;
+            }
+
+            case FormControlKind.Select:
+            {
+                // The DOM's own last-`selected`-wins semantics (mirroring how a real <select>
+                // resolves multiple `selected` attributes) - falling back to the first <option> when
+                // none is marked selected, exactly like a browser's own initial-selection default.
+                var options = element.Children.Where(child => string.Equals(child.LocalName, "option", StringComparison.OrdinalIgnoreCase)).ToList();
+                var selected = options.LastOrDefault(option => option.HasAttribute("selected")) ?? options.FirstOrDefault();
+                return selected is not null ? NormalizeWhitespace(selected.TextContent ?? string.Empty) : string.Empty;
+            }
+
+            default:
+                return string.Empty;
+        }
+    }
+
+    /// <summary>
+    /// Paints a form control's own visible content - typed/selected text, or a checkbox/radio's
+    /// checked-state fill, or a color swatch - directly into <paramref name="displayList"/> at the
+    /// same point <see cref="PaintListItemMarker"/> paints a list marker, so it lands after the
+    /// box's own background/border (spliced in later at the already-captured
+    /// <c>boxPaintInsertIndex</c>) but is otherwise unaffected by however tall the box's children
+    /// end up making it - none of these controls have real children of their own to wait on.
+    /// </summary>
+    private static void PaintFormControl(
+        DisplayList displayList,
+        IElement element,
+        FormControlKind kind,
+        RenderTextStyle textStyle,
+        LayoutContext context,
+        float contentX,
+        float contentY,
+        float contentWidth,
+        float contentHeight)
+    {
+        switch (kind)
+        {
+            case FormControlKind.TextLike:
+            case FormControlKind.Select:
+            case FormControlKind.Button:
+            {
+                var label = ResolveFormControlLabel(kind, element);
+
+                // Centers the glyphs' own visual ink, not the CSS line box: LayoutWrappedText's
+                // "content-box top plus one full line height" baseline convention places the
+                // baseline as if every pixel of the line-height were ascent, with none left over
+                // for descenders or leading - fine for stacked body-text lines (the next line's own
+                // top absorbs the difference), but for a single line centered in a form control's
+                // padded box it visibly pushed text toward the bottom. FormControlTextAscentRatio/
+                // DescentRatio approximate the bundled sans-serif font's real metrics at a
+                // representative size (measured via SKPaint.FontMetrics: ascent 14.85px, descent
+                // 3.77px at font-size 16, i.e. ~0.928/~0.236 of the em) the same way
+                // ParseVerticalAlign already approximates super/sub/middle offsets as fontSize
+                // fractions rather than querying per-font metrics through ITextMeasurer (which only
+                // ever exposes advance width, by design - see ITextMeasurer's own remarks). Computed
+                // unconditionally (not just when there is a label) since a focused, empty TextLike
+                // input still needs a baseline/left-edge position for its caret below.
+                var visualTextHeight = textStyle.FontSize * (FormControlTextAscentRatio + FormControlTextDescentRatio);
+                var verticalCenteringOffset = Math.Max(0f, (contentHeight - visualTextHeight) / 2f);
+                var baselineY = contentY + verticalCenteringOffset + (textStyle.FontSize * FormControlTextAscentRatio) + textStyle.VerticalAlignOffset;
+                var labelWidth = label.Length > 0 ? MeasureTextWidth(context, label, textStyle) : 0f;
+
+                if (label.Length > 0)
+                {
+                    // A text input's typed value and a select's selected option are both
+                    // left-aligned, matching how browsers show them; only a button's own label is
+                    // centered in its box.
+                    var labelX = kind == FormControlKind.Button
+                        ? contentX + Math.Max(0f, (contentWidth - labelWidth) / 2f)
+                        : contentX;
+
+                    displayList.DrawText(label, labelX, baselineY, textStyle.Color, textStyle.FontSize, textStyle.FontFamily, textStyle.FontWeight, textStyle.IsItalic, letterSpacing: textStyle.LetterSpacing);
+
+                    if (kind == FormControlKind.Select)
+                    {
+                        var arrowWidth = MeasureTextWidth(context, FormControlSelectArrowGlyph, textStyle);
+                        var arrowX = contentX + Math.Max(labelWidth, contentWidth - arrowWidth);
+                        var arrowBaselineY = baselineY + (textStyle.FontSize * FormControlSelectArrowVerticalOffsetRatio);
+                        displayList.DrawText(FormControlSelectArrowGlyph, arrowX, arrowBaselineY, textStyle.Color, textStyle.FontSize, textStyle.FontFamily, textStyle.FontWeight, textStyle.IsItalic, letterSpacing: textStyle.LetterSpacing);
+                    }
+                }
+
+                if (kind == FormControlKind.TextLike)
+                {
+                    PaintFormControlCaret(displayList, element, textStyle, contentX + labelWidth, baselineY);
+                }
+
+                break;
+            }
+
+            case FormControlKind.Checkbox:
+            {
+                if (element.HasAttribute("checked"))
+                {
+                    // Sized off the box's own smaller dimension so a checkbox whose width and
+                    // height default to the same font-relative size (the common case) still gets a
+                    // perfectly square fill even if either is overridden asymmetrically, and inset
+                    // independently per axis so the fill is centered on both axes rather than only
+                    // assuming a square box.
+                    var size = Math.Max(0f, Math.Min(contentWidth, contentHeight) * 0.6f);
+                    var insetX = (contentWidth - size) / 2f;
+                    var insetY = (contentHeight - size) / 2f;
+                    displayList.FillRect(new RenderRect(contentX + insetX, contentY + insetY, size, size), FormControlAccentColor);
+                }
+
+                break;
+            }
+
+            case FormControlKind.Radio:
+            {
+                if (element.HasAttribute("checked"))
+                {
+                    var size = Math.Max(0f, Math.Min(contentWidth, contentHeight) * 0.5f);
+                    var insetX = (contentWidth - size) / 2f;
+                    var insetY = (contentHeight - size) / 2f;
+                    var radii = new RenderCornerRadii(
+                        size / 2f, size / 2f, size / 2f, size / 2f,
+                        size / 2f, size / 2f, size / 2f, size / 2f);
+                    displayList.FillRect(new RenderRect(contentX + insetX, contentY + insetY, size, size), FormControlAccentColor, radii);
+                }
+
+                break;
+            }
+
+            case FormControlKind.Color:
+            {
+                // The swatch is painted as its own fill, independent of the box's own
+                // background-color (already defaulted to white above, as the swatch's "frame") -
+                // deliberately not overridable via CSS background-color, matching how a real
+                // browser's native color swatch ignores it too; only the frame around it (border,
+                // padding, size) goes through the ordinarily-overridable box model. It fills the
+                // entire content box (rather than a fixed line-height-tall rect within it) so it is
+                // always centered regardless of how tall the box's own content height ends up being.
+                var color = ParseColor(element.GetAttribute("value"), RenderColor.Black);
+                displayList.FillRect(new RenderRect(contentX, contentY, contentWidth, contentHeight), color);
+                break;
+            }
+        }
+    }
+
+    /// <summary>
+    /// Paints a text-insertion caret for a focused <see cref="FormControlKind.TextLike"/> input,
+    /// right after its current value (or at the content edge, for an empty one) - this renderer
+    /// has no concept of a selection/cursor offset within an input's own value (AngleSharp does
+    /// not track one either), so the caret always sits at the end of the text, matching by far the
+    /// most common "user is appending" case a static render would want to depict. Real focus comes
+    /// straight from the DOM (<see cref="IElement.IsFocused"/>) rather than being tracked
+    /// separately by this renderer - AngleSharp.Css's own `:focus` pseudo-class forcing already
+    /// delegates to it (see AGENTS.md's `:hover` section for the equivalent story with
+    /// <c>SetPseudoClass</c>), so a plain <c>element.Focus()</c> or
+    /// <c>element.SetPseudoClass("focus")</c> is already enough to make a caret appear, with no
+    /// extra wiring needed here. `&lt;textarea&gt;` is a deliberate, documented scope cut - unlike
+    /// a single-line input's fixed baseline, its caret position would depend on which wrapped line
+    /// its real child text node currently ends on, which this renderer does not track.
+    /// </summary>
+    private static void PaintFormControlCaret(
+        DisplayList displayList,
+        IElement element,
+        RenderTextStyle textStyle,
+        float caretX,
+        float baselineY)
+    {
+        if (!element.IsFocused)
+        {
+            return;
+        }
+
+        var alpha = 1f;
+
+        // The fade needs a live clock to animate against; without one (a plain, non-interactive
+        // RenderToPng/BuildDisplayList call, or a harness whose AdvanceTime was simply never
+        // called) it paints fully opaque rather than frozen at some arbitrary phase - the same
+        // "no harness means no animation, not a stuck mid-animation frame" fallback `transition`/
+        // `animation` already use (see ApplyActiveTransitionAndAnimationOverrides).
+        if (element.Owner is not null && element.Owner.Context.TryGetDomHarness(out var harness) && harness is not null)
+        {
+            // A smooth cosine "breathe" - continuously sweeping through fully visible, partway
+            // faded, and fully invisible - rather than a hard on/off blink, so sampling the virtual
+            // clock at any instant shows a plausible in-between frame instead of only ever a flat
+            // "on" or "off" pixel value.
+            var cyclePosition = harness.CurrentTime.TotalMilliseconds % FormControlCaretBlinkPeriodMs / FormControlCaretBlinkPeriodMs;
+            alpha = (float)((Math.Cos(cyclePosition * 2 * Math.PI) + 1) / 2);
+        }
+
+        var caretTop = baselineY - (textStyle.FontSize * FormControlTextAscentRatio);
+        var caretBottom = baselineY + (textStyle.FontSize * FormControlTextDescentRatio);
+        var alphaByte = (byte)Math.Clamp((int)MathF.Round(alpha * 255f), 0, 255);
+        var caretColor = new RenderColor(textStyle.Color.R, textStyle.Color.G, textStyle.Color.B, alphaByte);
+
+        displayList.FillRect(new RenderRect(caretX, caretTop, FormControlCaretWidth, caretBottom - caretTop), caretColor);
+    }
+
+    /// <summary>
+    /// Paints a `display: list-item` element's marker (bullet or number) and, for
+    /// `list-style-position: inside`, returns a copy of <paramref name="textStyle"/> whose
+    /// <see cref="RenderTextStyle.TextIndent"/> is widened to make room for it on the first line.
+    /// Safe to widen locally: <see cref="ResolveTextStyle"/> never falls back to an inherited
+    /// <c>TextIndent</c> (each element re-derives its own from its own style map, defaulting to
+    /// 0), so this local adjustment cannot leak into nested descendants' own indent.
+    /// </summary>
+    private static RenderTextStyle PaintListItemMarker(
+        DisplayList displayList,
+        IElement element,
+        Dictionary<string, string> styleMap,
+        RenderTextStyle textStyle,
+        LayoutContext context,
+        float borderBoxX,
+        float contentX,
+        float contentY)
+    {
+        var listStyleType = ResolveListStyleType(styleMap);
+
+        if (string.Equals(listStyleType, "none", StringComparison.OrdinalIgnoreCase))
+        {
+            return textStyle;
+        }
+
+        var isInside = styleMap.TryGetValue("list-style-position", out var positionValue) &&
+            string.Equals(positionValue.Trim(), "inside", StringComparison.OrdinalIgnoreCase);
+
+        // Aligns the marker with the first line of the li's own content, assuming that content
+        // starts as normal inline text at the default vertical-align - the common case, but an
+        // approximation when a li's first child is itself a block (its own first line may sit at
+        // a different offset than this).
+        var markerBaselineY = contentY + (textStyle.FontSize * textStyle.LineHeightMultiplier) + textStyle.VerticalAlignOffset;
+
+        // Not derived from any spec metric - a small, fixed visual gap between the marker and the
+        // content that follows it, matching the general proportions browsers use.
+        const float MarkerGap = 6f;
+
+        if (IsShapeListStyleType(listStyleType))
+        {
+            var markerSize = Math.Max(2f, textStyle.FontSize * 0.35f);
+            var markerTop = markerBaselineY - (textStyle.FontSize * 0.68f);
+            var markerLeft = isInside ? contentX : borderBoxX - MarkerGap - markerSize;
+            var markerRect = new RenderRect(markerLeft, markerTop, markerSize, markerSize);
+            var circularRadii = new RenderCornerRadii(
+                markerSize / 2f, markerSize / 2f, markerSize / 2f, markerSize / 2f,
+                markerSize / 2f, markerSize / 2f, markerSize / 2f, markerSize / 2f);
+
+            switch (listStyleType)
+            {
+                case "circle":
+                    displayList.StrokeRoundedRect(markerRect, textStyle.Color, Math.Max(1f, textStyle.FontSize * 0.08f), circularRadii);
+                    break;
+                case "square":
+                    displayList.FillRect(markerRect, textStyle.Color);
+                    break;
+                default: // disc
+                    displayList.FillRect(markerRect, textStyle.Color, circularRadii);
+                    break;
+            }
+
+            return isInside ? textStyle with { TextIndent = textStyle.TextIndent + markerSize + MarkerGap } : textStyle;
+        }
+
+        var markerText = FormatListMarkerText(ResolveListItemOrdinal(element), listStyleType);
+        var markerWidth = MeasureTextWidth(context, markerText, textStyle);
+        var markerX = isInside ? contentX : borderBoxX - MarkerGap - markerWidth;
+
+        displayList.DrawText(markerText, markerX, markerBaselineY, textStyle.Color, textStyle.FontSize, textStyle.FontFamily, textStyle.FontWeight, textStyle.IsItalic, letterSpacing: textStyle.LetterSpacing);
+
+        return isInside ? textStyle with { TextIndent = textStyle.TextIndent + markerWidth + MarkerGap } : textStyle;
+    }
+
+    /// <summary>
+    /// Whether an element's `overflow` clips its content. `scroll` and `auto` are treated the
+    /// same as `hidden`: a rendered PNG has no scrollbars or interactivity, so anything a browser
+    /// would let the user scroll to reveal is, here, simply clipped away like `hidden`.
+    /// </summary>
+    private static bool ShouldClipOverflow(Dictionary<string, string> styleMap) =>
+        IsClippingOverflowValue(ResolveOverflowAxis(styleMap, "overflow-x")) ||
+        IsClippingOverflowValue(ResolveOverflowAxis(styleMap, "overflow-y"));
+
+    /// <summary>
+    /// Resolves one overflow axis. AngleSharp.Css's `overflow` shorthand decomposes into
+    /// `overflow-x`/`overflow-y` in its own computed style, so the longhand can always be
+    /// read directly.
+    /// </summary>
+    private static string ResolveOverflowAxis(Dictionary<string, string> styleMap, string longhandProperty) =>
+        styleMap.TryGetValue(longhandProperty, out var axisValue) && !string.IsNullOrWhiteSpace(axisValue)
+            ? axisValue.Trim().ToLowerInvariant()
+            : "visible";
+
+    private static bool IsClippingOverflowValue(string overflowValue) =>
+        overflowValue is "hidden" or "scroll" or "auto";
+
+    // AngleSharp.Css's UA stylesheet sets list-style-type: disc directly on ol/ul/dir/menu/dd
+    // (fixed upstream), so this default is dead for the common case - it is still needed, and
+    // still correct, for an element given `display: list-item` explicitly (any other tag), which
+    // that UA rule does not cover and which still computes an empty list-style-type - confirmed
+    // empirically, not assumed.
+    private static string ResolveListStyleType(Dictionary<string, string> styleMap) =>
+        styleMap.TryGetValue("list-style-type", out var value) && !string.IsNullOrWhiteSpace(value)
+            ? value.Trim().ToLowerInvariant()
+            : "disc";
+
+    private static bool IsShapeListStyleType(string listStyleType) =>
+        listStyleType is "disc" or "circle" or "square";
+
+    /// <summary>
+    /// Formats an ordinal into the marker text for a numbered `list-style-type`. Any keyword this
+    /// renderer does not specifically implement (and plain `decimal`) falls back to a decimal
+    /// number, matching how browsers treat an unsupported `list-style-type` value.
+    /// </summary>
+    private static string FormatListMarkerText(int ordinal, string listStyleType) => listStyleType switch
+    {
+        "decimal-leading-zero" => (ordinal is >= 0 and < 10 ? "0" + ordinal.ToString(CultureInfo.InvariantCulture) : ordinal.ToString(CultureInfo.InvariantCulture)) + ".",
+        "lower-alpha" or "lower-latin" => FormatAlphaListMarker(ordinal, upper: false) + ".",
+        "upper-alpha" or "upper-latin" => FormatAlphaListMarker(ordinal, upper: true) + ".",
+        "lower-roman" => FormatRomanListMarker(ordinal, upper: false) + ".",
+        "upper-roman" => FormatRomanListMarker(ordinal, upper: true) + ".",
+        _ => ordinal.ToString(CultureInfo.InvariantCulture) + ".",
+    };
+
+    /// <summary>
+    /// Formats a 1-based ordinal as a base-26 letter sequence (a, b, ..., z, aa, ab, ...),
+    /// matching `list-style-type: lower-alpha`/`upper-alpha`.
+    /// </summary>
+    private static string FormatAlphaListMarker(int ordinal, bool upper)
+    {
+        if (ordinal < 1)
+        {
+            return ordinal.ToString(CultureInfo.InvariantCulture);
+        }
+
+        var baseChar = upper ? 'A' : 'a';
+        var chars = new Stack<char>();
+        var remaining = ordinal;
+
+        while (remaining > 0)
+        {
+            remaining--;
+            chars.Push((char)(baseChar + (remaining % 26)));
+            remaining /= 26;
+        }
+
+        return new string(chars.ToArray());
+    }
+
+    private static readonly (int Value, string Symbol)[] s_romanNumeralValues =
+    [
+        (1000, "M"), (900, "CM"), (500, "D"), (400, "CD"),
+        (100, "C"), (90, "XC"), (50, "L"), (40, "XL"),
+        (10, "X"), (9, "IX"), (5, "V"), (4, "IV"), (1, "I"),
+    ];
+
+    /// <summary>
+    /// Formats an ordinal as a Roman numeral, matching `list-style-type: lower-roman`/`upper-roman`.
+    /// Roman numerals have no standard representation outside 1-3999, so values outside that range
+    /// fall back to a plain decimal number, matching typical browser behavior.
+    /// </summary>
+    private static string FormatRomanListMarker(int ordinal, bool upper)
+    {
+        if (ordinal is < 1 or > 3999)
+        {
+            return ordinal.ToString(CultureInfo.InvariantCulture);
+        }
+
+        var builder = new StringBuilder();
+        var remaining = ordinal;
+
+        foreach (var (value, symbol) in s_romanNumeralValues)
+        {
+            while (remaining >= value)
+            {
+                builder.Append(symbol);
+                remaining -= value;
+            }
+        }
+
+        var result = builder.ToString();
+        return upper ? result : result.ToLowerInvariant();
+    }
+
+    /// <summary>
+    /// Resolves a `&lt;li&gt;`'s 1-based ordinal from its position among its parent's direct
+    /// `&lt;li&gt;` children in document order - not from a render-tree traversal order, which
+    /// can reorder for z-index/absolute positioning, and not from any generic CSS counter, since
+    /// only the common `&lt;ol&gt;`/`&lt;li&gt;` counting model (`start`, `reversed`, per-item
+    /// `value`) is implemented. A `&lt;li&gt;` outside any `&lt;ol&gt;`/`&lt;ul&gt;` still resolves
+    /// to 1, matching how browsers render a bare `&lt;li&gt;`.
+    /// </summary>
+    private static int ResolveListItemOrdinal(IElement liElement)
+    {
+        var parent = liElement.ParentElement;
+
+        if (parent is null)
+        {
+            return 1;
+        }
+
+        var isOrderedList = string.Equals(parent.LocalName, "ol", StringComparison.OrdinalIgnoreCase);
+        var reversed = isOrderedList && parent.HasAttribute("reversed");
+        var counter = isOrderedList && int.TryParse(parent.GetAttribute("start"), NumberStyles.Integer, CultureInfo.InvariantCulture, out var explicitStart)
+            ? explicitStart
+            : reversed
+                ? parent.Children.Count(c => string.Equals(c.LocalName, "li", StringComparison.OrdinalIgnoreCase))
+                : 1;
+
+        foreach (var child in parent.Children)
+        {
+            if (!string.Equals(child.LocalName, "li", StringComparison.OrdinalIgnoreCase))
+            {
+                continue;
+            }
+
+            if (int.TryParse(child.GetAttribute("value"), NumberStyles.Integer, CultureInfo.InvariantCulture, out var overrideValue))
+            {
+                counter = overrideValue;
+            }
+
+            if (ReferenceEquals(child, liElement))
+            {
+                return counter;
+            }
+
+            counter += reversed ? -1 : 1;
+        }
+
+        return counter;
+    }
+
+    private static void PaintTextShadows(DisplayList displayList, IReadOnlyList<RenderTextShadow> shadows, string text, float x, float y, RenderTextStyle textStyle)
+    {
+        if (shadows.Count == 0 || string.IsNullOrEmpty(text))
+        {
+            return;
+        }
+
+        // The first-listed shadow paints topmost among shadows (though always behind the text
+        // itself), so shadows are added back-to-front: last-authored first, first-authored last.
+        for (var i = shadows.Count - 1; i >= 0; i--)
+        {
+            var shadow = shadows[i];
+            displayList.DrawTextShadow(text, x + shadow.OffsetX, y + shadow.OffsetY, shadow.Color, textStyle.FontSize, textStyle.FontFamily, textStyle.FontWeight, textStyle.IsItalic, shadow.BlurRadius, textStyle.LetterSpacing);
+        }
+    }
+
+    private static void PaintBoxShadows(DisplayList displayList, IReadOnlyList<RenderBoxShadow> shadows, float x, float y, float width, float height, RenderCornerRadii radii)
+    {
+        if (shadows.Count == 0 || width <= 0f || height <= 0f)
+        {
+            return;
+        }
+
+        var clampedRadii = radii.ClampToBox(width, height);
+        var borderBoxRect = new RenderRect(x, y, width, height);
+
+        // The first-listed shadow paints topmost among shadows (though always behind the box
+        // itself), so shadows are added back-to-front: last-authored first, first-authored last.
+        for (var i = shadows.Count - 1; i >= 0; i--)
+        {
+            displayList.DrawBoxShadow(borderBoxRect, clampedRadii, shadows[i]);
+        }
+    }
+
+    private static void PaintBackground(DisplayList displayList, RenderPaint paint, float x, float y, float width, float height, RenderCornerRadii radii = default)
     {
         if (width <= 0f || height <= 0f)
         {
             return;
         }
+
+        var clampedRadii = radii.ClampToBox(width, height);
 
         if (paint is RenderColorPaint colorPaint)
         {
@@ -3328,20 +5095,40 @@ public sealed class HtmlRenderer
                 return;
             }
 
-            displayList.FillRect(new RenderRect(x, y, width, height), colorPaint.Color);
+            displayList.FillRect(new RenderRect(x, y, width, height), colorPaint.Color, clampedRadii);
             return;
         }
 
-        if (paint is RenderGradientPaint)
+        if (paint is RenderGradientPaint or RenderImagePaint)
         {
-            displayList.FillRect(new RenderRect(x, y, width, height), paint);
+            displayList.FillRect(new RenderRect(x, y, width, height), paint, clampedRadii);
         }
     }
 
-    private static void PaintBorder(DisplayList displayList, RenderColor color, float x, float y, float width, float height, EdgeSizes border)
+    private static void PaintBorder(DisplayList displayList, RenderColor color, float x, float y, float width, float height, EdgeSizes border, RenderCornerRadii radii = default)
     {
         if (color.A == 0 || width <= 0f || height <= 0f)
         {
+            return;
+        }
+
+        var clampedRadii = radii.ClampToBox(width, height);
+
+        // A uniform-width border with rounded corners can be drawn as a single stroked ring; a
+        // border whose edges differ in width has no single stroke width to give the ring, so it
+        // falls back to the un-rounded four-rectangle path (a documented limitation - mixed-width
+        // rounded borders are rare enough not to warrant a per-edge rounded-quad implementation).
+        if (!clampedRadii.IsZero && border.Top > 0f && border.Top == border.Right && border.Top == border.Bottom && border.Top == border.Left)
+        {
+            var half = border.Top / 2f;
+            var strokeRect = new RenderRect(x + half, y + half, width - border.Top, height - border.Top);
+            var strokeRadii = new RenderCornerRadii(
+                Math.Max(0f, clampedRadii.TopLeftX - half), Math.Max(0f, clampedRadii.TopLeftY - half),
+                Math.Max(0f, clampedRadii.TopRightX - half), Math.Max(0f, clampedRadii.TopRightY - half),
+                Math.Max(0f, clampedRadii.BottomRightX - half), Math.Max(0f, clampedRadii.BottomRightY - half),
+                Math.Max(0f, clampedRadii.BottomLeftX - half), Math.Max(0f, clampedRadii.BottomLeftY - half));
+
+            displayList.StrokeRoundedRect(strokeRect, color, border.Top, strokeRadii);
             return;
         }
 
@@ -3469,7 +5256,7 @@ public sealed class HtmlRenderer
         return ParseLengthValue(parsed, defaultValue, allowAuto: false);
     }
 
-    private static float ParseLengthValue(string value, float defaultValue, bool allowAuto = true)
+    internal static float ParseLengthValue(string value, float defaultValue, bool allowAuto = true)
     {
         if (allowAuto && string.Equals(value.Trim(), "auto", StringComparison.OrdinalIgnoreCase))
         {
@@ -3502,14 +5289,626 @@ public sealed class HtmlRenderer
         return false;
     }
 
-    private static RenderPaint ParseBackgroundPaint(Dictionary<string, string> styleMap, RenderColor fallbackColor)
+    private static RenderPaint ParseBackgroundPaint(Dictionary<string, string> styleMap, RenderColor fallbackColor, IElement element)
     {
         if (!styleMap.TryGetValue("background-image", out var backgroundImage) || string.IsNullOrWhiteSpace(backgroundImage))
         {
             return new RenderColorPaint(fallbackColor);
         }
 
-        return ParseGradientPaint(backgroundImage, fallbackColor);
+        var trimmed = backgroundImage.Trim();
+
+        if (string.Equals(trimmed, "none", StringComparison.OrdinalIgnoreCase))
+        {
+            return new RenderColorPaint(fallbackColor);
+        }
+
+        if (TryExtractCssUrl(trimmed, out var url))
+        {
+            // A background image that fails to load (bad data URI, 404, no IDocumentLoader
+            // configured, unsupported format) falls back to the background-color exactly like a
+            // browser does - the box is never left entirely unpainted because of it.
+            return TryGetOrLoadBackgroundImageResource(element, url, out var imageResource) && imageResource is not null
+                ? BuildImagePaint(imageResource, styleMap)
+                : new RenderColorPaint(fallbackColor);
+        }
+
+        return ParseGradientPaint(trimmed, fallbackColor);
+    }
+
+    private static bool TryExtractCssUrl(string value, out string url)
+    {
+        url = string.Empty;
+
+        if (!value.StartsWith("url(", StringComparison.OrdinalIgnoreCase))
+        {
+            return false;
+        }
+
+        var close = value.LastIndexOf(')');
+
+        if (close < 4)
+        {
+            return false;
+        }
+
+        url = value[4..close].Trim().Trim('\'', '"').Trim();
+        return url.Length > 0;
+    }
+
+    private static RenderPaint BuildImagePaint(CachedImageResource imageResource, Dictionary<string, string> styleMap)
+    {
+        var image = new RenderedImage(imageResource.Bytes, imageResource.NaturalWidth, imageResource.NaturalHeight, imageResource.MimeType);
+        var (repeatX, repeatY) = ParseBackgroundRepeat(styleMap);
+        var (positionX, positionY) = ParseBackgroundPosition(styleMap);
+        var size = ParseBackgroundSize(styleMap);
+
+        return new RenderImagePaint(image, repeatX, repeatY, positionX, positionY, size);
+    }
+
+    /// <summary>
+    /// Parses `background-repeat`. Only the single-keyword and two-keyword-per-axis forms are
+    /// recognized; `space`/`round` fall back to tiling like plain `repeat` rather than the spacing
+    /// they actually specify, since neither is otherwise implemented. The CSS initial value is
+    /// `repeat` on both axes.
+    /// </summary>
+    private static (bool RepeatX, bool RepeatY) ParseBackgroundRepeat(Dictionary<string, string> styleMap)
+    {
+        if (!styleMap.TryGetValue("background-repeat", out var value) || string.IsNullOrWhiteSpace(value))
+        {
+            return (true, true);
+        }
+
+        var tokens = value.Trim().Split(' ', StringSplitOptions.RemoveEmptyEntries);
+
+        if (tokens.Length == 0)
+        {
+            return (true, true);
+        }
+
+        bool IsRepeating(string token) => token.ToLowerInvariant() is "repeat" or "space" or "round";
+
+        return tokens[0].ToLowerInvariant() switch
+        {
+            "repeat-x" => (true, false),
+            "repeat-y" => (false, true),
+            "no-repeat" when tokens.Length == 1 => (false, false),
+            _ when tokens.Length >= 2 => (IsRepeating(tokens[0]), IsRepeating(tokens[1])),
+            _ => (IsRepeating(tokens[0]), IsRepeating(tokens[0])),
+        };
+    }
+
+    /// <summary>
+    /// Parses `background-position`. Only the common one- and two-value forms are recognized
+    /// (keywords, percentages, lengths); the four-value `&lt;side&gt; &lt;offset&gt;` edge-relative
+    /// syntax is not. The CSS initial value is `0% 0%` (top-left).
+    /// </summary>
+    private static (RenderBackgroundPositionComponent X, RenderBackgroundPositionComponent Y) ParseBackgroundPosition(Dictionary<string, string> styleMap)
+    {
+        if (!styleMap.TryGetValue("background-position", out var value) || string.IsNullOrWhiteSpace(value))
+        {
+            return (RenderBackgroundPositionComponent.Zero, RenderBackgroundPositionComponent.Zero);
+        }
+
+        var tokens = value.Trim().Split(' ', StringSplitOptions.RemoveEmptyEntries);
+
+        if (tokens.Length == 0)
+        {
+            return (RenderBackgroundPositionComponent.Zero, RenderBackgroundPositionComponent.Zero);
+        }
+
+        if (tokens.Length == 1)
+        {
+            // A single token positions the X axis (or both, for `center`); the Y axis defaults to
+            // centered, matching the CSS single-value `background-position` rule.
+            var only = tokens[0].ToLowerInvariant();
+
+            if (only is "top" or "bottom")
+            {
+                return (new RenderBackgroundPositionComponent(0.5f, 0f), ParsePositionComponent(only));
+            }
+
+            return (ParsePositionComponent(only), new RenderBackgroundPositionComponent(0.5f, 0f));
+        }
+
+        return (ParsePositionComponent(tokens[0]), ParsePositionComponent(tokens[1]));
+    }
+
+    private static RenderBackgroundPositionComponent ParsePositionComponent(string token)
+    {
+        return token.ToLowerInvariant() switch
+        {
+            "left" or "top" => RenderBackgroundPositionComponent.Zero,
+            "right" or "bottom" => new RenderBackgroundPositionComponent(1f, 0f),
+            "center" => new RenderBackgroundPositionComponent(0.5f, 0f),
+            _ => ParsePositionLength(token),
+        };
+    }
+
+    private static RenderBackgroundPositionComponent ParsePositionLength(string token)
+    {
+        var trimmed = token.Trim();
+
+        if (trimmed.EndsWith("%", StringComparison.Ordinal) &&
+            float.TryParse(trimmed[..^1], NumberStyles.Float, CultureInfo.InvariantCulture, out var percent))
+        {
+            return new RenderBackgroundPositionComponent(percent / 100f, 0f);
+        }
+
+        if (TryParsePixelValue(trimmed, out var pixels))
+        {
+            return new RenderBackgroundPositionComponent(0f, pixels);
+        }
+
+        return RenderBackgroundPositionComponent.Zero;
+    }
+
+    /// <summary>
+    /// Parses the CSS `transform` property plus `transform-origin` into a single, fully-resolved
+    /// <see cref="RenderTransform2D"/> - delegating each individual transform function's own
+    /// parsing and matrix computation entirely to AngleSharp.Css's own
+    /// <see cref="TransformParser"/>/<see cref="ICssTransformFunctionValue.ComputeMatrix"/>,
+    /// rather than re-implementing CSS transform function parsing, length/percentage/angle
+    /// resolution, or the underlying trigonometry in this renderer. This method's own
+    /// responsibility is limited to: looping <see cref="TransformParser.ParseTransform"/> across
+    /// the space-separated function list (it parses one function per call and advances the source
+    /// itself - including skipping the whitespace between calls, confirmed empirically rather than
+    /// assumed - returning <see langword="null"/> cleanly once the source is exhausted, which is
+    /// what ends the loop), multiplying the resulting per-function matrices together in CSS's own
+    /// left-to-right composition order (see <see cref="RenderTransform2D.Multiply"/>), converting
+    /// AngleSharp.Css's own <see cref="TransformMatrix"/> into this renderer's flat 2D `a,b,c,d,e,f`
+    /// representation (see <see cref="ConvertToRenderTransform"/> for the exact field mapping,
+    /// which is not the naive one), and wrapping the composed result around `transform-origin` -
+    /// AngleSharp.Css's own `ComputeMatrix` takes no origin parameter, so that translate/apply/
+    /// translate-back is this renderer's to do regardless of how the individual functions resolve.
+    ///
+    /// Resolved eagerly here (unlike a gradient's or background-image's own paint-time-deferred
+    /// geometry) because a transform's inputs - percentage `translate()` values, the default
+    /// `transform-origin` - only ever need the element's own already-known border-box dimensions,
+    /// never anything (like an image's natural size) that is not available until paint time.
+    ///
+    /// This renderer never special-cases individual transform functions or guards against
+    /// AngleSharp.Css bugs locally - `ConvertToRenderTransform` always trusts whatever
+    /// <see cref="ICssTransformFunctionValue.ComputeMatrix"/> returns, unconditionally. A
+    /// `TransformMatrix` is a genuinely general matrix regardless of which function produced it;
+    /// for a function whose own effect is entirely 2D, the third dimension simply stays at its own
+    /// identity value, so there is nothing to specialize for a "2D case" - the same six components
+    /// (M11/M12/M21/M22/Tx/Ty) are read the same way for every function. Any bug in what
+    /// AngleSharp.Css itself computes for a given function is AngleSharp.Css's own bug to fix -
+    /// this renderer reports and reproduces it there (with a failing test in that project's own
+    /// suite) rather than working around it here, matching this project's own "we do not touch the
+    /// CSS ourselves" policy. `translate`/`translateX`/`translateY` need one exception to "just call
+    /// AngleSharp.Css normally", though: the raw value is parsed directly here rather than through
+    /// AngleSharp.Css's own computed-style cascade, because that cascade path has a separate,
+    /// confirmed crash for exactly those three functions - see `TryExtractTransformDeclaration`'s
+    /// own remarks for why that cascade path has to be avoided entirely, independent of this method.
+    ///
+    /// `TransformParser` is AngleSharp.Css's own general-purpose transform-function parser and
+    /// recognizes 3D functions (`translate3d`, `rotate3d`, `matrix3d`, `perspective`, ...) too -
+    /// this method does not filter them out before parsing. For one of them, `translateZ`,
+    /// `ComputeMatrix`'s 2D component (M11/M12/M21/M22/Tx/Ty) happens to come back as pure identity
+    /// (only its Z-only shift is non-zero, which this renderer never reads), so it is harmlessly a
+    /// no-op through the exact same path real 2D functions use - confirmed with a structural test,
+    /// not assumed. A 3D function whose effect genuinely depends on a Z axis this renderer has no
+    /// projection for at all (`rotate3d`, `perspective`, ...) would not be meaningfully
+    /// representable even with a bug-free `ComputeMatrix`; this renderer's flat, backend-agnostic
+    /// display list simply has no camera/projection concept to give such a function real meaning -
+    /// a deliberate, permanent scope cut, unrelated to any upstream bug.
+    /// </summary>
+    private static RenderTransform2D ParseCssTransform(Dictionary<string, string> styleMap, float borderBoxX, float borderBoxY, float borderBoxWidth, float borderBoxHeight, float fontSize)
+    {
+        if (!styleMap.TryGetValue("transform", out var value) ||
+            string.IsNullOrWhiteSpace(value) ||
+            string.Equals(value.Trim(), "none", StringComparison.OrdinalIgnoreCase))
+        {
+            return RenderTransform2D.Identity;
+        }
+
+        var dimensions = new CssTransformRenderDimensions(borderBoxWidth, borderBoxHeight, fontSize);
+        var source = new StringSource(value);
+        var functionsMatrix = RenderTransform2D.Identity;
+
+        while (TransformParser.ParseTransform(source) is { } functionValue)
+        {
+            var next = ConvertToRenderTransform(functionValue, dimensions);
+            functionsMatrix = RenderTransform2D.Multiply(functionsMatrix, next);
+        }
+
+        if (functionsMatrix.IsIdentity)
+        {
+            return RenderTransform2D.Identity;
+        }
+
+        // transform-origin shifts the whole composed function chain to pivot around a point other
+        // than the box's own top-left corner (the origin every individual function's matrix
+        // otherwise implicitly pivots/scales/skews around): translate to the origin, apply the
+        // functions, translate back. The origin itself is resolved relative to the box (a fraction/
+        // offset of its own width/height), but PushTransformCommand's matrix is concatenated onto
+        // the canvas *before* any of this element's own commands run - which still carry their
+        // ordinary absolute page coordinates (borderBoxX/Y, not box-local 0..width/0..height) - so
+        // the pivot point has to be expressed in that same absolute space (borderBoxX/Y + the
+        // relative origin), not just the relative offset within the box. Getting this wrong was a
+        // real bug caught while building this feature: verified by hand-checking the resulting
+        // matrix against a box positioned away from the page origin, where a box-relative-only
+        // pivot rotated the box around the wrong point entirely (only appearing correct for a box
+        // that happened to sit at page position (0, 0), where relative and absolute coincide).
+        var (originOffsetX, originOffsetY) = ParseTransformOrigin(styleMap, borderBoxWidth, borderBoxHeight);
+        var originX = borderBoxX + originOffsetX;
+        var originY = borderBoxY + originOffsetY;
+        var toOrigin = RenderTransform2D.Translate(originX, originY);
+        var fromOrigin = RenderTransform2D.Translate(-originX, -originY);
+        return RenderTransform2D.Multiply(toOrigin, RenderTransform2D.Multiply(functionsMatrix, fromOrigin));
+    }
+
+    /// <summary>
+    /// Converts one already-parsed CSS transform function's own <see cref="TransformMatrix"/> into
+    /// this renderer's flat 2D <see cref="RenderTransform2D"/>, unconditionally - this renderer
+    /// always trusts the matrix AngleSharp.Css computes directly, with no NaN/exception guarding
+    /// and no 2D-vs-3D special-casing of its own. A <see cref="TransformMatrix"/> is a genuinely
+    /// general matrix regardless of which CSS function produced it; for a function whose own effect
+    /// is entirely 2D, the third dimension simply stays at its own identity value, so reading off
+    /// the same six 2D-relevant components (M11/M12/M21/M22/Tx/Ty) works uniformly for every
+    /// function - there is nothing here for this renderer to specialize. Any bug in what
+    /// AngleSharp.Css itself computes belongs to AngleSharp.Css, not to a defensive workaround in
+    /// this method - report and fix it there (with a reproducing test in its own suite) instead.
+    /// </summary>
+    private static RenderTransform2D ConvertToRenderTransform(ICssTransformFunctionValue functionValue, IRenderDimensions dimensions)
+    {
+        var matrix = functionValue.ComputeMatrix(dimensions);
+
+        // AngleSharp.Css's TransformMatrix uses a row-vector convention -
+        // x' = M11*x + M12*y + Tx, y' = M21*x + M22*y + Ty - which is *not* the naive mapping onto
+        // CSS's own column-vector matrix(a,b,c,d,e,f) (x' = a*x + c*y + e, y' = b*x + d*y + f) a
+        // reader might expect. Verified empirically (not assumed) against a known skew(10deg,5deg)
+        // result: M12 came back as tan(10deg) - the coefficient of y in the x' equation, i.e. CSS's
+        // "c" - and M21 came back as tan(5deg) - the coefficient of x in the y' equation, i.e. CSS's
+        // "b" - the opposite of what matching M12 to "b" and M21 to "c" by position would give.
+        return new RenderTransform2D(
+            (float)matrix.M11,
+            (float)matrix.M21,
+            (float)matrix.M12,
+            (float)matrix.M22,
+            (float)matrix.Tx,
+            (float)matrix.Ty);
+    }
+
+    private readonly struct CssTransformRenderDimensions(double renderWidth, double renderHeight, double fontSize) : IRenderDimensions
+    {
+        public double RenderWidth { get; } = renderWidth;
+
+        public double RenderHeight { get; } = renderHeight;
+
+        public double FontSize { get; } = fontSize;
+    }
+
+    /// <summary>
+    /// Parses `transform-origin` into pixel coordinates relative to the element's own border box -
+    /// the CSS initial value, "50% 50%", is the box's own center. Reuses `ParsePositionComponent`'s
+    /// keyword/percentage/length tokenizing (the identical single-axis grammar `background-position`
+    /// already uses: `left`/`center`/`right`/`top`/`bottom`, a percentage, or a length) rather than
+    /// re-deriving it, but resolves its `Percentage`/`OffsetPixels` breakdown with
+    /// `transform-origin`'s own formula (a position *within* the box) instead of
+    /// `background-position`'s (a position within the *remaining* space after subtracting the
+    /// image's own size) - the two properties share a grammar but not a resolution formula.
+    /// </summary>
+    private static (float X, float Y) ParseTransformOrigin(Dictionary<string, string> styleMap, float borderBoxWidth, float borderBoxHeight)
+    {
+        var xComponent = new RenderBackgroundPositionComponent(0.5f, 0f);
+        var yComponent = new RenderBackgroundPositionComponent(0.5f, 0f);
+
+        if (styleMap.TryGetValue("transform-origin", out var value) && !string.IsNullOrWhiteSpace(value))
+        {
+            var tokens = value.Trim().Split(' ', StringSplitOptions.RemoveEmptyEntries);
+
+            if (tokens.Length == 1)
+            {
+                var only = tokens[0].ToLowerInvariant();
+
+                if (only is "top" or "bottom")
+                {
+                    yComponent = ParsePositionComponent(only);
+                }
+                else
+                {
+                    xComponent = ParsePositionComponent(only);
+                }
+            }
+            else if (tokens.Length >= 2)
+            {
+                xComponent = ParsePositionComponent(tokens[0]);
+                yComponent = ParsePositionComponent(tokens[1]);
+            }
+        }
+
+        var x = (xComponent.Percentage * borderBoxWidth) + xComponent.OffsetPixels;
+        var y = (yComponent.Percentage * borderBoxHeight) + yComponent.OffsetPixels;
+        return (x, y);
+    }
+
+    /// <summary>
+    /// Parses CSS `opacity` via AngleSharp.Css's own typed `GetOpacity()` accessor - unlike
+    /// `filter`, this is an ordinary numeric property with no function-value syntax, so
+    /// AngleSharp.Css computes it normally with nothing for this renderer to work around. The CSS
+    /// initial value is `1` (fully opaque); a value outside `0..1` is clamped, per spec.
+    /// </summary>
+    private static float ParseCssOpacity(Dictionary<string, string> styleMap)
+    {
+        if (!styleMap.TryGetValue("opacity", out var value) || string.IsNullOrWhiteSpace(value))
+        {
+            return 1f;
+        }
+
+        return float.TryParse(value.Trim(), NumberStyles.Float, CultureInfo.InvariantCulture, out var opacity)
+            ? Math.Clamp(opacity, 0f, 1f)
+            : 1f;
+    }
+
+    /// <summary>
+    /// Parses `filter` via AngleSharp.Css's own `FilterParser.ParseFilter`/`ICssFilterFunctionValue`
+    /// (fixed upstream - AngleSharp.Css previously had no structured `filter` support at all, so
+    /// this renderer had to hand-parse the raw text itself, mirroring the CSS-gradient precedent;
+    /// it now mirrors the `transform` precedent instead) - AngleSharp.Css handles the outer
+    /// function-list syntax (name/parenthesis extraction, including nested parens) and gives each
+    /// function's own name plus its raw, still-unparsed argument text as a single
+    /// <c>Arguments</c> entry; this renderer still interprets what
+    /// each function *means* (its own argument grammar, and the CSS Filter Effects spec's per-function
+    /// color-matrix/blur-radius semantics - see <see cref="ConvertToRenderFilterFunction"/>), since
+    /// that is a rendering concern AngleSharp.Css does not (and should not) resolve for it, the same
+    /// division of labor `transform`'s `ConvertToRenderTransform` already established for
+    /// `ComputeMatrix`. `url(#filterId)` (an SVG filter reference) and any other unrecognized
+    /// function are silently skipped rather than aborting the whole chain, mirroring how an
+    /// unsupported SVG `&lt;filter&gt;` primitive passes its input through unchanged in
+    /// `SvgFilterBuilder` instead of breaking that chain.
+    /// </summary>
+    private static IReadOnlyList<RenderFilterFunction> ParseCssFilter(Dictionary<string, string> styleMap)
+    {
+        if (!styleMap.TryGetValue("filter", out var value) ||
+            string.IsNullOrWhiteSpace(value) ||
+            string.Equals(value.Trim(), "none", StringComparison.OrdinalIgnoreCase))
+        {
+            return [];
+        }
+
+        if (FilterParser.ParseFilter(new StringSource(value)) is not CssFilterValue parsed)
+        {
+            return [];
+        }
+
+        var functions = new List<RenderFilterFunction>();
+
+        foreach (var cssFunction in parsed.Functions)
+        {
+            if (ConvertToRenderFilterFunction(cssFunction, out var function))
+            {
+                functions.Add(function);
+            }
+        }
+
+        return functions;
+    }
+
+    private static bool ConvertToRenderFilterFunction(ICssFilterFunctionValue cssFunction, out RenderFilterFunction function)
+    {
+        function = null!;
+        var argsText = cssFunction.Arguments.Length > 0 ? cssFunction.Arguments[0].CssText.Trim() : string.Empty;
+
+        switch (cssFunction.Name.ToLowerInvariant())
+        {
+            case "blur":
+                function = RenderFilterFunction.Blur(Math.Max(0f, ParseLengthValue(argsText, defaultValue: 0f, allowAuto: false)));
+                return true;
+            case "brightness":
+                function = RenderFilterFunction.Brightness(Math.Max(0f, ParseFilterAmount(argsText, 1f)));
+                return true;
+            case "contrast":
+                function = RenderFilterFunction.Contrast(Math.Max(0f, ParseFilterAmount(argsText, 1f)));
+                return true;
+            case "grayscale":
+                function = RenderFilterFunction.Grayscale(Math.Clamp(ParseFilterAmount(argsText, 1f), 0f, 1f));
+                return true;
+            case "invert":
+                function = RenderFilterFunction.Invert(Math.Clamp(ParseFilterAmount(argsText, 1f), 0f, 1f));
+                return true;
+            case "opacity":
+                function = RenderFilterFunction.Opacity(Math.Clamp(ParseFilterAmount(argsText, 1f), 0f, 1f));
+                return true;
+            case "saturate":
+                function = RenderFilterFunction.Saturate(Math.Max(0f, ParseFilterAmount(argsText, 1f)));
+                return true;
+            case "sepia":
+                function = RenderFilterFunction.Sepia(Math.Clamp(ParseFilterAmount(argsText, 1f), 0f, 1f));
+                return true;
+            case "hue-rotate":
+                function = RenderFilterFunction.HueRotate(ParseAngle(argsText));
+                return true;
+            case "drop-shadow":
+                function = ParseDropShadowFilterFunction(argsText);
+                return true;
+            default:
+                return false;
+        }
+    }
+
+    // `grayscale(90%)` and `grayscale(0.9)` are equivalent per spec - a percentage argument is
+    // normalized to the same 0..1 fraction a bare number already is, so every downstream consumer
+    // (RenderFilterFunction.Amount) only ever has to handle one representation.
+    private static float ParseFilterAmount(string value, float defaultValue)
+    {
+        var trimmed = value.Trim();
+
+        if (trimmed.Length == 0)
+        {
+            return defaultValue;
+        }
+
+        if (trimmed.EndsWith('%') &&
+            float.TryParse(trimmed[..^1].Trim(), NumberStyles.Float, CultureInfo.InvariantCulture, out var percentage))
+        {
+            return percentage / 100f;
+        }
+
+        return float.TryParse(trimmed, NumberStyles.Float, CultureInfo.InvariantCulture, out var number) ? number : defaultValue;
+    }
+
+    // `drop-shadow(<offset-x> <offset-y> <blur-radius>? <color>?)` - CSS allows the color argument
+    // either first or last, so this classifies each whitespace-separated token by its own shape
+    // (a leading digit/sign/decimal point is a length, anything else is a color) rather than
+    // assuming a fixed position, then assigns lengths to offsetX/offsetY/blurRadius in the order
+    // they were seen.
+    private static RenderFilterFunction ParseDropShadowFilterFunction(string argsText)
+    {
+        var offsetX = 0f;
+        var offsetY = 0f;
+        var blurRadius = 0f;
+        var color = RenderColor.Black;
+        var lengthIndex = 0;
+
+        foreach (var token in SplitTopLevelWhitespaceList(argsText))
+        {
+            var trimmed = token.Trim();
+
+            if (trimmed.Length == 0)
+            {
+                continue;
+            }
+
+            var firstChar = trimmed[0];
+
+            if (char.IsDigit(firstChar) || firstChar is '-' or '+' or '.')
+            {
+                var length = ParseLengthValue(trimmed, 0f, allowAuto: false);
+
+                switch (lengthIndex)
+                {
+                    case 0:
+                        offsetX = length;
+                        break;
+                    case 1:
+                        offsetY = length;
+                        break;
+                    default:
+                        blurRadius = length;
+                        break;
+                }
+
+                lengthIndex++;
+            }
+            else
+            {
+                color = ParseColor(trimmed, color);
+            }
+        }
+
+        return RenderFilterFunction.DropShadow(offsetX, offsetY, Math.Max(0f, blurRadius), color);
+    }
+
+    // Splits a value on whitespace at paren-depth 0 only, so a nested function call within one of
+    // the tokens (e.g. a `rgb(255, 0, 0)` color argument) is never split apart. Used to tokenize
+    // `drop-shadow`'s own space-separated argument list - the outer `filter` function list itself
+    // is now split by AngleSharp.Css's own FilterParser instead (see ParseCssFilter's remarks).
+    private static string[] SplitTopLevelWhitespaceList(string value)
+    {
+        if (string.IsNullOrWhiteSpace(value))
+        {
+            return [];
+        }
+
+        var parts = new List<string>();
+        var current = new StringBuilder();
+        var depth = 0;
+
+        foreach (var character in value)
+        {
+            if (character == '(')
+            {
+                depth++;
+                current.Append(character);
+            }
+            else if (character == ')')
+            {
+                depth = Math.Max(0, depth - 1);
+                current.Append(character);
+            }
+            else if (char.IsWhiteSpace(character) && depth == 0)
+            {
+                if (current.Length > 0)
+                {
+                    parts.Add(current.ToString());
+                    current.Clear();
+                }
+            }
+            else
+            {
+                current.Append(character);
+            }
+        }
+
+        if (current.Length > 0)
+        {
+            parts.Add(current.ToString());
+        }
+
+        return [.. parts];
+    }
+
+    /// <summary>
+    /// Parses `background-size`. The CSS initial value is `auto` (the image's own natural size).
+    /// </summary>
+    private static RenderBackgroundSize ParseBackgroundSize(Dictionary<string, string> styleMap)
+    {
+        if (!styleMap.TryGetValue("background-size", out var value) || string.IsNullOrWhiteSpace(value))
+        {
+            return RenderBackgroundSize.Auto;
+        }
+
+        var trimmed = value.Trim();
+
+        if (string.Equals(trimmed, "cover", StringComparison.OrdinalIgnoreCase))
+        {
+            return new RenderBackgroundSize(RenderBackgroundSizeKind.Cover);
+        }
+
+        if (string.Equals(trimmed, "contain", StringComparison.OrdinalIgnoreCase))
+        {
+            return new RenderBackgroundSize(RenderBackgroundSizeKind.Contain);
+        }
+
+        var tokens = trimmed.Split(' ', StringSplitOptions.RemoveEmptyEntries);
+
+        if (tokens.Length == 0)
+        {
+            return RenderBackgroundSize.Auto;
+        }
+
+        var width = ParseSizeAxisToken(tokens[0]);
+        // A single-value `background-size` sizes only the width explicitly; the height is always
+        // `auto` (proportional to the image's aspect ratio), never a copy of the width token.
+        var height = tokens.Length > 1 ? ParseSizeAxisToken(tokens[1]) : new RenderBackgroundSizeAxis(true, false, 0f);
+
+        return new RenderBackgroundSize(RenderBackgroundSizeKind.Explicit, width, height);
+    }
+
+    private static RenderBackgroundSizeAxis ParseSizeAxisToken(string token)
+    {
+        var trimmed = token.Trim();
+
+        if (string.Equals(trimmed, "auto", StringComparison.OrdinalIgnoreCase))
+        {
+            return new RenderBackgroundSizeAxis(true, false, 0f);
+        }
+
+        if (trimmed.EndsWith("%", StringComparison.Ordinal) &&
+            float.TryParse(trimmed[..^1], NumberStyles.Float, CultureInfo.InvariantCulture, out var percent))
+        {
+            return new RenderBackgroundSizeAxis(false, true, percent / 100f);
+        }
+
+        if (TryParsePixelValue(trimmed, out var pixels))
+        {
+            return new RenderBackgroundSizeAxis(false, false, pixels);
+        }
+
+        return new RenderBackgroundSizeAxis(true, false, 0f);
     }
 
     private static RenderPaint ParseGradientPaint(string rawValue, RenderColor fallbackColor)
@@ -3552,7 +5951,7 @@ public sealed class HtmlRenderer
     private static RenderGradient ParseLinearGradient(string rawValue, string functionName, bool repeating, RenderColor fallbackColor)
     {
         var inner = ExtractGradientInnerExpression(rawValue, functionName);
-        var parts = SplitGradientArguments(inner);
+        var parts = SplitTopLevelCommaList(inner);
         var startIndex = 0;
         var angleDegrees = 90f;
 
@@ -3574,7 +5973,7 @@ public sealed class HtmlRenderer
     private static RenderGradient ParseRadialGradient(string rawValue, string functionName, bool repeating, RenderColor fallbackColor)
     {
         var inner = ExtractGradientInnerExpression(rawValue, functionName);
-        var parts = SplitGradientArguments(inner);
+        var parts = SplitTopLevelCommaList(inner);
         var startIndex = 0;
 
         var isCircle = false;
@@ -3617,7 +6016,7 @@ public sealed class HtmlRenderer
     private static RenderGradient ParseConicGradient(string rawValue, string functionName, bool repeating, RenderColor fallbackColor)
     {
         var inner = ExtractGradientInnerExpression(rawValue, functionName);
-        var parts = SplitGradientArguments(inner);
+        var parts = SplitTopLevelCommaList(inner);
         var startIndex = 0;
         var angleDegrees = 0f;
         var centerX = 0.5f;
@@ -3810,7 +6209,7 @@ public sealed class HtmlRenderer
         return rawValue[(opening + 1)..closing].Trim();
     }
 
-    private static string[] SplitGradientArguments(string value)
+    internal static string[] SplitTopLevelCommaList(string value)
     {
         if (string.IsNullOrWhiteSpace(value))
         {
@@ -3997,7 +6396,7 @@ public sealed class HtmlRenderer
         return TryParseAngle(value, out var angle) ? angle : 0f;
     }
 
-    private static RenderColor ParseColor(string? rawColor, RenderColor fallback)
+    internal static RenderColor ParseColor(string? rawColor, RenderColor fallback)
     {
         if (string.IsNullOrWhiteSpace(rawColor))
         {
@@ -4397,11 +6796,45 @@ public sealed class HtmlRenderer
         };
     }
 
-    private static string NormalizeWhitespace(string value)
+    /// <summary>
+    /// Collapses whitespace the way <c>white-space: normal</c> always did before this property was
+    /// read at all - every call site that is not itself part of text layout (table cell text, form
+    /// control labels, and the two "does this text node count as non-empty content" checks used for
+    /// child-ordering purposes) still goes through this, a deliberate scope cut: none of those sites
+    /// feed a wrapping-aware layout path today, so a real `white-space` value on them would have
+    /// nothing to change even if read.
+    /// </summary>
+    private static string NormalizeWhitespace(string value) => NormalizeWhitespace(value, WhiteSpaceMode.Normal);
+
+    /// <summary>
+    /// Collapses or preserves whitespace per the resolved <c>white-space</c> value, matching the CSS
+    /// spec's own collapsing/newline-preservation table: <c>normal</c>/<c>nowrap</c> collapse both
+    /// runs of horizontal whitespace and newlines into a single space and trim the ends; <c>pre</c>/
+    /// <c>pre-wrap</c>/<c>break-spaces</c> preserve every character verbatim (only normalizing
+    /// <c>\r\n</c>/<c>\r</c> line endings to a plain <c>\n</c>, the same source-text preprocessing
+    /// step HTML always applies regardless of `white-space`); <c>pre-line</c> collapses runs of
+    /// horizontal whitespace to a single space but preserves each `\n` as its own forced break.
+    /// </summary>
+    private static string NormalizeWhitespace(string value, WhiteSpaceMode whiteSpace)
     {
         if (value.Length == 0)
         {
             return string.Empty;
+        }
+
+        var preserveNewlines = whiteSpace is WhiteSpaceMode.Pre or WhiteSpaceMode.PreWrap or WhiteSpaceMode.PreLine or WhiteSpaceMode.BreakSpaces;
+        var collapseHorizontalWhitespace = whiteSpace is WhiteSpaceMode.Normal or WhiteSpaceMode.Nowrap or WhiteSpaceMode.PreLine;
+
+        // Collapse \r\n/\r to a plain \n unconditionally, before any mode-specific handling - this
+        // is source-text preprocessing HTML always applies regardless of `white-space`, not part of
+        // the whitespace-collapsing semantics below. Doing it first (rather than per-character
+        // inside the loop) also avoids double-counting a \r\n pair as two separate forced breaks
+        // under pre-line's own char-by-char newline handling.
+        value = value.Replace("\r\n", "\n").Replace('\r', '\n');
+
+        if (!collapseHorizontalWhitespace)
+        {
+            return value;
         }
 
         var sb = new StringBuilder(value.Length);
@@ -4409,6 +6842,13 @@ public sealed class HtmlRenderer
 
         foreach (var c in value)
         {
+            if (preserveNewlines && c == '\n')
+            {
+                sb.Append('\n');
+                inWhitespace = false;
+                continue;
+            }
+
             if (char.IsWhiteSpace(c))
             {
                 if (!inWhitespace)
@@ -4424,8 +6864,24 @@ public sealed class HtmlRenderer
             inWhitespace = false;
         }
 
-        return sb.ToString().Trim();
+        return preserveNewlines ? sb.ToString() : sb.ToString().Trim();
     }
+
+    /// <summary>
+    /// Like <see cref="NormalizeWhitespace(string, WhiteSpaceMode)"/>, but always collapses an
+    /// explicit forced break down to a plain space rather than preserving it - <see
+    /// cref="LayoutInlineTextRun"/>'s word-by-word model (mixed inline content sharing a line with
+    /// sibling elements) has no way to represent a forced mid-line break, so preserving one here
+    /// would hand it a literal <c>\n</c> character to measure/draw as if it were an ordinary glyph.
+    /// `nowrap`/`pre`'s wrap *suppression* still applies (read directly off <c>textStyle.WhiteSpace</c>
+    /// inside <see cref="LayoutInlineTextRun"/> itself) - only the newline-*preservation* half of
+    /// `pre`/`pre-wrap`/`pre-line` is out of scope for this specific layout path, not the whole
+    /// `white-space` feature; that half is fully supported for the far more common case of `pre`/
+    /// `pre-wrap`/`pre-line` on a block-level element's own direct text content (see
+    /// <see cref="LayoutWrappedText"/>/<see cref="WrapTextRespectingWhiteSpace"/>).
+    /// </summary>
+    private static string NormalizeWhitespaceForInlineRun(string value, WhiteSpaceMode whiteSpace) =>
+        NormalizeWhitespace(value, whiteSpace).Replace('\n', ' ');
 
     /// <summary>
     /// Where a cell's content sits within the box the cell occupies.
@@ -4475,13 +6931,30 @@ public sealed class HtmlRenderer
         TextAlign TextAlign,
         float LetterSpacing,
         float TextIndent,
-        float VerticalAlignOffset);
+        float VerticalAlignOffset,
+        IReadOnlyList<global::AngleSharp.Renderer.Rendering.RenderTextShadow> TextShadows,
+        WhiteSpaceMode WhiteSpace);
 
     private enum TextAlign
     {
         Left,
         Center,
         Right,
+    }
+
+    /// <summary>
+    /// The CSS <c>white-space</c> keywords this renderer distinguishes. See
+    /// <see cref="NormalizeWhitespace(string, WhiteSpaceMode)"/> for collapsing/newline-preservation
+    /// and <see cref="LayoutWrappedText"/>/<see cref="LayoutInlineTextRun"/> for wrap suppression.
+    /// </summary>
+    private enum WhiteSpaceMode
+    {
+        Normal,
+        Nowrap,
+        Pre,
+        PreWrap,
+        PreLine,
+        BreakSpaces,
     }
 
     private readonly record struct EdgeSizes(float Top, float Right, float Bottom, float Left);
@@ -4500,5 +6973,7 @@ public sealed class HtmlRenderer
         EdgeSizes Padding,
         EdgeSizes BorderWidth,
         RenderPaint BackgroundPaint,
-        RenderColor BorderColor);
+        RenderColor BorderColor,
+        RenderCornerRadii BorderRadius,
+        IReadOnlyList<RenderBoxShadow> BoxShadows);
 }
