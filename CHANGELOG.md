@@ -1,3 +1,9 @@
+# 0.5.0
+
+Released on ?.
+
+- Updated to use the AngleSharp.Css gradient model (#10)
+
 # 0.4.0
 
 Released on Thursday, September 10 2026.
