@@ -330,7 +330,7 @@ public sealed class HtmlRenderer
             return displayList;
         }
 
-        var textStyle = new RenderTextStyle(context.FontSize, context.TextColor, context.FontFamily, context.LineHeightMultiplier, 400f, false, false, false, context.TextColor, global::AngleSharp.Renderer.Rendering.RenderTextDecorationStyle.Solid, TextAlign.Left, 0f, 0f, 0f, []);
+        var textStyle = new RenderTextStyle(context.FontSize, context.TextColor, context.FontFamily, context.LineHeightMultiplier, 400f, false, false, false, context.TextColor, global::AngleSharp.Renderer.Rendering.RenderTextDecorationStyle.Solid, TextAlign.Left, 0f, 0f, 0f, [], WhiteSpaceMode.Normal);
         var cursorY = contentY;
         var previousBlockMarginBottom = 0f;
         var suppressNextBlockTopMargin = false;
@@ -518,7 +518,7 @@ public sealed class HtmlRenderer
             }
             else
             {
-            var inlineText = NormalizeWhitespace(element.TextContent ?? string.Empty);
+            var inlineText = NormalizeWhitespace(element.TextContent ?? string.Empty, currentTextStyle.WhiteSpace);
             if (inlineText.Length > 0)
             {
                     LayoutWrappedText(inlineText, flowContainingX, flowContainingWidth, ref cursorY, currentTextStyle, context, displayList, maxY, textIndentConsumed ? 0f : currentTextStyle.TextIndent);
@@ -875,7 +875,7 @@ public sealed class HtmlRenderer
 
                     if (child is TextRenderNode textNode)
                     {
-                        var inlineText = NormalizeWhitespace(textNode.Ref.Data);
+                        var inlineText = NormalizeWhitespaceForInlineRun(textNode.Ref.Data, currentTextStyle.WhiteSpace);
 
                         if (inlineText.Length > 0)
                         {
@@ -963,7 +963,7 @@ public sealed class HtmlRenderer
                         else
                         {
                             var childTextStyle = ResolveTextStyle(CreateStyleMap(inlineElement.ComputedStyle), currentTextStyle);
-                            var inlineText = NormalizeWhitespace(inlineElement.Ref.TextContent ?? string.Empty);
+                            var inlineText = NormalizeWhitespaceForInlineRun(inlineElement.Ref.TextContent ?? string.Empty, childTextStyle.WhiteSpace);
 
                             if (inlineText.Length > 0)
                             {
@@ -2412,7 +2412,7 @@ public sealed class HtmlRenderer
         DisplayList displayList,
         float maxY)
     {
-        var text = NormalizeWhitespace(textNode.Data);
+        var text = NormalizeWhitespace(textNode.Data, textStyle.WhiteSpace);
 
         if (text.Length == 0)
         {
@@ -2445,7 +2445,7 @@ public sealed class HtmlRenderer
         float firstLineIndent)
     {
         var lineHeight = textStyle.FontSize * textStyle.LineHeightMultiplier;
-        var lines = WrapText(context, text, maxWidth, textStyle);
+        var lines = WrapTextRespectingWhiteSpace(context, text, maxWidth, textStyle);
 
         for (var index = 0; index < lines.Count; index++)
         {
@@ -2455,6 +2455,13 @@ public sealed class HtmlRenderer
             if (cursorY > maxY)
             {
                 return;
+            }
+
+            // An empty line (a blank `pre`/`pre-wrap`/`pre-line` row from a run of consecutive
+            // forced breaks) still needs to advance cursorY above, but has nothing to measure/paint.
+            if (line.Length == 0)
+            {
+                continue;
             }
 
             var lineWidth = MeasureTextWidth(context, line, textStyle);
@@ -2480,6 +2487,47 @@ public sealed class HtmlRenderer
         }
     }
 
+    /// <summary>
+    /// Splits <paramref name="text"/> into display lines, honoring <c>white-space</c>'s two layout-
+    /// relevant effects <see cref="NormalizeWhitespace(string, WhiteSpaceMode)"/> itself cannot: an
+    /// explicit `\n` (only ever present in the input at all under <c>pre</c>/<c>pre-wrap</c>/
+    /// <c>pre-line</c>/<c>break-spaces</c> - every other mode already collapsed it away) is always a
+    /// forced break, laid out as its own paragraph rather than merely a wrappable space; and
+    /// <c>nowrap</c>/<c>pre</c> never word-wrap at all, so each paragraph becomes exactly one
+    /// (possibly overflowing) line regardless of <paramref name="maxWidth"/> - the box's own
+    /// `overflow` clipping, if any, still applies to whatever ends up painted past its edge, since
+    /// this only changes layout, not painting.
+    /// </summary>
+    private static IReadOnlyList<string> WrapTextRespectingWhiteSpace(LayoutContext context, string text, float maxWidth, RenderTextStyle textStyle)
+    {
+        var noWrap = IsNoWrapWhiteSpace(textStyle.WhiteSpace);
+        var paragraphs = text.Split('\n');
+
+        if (paragraphs.Length == 1)
+        {
+            return noWrap ? [text] : WrapText(context, text, maxWidth, textStyle);
+        }
+
+        var lines = new List<string>();
+
+        foreach (var paragraph in paragraphs)
+        {
+            if (noWrap || paragraph.Length == 0)
+            {
+                lines.Add(paragraph);
+            }
+            else
+            {
+                lines.AddRange(WrapText(context, paragraph, maxWidth, textStyle));
+            }
+        }
+
+        return lines;
+    }
+
+    private static bool IsNoWrapWhiteSpace(WhiteSpaceMode whiteSpace) =>
+        whiteSpace is WhiteSpaceMode.Nowrap or WhiteSpaceMode.Pre;
+
     private static void LayoutInlineTextRun(
         DisplayList displayList,
         string text,
@@ -2495,12 +2543,19 @@ public sealed class HtmlRenderer
         var words = text.Split(' ', StringSplitOptions.RemoveEmptyEntries);
         var rightEdge = flowX + flowWidth;
         var spaceWidth = MeasureTextWidth(context, " ", textStyle);
+        // `nowrap`/`pre` on mixed inline content (a <span> sharing a line with sibling text/elements)
+        // still suppresses width-driven wrapping, same as the block-level LayoutWrappedText path -
+        // multi-space preservation and explicit forced breaks are not supported at this level (a
+        // deliberate scope cut: the caller already collapsed any literal '\n' in `text` to a plain
+        // space before it ever reaches here, since this word-by-word model has no way to represent
+        // one - see the two LayoutNode call sites that build `inlineText`).
+        var noWrap = IsNoWrapWhiteSpace(textStyle.WhiteSpace);
 
         foreach (var word in words)
         {
             var wordWidth = MeasureTextWidth(context, word, textStyle);
 
-            if (inlineCursorX > flowX && inlineCursorX + spaceWidth + wordWidth > rightEdge)
+            if (!noWrap && inlineCursorX > flowX && inlineCursorX + spaceWidth + wordWidth > rightEdge)
             {
                 inlineLineTop += inlineLineHeight;
                 inlineCursorX = flowX;
@@ -2718,8 +2773,33 @@ public sealed class HtmlRenderer
         var textIndent = ParseLength(styleMap, "text-indent", inherited.FontSize, 0f, allowAuto: false);
         var verticalAlignOffset = ParseVerticalAlign(styleMap, fontSize);
         var textShadows = ParseTextShadows(styleMap.TryGetValue("text-shadow", out var textShadowValue) ? textShadowValue : null, inherited.TextShadows);
+        var whiteSpace = ParseWhiteSpace(styleMap, inherited.WhiteSpace);
 
-        return new RenderTextStyle(fontSize, color, fontFamily, lineHeight, fontWeight, isItalic, underline, strikeThrough, decorationColor, decorationStyle, textAlign, letterSpacing, textIndent, verticalAlignOffset, textShadows);
+        return new RenderTextStyle(fontSize, color, fontFamily, lineHeight, fontWeight, isItalic, underline, strikeThrough, decorationColor, decorationStyle, textAlign, letterSpacing, textIndent, verticalAlignOffset, textShadows, whiteSpace);
+    }
+
+    /// <summary>
+    /// <c>white-space</c> is inherited (confirmed empirically - an unset value on a child reports
+    /// empty, not the CSS initial <c>normal</c>, the same "never serialized when nothing in the
+    /// cascade set it explicitly" behavior already documented for <c>list-style-type</c> - so
+    /// <paramref name="inherited"/> is the correct fallback, not a hardcoded <c>Normal</c>).
+    /// </summary>
+    private static WhiteSpaceMode ParseWhiteSpace(Dictionary<string, string> styleMap, WhiteSpaceMode inherited)
+    {
+        if (!styleMap.TryGetValue("white-space", out var value) || string.IsNullOrWhiteSpace(value))
+        {
+            return inherited;
+        }
+
+        return value.Trim().ToLowerInvariant() switch
+        {
+            "nowrap" => WhiteSpaceMode.Nowrap,
+            "pre" => WhiteSpaceMode.Pre,
+            "pre-wrap" => WhiteSpaceMode.PreWrap,
+            "pre-line" => WhiteSpaceMode.PreLine,
+            "break-spaces" => WhiteSpaceMode.BreakSpaces,
+            _ => WhiteSpaceMode.Normal,
+        };
     }
 
     /// <summary>
@@ -3270,6 +3350,7 @@ public sealed class HtmlRenderer
         AddIfPresent(map, "letter-spacing", style.GetPropertyValue("letter-spacing"));
         AddIfPresent(map, "line-height", style.GetLineHeight());
         AddIfPresent(map, "color", style.GetColor());
+        AddIfPresent(map, "white-space", style.GetPropertyValue("white-space"));
 
         ApplyActiveTransitionAndAnimationOverrides(map, element);
 
@@ -4246,6 +4327,19 @@ public sealed class HtmlRenderer
     /// </summary>
     private const float FormControlSelectArrowVerticalOffsetRatio = -0.19f;
 
+    /// <summary>
+    /// The width, in pixels, of a focused text-like input's caret - a fixed value rather than a
+    /// font-size fraction, matching how a real browser's own caret stays a thin ~1-2px line
+    /// regardless of font size rather than scaling with it.
+    /// </summary>
+    private const float FormControlCaretWidth = 1.5f;
+
+    /// <summary>
+    /// One full fade cycle of the caret's blink animation, in milliseconds - see
+    /// <see cref="PaintFormControlCaret"/> for how this is used.
+    /// </summary>
+    private const double FormControlCaretBlinkPeriodMs = 1000d;
+
     private static FormControlKind ResolveFormControlKind(IElement element)
     {
         var tagName = element.LocalName;
@@ -4571,11 +4665,6 @@ public sealed class HtmlRenderer
             {
                 var label = ResolveFormControlLabel(kind, element);
 
-                if (label.Length == 0)
-                {
-                    break;
-                }
-
                 // Centers the glyphs' own visual ink, not the CSS line box: LayoutWrappedText's
                 // "content-box top plus one full line height" baseline convention places the
                 // baseline as if every pixel of the line-height were ascent, with none left over
@@ -4587,26 +4676,37 @@ public sealed class HtmlRenderer
                 // 3.77px at font-size 16, i.e. ~0.928/~0.236 of the em) the same way
                 // ParseVerticalAlign already approximates super/sub/middle offsets as fontSize
                 // fractions rather than querying per-font metrics through ITextMeasurer (which only
-                // ever exposes advance width, by design - see ITextMeasurer's own remarks).
+                // ever exposes advance width, by design - see ITextMeasurer's own remarks). Computed
+                // unconditionally (not just when there is a label) since a focused, empty TextLike
+                // input still needs a baseline/left-edge position for its caret below.
                 var visualTextHeight = textStyle.FontSize * (FormControlTextAscentRatio + FormControlTextDescentRatio);
                 var verticalCenteringOffset = Math.Max(0f, (contentHeight - visualTextHeight) / 2f);
                 var baselineY = contentY + verticalCenteringOffset + (textStyle.FontSize * FormControlTextAscentRatio) + textStyle.VerticalAlignOffset;
-                var labelWidth = MeasureTextWidth(context, label, textStyle);
+                var labelWidth = label.Length > 0 ? MeasureTextWidth(context, label, textStyle) : 0f;
 
-                // A text input's typed value and a select's selected option are both left-aligned,
-                // matching how browsers show them; only a button's own label is centered in its box.
-                var labelX = kind == FormControlKind.Button
-                    ? contentX + Math.Max(0f, (contentWidth - labelWidth) / 2f)
-                    : contentX;
-
-                displayList.DrawText(label, labelX, baselineY, textStyle.Color, textStyle.FontSize, textStyle.FontFamily, textStyle.FontWeight, textStyle.IsItalic, letterSpacing: textStyle.LetterSpacing);
-
-                if (kind == FormControlKind.Select)
+                if (label.Length > 0)
                 {
-                    var arrowWidth = MeasureTextWidth(context, FormControlSelectArrowGlyph, textStyle);
-                    var arrowX = contentX + Math.Max(labelWidth, contentWidth - arrowWidth);
-                    var arrowBaselineY = baselineY + (textStyle.FontSize * FormControlSelectArrowVerticalOffsetRatio);
-                    displayList.DrawText(FormControlSelectArrowGlyph, arrowX, arrowBaselineY, textStyle.Color, textStyle.FontSize, textStyle.FontFamily, textStyle.FontWeight, textStyle.IsItalic, letterSpacing: textStyle.LetterSpacing);
+                    // A text input's typed value and a select's selected option are both
+                    // left-aligned, matching how browsers show them; only a button's own label is
+                    // centered in its box.
+                    var labelX = kind == FormControlKind.Button
+                        ? contentX + Math.Max(0f, (contentWidth - labelWidth) / 2f)
+                        : contentX;
+
+                    displayList.DrawText(label, labelX, baselineY, textStyle.Color, textStyle.FontSize, textStyle.FontFamily, textStyle.FontWeight, textStyle.IsItalic, letterSpacing: textStyle.LetterSpacing);
+
+                    if (kind == FormControlKind.Select)
+                    {
+                        var arrowWidth = MeasureTextWidth(context, FormControlSelectArrowGlyph, textStyle);
+                        var arrowX = contentX + Math.Max(labelWidth, contentWidth - arrowWidth);
+                        var arrowBaselineY = baselineY + (textStyle.FontSize * FormControlSelectArrowVerticalOffsetRatio);
+                        displayList.DrawText(FormControlSelectArrowGlyph, arrowX, arrowBaselineY, textStyle.Color, textStyle.FontSize, textStyle.FontFamily, textStyle.FontWeight, textStyle.IsItalic, letterSpacing: textStyle.LetterSpacing);
+                    }
+                }
+
+                if (kind == FormControlKind.TextLike)
+                {
+                    PaintFormControlCaret(displayList, element, textStyle, contentX + labelWidth, baselineY);
                 }
 
                 break;
@@ -4660,6 +4760,58 @@ public sealed class HtmlRenderer
                 break;
             }
         }
+    }
+
+    /// <summary>
+    /// Paints a text-insertion caret for a focused <see cref="FormControlKind.TextLike"/> input,
+    /// right after its current value (or at the content edge, for an empty one) - this renderer
+    /// has no concept of a selection/cursor offset within an input's own value (AngleSharp does
+    /// not track one either), so the caret always sits at the end of the text, matching by far the
+    /// most common "user is appending" case a static render would want to depict. Real focus comes
+    /// straight from the DOM (<see cref="IElement.IsFocused"/>) rather than being tracked
+    /// separately by this renderer - AngleSharp.Css's own `:focus` pseudo-class forcing already
+    /// delegates to it (see AGENTS.md's `:hover` section for the equivalent story with
+    /// <c>SetPseudoClass</c>), so a plain <c>element.Focus()</c> or
+    /// <c>element.SetPseudoClass("focus")</c> is already enough to make a caret appear, with no
+    /// extra wiring needed here. `&lt;textarea&gt;` is a deliberate, documented scope cut - unlike
+    /// a single-line input's fixed baseline, its caret position would depend on which wrapped line
+    /// its real child text node currently ends on, which this renderer does not track.
+    /// </summary>
+    private static void PaintFormControlCaret(
+        DisplayList displayList,
+        IElement element,
+        RenderTextStyle textStyle,
+        float caretX,
+        float baselineY)
+    {
+        if (!element.IsFocused)
+        {
+            return;
+        }
+
+        var alpha = 1f;
+
+        // The fade needs a live clock to animate against; without one (a plain, non-interactive
+        // RenderToPng/BuildDisplayList call, or a harness whose AdvanceTime was simply never
+        // called) it paints fully opaque rather than frozen at some arbitrary phase - the same
+        // "no harness means no animation, not a stuck mid-animation frame" fallback `transition`/
+        // `animation` already use (see ApplyActiveTransitionAndAnimationOverrides).
+        if (element.Owner is not null && element.Owner.Context.TryGetDomHarness(out var harness) && harness is not null)
+        {
+            // A smooth cosine "breathe" - continuously sweeping through fully visible, partway
+            // faded, and fully invisible - rather than a hard on/off blink, so sampling the virtual
+            // clock at any instant shows a plausible in-between frame instead of only ever a flat
+            // "on" or "off" pixel value.
+            var cyclePosition = harness.CurrentTime.TotalMilliseconds % FormControlCaretBlinkPeriodMs / FormControlCaretBlinkPeriodMs;
+            alpha = (float)((Math.Cos(cyclePosition * 2 * Math.PI) + 1) / 2);
+        }
+
+        var caretTop = baselineY - (textStyle.FontSize * FormControlTextAscentRatio);
+        var caretBottom = baselineY + (textStyle.FontSize * FormControlTextDescentRatio);
+        var alphaByte = (byte)Math.Clamp((int)MathF.Round(alpha * 255f), 0, 255);
+        var caretColor = new RenderColor(textStyle.Color.R, textStyle.Color.G, textStyle.Color.B, alphaByte);
+
+        displayList.FillRect(new RenderRect(caretX, caretTop, FormControlCaretWidth, caretBottom - caretTop), caretColor);
     }
 
     /// <summary>
@@ -6644,11 +6796,45 @@ public sealed class HtmlRenderer
         };
     }
 
-    private static string NormalizeWhitespace(string value)
+    /// <summary>
+    /// Collapses whitespace the way <c>white-space: normal</c> always did before this property was
+    /// read at all - every call site that is not itself part of text layout (table cell text, form
+    /// control labels, and the two "does this text node count as non-empty content" checks used for
+    /// child-ordering purposes) still goes through this, a deliberate scope cut: none of those sites
+    /// feed a wrapping-aware layout path today, so a real `white-space` value on them would have
+    /// nothing to change even if read.
+    /// </summary>
+    private static string NormalizeWhitespace(string value) => NormalizeWhitespace(value, WhiteSpaceMode.Normal);
+
+    /// <summary>
+    /// Collapses or preserves whitespace per the resolved <c>white-space</c> value, matching the CSS
+    /// spec's own collapsing/newline-preservation table: <c>normal</c>/<c>nowrap</c> collapse both
+    /// runs of horizontal whitespace and newlines into a single space and trim the ends; <c>pre</c>/
+    /// <c>pre-wrap</c>/<c>break-spaces</c> preserve every character verbatim (only normalizing
+    /// <c>\r\n</c>/<c>\r</c> line endings to a plain <c>\n</c>, the same source-text preprocessing
+    /// step HTML always applies regardless of `white-space`); <c>pre-line</c> collapses runs of
+    /// horizontal whitespace to a single space but preserves each `\n` as its own forced break.
+    /// </summary>
+    private static string NormalizeWhitespace(string value, WhiteSpaceMode whiteSpace)
     {
         if (value.Length == 0)
         {
             return string.Empty;
+        }
+
+        var preserveNewlines = whiteSpace is WhiteSpaceMode.Pre or WhiteSpaceMode.PreWrap or WhiteSpaceMode.PreLine or WhiteSpaceMode.BreakSpaces;
+        var collapseHorizontalWhitespace = whiteSpace is WhiteSpaceMode.Normal or WhiteSpaceMode.Nowrap or WhiteSpaceMode.PreLine;
+
+        // Collapse \r\n/\r to a plain \n unconditionally, before any mode-specific handling - this
+        // is source-text preprocessing HTML always applies regardless of `white-space`, not part of
+        // the whitespace-collapsing semantics below. Doing it first (rather than per-character
+        // inside the loop) also avoids double-counting a \r\n pair as two separate forced breaks
+        // under pre-line's own char-by-char newline handling.
+        value = value.Replace("\r\n", "\n").Replace('\r', '\n');
+
+        if (!collapseHorizontalWhitespace)
+        {
+            return value;
         }
 
         var sb = new StringBuilder(value.Length);
@@ -6656,6 +6842,13 @@ public sealed class HtmlRenderer
 
         foreach (var c in value)
         {
+            if (preserveNewlines && c == '\n')
+            {
+                sb.Append('\n');
+                inWhitespace = false;
+                continue;
+            }
+
             if (char.IsWhiteSpace(c))
             {
                 if (!inWhitespace)
@@ -6671,8 +6864,24 @@ public sealed class HtmlRenderer
             inWhitespace = false;
         }
 
-        return sb.ToString().Trim();
+        return preserveNewlines ? sb.ToString() : sb.ToString().Trim();
     }
+
+    /// <summary>
+    /// Like <see cref="NormalizeWhitespace(string, WhiteSpaceMode)"/>, but always collapses an
+    /// explicit forced break down to a plain space rather than preserving it - <see
+    /// cref="LayoutInlineTextRun"/>'s word-by-word model (mixed inline content sharing a line with
+    /// sibling elements) has no way to represent a forced mid-line break, so preserving one here
+    /// would hand it a literal <c>\n</c> character to measure/draw as if it were an ordinary glyph.
+    /// `nowrap`/`pre`'s wrap *suppression* still applies (read directly off <c>textStyle.WhiteSpace</c>
+    /// inside <see cref="LayoutInlineTextRun"/> itself) - only the newline-*preservation* half of
+    /// `pre`/`pre-wrap`/`pre-line` is out of scope for this specific layout path, not the whole
+    /// `white-space` feature; that half is fully supported for the far more common case of `pre`/
+    /// `pre-wrap`/`pre-line` on a block-level element's own direct text content (see
+    /// <see cref="LayoutWrappedText"/>/<see cref="WrapTextRespectingWhiteSpace"/>).
+    /// </summary>
+    private static string NormalizeWhitespaceForInlineRun(string value, WhiteSpaceMode whiteSpace) =>
+        NormalizeWhitespace(value, whiteSpace).Replace('\n', ' ');
 
     /// <summary>
     /// Where a cell's content sits within the box the cell occupies.
@@ -6723,13 +6932,29 @@ public sealed class HtmlRenderer
         float LetterSpacing,
         float TextIndent,
         float VerticalAlignOffset,
-        IReadOnlyList<global::AngleSharp.Renderer.Rendering.RenderTextShadow> TextShadows);
+        IReadOnlyList<global::AngleSharp.Renderer.Rendering.RenderTextShadow> TextShadows,
+        WhiteSpaceMode WhiteSpace);
 
     private enum TextAlign
     {
         Left,
         Center,
         Right,
+    }
+
+    /// <summary>
+    /// The CSS <c>white-space</c> keywords this renderer distinguishes. See
+    /// <see cref="NormalizeWhitespace(string, WhiteSpaceMode)"/> for collapsing/newline-preservation
+    /// and <see cref="LayoutWrappedText"/>/<see cref="LayoutInlineTextRun"/> for wrap suppression.
+    /// </summary>
+    private enum WhiteSpaceMode
+    {
+        Normal,
+        Nowrap,
+        Pre,
+        PreWrap,
+        PreLine,
+        BreakSpaces,
     }
 
     private readonly record struct EdgeSizes(float Top, float Right, float Bottom, float Left);

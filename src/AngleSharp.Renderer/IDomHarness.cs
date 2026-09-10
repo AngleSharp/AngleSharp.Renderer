@@ -63,6 +63,13 @@ public interface IDomHarness
     void AdvanceTime(TimeSpan delta);
 
     /// <summary>
+    /// Gets the current position of the virtual clock <see cref="AdvanceTime"/> advances - the same
+    /// clock CSS `transition`/`animation` are measured against, and what a focused text input's
+    /// caret blink is measured against too.
+    /// </summary>
+    TimeSpan CurrentTime { get; }
+
+    /// <summary>
     /// Gets the interpolated value currently in effect for <paramref name="property"/> on
     /// <paramref name="element"/> if a CSS `transition` is actively running for it, or null if none
     /// is active - in which case the property's ordinary computed value applies, unaffected.

@@ -251,6 +251,8 @@ internal sealed class InteractiveHtmlRendererState : IDomHarness
         PaintInvalidated?.Invoke(this, EventArgs.Empty);
     }
 
+    public TimeSpan CurrentTime => TimeSpan.FromMilliseconds(_clockMs);
+
     public string? GetTransitioningValue(IElement element, string property)
     {
         ArgumentNullException.ThrowIfNull(element);

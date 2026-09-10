@@ -2,6 +2,7 @@ using AngleSharp;
 using AngleSharp.Css;
 using AngleSharp.Css.Dom;
 using AngleSharp.Dom;
+using AngleSharp.Html.Dom;
 using AngleSharp.Io;
 using AngleSharp.Renderer.Rendering;
 
@@ -1127,6 +1128,259 @@ public sealed class HtmlRendererTests
         Assert.True(textCommands.Length >= 2);
         Assert.True(textCommands[0].X >= 20f);
         Assert.True(textCommands[1].X < textCommands[0].X);
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_NormalWhiteSpaceCollapsesRunsOfSpacesAndNewlines()
+    {
+        var document = await ParseAsync("""
+            <html><body>
+                <p style="width:400px;">a    b
+                c</p>
+            </body></html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, new DefaultRenderDevice
+        {
+            ViewPortWidth = 500,
+            ViewPortHeight = 120,
+            FontSize = 16f,
+        });
+
+        var text = Assert.Single(displayList.Commands.OfType<DrawTextCommand>());
+        Assert.Equal("a b c", text.Text);
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_PreWhiteSpacePreservesRunsOfSpacesAndForcesLineBreaks()
+    {
+        var document = await ParseAsync("""
+            <html><body>
+                <p style="white-space:pre; width:400px;">a    b
+            c</p>
+            </body></html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, new DefaultRenderDevice
+        {
+            ViewPortWidth = 500,
+            ViewPortHeight = 120,
+            FontSize = 16f,
+        });
+
+        var lines = displayList.Commands.OfType<DrawTextCommand>().ToArray();
+
+        Assert.Equal(2, lines.Length);
+        Assert.Equal("a    b", lines[0].Text);
+        Assert.Equal("c", lines[1].Text);
+        // The forced break lands on the very next line, not merely wherever the wrap algorithm
+        // would otherwise have broken - confirmed by the line-height gap between the two baselines.
+        Assert.Equal(16f * 1.35f, lines[1].Y - lines[0].Y, precision: 2);
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_PreWhiteSpaceDoesNotWrapEvenWhenWiderThanItsBox()
+    {
+        var document = await ParseAsync("""
+            <html><body>
+                <p style="white-space:pre; width:40px;">a long line that would normally wrap</p>
+            </body></html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, new DefaultRenderDevice
+        {
+            ViewPortWidth = 300,
+            ViewPortHeight = 120,
+            FontSize = 16f,
+        });
+
+        var text = Assert.Single(displayList.Commands.OfType<DrawTextCommand>());
+        Assert.Equal("a long line that would normally wrap", text.Text);
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_PreWrapWhiteSpaceWrapsButStillForcesExplicitLineBreaks()
+    {
+        var document = await ParseAsync("""
+            <html><body>
+                <p style="white-space:pre-wrap; width:100px; font-size:16px;">short
+            a somewhat longer line that should wrap</p>
+            </body></html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, new DefaultRenderDevice
+        {
+            ViewPortWidth = 300,
+            ViewPortHeight = 200,
+            FontSize = 16f,
+        });
+
+        var lines = displayList.Commands.OfType<DrawTextCommand>().ToArray();
+
+        // The forced break after "short" always starts a new paragraph, and that paragraph's own
+        // long line then wraps independently across more than one line of its own.
+        Assert.True(lines.Length >= 3);
+        Assert.Equal("short", lines[0].Text);
+        Assert.NotEqual("short", lines[1].Text);
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_PreLineWhiteSpaceCollapsesSpacesButKeepsForcedBreaks()
+    {
+        var document = await ParseAsync("""
+            <html><body>
+                <p style="white-space:pre-line; width:400px;">a    b
+            c</p>
+            </body></html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, new DefaultRenderDevice
+        {
+            ViewPortWidth = 500,
+            ViewPortHeight = 120,
+            FontSize = 16f,
+        });
+
+        var lines = displayList.Commands.OfType<DrawTextCommand>().ToArray();
+
+        Assert.Equal(2, lines.Length);
+        Assert.Equal("a b", lines[0].Text);
+        Assert.Equal("c", lines[1].Text);
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_NowrapWhiteSpaceKeepsTextOnOneLineEvenWhenWiderThanItsBox()
+    {
+        var document = await ParseAsync("""
+            <html><body>
+                <p style="white-space:nowrap; width:40px;">a long line that would normally wrap</p>
+            </body></html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, new DefaultRenderDevice
+        {
+            ViewPortWidth = 300,
+            ViewPortHeight = 120,
+            FontSize = 16f,
+        });
+
+        var text = Assert.Single(displayList.Commands.OfType<DrawTextCommand>());
+        Assert.Equal("a long line that would normally wrap", text.Text);
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_NowrapWhiteSpaceStillCollapsesRunsOfSpaces()
+    {
+        var document = await ParseAsync("""
+            <html><body>
+                <p style="white-space:nowrap;">a    b</p>
+            </body></html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, new DefaultRenderDevice
+        {
+            ViewPortWidth = 300,
+            ViewPortHeight = 120,
+            FontSize = 16f,
+        });
+
+        var text = Assert.Single(displayList.Commands.OfType<DrawTextCommand>());
+        Assert.Equal("a b", text.Text);
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_NowrapSpanStaysUnwrappedEvenInANarrowContainer()
+    {
+        var document = await ParseAsync("""
+            <html><body>
+                <p style="width:80px;">before <span style="white-space:nowrap;">a long run of nowrap text</span> after</p>
+            </body></html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, new DefaultRenderDevice
+        {
+            ViewPortWidth = 300,
+            ViewPortHeight = 120,
+            FontSize = 16f,
+        });
+
+        // The span's own text stays a single, unwrapped DrawText command despite the 80px-wide
+        // container - without `nowrap` this would have been split across several wrapped lines.
+        var run = Assert.Single(displayList.Commands.OfType<DrawTextCommand>().Where(t => t.Text.Contains("nowrap")));
+        Assert.Equal("a long run of nowrap text", run.Text);
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_PreHtmlElementDefaultsToPreservingWhitespace()
+    {
+        // <pre> gets `white-space: pre` from AngleSharp.Css's own UA stylesheet, the same way <ol>/
+        // <ul> get their list-style-type default - not something this renderer has to inject itself.
+        var document = await ParseAsync("""
+            <html><body><pre>a    b</pre></body></html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, new DefaultRenderDevice
+        {
+            ViewPortWidth = 300,
+            ViewPortHeight = 120,
+            FontSize = 16f,
+        });
+
+        var text = Assert.Single(displayList.Commands.OfType<DrawTextCommand>());
+        Assert.Equal("a    b", text.Text);
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_UnsetWhiteSpaceDefaultsToNormal()
+    {
+        var document = await ParseAsync("""
+            <html><body><p>a    b</p></body></html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, new DefaultRenderDevice
+        {
+            ViewPortWidth = 300,
+            ViewPortHeight = 120,
+            FontSize = 16f,
+        });
+
+        var text = Assert.Single(displayList.Commands.OfType<DrawTextCommand>());
+        Assert.Equal("a b", text.Text);
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_WhiteSpaceIsInheritedByChildElements()
+    {
+        var document = await ParseAsync("""
+            <html><body>
+                <div style="white-space:pre;"><span id="child">a    b</span></div>
+            </body></html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, new DefaultRenderDevice
+        {
+            ViewPortWidth = 300,
+            ViewPortHeight = 120,
+            FontSize = 16f,
+        });
+
+        // The child <span> has no white-space of its own, so it inherits `pre` from its parent - a
+        // single all-inline child with no plain-text siblings routes through the same leaf-text
+        // shortcut a lone inline element with only text content already uses elsewhere in
+        // LayoutNode (the one LayoutWrappedText itself goes through), preserving the run verbatim.
+        var text = Assert.Single(displayList.Commands.OfType<DrawTextCommand>());
+        Assert.Equal("a    b", text.Text);
     }
 
     [Fact]
@@ -3543,6 +3797,112 @@ public sealed class HtmlRendererTests
 
         var borderEdges = displayList.Commands.OfType<FillRectCommand>().Where(f => f.Color.Equals(new RenderColor(0, 0, 255))).ToList();
         Assert.NotEmpty(borderEdges);
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_UnfocusedTextInputPaintsNoCaret()
+    {
+        var document = await ParseAsync("""<html><body><input type="text" value="Hi" /></body></html>""");
+
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, new DefaultRenderDevice
+        {
+            ViewPortWidth = 300,
+            ViewPortHeight = 100,
+            FontSize = 16f,
+        });
+
+        // The caret is 1.5px wide (FormControlCaretWidth) - narrow enough that no other form
+        // control fill (background, border edge, checkbox/radio accent) could plausibly collide
+        // with it, so filtering on that width alone is enough to isolate it.
+        Assert.DoesNotContain(displayList.Commands, c => c is FillRectCommand f && f.Rect.Width == 1.5f);
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_FocusedTextInputPaintsAnOpaqueCaretAfterItsValue()
+    {
+        var document = await ParseAsync("""<html><body><input id="target" type="text" value="Hi" /></body></html>""");
+        var target = (IHtmlElement)document.GetElementById("target")!;
+        target.DoFocus();
+
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, new DefaultRenderDevice
+        {
+            ViewPortWidth = 300,
+            ViewPortHeight = 100,
+            FontSize = 16f,
+        });
+
+        var valueText = Assert.Single(displayList.Commands.OfType<DrawTextCommand>().Where(t => t.Text == "Hi"));
+        var background = Assert.Single(displayList.Commands.OfType<FillRectCommand>().Where(f => f.Color.Equals(new RenderColor(255, 255, 255)) && f.Rect.Width == 160f));
+
+        // Without a registered IDomHarness there is no virtual clock to fade the caret against, so
+        // it paints fully opaque instead of frozen mid-fade - the same fallback CSS `transition`/
+        // `animation` use when no harness exists.
+        var caret = Assert.Single(displayList.Commands.OfType<FillRectCommand>().Where(f => f.Rect.Width == 1.5f));
+        Assert.Equal(255, caret.Color.A);
+        // Right after the typed value's own left edge, and still inside the input's own box - not
+        // asserting an exact pixel offset (which would require duplicating this renderer's own text
+        // measurement in the test), just that it tracks the end of the text rather than always
+        // sitting at the content edge.
+        Assert.True(caret.Rect.X > valueText.X);
+        Assert.True(caret.Rect.X < background.Rect.X + background.Rect.Width);
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_FocusedEmptyTextInputPaintsCaretAtTheContentEdge()
+    {
+        var document = await ParseAsync("""<html><body><input id="target" type="text" /></body></html>""");
+        var target = (IHtmlElement)document.GetElementById("target")!;
+        target.DoFocus();
+
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, new DefaultRenderDevice
+        {
+            ViewPortWidth = 300,
+            ViewPortHeight = 100,
+            FontSize = 16f,
+        });
+
+        var background = Assert.Single(displayList.Commands.OfType<FillRectCommand>().Where(f => f.Color.Equals(new RenderColor(255, 255, 255)) && f.Rect.Width == 160f));
+        var caret = Assert.Single(displayList.Commands.OfType<FillRectCommand>().Where(f => f.Rect.Width == 1.5f));
+
+        // border-left-width 1px + default padding-left 4px, the same content-edge math the value
+        // text itself is positioned at (see BuildDisplayList_TextLikeInputGetsDefaultChromeAndShowsItsValue).
+        Assert.Equal(background.Rect.X + 1f + 4f, caret.Rect.X, precision: 3);
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_FocusedTextInputCaretFadesWithTheVirtualClock()
+    {
+        var renderDevice = new DefaultRenderDevice { ViewPortWidth = 300, ViewPortHeight = 100, FontSize = 16f };
+        var configuration = Configuration.Default.WithCss().WithRenderDevice(renderDevice);
+        var document = await ParseAsync("""<html><body><input id="target" type="text" value="Hi" /></body></html>""", configuration);
+        var target = (IHtmlElement)document.GetElementById("target")!;
+        target.DoFocus();
+        var harness = document.Context.GetDomHarness();
+        var renderer = new HtmlRenderer();
+
+        int CurrentCaretAlpha()
+        {
+            var displayList = renderer.BuildDisplayList(document, renderDevice);
+            return Assert.Single(displayList.Commands.OfType<FillRectCommand>().Where(f => f.Rect.Width == 1.5f)).Color.A;
+        }
+
+        // A smooth cosine "breathe" over a 1000ms period (FormControlCaretBlinkPeriodMs): fully
+        // visible at t=0, fully invisible at the half-period mark, back to fully visible a full
+        // period later - not a hard on/off blink, so the quarter-period sample lands at a genuine
+        // in-between alpha rather than either extreme.
+        Assert.Equal(255, CurrentCaretAlpha());
+
+        harness.AdvanceTime(TimeSpan.FromMilliseconds(500));
+        Assert.Equal(0, CurrentCaretAlpha());
+
+        harness.AdvanceTime(TimeSpan.FromMilliseconds(250));
+        Assert.InRange(CurrentCaretAlpha(), 100, 155);
+
+        harness.AdvanceTime(TimeSpan.FromMilliseconds(250));
+        Assert.Equal(255, CurrentCaretAlpha());
     }
 
     [Fact]

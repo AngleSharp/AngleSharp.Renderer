@@ -1,8 +1,9 @@
 # 0.4.0
 
-Released on Wednesday, September 9 2026.
+Released on Thursday, September 10 2026.
 
 - Improved support for clipping and `overflow` declarations
+- Improved whitespace handling for rendering
 - Fixed painting of scrolled content
 - Fixed handling of background images
 - Added support for rounded corners

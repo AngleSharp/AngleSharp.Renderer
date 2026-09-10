@@ -2570,6 +2570,56 @@ public sealed class VisualConformanceTests
           maxDifferentPixels: 0);
     }
 
+    [Fact]
+    public async Task RenderToPng_FocusedTextInputShowsAnOpaqueCaret()
+    {
+        var renderDevice = new DefaultRenderDevice { ViewPortWidth = 120, ViewPortHeight = 60, FontSize = 16 };
+        var configuration = Configuration.Default.WithCss().WithRenderDevice(renderDevice);
+        var document = await ParseAsync("""
+            <html>
+              <head>
+                <style>html, body { margin: 0; padding: 0; background-color: white; }</style>
+              </head>
+              <body>
+                <input id="target" type="text" value="Hi" style="margin:10px;" />
+              </body>
+            </html>
+            """, configuration);
+
+        var target = (IHtmlElement)document.GetElementById("target")!;
+        target.DoFocus();
+
+        // Registering the harness starts the virtual clock at 0, where the caret's cosine "breathe"
+        // is at its peak (see FormControlCaretBlinkPeriodMs) - a deterministic, fully-opaque frame.
+        var harness = document.Context.GetDomHarness();
+        var image = harness.PaintToPng();
+
+        VisualSnapshotVerifier.VerifyOrCreate(
+          snapshotName: "focused-text-input-shows-an-opaque-caret.png",
+          actualPng: image.Data,
+          perChannelTolerance: 0,
+          maxDifferentPixels: 0);
+    }
+
+    [Fact]
+    public async Task RenderToPng_PreWhiteSpacePreservesIndentationAndLineBreaks()
+    {
+        var renderDevice = new DefaultRenderDevice { ViewPortWidth = 260, ViewPortHeight = 120, FontSize = 16 };
+        var configuration = Configuration.Default.WithCss().WithRenderDevice(renderDevice);
+        var html = "<html><head><style>html, body { margin: 0; padding: 0; background-color: white; }</style></head>"
+            + "<body><pre>function f() {\n    return 1;\n}</pre></body></html>";
+        var document = await ParseAsync(html, configuration);
+
+        var renderer = new HtmlRenderer();
+        var image = renderer.RenderToPng(document, renderDevice);
+
+        VisualSnapshotVerifier.VerifyOrCreate(
+          snapshotName: "pre-white-space-preserves-indentation-and-line-breaks.png",
+          actualPng: image.Data,
+          perChannelTolerance: 0,
+          maxDifferentPixels: 0);
+    }
+
     private static async Task<AngleSharp.Dom.IDocument> ParseAsync(string html, IConfiguration? configuration = null)
     {
         var context = BrowsingContext.New(configuration ?? Configuration.Default.WithCss());
