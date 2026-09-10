@@ -3192,7 +3192,6 @@ public sealed class HtmlRenderer
         AddIfPresent(map, "list-style-type", style.GetPropertyValue("list-style-type"));
         AddIfPresent(map, "list-style-position", style.GetPropertyValue("list-style-position"));
 
-        AddIfPresent(map, "overflow", style.GetPropertyValue("overflow"));
         AddIfPresent(map, "overflow-x", style.GetPropertyValue("overflow-x"));
         AddIfPresent(map, "overflow-y", style.GetPropertyValue("overflow-y"));
 
@@ -3251,12 +3250,11 @@ public sealed class HtmlRenderer
         var rawTransformValue = element?.GetAttribute("data-render-transform");
         AddIfPresent(map, "transform", rawTransformValue);
         AddIfPresent(map, "transform-origin", string.IsNullOrWhiteSpace(style.GetPropertyValue("transform-origin")) ? ParseStyleAttributeValue(inlineStyle, "transform-origin") : style.GetPropertyValue("transform-origin"));
-        // AngleSharp.Css has no structured `filter` support at all (confirmed empirically - its own
-        // computed style always reports an empty string for this property, unlike `transform`,
-        // which merely crashed on one function until fixed upstream), so this always falls through
-        // to the raw inline `style=""` attribute, exactly like `background-image`'s gradient-opaque
-        // fallback above.
-        AddIfPresent(map, "filter", string.IsNullOrWhiteSpace(style.GetPropertyValue("filter")) ? ParseStyleAttributeValue(inlineStyle, "filter") : style.GetPropertyValue("filter"));
+        // AngleSharp.Css now parses `filter` into a structured CssFilterValue and preserves it
+        // through computed style (fixed upstream - it used to always report an empty string here),
+        // so this can now read the ordinary computed-style value directly, the same as any other
+        // property.
+        AddIfPresent(map, "filter", style.GetPropertyValue("filter"));
         AddIfPresent(map, "opacity", style.GetOpacity());
         AddIfPresent(map, "font-size", style.GetFontSize());
         AddIfPresent(map, "font-family", style.GetFontFamily());
@@ -4747,22 +4745,23 @@ public sealed class HtmlRenderer
         IsClippingOverflowValue(ResolveOverflowAxis(styleMap, "overflow-y"));
 
     /// <summary>
-    /// Resolves one overflow axis. AngleSharp.Css's `overflow` shorthand does not decompose into
-    /// `overflow-x`/`overflow-y` in its computed style (verified empirically) - unlike a real
-    /// cascade, the longhand and shorthand never coexist in the computed declaration here, so the
-    /// longhand is preferred when both happen to be present and the shorthand is used as a
-    /// fallback, rather than needing to resolve cascade precedence between them.
+    /// Resolves one overflow axis. AngleSharp.Css's `overflow` shorthand decomposes into
+    /// `overflow-x`/`overflow-y` in its own computed style, so the longhand can always be
+    /// read directly.
     /// </summary>
     private static string ResolveOverflowAxis(Dictionary<string, string> styleMap, string longhandProperty) =>
         styleMap.TryGetValue(longhandProperty, out var axisValue) && !string.IsNullOrWhiteSpace(axisValue)
             ? axisValue.Trim().ToLowerInvariant()
-            : styleMap.TryGetValue("overflow", out var shorthandValue) && !string.IsNullOrWhiteSpace(shorthandValue)
-                ? shorthandValue.Trim().ToLowerInvariant()
-                : "visible";
+            : "visible";
 
     private static bool IsClippingOverflowValue(string overflowValue) =>
         overflowValue is "hidden" or "scroll" or "auto";
 
+    // AngleSharp.Css's UA stylesheet sets list-style-type: disc directly on ol/ul/dir/menu/dd
+    // (fixed upstream), so this default is dead for the common case - it is still needed, and
+    // still correct, for an element given `display: list-item` explicitly (any other tag), which
+    // that UA rule does not cover and which still computes an empty list-style-type - confirmed
+    // empirically, not assumed.
     private static string ResolveListStyleType(Dictionary<string, string> styleMap) =>
         styleMap.TryGetValue("list-style-type", out var value) && !string.IsNullOrWhiteSpace(value)
             ? value.Trim().ToLowerInvariant()
@@ -5493,16 +5492,21 @@ public sealed class HtmlRenderer
     }
 
     /// <summary>
-    /// Parses `filter` into a list of <see cref="RenderFilterFunction"/>s, entirely by hand rather
-    /// than through AngleSharp.Css - unlike `transform`, AngleSharp.Css has no structured support
-    /// for `filter` at all (confirmed empirically: its computed style always reports an empty
-    /// string for this property, and reflecting over its assembly finds no `FilterParser`/
-    /// `ICssFilterFunctionValue` equivalent), so there is nothing to delegate to. This mirrors the
-    /// pre-existing CSS-gradient precedent (`ParseGradientPaint`, hand-parsed for the same reason)
-    /// rather than the `transform` precedent. `url(#filterId)` (an SVG filter reference) and any
-    /// other unrecognized function are silently skipped rather than aborting the whole chain,
-    /// mirroring how an unsupported SVG `&lt;filter&gt;` primitive passes its input through
-    /// unchanged in `SvgFilterBuilder` instead of breaking that chain.
+    /// Parses `filter` via AngleSharp.Css's own `FilterParser.ParseFilter`/`ICssFilterFunctionValue`
+    /// (fixed upstream - AngleSharp.Css previously had no structured `filter` support at all, so
+    /// this renderer had to hand-parse the raw text itself, mirroring the CSS-gradient precedent;
+    /// it now mirrors the `transform` precedent instead) - AngleSharp.Css handles the outer
+    /// function-list syntax (name/parenthesis extraction, including nested parens) and gives each
+    /// function's own name plus its raw, still-unparsed argument text as a single
+    /// <c>Arguments</c> entry; this renderer still interprets what
+    /// each function *means* (its own argument grammar, and the CSS Filter Effects spec's per-function
+    /// color-matrix/blur-radius semantics - see <see cref="ConvertToRenderFilterFunction"/>), since
+    /// that is a rendering concern AngleSharp.Css does not (and should not) resolve for it, the same
+    /// division of labor `transform`'s `ConvertToRenderTransform` already established for
+    /// `ComputeMatrix`. `url(#filterId)` (an SVG filter reference) and any other unrecognized
+    /// function are silently skipped rather than aborting the whole chain, mirroring how an
+    /// unsupported SVG `&lt;filter&gt;` primitive passes its input through unchanged in
+    /// `SvgFilterBuilder` instead of breaking that chain.
     /// </summary>
     private static IReadOnlyList<RenderFilterFunction> ParseCssFilter(Dictionary<string, string> styleMap)
     {
@@ -5513,11 +5517,16 @@ public sealed class HtmlRenderer
             return [];
         }
 
+        if (FilterParser.ParseFilter(new StringSource(value)) is not CssFilterValue parsed)
+        {
+            return [];
+        }
+
         var functions = new List<RenderFilterFunction>();
 
-        foreach (var token in SplitTopLevelWhitespaceList(value.Trim()))
+        foreach (var cssFunction in parsed.Functions)
         {
-            if (TryParseFilterFunction(token, out var function))
+            if (ConvertToRenderFilterFunction(cssFunction, out var function))
             {
                 functions.Add(function);
             }
@@ -5526,21 +5535,12 @@ public sealed class HtmlRenderer
         return functions;
     }
 
-    private static bool TryParseFilterFunction(string token, out RenderFilterFunction function)
+    private static bool ConvertToRenderFilterFunction(ICssFilterFunctionValue cssFunction, out RenderFilterFunction function)
     {
         function = null!;
-        var opening = token.IndexOf('(');
-        var closing = token.LastIndexOf(')');
+        var argsText = cssFunction.Arguments.Length > 0 ? cssFunction.Arguments[0].CssText.Trim() : string.Empty;
 
-        if (opening < 0 || closing <= opening)
-        {
-            return false;
-        }
-
-        var name = token[..opening].Trim().ToLowerInvariant();
-        var argsText = token[(opening + 1)..closing].Trim();
-
-        switch (name)
+        switch (cssFunction.Name.ToLowerInvariant())
         {
             case "blur":
                 function = RenderFilterFunction.Blur(Math.Max(0f, ParseLengthValue(argsText, defaultValue: 0f, allowAuto: false)));
@@ -5650,10 +5650,10 @@ public sealed class HtmlRenderer
         return RenderFilterFunction.DropShadow(offsetX, offsetY, Math.Max(0f, blurRadius), color);
     }
 
-    // Splits a value on whitespace at paren-depth 0 only, so a function's own arguments (which may
-    // contain spaces, e.g. `rgb(255, 0, 0)` or `drop-shadow(2px 4px red)`) are never split apart.
-    // Shared by the top-level `filter` function list (`grayscale(0.9) blur(2px)`) and by
-    // `drop-shadow`'s own space-separated argument list.
+    // Splits a value on whitespace at paren-depth 0 only, so a nested function call within one of
+    // the tokens (e.g. a `rgb(255, 0, 0)` color argument) is never split apart. Used to tokenize
+    // `drop-shadow`'s own space-separated argument list - the outer `filter` function list itself
+    // is now split by AngleSharp.Css's own FilterParser instead (see ParseCssFilter's remarks).
     private static string[] SplitTopLevelWhitespaceList(string value)
     {
         if (string.IsNullOrWhiteSpace(value))

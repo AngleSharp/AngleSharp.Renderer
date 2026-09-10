@@ -251,12 +251,12 @@ internal sealed class CssAnimationTracker
     /// Reads `animation-name`/`-duration`/`-delay`/`-timing-function`/`-iteration-count`/
     /// `-direction`/`-fill-mode` from an element's own computed style and builds one
     /// <see cref="CssAnimationSpec"/> per named animation, cycling the shorter lists against a
-    /// longer `animation-name` list per spec. AngleSharp.Css reports the literal string `"initial"`
-    /// (not each property's own actual initial value, and not an empty string) for any of these
-    /// longhands the `animation` shorthand did not explicitly set - confirmed empirically, unlike
-    /// `transition`'s equivalent longhands, which report empty instead - so each list is mapped
-    /// through its own initial-value fallback below rather than reusing `transition`'s "empty list
-    /// means 0/linear" convention directly.
+    /// longer `animation-name` list per spec. AngleSharp.Css used to report the literal string
+    /// `"initial"` (not each property's own actual initial value) for any of these longhands the
+    /// `animation` shorthand did not explicitly set - fixed upstream, confirmed empirically each
+    /// now resolves to its real initial value (`normal`/`none`/`0s`/`running`) directly, so
+    /// <see cref="ResolveListValue"/> only has to handle the "list shorter than `animation-name`"
+    /// cycling case per spec, not a literal-`"initial"` substitution too.
     /// </summary>
     private static List<CssAnimationSpec> ParseAnimationSpecs(ICssStyleDeclaration style)
     {
@@ -294,19 +294,10 @@ internal sealed class CssAnimationTracker
         return result;
     }
 
-    // Cycles a shorter list against a longer one per spec, treating both an empty list and the
-    // literal "initial" AngleSharp.Css reports for an unset longhand (see ParseAnimationSpecs'
-    // remarks) as "use the property's own initial value" (the caller-supplied default).
-    private static string? ResolveListValue(string[] list, int index, string initialValue)
-    {
-        if (list.Length == 0)
-        {
-            return initialValue;
-        }
-
-        var value = list[index % list.Length].Trim();
-        return value.Equals("initial", StringComparison.OrdinalIgnoreCase) ? initialValue : value;
-    }
+    // Cycles a shorter list against a longer one per spec; an empty list (the property was never
+    // set at all) falls back to the caller-supplied initial value.
+    private static string? ResolveListValue(string[] list, int index, string initialValue) =>
+        list.Length == 0 ? initialValue : list[index % list.Length].Trim();
 
     private static double ParseIterationCount(string? value)
     {
