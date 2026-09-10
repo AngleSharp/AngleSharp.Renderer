@@ -2624,6 +2624,38 @@ public sealed class VisualConformanceTests
           maxDifferentPixels: TextRenderingToleranceMaxPixels);
     }
 
+    [Fact]
+    public async Task RenderToPng_SizesGridTracksWithFrRepeatAndMinMax()
+    {
+        var document = await ParseAsync("""
+            <html>
+              <head>
+                <style>html, body { margin: 0; padding: 0; }</style>
+              </head>
+              <body>
+                <div style="margin:10px; width:160px; height:60px; display:grid; grid-template-columns:minmax(30px, 1fr) repeat(2, 40px); gap:5px; background-color:#eeeeee;">
+                  <div style="height:60px; background-color:rgb(220,50,50);"></div>
+                  <div style="height:60px; background-color:rgb(50,150,220);"></div>
+                  <div style="height:60px; background-color:rgb(80,200,120);"></div>
+                </div>
+              </body>
+            </html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var image = renderer.RenderToPng(document, new DefaultRenderDevice
+        {
+            ViewPortWidth = 200,
+            ViewPortHeight = 100,
+        });
+
+        VisualSnapshotVerifier.VerifyOrCreate(
+          snapshotName: "sizes-grid-tracks-with-fr-repeat-and-minmax.png",
+          actualPng: image.Data,
+          perChannelTolerance: 0,
+          maxDifferentPixels: 0);
+    }
+
     private static async Task<AngleSharp.Dom.IDocument> ParseAsync(string html, IConfiguration? configuration = null)
     {
         var context = BrowsingContext.New(configuration ?? Configuration.Default.WithCss());

@@ -956,15 +956,160 @@ public sealed class HtmlRendererTests
             .ThenBy(command => command.Rect.X)
             .ToArray();
 
+        // gap's two-value form is <row-gap> <column-gap> per spec, so "gap:10px 20px" is
+        // row-gap=10px (second row starts at 20+10=30) and column-gap=20px (second column
+        // starts at 50+20=70) - this used to assert the reverse, matching a real, now-fixed
+        // upstream bug in AngleSharp.Css's GapDeclaration ordering (see AGENTS.md/GapShorthandComputedStyleTests).
         Assert.Equal(4, childBackgrounds.Length);
         Assert.Equal(0f, childBackgrounds[0].Rect.X);
         Assert.Equal(0f, childBackgrounds[0].Rect.Y);
-        Assert.Equal(60f, childBackgrounds[1].Rect.X);
+        Assert.Equal(70f, childBackgrounds[1].Rect.X);
         Assert.Equal(0f, childBackgrounds[1].Rect.Y);
         Assert.Equal(0f, childBackgrounds[2].Rect.X);
         Assert.Equal(30f, childBackgrounds[2].Rect.Y);
-        Assert.Equal(60f, childBackgrounds[3].Rect.X);
+        Assert.Equal(70f, childBackgrounds[3].Rect.X);
         Assert.Equal(30f, childBackgrounds[3].Rect.Y);
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_SizesFractionalTracksProportionally()
+    {
+        var document = await ParseAsync("""
+            <html><body>
+                <div style="display:grid; grid-template-columns:1fr 2fr; width:150px; height:20px;">
+                    <div style="height:20px; background-color:#ff0000;"></div>
+                    <div style="height:20px; background-color:#0000ff;"></div>
+                </div>
+            </body></html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, new DefaultRenderDevice
+        {
+            ViewPortWidth = 200,
+            ViewPortHeight = 120,
+            FontSize = 16f,
+        });
+
+        var childBackgrounds = displayList.Commands
+            .OfType<FillRectCommand>()
+            .Where(command => command.Rect.Height == 20f && command.Rect.Width < 150f)
+            .OrderBy(command => command.Rect.X)
+            .ToArray();
+
+        Assert.Equal(2, childBackgrounds.Length);
+        Assert.Equal(0f, childBackgrounds[0].Rect.X);
+        Assert.Equal(50f, childBackgrounds[0].Rect.Width);
+        Assert.Equal(50f, childBackgrounds[1].Rect.X);
+        Assert.Equal(100f, childBackgrounds[1].Rect.Width);
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_ExpandsRepeatFunctionIntoFixedTracks()
+    {
+        var document = await ParseAsync("""
+            <html><body>
+                <div style="display:grid; grid-template-columns:repeat(3, 40px); gap:5px; width:150px; height:20px;">
+                    <div style="height:20px; background-color:#ff0000;"></div>
+                    <div style="height:20px; background-color:#0000ff;"></div>
+                    <div style="height:20px; background-color:#00ff00;"></div>
+                </div>
+            </body></html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, new DefaultRenderDevice
+        {
+            ViewPortWidth = 200,
+            ViewPortHeight = 120,
+            FontSize = 16f,
+        });
+
+        var childBackgrounds = displayList.Commands
+            .OfType<FillRectCommand>()
+            .Where(command => command.Rect.Height == 20f && command.Rect.Width < 150f)
+            .OrderBy(command => command.Rect.X)
+            .ToArray();
+
+        Assert.Equal(3, childBackgrounds.Length);
+        Assert.Equal(0f, childBackgrounds[0].Rect.X);
+        Assert.Equal(40f, childBackgrounds[0].Rect.Width);
+        Assert.Equal(45f, childBackgrounds[1].Rect.X);
+        Assert.Equal(40f, childBackgrounds[1].Rect.Width);
+        Assert.Equal(90f, childBackgrounds[2].Rect.X);
+        Assert.Equal(40f, childBackgrounds[2].Rect.Width);
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_ClampsMinMaxTrackToItsFractionalMaximum()
+    {
+        var document = await ParseAsync("""
+            <html><body>
+                <div style="display:grid; grid-template-columns:minmax(30px, 1fr) 60px; width:150px; height:20px;">
+                    <div style="height:20px; background-color:#ff0000;"></div>
+                    <div style="height:20px; background-color:#0000ff;"></div>
+                </div>
+            </body></html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, new DefaultRenderDevice
+        {
+            ViewPortWidth = 200,
+            ViewPortHeight = 120,
+            FontSize = 16f,
+        });
+
+        var childBackgrounds = displayList.Commands
+            .OfType<FillRectCommand>()
+            .Where(command => command.Rect.Height == 20f && command.Rect.Width < 150f)
+            .OrderBy(command => command.Rect.X)
+            .ToArray();
+
+        Assert.Equal(2, childBackgrounds.Length);
+        Assert.Equal(0f, childBackgrounds[0].Rect.X);
+        Assert.Equal(90f, childBackgrounds[0].Rect.Width);
+        Assert.Equal(90f, childBackgrounds[1].Rect.X);
+        Assert.Equal(60f, childBackgrounds[1].Rect.Width);
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_ClampsAutoTrackToItsMinMaxLengthBounds()
+    {
+        var document = await ParseAsync("""
+            <html><body>
+                <div style="display:grid; grid-template-columns:minmax(60px, 100px) 30px; width:200px; height:20px;">
+                    <div style="width:20px; height:20px; background-color:#ff0000;"></div>
+                    <div style="height:20px; background-color:#0000ff;"></div>
+                </div>
+                <div style="display:grid; grid-template-columns:minmax(60px, 100px) 30px; width:250px; height:15px;">
+                    <div style="width:150px; height:15px; background-color:#00ff00;"></div>
+                    <div style="height:15px; background-color:#ffff00;"></div>
+                </div>
+            </body></html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, new DefaultRenderDevice
+        {
+            ViewPortWidth = 300,
+            ViewPortHeight = 200,
+            FontSize = 16f,
+        });
+
+        var secondColumnCells = displayList.Commands
+            .OfType<FillRectCommand>()
+            .Where(command => command.Rect.Width == 30f)
+            .OrderBy(command => command.Rect.Y)
+            .ToArray();
+
+        Assert.Equal(2, secondColumnCells.Length);
+        // First grid: the item's estimated size (20px) is below the minmax() floor, so the
+        // Auto track clamps up to its 60px minimum.
+        Assert.Equal(60f, secondColumnCells[0].Rect.X);
+        // Second grid: the item's estimated size (150px) exceeds the minmax() ceiling, so the
+        // Auto track clamps down to its 100px maximum.
+        Assert.Equal(100f, secondColumnCells[1].Rect.X);
     }
 
     [Fact]
@@ -1049,13 +1194,17 @@ public sealed class HtmlRendererTests
             .ThenBy(command => command.Rect.X)
             .ToArray();
 
+        // Implicit auto rows now size to their own content (10px, each item's actual height),
+        // the same way auto columns already did - this used to assert 20 (containerHeight/rowCount,
+        // 40/2), a coarse guess from before implicit rows grew to fit content like explicit Auto
+        // tracks do (see GrowGridTrackSize).
         Assert.Equal(3, childBackgrounds.Length);
         Assert.Equal(0f, childBackgrounds[0].Rect.X);
         Assert.Equal(0f, childBackgrounds[0].Rect.Y);
         Assert.Equal(50f, childBackgrounds[1].Rect.X);
         Assert.Equal(0f, childBackgrounds[1].Rect.Y);
         Assert.Equal(0f, childBackgrounds[2].Rect.X);
-        Assert.Equal(20f, childBackgrounds[2].Rect.Y);
+        Assert.Equal(10f, childBackgrounds[2].Rect.Y);
     }
 
     [Fact]
