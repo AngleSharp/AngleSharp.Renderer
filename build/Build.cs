@@ -26,7 +26,7 @@ class Build : FalloutBuild
     [Fallout.Common.Parameter("ReleaseNotesFilePath - To determine the SemanticVersion")]
     readonly AbsolutePath ReleaseNotesFilePath = RootDirectory / "CHANGELOG.md";
 
-    [Fallout.Common.Parameter("AngleSharp package version override (e.g. 1.8.0 for compatibility checks)")]
+    [Fallout.Common.Parameter("AngleSharp package version override (e.g. 1.8.1 for compatibility checks)")]
     readonly string AngleSharpVersion;
 
     [Fallout.Common.Parameter("AngleSharp.Css package version override (e.g. 1.1.1 for compatibility checks)")]

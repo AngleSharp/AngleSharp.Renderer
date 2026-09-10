@@ -15,7 +15,7 @@ permissions:
   contents: write
 
 env:
-  ANGLESHARP_VERSION: 1.8.0
+  ANGLESHARP_VERSION: 1.8.1
   ANGLESHARP_CSS_VERSION: 1.1.1
 
 jobs:
