@@ -2042,7 +2042,7 @@ public sealed class HtmlRendererTests
         // A border-radius percentage resolves per-axis against the element's own border box - the
         // horizontal component against its 200px width (10% = 20px), the vertical component
         // against its 80px height (10% = 8px) - per spec. An older AngleSharp.Css version this
-        // test used to pin (1.1.0) resolved both components against the containing block's width
+        // test used to pin (1.1.1) resolved both components against the containing block's width
         // instead (a confirmed upstream bug, reported with a reproducing test in AngleSharp.Css's
         // own suite - see BorderRadiusPercentageResolutionTests.cs there); fixed upstream since,
         // confirmed by this test flipping from the old (wrong) 30px/30px to the correct 20px/8px
@@ -4085,11 +4085,6 @@ public sealed class HtmlRendererTests
     [Fact]
     public async Task BuildDisplayList_AuthoredTransformDoesNotCrashAngleSharpCssComputation()
     {
-        // A real, confirmed AngleSharp.Css 1.1.0 bug: computing *any* declared `transform`
-        // containing a translate/translateX/translateY function throws a NullReferenceException
-        // from inside its own CssTranslateValue.Compute() during render-tree construction, before
-        // this renderer's own code even runs - this regression test's only job is to keep
-        // succeeding (not throwing) for exactly the functions confirmed to trigger it.
         var document = await ParseAsync("""
             <html><body>
                 <div style="width:10px; height:10px; transform: translate(1px, 1px);"></div>

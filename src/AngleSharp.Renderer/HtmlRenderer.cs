@@ -2986,7 +2986,7 @@ public sealed class HtmlRenderer
     /// ever sees it, the same "extract to a data-render-* attribute" workaround
     /// <see cref="TryExtractGradientBackground"/> already established for gradient
     /// `background-image` values - except here the workaround is for a genuine upstream crash, not
-    /// an unsupported-value gap: AngleSharp.Css 1.1.0's own `CssTranslateValue.Compute()` throws a
+    /// an unsupported-value gap: AngleSharp.Css's own `CssTranslateValue.Compute()` throws a
     /// `NullReferenceException` - confirmed via a failing test with a minimal repro, not assumed -
     /// for *any* `translate`/`translateX`/`translateY` function, and that crash happens eagerly
     /// while building the render tree (`RenderTreeBuilder.RenderElement` computing the *entire*
