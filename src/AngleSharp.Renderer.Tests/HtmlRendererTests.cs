@@ -2444,14 +2444,7 @@ public sealed class HtmlRendererTests
 
         // A border-radius percentage resolves per-axis against the element's own border box - the
         // horizontal component against its 200px width (10% = 20px), the vertical component
-        // against its 80px height (10% = 8px) - per spec. An older AngleSharp.Css version this
-        // test used to pin (1.1.1) resolved both components against the containing block's width
-        // instead (a confirmed upstream bug, reported with a reproducing test in AngleSharp.Css's
-        // own suite - see BorderRadiusPercentageResolutionTests.cs there); fixed upstream since,
-        // confirmed by this test flipping from the old (wrong) 30px/30px to the correct 20px/8px
-        // with no renderer-side code change of its own. Neither exceeds either edge, so no
-        // overlap-clamping kicks in here (that path is covered separately by the pixel-radius
-        // clamp test below).
+        // against its 80px height (10% = 8px) - per spec.
         Assert.Equal(20f, boxBackground.Radii.TopLeftX);
         Assert.Equal(8f, boxBackground.Radii.TopLeftY);
     }
