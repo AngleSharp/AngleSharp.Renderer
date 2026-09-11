@@ -299,15 +299,37 @@ numbers), `BuildDisplayList` (pure layout, the baseline), and `RenderToPng` (lay
 rasterization + PNG encoding) - the document is parsed once in `[GlobalSetup]`, not inside the
 timed methods, since layout never mutates the DOM.
 
-`BASELINE.md` (same directory) records the current baseline numbers and the reasoning for where to
-look first when investigating performance - update it (numbers and date) whenever a meaningful
-optimization lands, so it keeps tracking the current state rather than the day it was first
-written. As of this writing the standout finding is allocation, not raw CPU time: ~1.45 GB managed
-allocation for that one ~1500-element page (roughly 1MB per DOM element laid out) - `CreateStyleMap`
-being rebuilt from scratch on every call, and called more than once per element in some paths
-(flex/grid item size estimation, inline-block size prediction, and an element's own real layout
-pass each build an independent copy of the same element's style map), is the leading suspect and
-the natural place to start.
+`BASELINE.md` (same directory) records the current baseline numbers, plus a `History` section
+documenting each optimization pass and the before/after it produced - update it (numbers, and a
+new `History` entry) whenever a meaningful optimization lands, so the top-level "current numbers"
+section keeps tracking the current state rather than the day this file was first written.
+
+The first pass already landed: **`CreateStyleMap` result caching**, keyed by element identity for
+the lifetime of a single render. `CreateStyleMap` builds a full ~90-property style map from scratch
+on every call, but was being called more than once for the same element in several places - flex/
+grid item size estimation, inline-block line-flow prediction, a margin-collapse lookahead, and
+(the biggest offender, since it runs for essentially every container's every child)
+`OrderChildrenForPainting`'s own z-index-bucketing pass - all reading a given element's style ahead
+of that same element's own, later, authoritative layout call. `LayoutContext` now carries a
+`Dictionary<IElement, Dictionary<string, string>> StyleMapCache` (`ReferenceEqualityComparer`,
+matching `LayoutCapture`'s own precedent for keying by `IElement`); `GetOrCreateStyleMap(context,
+element, style)` wraps `CreateStyleMap` with a cache check/populate and is now what every call site
+uses instead of calling `CreateStyleMap` directly. This cut `BuildDisplayList` to roughly 40% of its
+original time and allocation (~2.5x faster, ~2.4x less allocated - see `BASELINE.md`'s `History`
+section for exact numbers). Correctness rests entirely on the cache never outliving the single
+`BuildDisplayList`/`RenderToPng`/`CaptureLayoutMetrics` call it was built for - `CreateLayoutContext`
+constructs a brand new, empty cache every call, never reusing one from a previous call, which is
+what keeps this safe for the interactive `:hover`/`transition`/`animation`/caret-blink case (a
+cache that outlived one call would silently serve stale style once the same document legitimately
+computes different style on a later render). Any *new* call site that needs an element's style map
+must go through `GetOrCreateStyleMap`, not `CreateStyleMap` directly, to stay covered by this.
+
+Remaining allocation after that fix is still real (~615 MB for the same ~1500-element page, ~400KB
+per element) - `CreateStyleMap` itself still builds a full `Dictionary<string, string>` plus
+per-property strings for every element exactly once now, which is the natural next target (e.g.
+avoiding the dictionary entirely in favor of typed fields), but is a substantially larger, riskier
+refactor - every `ParseLength`/`GetPropertyValue`-style call site throughout this file reads from
+that dictionary by string key - deliberately not attempted in the same pass as the caching fix.
 
 ## Repository Notes
 

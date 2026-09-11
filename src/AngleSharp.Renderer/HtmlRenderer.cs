@@ -70,7 +70,8 @@ public sealed class HtmlRenderer
         float LineHeightMultiplier,
         float ParagraphSpacing,
         ITextMeasurer TextMeasurer,
-        FontFaceSet Fonts);
+        FontFaceSet Fonts,
+        Dictionary<IElement, Dictionary<string, string>> StyleMapCache);
 
     private sealed class LayoutCapture
     {
@@ -210,7 +211,14 @@ public sealed class HtmlRenderer
             LineHeightMultiplier: defaultLineHeight,
             ParagraphSpacing: 0f,
             TextMeasurer: textMeasurer,
-            Fonts: FontFaceLoader.Load(document));
+            Fonts: FontFaceLoader.Load(document),
+            // Scoped to this one BuildDisplayList/RenderToPng/CaptureLayoutMetrics call only - a
+            // fresh, empty cache every time CreateLayoutContext runs (never persisted across
+            // calls) is what keeps this safe for interactive re-renders: a hover/transition/
+            // animation-driven style change between two successive renders of the same document
+            // must never be answered from a stale map computed on a previous call. See
+            // GetOrCreateStyleMap's own remarks for why caching within a single call is safe.
+            StyleMapCache: new Dictionary<IElement, Dictionary<string, string>>(ReferenceEqualityComparer.Instance));
     }
 
     /// <summary>
@@ -355,10 +363,10 @@ public sealed class HtmlRenderer
         // has been laid out - see the loop below.
         var stickyRanges = new List<(int StartIndex, int Count)>();
 
-        foreach (var child in OrderChildrenForPainting(root.Children))
+        foreach (var child in OrderChildrenForPainting(root.Children, context))
         {
             var isStickyChild = child is ElementRenderNode stickyCandidate &&
-                IsStickyPositioned(CreateStyleMap(stickyCandidate.ComputedStyle, stickyCandidate.Ref));
+                IsStickyPositioned(GetOrCreateStyleMap(context, stickyCandidate.Ref, stickyCandidate.ComputedStyle));
             var stickyStartIndex = displayList.Commands.Count;
 
             LayoutNode(
@@ -483,7 +491,7 @@ public sealed class HtmlRenderer
     {
         var element = node.Ref;
         var computedStyle = node.ComputedStyle;
-        var styleMap = CreateStyleMap(node.ComputedStyle, node.Ref);
+        var styleMap = GetOrCreateStyleMap(context, node.Ref, node.ComputedStyle);
 
         if (!node.IsVisible())
         {
@@ -614,7 +622,7 @@ public sealed class HtmlRenderer
         var effectiveMarginTop = marginTop;
 
         if (collapseWithFirstChild &&
-            TryGetFirstCollapsibleChildTopMargin(node, flowContainingWidth, out var firstChildTopMargin))
+            TryGetFirstCollapsibleChildTopMargin(node, flowContainingWidth, context, out var firstChildTopMargin))
         {
             effectiveMarginTop = CollapseMargins(marginTop, firstChildTopMargin);
         }
@@ -751,7 +759,7 @@ public sealed class HtmlRenderer
                                (string.Equals(tagName, "svg", StringComparison.OrdinalIgnoreCase) ||
                                formControlKind is FormControlKind.Select or FormControlKind.Button)
             ? []
-            : OrderChildrenForPainting(node.Children).ToList();
+            : OrderChildrenForPainting(node.Children, context).ToList();
         // An inline-block child counts as inline content here too (not just plain inline/br) - it
         // is a real, confirmed bug that it previously did not: a parent whose children were *only*
         // inline-block elements (the common form-control case - two checkboxes with no other inline
@@ -1020,7 +1028,7 @@ public sealed class HtmlRenderer
                         }
                         else
                         {
-                            var childTextStyle = ResolveTextStyle(CreateStyleMap(inlineElement.ComputedStyle), currentTextStyle);
+                            var childTextStyle = ResolveTextStyle(GetOrCreateStyleMap(context, inlineElement.Ref, inlineElement.ComputedStyle), currentTextStyle);
                             var inlineText = NormalizeWhitespaceForInlineRun(ResolvePlainInlineElementText(inlineElement), childTextStyle.WhiteSpace);
 
                             if (inlineText.Length > 0)
@@ -1298,9 +1306,9 @@ public sealed class HtmlRenderer
         var alignItems = GetAlignItems(styleMap);
         var flexWrap = GetFlexWrap(styleMap);
         var alignContent = GetAlignContent(styleMap);
-        var flexItems = OrderChildrenForPainting(node.Children)
+        var flexItems = OrderChildrenForPainting(node.Children, context)
             .Where(child => child is ElementRenderNode || child is TextRenderNode)
-            .Select(child => CreateFlexItemLayoutInfo(child, isRowDirection, containingWidth))
+            .Select(child => CreateFlexItemLayoutInfo(child, isRowDirection, containingWidth, context))
             .OrderBy(item => item.Order)
             .ToList();
 
@@ -1691,7 +1699,7 @@ public sealed class HtmlRenderer
         marginBottom = 0f;
 
         var element = elementNode.Ref;
-        var styleMap = CreateStyleMap(elementNode.ComputedStyle, element);
+        var styleMap = GetOrCreateStyleMap(context, element, elementNode.ComputedStyle);
         var textStyle = ResolveTextStyle(styleMap, inheritedTextStyle);
         var formControlKind = ResolveFormControlKind(element);
 
@@ -1772,7 +1780,7 @@ public sealed class HtmlRenderer
         DisplayList displayList,
         float maxY)
     {
-        var tableStyle = CreateStyleMap(tableNode.ComputedStyle);
+        var tableStyle = GetOrCreateStyleMap(context, tableNode.Ref, tableNode.ComputedStyle);
         var specifiedWidth = ParseLength(tableStyle, "width", containingWidth, float.NaN, allowAuto: true);
         var availableWidth = float.IsNaN(specifiedWidth) ? containingWidth : specifiedWidth;
         var borderCollapse = string.Equals(tableStyle.TryGetValue("border-collapse", out var borderCollapseValue) ? borderCollapseValue : null, "collapse", StringComparison.OrdinalIgnoreCase);
@@ -1793,7 +1801,7 @@ public sealed class HtmlRenderer
 
             for (var index = 0; index < columnNodes.Count; index++)
             {
-                var columnStyle = CreateStyleMap(columnNodes[index].ComputedStyle);
+                var columnStyle = GetOrCreateStyleMap(context, columnNodes[index].Ref, columnNodes[index].ComputedStyle);
                 var specifiedColumnWidth = ParseLength(columnStyle, "width", availableWidth, float.NaN, allowAuto: true);
                 if (!float.IsNaN(specifiedColumnWidth))
                 {
@@ -1848,7 +1856,7 @@ public sealed class HtmlRenderer
                     currentColumnIndex++;
                 }
 
-                var cellStyle = CreateStyleMap(cellNode.ComputedStyle);
+                var cellStyle = GetOrCreateStyleMap(context, cellNode.Ref, cellNode.ComputedStyle);
                 var cellTextStyle = ResolveTextStyle(cellStyle, inheritedTextStyle);
                 var text = NormalizeWhitespace(cellNode.Ref.TextContent ?? string.Empty);
                 var colspan = 1;
@@ -2224,7 +2232,7 @@ public sealed class HtmlRenderer
                 continue;
             }
 
-            var childStyleMap = CreateStyleMap(elementChild.ComputedStyle, elementChild.Ref);
+            var childStyleMap = GetOrCreateStyleMap(context, elementChild.Ref, elementChild.ComputedStyle);
             var placementColumn = ResolveGridPlacementFromMap(childStyleMap, "grid-column", currentColumn);
             var placementRow = ResolveGridPlacementFromMap(childStyleMap, "grid-row", currentRow);
             var hasExplicitPlacement = childStyleMap.ContainsKey("grid-column") || childStyleMap.ContainsKey("grid-row");
@@ -3032,14 +3040,14 @@ public sealed class HtmlRenderer
         return normalized == "auto" ? fallback : normalized;
     }
 
-    private static FlexItemLayoutInfo CreateFlexItemLayoutInfo(IRenderNode child, bool isRowDirection, float relativeTo)
+    private static FlexItemLayoutInfo CreateFlexItemLayoutInfo(IRenderNode child, bool isRowDirection, float relativeTo, LayoutContext context)
     {
         if (child is not ElementRenderNode elementChild)
         {
             return new FlexItemLayoutInfo(child, new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase), 0f, 0f, 1f, 0f, 0f, "auto");
         }
 
-        var childStyle = CreateStyleMap(elementChild.ComputedStyle, elementChild.Ref);
+        var childStyle = GetOrCreateStyleMap(context, elementChild.Ref, elementChild.ComputedStyle);
         // Needed so ResolveFlexBaseSize/ResolveFlexCrossSize can convert an authored border-box
         // width/height/flex-basis into this renderer's content-box convention using *this item's*
         // own border/padding - not the container's - before flex-grow/shrink ever runs, the same
@@ -3549,6 +3557,47 @@ public sealed class HtmlRenderer
         return computedStyle.GetPropertyValue(propertyName);
     }
 
+    /// <summary>
+    /// A single element's style map is rebuilt by <see cref="CreateStyleMap"/> more than once per
+    /// render in several places - a flex/grid item's own placement/size estimation pass, an
+    /// inline-block's line-flow-prediction pass, a margin-collapse lookahead at the first visible
+    /// child, and <see cref="OrderChildrenForPainting"/>'s own z-index-bucketing pass all read the
+    /// same element's style ahead of that same element's own, authoritative layout call later -
+    /// confirmed, via <c>AngleSharp.Renderer.Benchmarks</c>, to be the single largest source of
+    /// managed allocation in this renderer (~1MB per element laid out on a realistic page, almost
+    /// entirely from <see cref="CreateStyleMap"/>'s own ~90 individual property reads run more
+    /// than once for the same element). This wraps it with a cache keyed by element identity
+    /// (<see cref="ReferenceEqualityComparer"/>, matching <see cref="LayoutCapture"/>'s own
+    /// precedent for keying by <see cref="IElement"/>) so each element's style is actually computed
+    /// only once per render, regardless of how many places along the way ask for it.
+    ///
+    /// Safe specifically because layout never mutates the DOM or a node's computed style while
+    /// laying it out - nothing between two reads of the same element's style within one
+    /// <see cref="BuildDisplayList(IDocument, IRenderDevice)"/>/<see cref="RenderToPng(IDocument, IRenderDevice)"/>
+    /// call could ever make a second, differently-answered call actually necessary. Correctness
+    /// across *separate* calls (the interactive `:hover`/`transition`/`animation`/caret-blink
+    /// case, where the same document really can compute different style between one render and
+    /// the next) relies entirely on <c>CreateLayoutContext</c> creating a brand new, empty cache
+    /// every single call - never reusing one from a previous call - so this cache's own lifetime
+    /// is never longer than the styles it caches remain valid for.
+    /// </summary>
+    private static Dictionary<string, string> GetOrCreateStyleMap(LayoutContext context, IElement? element, ICssStyleDeclaration style)
+    {
+        if (element is null)
+        {
+            return CreateStyleMap(style, element);
+        }
+
+        if (context.StyleMapCache.TryGetValue(element, out var cached))
+        {
+            return cached;
+        }
+
+        var map = CreateStyleMap(style, element);
+        context.StyleMapCache[element] = map;
+        return map;
+    }
+
     private static Dictionary<string, string> CreateStyleMap(ICssStyleDeclaration style, IElement? element = null)
     {
         var map = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
@@ -3769,7 +3818,7 @@ public sealed class HtmlRenderer
         return null;
     }
 
-    private static bool TryGetFirstCollapsibleChildTopMargin(ElementRenderNode node, float containingWidth, out float marginTop)
+    private static bool TryGetFirstCollapsibleChildTopMargin(ElementRenderNode node, float containingWidth, LayoutContext context, out float marginTop)
     {
         foreach (var child in node.Children)
         {
@@ -3808,7 +3857,7 @@ public sealed class HtmlRenderer
                 return false;
             }
 
-            var childStyle = CreateStyleMap(childElement.ComputedStyle, childElement.Ref);
+            var childStyle = GetOrCreateStyleMap(context, childElement.Ref, childElement.ComputedStyle);
             marginTop = ParseLength(childStyle, "margin-top", containingWidth, 0f, allowAuto: false);
             return true;
         }
@@ -3817,7 +3866,7 @@ public sealed class HtmlRenderer
         return false;
     }
 
-    private static IEnumerable<IRenderNode> OrderChildrenForPainting(IEnumerable<IRenderNode> children)
+    private static IEnumerable<IRenderNode> OrderChildrenForPainting(IEnumerable<IRenderNode> children, LayoutContext context)
     {
         var negatives = new List<(IRenderNode Node, int Z, int Index)>();
         var flow = new List<(IRenderNode Node, int Index)>();
@@ -3829,7 +3878,7 @@ public sealed class HtmlRenderer
         {
             if (child is ElementRenderNode elementChild)
             {
-                var childStyleMap = CreateStyleMap(elementChild.ComputedStyle, elementChild.Ref);
+                var childStyleMap = GetOrCreateStyleMap(context, elementChild.Ref, elementChild.ComputedStyle);
 
                 if (IsOutOfFlowPositioned(childStyleMap))
                 {
