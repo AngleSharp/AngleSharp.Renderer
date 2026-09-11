@@ -5223,6 +5223,198 @@ public sealed class HtmlRendererTests
         Assert.Equal(-40f, fill.Rect.Y);
     }
 
+    [Fact]
+    public async Task BuildDisplayList_ContentBoxSizingRemainsTheDefaultAndAddsPaddingAndBorderOnTop()
+    {
+        var renderDevice = new DefaultRenderDevice { ViewPortWidth = 300, ViewPortHeight = 200, FontSize = 16 };
+        var configuration = Configuration.Default.WithCss().WithRenderDevice(renderDevice);
+        var document = await ParseAsync("""
+            <html>
+              <head><style>html, body { margin: 0; padding: 0; }</style></head>
+              <body>
+                <div style="width:100px; height:50px; padding:10px; border:5px solid black; background-color:#00ff00;"></div>
+              </body>
+            </html>
+            """, configuration);
+
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, renderDevice);
+        var fill = Assert.Single(displayList.Commands.OfType<FillRectCommand>().Where(f => f.Color.Equals(new RenderColor(0, 255, 0))));
+
+        // Unset box-sizing (content-box, the CSS default) is unaffected by this feature: the
+        // authored width/height already describe the content box, so padding and border are added
+        // on top of it, exactly as this renderer always assumed before box-sizing existed anywhere
+        // in its style map - 100 + 2*10 (padding) + 2*5 (border) = 130.
+        Assert.Equal(130f, fill.Rect.Width);
+        Assert.Equal(80f, fill.Rect.Height);
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_BorderBoxSizingMakesWidthAndHeightIncludePaddingAndBorder()
+    {
+        var renderDevice = new DefaultRenderDevice { ViewPortWidth = 300, ViewPortHeight = 200, FontSize = 16 };
+        var configuration = Configuration.Default.WithCss().WithRenderDevice(renderDevice);
+        var document = await ParseAsync("""
+            <html>
+              <head><style>html, body { margin: 0; padding: 0; }</style></head>
+              <body>
+                <div style="box-sizing:border-box; width:100px; height:50px; padding:10px; border:5px solid black; background-color:#00ff00;"></div>
+              </body>
+            </html>
+            """, configuration);
+
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, renderDevice);
+        var fill = Assert.Single(displayList.Commands.OfType<FillRectCommand>().Where(f => f.Color.Equals(new RenderColor(0, 255, 0))));
+
+        // box-sizing: border-box means the authored width/height already *are* the border-box
+        // size - padding and border eat into the content area instead of being added on top of it,
+        // so the painted border box stays exactly 100x50 regardless of padding/border.
+        Assert.Equal(100f, fill.Rect.Width);
+        Assert.Equal(50f, fill.Rect.Height);
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_BorderBoxSizingClampsContentToZeroWhenPaddingAndBorderExceedTheDeclaredSize()
+    {
+        var renderDevice = new DefaultRenderDevice { ViewPortWidth = 300, ViewPortHeight = 200, FontSize = 16 };
+        var configuration = Configuration.Default.WithCss().WithRenderDevice(renderDevice);
+        var document = await ParseAsync("""
+            <html>
+              <head><style>html, body { margin: 0; padding: 0; }</style></head>
+              <body>
+                <div style="box-sizing:border-box; width:20px; height:20px; padding:20px; border:5px solid black; background-color:#00ff00;"></div>
+              </body>
+            </html>
+            """, configuration);
+
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, renderDevice);
+        var fill = Assert.Single(displayList.Commands.OfType<FillRectCommand>().Where(f => f.Color.Equals(new RenderColor(0, 255, 0))));
+
+        // Padding (20px each side) plus border (5px each side) alone already exceed the declared
+        // 20px border box - ResolveAuthoredDimension clamps the resulting negative content size to
+        // 0 rather than letting it go negative, matching a real browser: the box still cannot be
+        // physically smaller than its own border+padding, so the rendered border box ends up
+        // border+padding (2*5 + 2*20 = 50) rather than the too-small declared 20px, exactly as
+        // borderBoxWidth/Height's own pre-existing bottom-up "border + padding + content" formula
+        // (unchanged by this feature) already produces once content is 0.
+        Assert.Equal(50f, fill.Rect.Width);
+        Assert.Equal(50f, fill.Rect.Height);
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_FlexItemBorderBoxWidthIncludesPaddingAndBorder()
+    {
+        var renderDevice = new DefaultRenderDevice { ViewPortWidth = 300, ViewPortHeight = 200, FontSize = 16 };
+        var configuration = Configuration.Default.WithCss().WithRenderDevice(renderDevice);
+        var document = await ParseAsync("""
+            <html>
+              <head><style>html, body { margin: 0; padding: 0; }</style></head>
+              <body>
+                <div style="display:flex; width:300px;">
+                  <div style="box-sizing:border-box; width:100px; height:40px; padding:10px; border:5px solid black; background-color:#00ff00;"></div>
+                </div>
+              </body>
+            </html>
+            """, configuration);
+
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, renderDevice);
+        var fill = Assert.Single(displayList.Commands.OfType<FillRectCommand>().Where(f => f.Color.Equals(new RenderColor(0, 255, 0))));
+
+        // A flex item's own box-sizing follows the same rule as an ordinary block box -
+        // ResolveFlexBaseSize converts the item's authored border-box width into a content-box
+        // main size, using this item's own (not the container's) border/padding, before the
+        // flex-grow/shrink distribution ever runs.
+        Assert.Equal(100f, fill.Rect.Width);
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_FlexContainerBorderBoxWidthIncludesPaddingAndBorder()
+    {
+        var renderDevice = new DefaultRenderDevice { ViewPortWidth = 300, ViewPortHeight = 200, FontSize = 16 };
+        var configuration = Configuration.Default.WithCss().WithRenderDevice(renderDevice);
+        var document = await ParseAsync("""
+            <html>
+              <head><style>html, body { margin: 0; padding: 0; }</style></head>
+              <body>
+                <div style="display:flex; box-sizing:border-box; width:200px; height:80px; padding:20px; border:10px solid black; background-color:#ff00ff;">
+                  <div style="width:30px; height:30px; background-color:#00ff00;"></div>
+                </div>
+              </body>
+            </html>
+            """, configuration);
+
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, renderDevice);
+        var fill = Assert.Single(displayList.Commands.OfType<FillRectCommand>().Where(f => f.Color.Equals(new RenderColor(255, 0, 255))));
+
+        // The flex container itself is an ordinary box for sizing purposes - its own declared
+        // border-box width/height (200x80) must stay exactly that regardless of its own padding
+        // (20px) and border (10px), with the reduced space left over distributed to items instead.
+        Assert.Equal(200f, fill.Rect.Width);
+        Assert.Equal(80f, fill.Rect.Height);
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_GridContainerBorderBoxHeightIncludesPaddingAndBorder()
+    {
+        var renderDevice = new DefaultRenderDevice { ViewPortWidth = 300, ViewPortHeight = 200, FontSize = 16 };
+        var configuration = Configuration.Default.WithCss().WithRenderDevice(renderDevice);
+        var document = await ParseAsync("""
+            <html>
+              <head><style>html, body { margin: 0; padding: 0; }</style></head>
+              <body>
+                <div style="display:grid; grid-template-columns: 1fr; box-sizing:border-box; width:150px; height:100px; padding:10px; border:5px solid black; background-color:#ff00ff;">
+                  <div style="height:10px; background-color:#00ff00;"></div>
+                </div>
+              </body>
+            </html>
+            """, configuration);
+
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, renderDevice);
+        var fill = Assert.Single(displayList.Commands.OfType<FillRectCommand>().Where(f => f.Color.Equals(new RenderColor(255, 0, 255))));
+
+        // The child is given an explicit, small height so the implicit row's own auto-growth
+        // (ResolveGridItemEstimatedSize's pre-existing, unrelated fallback of the *container's*
+        // content width whenever an item's own height is unset) never dominates over the
+        // container's own specified height - isolating this assertion to the box-sizing
+        // conversion this test actually targets.
+        Assert.Equal(100f, fill.Rect.Height);
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_InlineBlockBorderBoxWidthIsUsedForLineWrapPrediction()
+    {
+        var renderDevice = new DefaultRenderDevice { ViewPortWidth = 300, ViewPortHeight = 200, FontSize = 16 };
+        var configuration = Configuration.Default.WithCss().WithRenderDevice(renderDevice);
+        var document = await ParseAsync("""
+            <html>
+              <head><style>html, body { margin: 0; padding: 0; }</style></head>
+              <body>
+                <div style="width:100px;">
+                  <span style="display:inline-block; box-sizing:border-box; width:50px; height:20px; padding:5px; border:2px solid black; background-color:#00ff00;"></span><span style="display:inline-block; box-sizing:border-box; width:50px; height:20px; padding:5px; border:2px solid black; background-color:#0000ff;"></span>
+                </div>
+              </body>
+            </html>
+            """, configuration);
+
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, renderDevice);
+        var greenFill = Assert.Single(displayList.Commands.OfType<FillRectCommand>().Where(f => f.Color.Equals(new RenderColor(0, 255, 0))));
+        var blueFill = Assert.Single(displayList.Commands.OfType<FillRectCommand>().Where(f => f.Color.Equals(new RenderColor(0, 0, 255))));
+
+        // TryMeasureInlineBlockBoxSize's own prediction must agree with box-sizing too: each
+        // border-box inline-block is exactly 50px wide (not 50+2*5+2*2=64, which its own padding
+        // and border would inflate it to under the old, box-sizing-unaware prediction), so both
+        // fit together in the 100px container on the very same line without wrapping.
+        Assert.Equal(50f, greenFill.Rect.Width);
+        Assert.Equal(greenFill.Rect.Y, blueFill.Rect.Y);
+        Assert.Equal(50f, blueFill.Rect.X);
+    }
+
     private static readonly RenderColor FormControlAccentColorForTests = new(26, 115, 232);
 
     private static async Task<AngleSharp.Dom.IDocument> ParseAsync(string html, IConfiguration? configuration = null, string? address = null)

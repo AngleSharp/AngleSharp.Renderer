@@ -2758,6 +2758,42 @@ public sealed class VisualConformanceTests
           maxDifferentPixels: 0);
     }
 
+    [Fact]
+    public async Task RenderToPng_BorderBoxSizingKeepsTheDeclaredWidthInsteadOfAddingPaddingAndBorder()
+    {
+        var renderDevice = new DefaultRenderDevice
+        {
+            ViewPortWidth = 200,
+            ViewPortHeight = 80,
+            DeviceWidth = 200,
+            DeviceHeight = 80,
+            FontSize = 16,
+        };
+        var configuration = Configuration.Default.WithCss().WithRenderDevice(renderDevice);
+        var document = await ParseAsync("""
+            <html>
+              <head><style>html, body { margin: 0; padding: 0; }</style></head>
+              <body>
+                <div style="width:60px; height:20px; padding:10px; border:5px solid black; background-color:rgb(0,180,0);"></div>
+                <div style="box-sizing:border-box; width:60px; height:20px; padding:10px; border:5px solid black; background-color:rgb(0,0,255);"></div>
+              </body>
+            </html>
+            """, configuration);
+
+        var renderer = new HtmlRenderer();
+        var image = renderer.RenderToPng(document, renderDevice);
+
+        // The green box (default content-box) grows to 60 + 2*10 (padding) + 2*5 (border) = 90px
+        // wide; the blue box (box-sizing: border-box), authored with the exact same width/padding/
+        // border, stays exactly 60px wide instead - the padding and border eat into its content
+        // area rather than adding to the declared size.
+        VisualSnapshotVerifier.VerifyOrCreate(
+          snapshotName: "border-box-sizing-keeps-the-declared-width.png",
+          actualPng: image.Data,
+          perChannelTolerance: 0,
+          maxDifferentPixels: 0);
+    }
+
     private static async Task<AngleSharp.Dom.IDocument> ParseAsync(string html, IConfiguration? configuration = null)
     {
         var context = BrowsingContext.New(configuration ?? Configuration.Default.WithCss());

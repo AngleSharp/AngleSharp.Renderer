@@ -623,6 +623,7 @@ public sealed class HtmlRenderer
             styleMap,
             flowContainingWidth,
             float.NaN,
+            borderLeft + borderRight + paddingLeft + paddingRight,
             isFlexItem,
             isRowDirection,
             flexMainSize,
@@ -708,6 +709,7 @@ public sealed class HtmlRenderer
                 styleMap,
                 flowContainingWidth,
                 float.NaN,
+                borderTop + borderBottom + paddingTop + paddingBottom,
                 isFlexItem,
                 isRowDirection,
                 flexMainSize,
@@ -1051,6 +1053,7 @@ public sealed class HtmlRenderer
             styleMap,
             flowContainingWidth,
             float.NaN,
+            borderTop + borderBottom + paddingTop + paddingBottom,
             isFlexItem,
             isRowDirection,
             flexMainSize,
@@ -1309,9 +1312,12 @@ public sealed class HtmlRenderer
             return;
         }
 
+        var horizontalBorderAndPadding = borderLeft + borderRight + paddingLeft + paddingRight;
+        var verticalBorderAndPadding = borderTop + borderBottom + paddingTop + paddingBottom;
+
         var containerMainSize = isRowDirection
-            ? ParseLength(styleMap, "width", containingWidth, containingWidth, allowAuto: true)
-            : ParseLength(styleMap, "height", containingWidth, containingWidth, allowAuto: true);
+            ? ResolveAuthoredDimension(styleMap, "width", containingWidth, containingWidth, horizontalBorderAndPadding)
+            : ResolveAuthoredDimension(styleMap, "height", containingWidth, containingWidth, verticalBorderAndPadding);
 
         if (float.IsNaN(containerMainSize) || containerMainSize <= 0f)
         {
@@ -1319,8 +1325,8 @@ public sealed class HtmlRenderer
         }
 
         var specifiedCrossSize = isRowDirection
-            ? ParseLength(styleMap, "height", containingWidth, float.NaN, allowAuto: true)
-            : ParseLength(styleMap, "width", containingWidth, float.NaN, allowAuto: true);
+            ? ResolveAuthoredDimension(styleMap, "height", containingWidth, float.NaN, verticalBorderAndPadding)
+            : ResolveAuthoredDimension(styleMap, "width", containingWidth, float.NaN, horizontalBorderAndPadding);
         var containerCrossSize = float.IsNaN(specifiedCrossSize) ? 0f : specifiedCrossSize;
 
         var contentWidth = containingWidth;
@@ -1543,7 +1549,7 @@ public sealed class HtmlRenderer
         }
 
         var autoContentHeight = Math.Max(0f, (isRowDirection ? containerCrossSize : containerMainSize) - 0f);
-        var specifiedContentHeight = ParseLength(styleMap, "height", containingWidth, float.NaN, allowAuto: true);
+        var specifiedContentHeight = ResolveAuthoredDimension(styleMap, "height", containingWidth, float.NaN, verticalBorderAndPadding);
         contentHeight = float.IsNaN(specifiedContentHeight) ? Math.Max(autoContentHeight, totalLineMainSize) : Math.Max(specifiedContentHeight, autoContentHeight);
         var borderBoxWidth = borderLeft + paddingLeft + containingWidth + paddingRight + borderRight;
         var borderBoxHeight = borderTop + paddingTop + contentHeight + paddingBottom + borderBottom;
@@ -1619,6 +1625,7 @@ public sealed class HtmlRenderer
         Dictionary<string, string> styleMap,
         float relativeTo,
         float defaultValue,
+        float borderAndPaddingSum,
         bool isFlexItem,
         bool isRowDirection,
         float? flexMainSize,
@@ -1627,19 +1634,25 @@ public sealed class HtmlRenderer
     {
         if (!isFlexItem)
         {
-            return ParseLength(styleMap, propertyName, relativeTo, defaultValue, allowAuto: true);
+            return ResolveAuthoredDimension(styleMap, propertyName, relativeTo, defaultValue, borderAndPaddingSum);
         }
 
+        // flexMainSize/flexCrossSize already arrive as content-box sizes - LayoutFlexContainer's
+        // own algorithm resolves them from ResolveFlexBaseSize/ResolveFlexCrossSize, which already
+        // apply this same box-sizing conversion using this item's own border/padding before the
+        // flex-grow/shrink distribution ever runs - so they must not be adjusted a second time
+        // here. Only the "no container override" fallback (this property wasn't driven by the flex
+        // algorithm at all) re-reads the raw authored value and needs the adjustment applied fresh.
         if (string.Equals(propertyName, "width", StringComparison.OrdinalIgnoreCase))
         {
             return isRowDirection
-                ? (flexMainSize.HasValue ? flexMainSize.Value : ParseLength(styleMap, propertyName, relativeTo, defaultValue, allowAuto: true))
-                : (flexCrossSize.HasValue ? flexCrossSize.Value : ParseLength(styleMap, propertyName, relativeTo, defaultValue, allowAuto: true));
+                ? (flexMainSize.HasValue ? flexMainSize.Value : ResolveAuthoredDimension(styleMap, propertyName, relativeTo, defaultValue, borderAndPaddingSum))
+                : (flexCrossSize.HasValue ? flexCrossSize.Value : ResolveAuthoredDimension(styleMap, propertyName, relativeTo, defaultValue, borderAndPaddingSum));
         }
 
         return isRowDirection
-            ? (flexCrossSize.HasValue ? flexCrossSize.Value : ParseLength(styleMap, propertyName, relativeTo, defaultValue, allowAuto: true))
-            : (flexMainSize.HasValue ? flexMainSize.Value : ParseLength(styleMap, propertyName, relativeTo, defaultValue, allowAuto: true));
+            ? (flexCrossSize.HasValue ? flexCrossSize.Value : ResolveAuthoredDimension(styleMap, propertyName, relativeTo, defaultValue, borderAndPaddingSum))
+            : (flexMainSize.HasValue ? flexMainSize.Value : ResolveAuthoredDimension(styleMap, propertyName, relativeTo, defaultValue, borderAndPaddingSum));
     }
 
     /// <summary>
@@ -1694,18 +1707,21 @@ public sealed class HtmlRenderer
             ApplyFormControlDefaults(formControlKind, element, styleMap, textStyle, context);
         }
 
-        var specifiedContentWidth = ParseLength(styleMap, "width", containingWidth, float.NaN, allowAuto: true);
-        var specifiedContentHeight = ParseLength(styleMap, "height", containingWidth, float.NaN, allowAuto: true);
+        // Reuses the exact same box-model resolution LayoutElement itself calls for every other
+        // element, rather than re-deriving border/padding/margin independently, so this prediction
+        // can never quietly drift out of sync with what actually gets laid out. Resolved up front
+        // (rather than after width/height, as before) because its own border/padding sums are now
+        // needed to convert an authored border-box width/height into this renderer's content-box
+        // convention, the same way LayoutElement itself does.
+        var box = ResolveBoxStyle(styleMap, element);
+        var specifiedContentWidth = ResolveAuthoredDimension(styleMap, "width", containingWidth, float.NaN, box.BorderWidth.Left + box.BorderWidth.Right + box.Padding.Left + box.Padding.Right);
+        var specifiedContentHeight = ResolveAuthoredDimension(styleMap, "height", containingWidth, float.NaN, box.BorderWidth.Top + box.BorderWidth.Bottom + box.Padding.Top + box.Padding.Bottom);
 
         if (float.IsNaN(specifiedContentWidth) || float.IsNaN(specifiedContentHeight))
         {
             return false;
         }
 
-        // Reuses the exact same box-model resolution LayoutElement itself calls for every other
-        // element, rather than re-deriving border/padding/margin independently, so this prediction
-        // can never quietly drift out of sync with what actually gets laid out.
-        var box = ResolveBoxStyle(styleMap, element);
         width = box.BorderWidth.Left + box.Padding.Left + specifiedContentWidth + box.Padding.Right + box.BorderWidth.Right;
         height = box.BorderWidth.Top + box.Padding.Top + specifiedContentHeight + box.Padding.Bottom + box.BorderWidth.Bottom;
 
@@ -2170,7 +2186,8 @@ public sealed class HtmlRenderer
         var gridItems = node.Children
             .Where(child => child is ElementRenderNode || (child is TextRenderNode textNode && NormalizeWhitespace(textNode.Ref.Data).Length > 0))
             .ToList();
-        var containerHeight = ParseLength(styleMap, "height", containingWidth, containingWidth, allowAuto: true);
+        var gridVerticalBorderAndPadding = borderTop + borderBottom + paddingTop + paddingBottom;
+        var containerHeight = ResolveAuthoredDimension(styleMap, "height", containingWidth, containingWidth, gridVerticalBorderAndPadding);
         var explicitGridTemplateRows = ResolveExplicitPropertyValue(node.Ref, node.ComputedStyle, "grid-template-rows");
         var rows = ParseGridTrackListStructured(explicitGridTemplateRows, containerHeight);
         var hasExplicitRowTracks = rows.Count > 0;
@@ -2318,10 +2335,10 @@ public sealed class HtmlRenderer
         }
 
         var gridContentWidth = GetGridContentSize(columnSizes, resolvedColumnGap, containingWidth);
-        var specifiedHeight = ParseLength(styleMap, "height", containingWidth, containingWidth, allowAuto: true);
+        var specifiedHeight = ResolveAuthoredDimension(styleMap, "height", containingWidth, containingWidth, gridVerticalBorderAndPadding);
         var gridContentHeight = GetGridContentSize(rowSizes, resolvedRowGap, specifiedHeight);
         var borderBoxWidth = borderLeft + paddingLeft + Math.Max(containingWidth, gridContentWidth) + paddingRight + borderRight;
-        var borderBoxHeight = borderTop + paddingTop + Math.Max(ParseLength(styleMap, "height", containingWidth, containingWidth, allowAuto: true), gridContentHeight) + paddingBottom + borderBottom;
+        var borderBoxHeight = borderTop + paddingTop + Math.Max(specifiedHeight, gridContentHeight) + paddingBottom + borderBottom;
         var canCollapseWithLastChild = borderBottom <= 0f && paddingBottom <= 0f;
         var effectiveMarginBottom = ParseLength(styleMap, "margin-bottom", containingWidth, box.Margin.Bottom, allowAuto: false);
 
@@ -3023,8 +3040,18 @@ public sealed class HtmlRenderer
         }
 
         var childStyle = CreateStyleMap(elementChild.ComputedStyle, elementChild.Ref);
-        var baseMainSize = ResolveFlexBaseSize(childStyle, isRowDirection, relativeTo);
-        var crossSize = ResolveFlexCrossSize(childStyle, isRowDirection, relativeTo);
+        // Needed so ResolveFlexBaseSize/ResolveFlexCrossSize can convert an authored border-box
+        // width/height/flex-basis into this renderer's content-box convention using *this item's*
+        // own border/padding - not the container's - before flex-grow/shrink ever runs, the same
+        // way LayoutElement resolves its own specifiedContentWidth/Height (see
+        // ResolveAuthoredDimension's remarks). The resulting BaseMainSize/CrossSize therefore
+        // already represent content-box sizes, so LayoutElement's own isFlexItem branch in
+        // ResolveFlexibleContentDimension must not (and does not) adjust them a second time.
+        var childBox = ResolveBoxStyle(childStyle, elementChild.Ref);
+        var horizontalBorderAndPadding = childBox.BorderWidth.Left + childBox.BorderWidth.Right + childBox.Padding.Left + childBox.Padding.Right;
+        var verticalBorderAndPadding = childBox.BorderWidth.Top + childBox.BorderWidth.Bottom + childBox.Padding.Top + childBox.Padding.Bottom;
+        var baseMainSize = ResolveFlexBaseSize(childStyle, isRowDirection, relativeTo, isRowDirection ? horizontalBorderAndPadding : verticalBorderAndPadding);
+        var crossSize = ResolveFlexCrossSize(childStyle, isRowDirection, relativeTo, isRowDirection ? verticalBorderAndPadding : horizontalBorderAndPadding);
         return new FlexItemLayoutInfo(
             child,
             childStyle,
@@ -3036,26 +3063,26 @@ public sealed class HtmlRenderer
             GetAlignSelf(childStyle, "auto"));
     }
 
-    private static float ResolveFlexBaseSize(Dictionary<string, string> styleMap, bool isRowDirection, float relativeTo)
+    private static float ResolveFlexBaseSize(Dictionary<string, string> styleMap, bool isRowDirection, float relativeTo, float mainAxisBorderAndPadding)
     {
-        var flexBasis = ParseLength(styleMap, "flex-basis", relativeTo, float.NaN, allowAuto: true);
+        var flexBasis = ResolveAuthoredDimension(styleMap, "flex-basis", relativeTo, float.NaN, mainAxisBorderAndPadding);
         if (!float.IsNaN(flexBasis))
         {
             return flexBasis;
         }
 
         var mainSize = isRowDirection
-            ? ParseLength(styleMap, "width", relativeTo, float.NaN, allowAuto: true)
-            : ParseLength(styleMap, "height", relativeTo, float.NaN, allowAuto: true);
+            ? ResolveAuthoredDimension(styleMap, "width", relativeTo, float.NaN, mainAxisBorderAndPadding)
+            : ResolveAuthoredDimension(styleMap, "height", relativeTo, float.NaN, mainAxisBorderAndPadding);
 
         return float.IsNaN(mainSize) ? 0f : mainSize;
     }
 
-    private static float ResolveFlexCrossSize(Dictionary<string, string> styleMap, bool isRowDirection, float relativeTo)
+    private static float ResolveFlexCrossSize(Dictionary<string, string> styleMap, bool isRowDirection, float relativeTo, float crossAxisBorderAndPadding)
     {
         var crossSize = isRowDirection
-            ? ParseLength(styleMap, "height", relativeTo, float.NaN, allowAuto: true)
-            : ParseLength(styleMap, "width", relativeTo, float.NaN, allowAuto: true);
+            ? ResolveAuthoredDimension(styleMap, "height", relativeTo, float.NaN, crossAxisBorderAndPadding)
+            : ResolveAuthoredDimension(styleMap, "width", relativeTo, float.NaN, crossAxisBorderAndPadding);
 
         return float.IsNaN(crossSize) ? 0f : crossSize;
     }
@@ -3537,6 +3564,7 @@ public sealed class HtmlRenderer
         AddIfPresent(map, "visibility", style.GetVisibility());
         AddIfPresent(map, "width", style.GetWidth());
         AddIfPresent(map, "height", style.GetHeight());
+        AddIfPresent(map, "box-sizing", style.GetBoxSizing());
         AddIfPresent(map, "position", style.GetPropertyValue("position"));
         AddIfPresent(map, "left", style.GetPropertyValue("left"));
         AddIfPresent(map, "top", style.GetPropertyValue("top"));
@@ -4149,6 +4177,12 @@ public sealed class HtmlRenderer
         return styleMap.TryGetValue("float", out var value)
             ? value.Trim().ToLowerInvariant()
             : string.Empty;
+    }
+
+    private static bool IsBorderBox(Dictionary<string, string> styleMap)
+    {
+        return styleMap.TryGetValue("box-sizing", out var value) &&
+            string.Equals(value.Trim(), "border-box", StringComparison.OrdinalIgnoreCase);
     }
 
     private static void PaintOutline(DisplayList displayList, Dictionary<string, string> styleMap, float x, float y, float width, float height)
@@ -5560,6 +5594,41 @@ public sealed class HtmlRenderer
 
         marginLeft = usedMarginLeft;
         marginRight = usedMarginRight + underflow;
+    }
+
+    /// <summary>
+    /// Resolves an authored `width`/`height`/`flex-basis` length exactly like
+    /// <see cref="ParseLength"/> does (an unset/`auto` value falls back to
+    /// <paramref name="defaultValue"/>), then - only when this element's own `box-sizing` computes
+    /// to `border-box` - subtracts <paramref name="borderAndPaddingSum"/> (this same axis's own
+    /// border width plus padding) from an actually-authored value, so the result always represents
+    /// this renderer's pre-existing content-box convention regardless of which box model the
+    /// author wrote against. CSS's default box model is content-box, where an authored `width`/
+    /// `height` already *is* the content size - this renderer always assumed that unconditionally
+    /// before `box-sizing` existed anywhere in its style map, so a huge, previously-unflagged gap:
+    /// `box-sizing: border-box` (set globally by nearly every real-world CSS reset - Bootstrap,
+    /// Tailwind's preflight, `* { box-sizing: border-box }`) authors a `width`/`height` that
+    /// instead describes the *border* box, and every downstream computation in this renderer
+    /// (`ResolveHorizontalMetrics`, `borderBoxWidth`/`borderBoxHeight`, the flex/grow-shrink and
+    /// grid track-sizing algorithms, ...) universally assumes it is handed a content size. This is
+    /// the one place that distinction gets resolved, so every other computation can stay unaware
+    /// of `box-sizing` entirely, exactly as before.
+    /// </summary>
+    private static float ResolveAuthoredDimension(Dictionary<string, string> styleMap, string propertyName, float relativeTo, float defaultValue, float borderAndPaddingSum)
+    {
+        var specified = ParseLength(styleMap, propertyName, relativeTo, float.NaN, allowAuto: true);
+
+        if (float.IsNaN(specified))
+        {
+            return defaultValue;
+        }
+
+        if (borderAndPaddingSum <= 0f || !IsBorderBox(styleMap))
+        {
+            return specified;
+        }
+
+        return Math.Max(0f, specified - borderAndPaddingSum);
     }
 
     private static float ParseLength(Dictionary<string, string> styleMap, string propertyName, float relativeTo, float defaultValue, bool allowAuto)
