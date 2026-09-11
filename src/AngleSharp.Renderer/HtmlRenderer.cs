@@ -3652,6 +3652,24 @@ public sealed class HtmlRenderer
             displayValue = ParseStyleAttributeValue(inlineStyle, "display");
         }
 
+        // Only a grid/flex *container* itself can ever consult its own grid-template-columns/rows,
+        // gap, or flex-direction/justify-content/align-items/flex-wrap/align-content - none of
+        // those five flex properties or three grid/gap properties are ever read off anything but
+        // the element that is itself display:grid/inline-grid or display:flex/inline-flex (see
+        // LayoutGridContainer/LayoutFlexContainer's own property reads). Skipping the GetPropertyValue/
+        // explicit-declaration calls for them entirely on the overwhelming majority of elements that
+        // are neither avoids real, confirmed cost - each is its own CSSOM string-serialization call
+        // (or, for the grid/gap trio, a read off the shared explicit-declaration object). grid-column/
+        // grid-row/align-self/flex-grow/flex-shrink/flex-basis/order are deliberately NOT included in
+        // this skip - those are *item*-level properties read off a child by its *parent's* container
+        // layout, and a flex/grid item's own display is typically unset/block, not flex/grid, so
+        // there is no cheap way to know from this element's own display alone whether some ancestor
+        // will need them.
+        var isGridContainer = string.Equals(displayValue, "grid", StringComparison.OrdinalIgnoreCase) ||
+                               string.Equals(displayValue, "inline-grid", StringComparison.OrdinalIgnoreCase);
+        var isFlexContainer = string.Equals(displayValue, "flex", StringComparison.OrdinalIgnoreCase) ||
+                               string.Equals(displayValue, "inline-flex", StringComparison.OrdinalIgnoreCase);
+
         AddIfPresent(map, "display", displayValue);
         AddIfPresent(map, "visibility", style.GetVisibility());
         AddIfPresent(map, "width", style.GetWidth());
@@ -3716,30 +3734,39 @@ public sealed class HtmlRenderer
         // entirely for the common `<line> / span <n>` form (CssTupleValue<T>.Compute() calling
         // .Compute() on the omitted end line's null entry) - fixed upstream, but reading the
         // explicit declaration sidesteps that whole bug class regardless.
-        var explicitGridTemplateColumns = explicitDeclarations is not null ? ReadExplicitOrComputed(explicitDeclarations, style, "grid-template-columns") : ResolveExplicitPropertyValue(element, style, "grid-template-columns");
-        AddIfPresent(map, "grid-template-columns", string.IsNullOrWhiteSpace(explicitGridTemplateColumns) ? ParseStyleAttributeValue(inlineStyle, "grid-template-columns") : explicitGridTemplateColumns);
-        var explicitGridTemplateRows = explicitDeclarations is not null ? ReadExplicitOrComputed(explicitDeclarations, style, "grid-template-rows") : ResolveExplicitPropertyValue(element, style, "grid-template-rows");
-        AddIfPresent(map, "grid-template-rows", string.IsNullOrWhiteSpace(explicitGridTemplateRows) ? ParseStyleAttributeValue(inlineStyle, "grid-template-rows") : explicitGridTemplateRows);
-        var explicitColumnGap = explicitDeclarations is not null ? ReadExplicitOrComputed(explicitDeclarations, style, "column-gap") : ResolveExplicitPropertyValue(element, style, "column-gap");
-        AddIfPresent(map, "column-gap", string.IsNullOrWhiteSpace(explicitColumnGap) ? ParseStyleAttributeValue(inlineStyle, "column-gap") : explicitColumnGap);
-        var explicitRowGap = explicitDeclarations is not null ? ReadExplicitOrComputed(explicitDeclarations, style, "row-gap") : ResolveExplicitPropertyValue(element, style, "row-gap");
-        AddIfPresent(map, "row-gap", string.IsNullOrWhiteSpace(explicitRowGap) ? ParseStyleAttributeValue(inlineStyle, "row-gap") : explicitRowGap);
-        var explicitGap = explicitDeclarations is not null ? ReadExplicitOrComputed(explicitDeclarations, style, "gap") : ResolveExplicitPropertyValue(element, style, "gap");
-        AddIfPresent(map, "gap", string.IsNullOrWhiteSpace(explicitGap) ? ParseStyleAttributeValue(inlineStyle, "gap") : explicitGap);
+        if (isGridContainer)
+        {
+            var explicitGridTemplateColumns = explicitDeclarations is not null ? ReadExplicitOrComputed(explicitDeclarations, style, "grid-template-columns") : ResolveExplicitPropertyValue(element, style, "grid-template-columns");
+            AddIfPresent(map, "grid-template-columns", string.IsNullOrWhiteSpace(explicitGridTemplateColumns) ? ParseStyleAttributeValue(inlineStyle, "grid-template-columns") : explicitGridTemplateColumns);
+            var explicitGridTemplateRows = explicitDeclarations is not null ? ReadExplicitOrComputed(explicitDeclarations, style, "grid-template-rows") : ResolveExplicitPropertyValue(element, style, "grid-template-rows");
+            AddIfPresent(map, "grid-template-rows", string.IsNullOrWhiteSpace(explicitGridTemplateRows) ? ParseStyleAttributeValue(inlineStyle, "grid-template-rows") : explicitGridTemplateRows);
+            var explicitColumnGap = explicitDeclarations is not null ? ReadExplicitOrComputed(explicitDeclarations, style, "column-gap") : ResolveExplicitPropertyValue(element, style, "column-gap");
+            AddIfPresent(map, "column-gap", string.IsNullOrWhiteSpace(explicitColumnGap) ? ParseStyleAttributeValue(inlineStyle, "column-gap") : explicitColumnGap);
+            var explicitRowGap = explicitDeclarations is not null ? ReadExplicitOrComputed(explicitDeclarations, style, "row-gap") : ResolveExplicitPropertyValue(element, style, "row-gap");
+            AddIfPresent(map, "row-gap", string.IsNullOrWhiteSpace(explicitRowGap) ? ParseStyleAttributeValue(inlineStyle, "row-gap") : explicitRowGap);
+            var explicitGap = explicitDeclarations is not null ? ReadExplicitOrComputed(explicitDeclarations, style, "gap") : ResolveExplicitPropertyValue(element, style, "gap");
+            AddIfPresent(map, "gap", string.IsNullOrWhiteSpace(explicitGap) ? ParseStyleAttributeValue(inlineStyle, "gap") : explicitGap);
+        }
+
         var explicitGridColumn = explicitDeclarations is not null ? ReadExplicitOrComputed(explicitDeclarations, style, "grid-column") : ResolveExplicitPropertyValue(element, style, "grid-column");
         AddIfPresent(map, "grid-column", string.IsNullOrWhiteSpace(explicitGridColumn) ? ParseStyleAttributeValue(inlineStyle, "grid-column") : explicitGridColumn);
         var explicitGridRow = explicitDeclarations is not null ? ReadExplicitOrComputed(explicitDeclarations, style, "grid-row") : ResolveExplicitPropertyValue(element, style, "grid-row");
         AddIfPresent(map, "grid-row", string.IsNullOrWhiteSpace(explicitGridRow) ? ParseStyleAttributeValue(inlineStyle, "grid-row") : explicitGridRow);
-        AddIfPresent(map, "flex-direction", string.IsNullOrWhiteSpace(style.GetPropertyValue("flex-direction")) ? ParseStyleAttributeValue(inlineStyle, "flex-direction") : style.GetPropertyValue("flex-direction"));
-        AddIfPresent(map, "justify-content", string.IsNullOrWhiteSpace(style.GetPropertyValue("justify-content")) ? ParseStyleAttributeValue(inlineStyle, "justify-content") : style.GetPropertyValue("justify-content"));
-        AddIfPresent(map, "align-items", string.IsNullOrWhiteSpace(style.GetPropertyValue("align-items")) ? ParseStyleAttributeValue(inlineStyle, "align-items") : style.GetPropertyValue("align-items"));
+
+        if (isFlexContainer)
+        {
+            AddIfPresent(map, "flex-direction", string.IsNullOrWhiteSpace(style.GetPropertyValue("flex-direction")) ? ParseStyleAttributeValue(inlineStyle, "flex-direction") : style.GetPropertyValue("flex-direction"));
+            AddIfPresent(map, "justify-content", string.IsNullOrWhiteSpace(style.GetPropertyValue("justify-content")) ? ParseStyleAttributeValue(inlineStyle, "justify-content") : style.GetPropertyValue("justify-content"));
+            AddIfPresent(map, "align-items", string.IsNullOrWhiteSpace(style.GetPropertyValue("align-items")) ? ParseStyleAttributeValue(inlineStyle, "align-items") : style.GetPropertyValue("align-items"));
+            AddIfPresent(map, "flex-wrap", string.IsNullOrWhiteSpace(style.GetPropertyValue("flex-wrap")) ? ParseStyleAttributeValue(inlineStyle, "flex-wrap") : style.GetPropertyValue("flex-wrap"));
+            AddIfPresent(map, "align-content", string.IsNullOrWhiteSpace(style.GetPropertyValue("align-content")) ? ParseStyleAttributeValue(inlineStyle, "align-content") : style.GetPropertyValue("align-content"));
+        }
+
         AddIfPresent(map, "align-self", string.IsNullOrWhiteSpace(style.GetPropertyValue("align-self")) ? ParseStyleAttributeValue(inlineStyle, "align-self") : style.GetPropertyValue("align-self"));
-        AddIfPresent(map, "flex-wrap", string.IsNullOrWhiteSpace(style.GetPropertyValue("flex-wrap")) ? ParseStyleAttributeValue(inlineStyle, "flex-wrap") : style.GetPropertyValue("flex-wrap"));
         AddIfPresent(map, "flex-grow", string.IsNullOrWhiteSpace(style.GetPropertyValue("flex-grow")) ? ParseStyleAttributeValue(inlineStyle, "flex-grow") : style.GetPropertyValue("flex-grow"));
         AddIfPresent(map, "flex-shrink", string.IsNullOrWhiteSpace(style.GetPropertyValue("flex-shrink")) ? ParseStyleAttributeValue(inlineStyle, "flex-shrink") : style.GetPropertyValue("flex-shrink"));
         AddIfPresent(map, "flex-basis", string.IsNullOrWhiteSpace(style.GetPropertyValue("flex-basis")) ? ParseStyleAttributeValue(inlineStyle, "flex-basis") : style.GetPropertyValue("flex-basis"));
         AddIfPresent(map, "order", string.IsNullOrWhiteSpace(style.GetPropertyValue("order")) ? ParseStyleAttributeValue(inlineStyle, "order") : style.GetPropertyValue("order"));
-        AddIfPresent(map, "align-content", string.IsNullOrWhiteSpace(style.GetPropertyValue("align-content")) ? ParseStyleAttributeValue(inlineStyle, "align-content") : style.GetPropertyValue("align-content"));
 
         var resolvedBackgroundImage = explicitDeclarations is not null ? ReadExplicitOrComputed(explicitDeclarations, style, "background-image") : ResolveExplicitBackgroundImage(element, style);
         AddIfPresent(map, "background-image", string.IsNullOrWhiteSpace(resolvedBackgroundImage)

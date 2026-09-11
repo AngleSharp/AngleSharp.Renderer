@@ -14,7 +14,8 @@ filter (blur/grayscale), opacity, and `position: sticky` - the same combination 
 paint features a real dashboard-style page would use, not a synthetic worst case for any one
 feature. Viewport 1280x6000.
 
-## Current numbers (2026-09-11, after the style-map caching + explicit-declaration caching fixes)
+## Current numbers (2026-09-11, after the style-map caching, explicit-declaration caching, and
+container-only-property-skip fixes)
 
 Against `AngleSharp` 1.8.1, `AngleSharp.Css` 1.1.2 (both via `PackageReference`).
 
@@ -22,20 +23,23 @@ Against `AngleSharp` 1.8.1, `AngleSharp.Css` 1.1.2 (both via `PackageReference`)
 
 | Method | Mean | Allocated |
 |---|---:|---:|
-| Parse HTML+CSS into a DOM (AngleSharp's own cost) | 1.52 ms | 1.96 MB |
-| **Layout only: `BuildDisplayList`** | **268 ms** | **200.91 MB** |
-| Full pipeline: layout + Skia rasterization + PNG encoding (`RenderToPng`) | 494 ms | 205.82 MB |
+| Parse HTML+CSS into a DOM (AngleSharp's own cost) | 1.49 ms | 1.96 MB |
+| **Layout only: `BuildDisplayList`** | **255 ms** | **193.68 MB** |
+| Full pipeline: layout + Skia rasterization + PNG encoding (`RenderToPng`) | 476 ms | 198.59 MB |
 
 ### .NET 8.0.25 (net8.0)
 
 | Method | Mean | Allocated |
 |---|---:|---:|
-| Parse HTML+CSS into a DOM (AngleSharp's own cost) | 1.46 ms | 2.04 MB |
-| **Layout only: `BuildDisplayList`** | **351 ms** | **201.37 MB** |
-| Full pipeline: layout + Skia rasterization + PNG encoding (`RenderToPng`) | 581 ms | 206.63 MB |
+| Parse HTML+CSS into a DOM (AngleSharp's own cost) | 1.79 ms | 2.04 MB |
+| **Layout only: `BuildDisplayList`** | **364 ms** | **194.14 MB** |
+| Full pipeline: layout + Skia rasterization + PNG encoding (`RenderToPng`) | 527 ms | 199.41 MB |
 
-**Cumulative improvement over the original, pre-optimization baseline: ~9x faster, ~7.25x less
-allocation** on `BuildDisplayList` (net10.0: 2,415 ms / 1,456 MB &rarr; 268 ms / 201 MB).
+**Cumulative improvement over the original, pre-optimization baseline: ~9.5x faster, ~7.5x less
+allocation** on `BuildDisplayList` (net10.0: 2,415 ms / 1,456 MB &rarr; 255 ms / 194 MB). The
+net8.0 mean above carries a wide error margin in this particular short-job run (~285ms on a 364ms
+mean - re-run with the default job before trusting the exact net8.0 timing figure); allocation is
+a per-run-deterministic number and does not have this problem.
 
 ## History
 
@@ -108,26 +112,57 @@ in `CreateLayoutContext` itself, before the context (and therefore this cache) e
 / 614 MB &rarr; 268 ms / 201 MB; net8.0: 1,174 ms / 616 MB &rarr; 351 ms / 201 MB) - confirming this
 really was the next-dominant cost, not a smaller contributor.
 
+### Fix: skip container-only grid/flex property reads for elements that can't need them
+
+`CreateStyleMap` read all 89 properties unconditionally for every element, including all 5
+grid-container-only properties (`grid-template-columns`/`-rows`, `column-gap`/`row-gap`/`gap` - the
+three gap properties are only ever consumed by `LayoutGridContainer`'s `ParseGridGap` calls in this
+renderer today, confirmed by grep before assuming so, not by flex layout) and all 5
+flex-container-only properties (`flex-direction`/`justify-content`/`align-items`/`flex-wrap`/
+`align-content`). Since `display` is already known first in the same function, these ten reads are
+now skipped entirely unless the element's own `display` is actually `grid`/`inline-grid` or
+`flex`/`inline-flex` respectively - true for a handful of container elements and false for the
+overwhelming majority of elements on a real page. `grid-column`/`grid-row`/`align-self`/
+`flex-grow`/`flex-shrink`/`flex-basis`/`order` are deliberately *not* skipped - those are item-level
+properties read off a child by its parent's container layout, and a flex/grid item's own `display`
+is typically unset/block, not flex/grid, so there is no cheap way to know from an element's own
+display alone whether some ancestor will need them.
+
+**Result: a further ~5% faster and ~3.6% less allocation** on `BuildDisplayList` (net10.0: 268 ms /
+201 MB &rarr; 255 ms / 194 MB) - real, but much smaller than either fix above, and that smallness is
+itself informative: the explicit-declaration caching fix already collapsed the grid/gap trio's own
+cost down to a cheap already-cached lookup, so skipping them saves little now; only the 5 plain
+`flex-*` container properties (still a real, uncached `style.GetPropertyValue()` call each) carried
+genuine per-call cost to avoid. This is a useful data point for anyone considering the larger
+typed-field rewrite floated below: the remaining ~194 MB/~255 ms is now fairly evenly spread across
+the ~80 *necessary* property reads plus the `Dictionary` allocation itself, not concentrated in a
+handful of skippable/cacheable hot spots the way the first two rounds were - a further "avoid doing
+unnecessary work" pass is unlikely to find another large win the way the previous two did.
+
 ## Reading these numbers
 
 - Parsing the HTML+CSS document itself is fast (~1-1.5ms) and allocates almost nothing by
   comparison - the cost is overwhelmingly in this renderer's own layout, not in AngleSharp's HTML
   parser or AngleSharp.Css's cascade.
 - `BuildDisplayList` (pure layout, no rasterization) is still the dominant cost in the full
-  pipeline, though rasterization/encoding is now a proportionally larger slice (~225ms on top of
-  ~268ms of layout) than it was before either fix, since layout itself shrank so much.
-- Remaining allocation (~201 MB, ~135KB per element) is still dominated by `CreateStyleMap` itself,
-  which now runs exactly once per element (no more duplicate rebuilds, no more duplicate
-  explicit-declaration walks) but still allocates a full `Dictionary<string, string>` plus a
-  separate string for each of its ~90 properties every time. Eliminating that - e.g. moving off a
-  string-keyed dictionary entirely in favor of typed fields - is the natural next target, but is a
-  substantially larger, riskier refactor than either fix above: essentially every
-  `ParseLength`/`GetPropertyValue`-style call site throughout `HtmlRenderer.cs` reads from that
-  dictionary by string key today, so this would touch the whole file rather than a handful of
-  call sites. Deliberately not attempted in the same pass as either fix above.
+  pipeline, though rasterization/encoding is now a proportionally larger slice (~220ms on top of
+  ~255ms of layout) than it was before any of these fixes, since layout itself shrank so much.
+- Remaining allocation (~194 MB, ~130KB per element) is still dominated by `CreateStyleMap` itself,
+  which now runs exactly once per element with no duplicate rebuilds, no duplicate
+  explicit-declaration walks, and no unnecessary container-only property reads - but still
+  allocates a full `Dictionary<string, string>` plus a separate string for each of its remaining
+  necessary properties every time. Eliminating that - e.g. moving off a string-keyed dictionary
+  entirely in favor of typed fields - is the only remaining lever with real further headroom, but
+  is a substantially larger, riskier refactor than any fix above (scoped: 62 functions take a style
+  map as a parameter, 42 separate `ParseLength` call sites, 68 direct dictionary accesses, across a
+  7,500+ line file) - and, per the third fix's own result above, is now working against a cost that
+  is spread evenly across ~80 necessary reads rather than concentrated in a few hot spots, so its
+  expected further gain is real but more modest than either of the first two fixes, for
+  meaningfully higher risk to a shipped, published library. Deliberately not attempted here.
 - net10.0 is meaningfully faster than net8.0 on identical code with nearly identical allocation,
-  consistently across the original baseline and both fixes - consistent with JIT/GC improvements
-  across runtime versions rather than anything version-specific in this renderer's own code.
+  consistently across the original baseline and all three fixes - consistent with JIT/GC
+  improvements across runtime versions rather than anything version-specific in this renderer's
+  own code.
 
 ## Reproducing/updating this baseline
 

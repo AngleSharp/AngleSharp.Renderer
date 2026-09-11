@@ -345,13 +345,42 @@ one object. This cut `BuildDisplayList` by a further ~3.5x (~3.1x less allocated
 two fixes together take `BuildDisplayList` from the original baseline to roughly 1/9th its time
 and 1/7th its allocation - see `BASELINE.md`'s `History` section for exact numbers on both passes.
 
-Remaining allocation after both fixes is still real (~201 MB for the same ~1500-element page,
-~135KB per element) - `CreateStyleMap` itself now runs exactly once per element with no redundant
-explicit-declaration walks either, but still builds a full `Dictionary<string, string>` plus
-per-property strings every time. Eliminating that (e.g. avoiding the dictionary entirely in favor
-of typed fields) is the natural next target, but is a substantially larger, riskier refactor than
-either fix above - essentially every `ParseLength`/`GetPropertyValue`-style call site throughout
-this file reads from that dictionary by string key - deliberately not attempted in the same pass.
+A third, smaller pass followed: **skipping grid/flex container-only property reads**.
+`grid-template-columns`/`-rows`/the three gap properties, and `flex-direction`/`justify-content`/
+`align-items`/`flex-wrap`/`align-content`, are only ever consulted on the element that is itself
+`display: grid`/`inline-grid` or `flex`/`inline-flex` respectively (confirmed by checking every
+consumer, not assumed - the gap properties specifically are only read by `LayoutGridContainer`'s
+`ParseGridGap` calls in this renderer today, never by flex layout). Since `display` is already
+known first in `CreateStyleMap`, these ten reads are now skipped entirely for the overwhelming
+majority of elements that are provably neither. `grid-column`/`grid-row`/`align-self`/`flex-grow`/
+`flex-shrink`/`flex-basis`/`order` are deliberately *not* skipped this way - those are item-level
+properties read off a child by its parent's container layout, and an item's own `display` is
+typically unset/block, not flex/grid, so there is no cheap way to know from an element's own
+display alone whether some ancestor will need them. This cut `BuildDisplayList` by a further ~5%
+(~3.6% less allocated) - real, but much smaller than either fix above, which is itself a useful
+result: the explicit-declaration caching fix already made the grid/gap trio cheap to read (a
+lookup on an already-cached object, not a full walk), so skipping them saved little; only the five
+plain `flex-*` properties (still an uncached `style.GetPropertyValue()` call each) carried genuine
+per-call cost to avoid.
+
+Combined, all three fixes together take `BuildDisplayList` from the original baseline to roughly
+1/9.5th its time and 1/7.5th its allocation - see `BASELINE.md`'s `History` section for exact
+numbers on all three passes.
+
+Remaining allocation after all three fixes is still real (~194 MB for the same ~1500-element page,
+~130KB per element) - `CreateStyleMap` itself now runs exactly once per element with no redundant
+rebuilds, no redundant explicit-declaration walks, and no unnecessary container-only property
+reads either, but still builds a full `Dictionary<string, string>` plus a separate string for each
+of its remaining necessary properties every time. Eliminating that (e.g. avoiding the dictionary
+entirely in favor of typed fields) is the only lever left with real further headroom, but is a
+substantially larger, riskier refactor than any fix above: **scoped and confirmed, not assumed** -
+62 functions take a style map as a parameter, 42 separate `ParseLength` call sites, 68 direct
+dictionary accesses, spread across this 7,500+ line file. The third fix's own small result is a
+relevant data point for anyone considering it: the remaining cost is now spread fairly evenly
+across ~80 necessary property reads rather than concentrated in a few hot spots the way the first
+two rounds' costs were, so this refactor's expected further gain is real but more modest than
+either of the first two fixes, for meaningfully higher risk to a shipped, published library.
+Deliberately not attempted here.
 
 ## Repository Notes
 
