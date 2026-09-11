@@ -3,7 +3,7 @@
 Released on ?
 
 - Added performance evaluation benchmark
-- Improved layout performance by caching each element's computed style per render (~2.5x faster, ~2.4x less allocation - see `docs/benchmarks.md`)
+- Improved layout performance by caching each element's computed style and explicit-declaration lookups per render (~9x faster, ~7.25x less allocation - see `docs/benchmarks.md`)
 
 # 0.5.0
 

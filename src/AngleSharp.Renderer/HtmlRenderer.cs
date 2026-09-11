@@ -71,7 +71,8 @@ public sealed class HtmlRenderer
         float ParagraphSpacing,
         ITextMeasurer TextMeasurer,
         FontFaceSet Fonts,
-        Dictionary<IElement, Dictionary<string, string>> StyleMapCache);
+        Dictionary<IElement, Dictionary<string, string>> StyleMapCache,
+        IStyleCollection? StyleCollection);
 
     private sealed class LayoutCapture
     {
@@ -200,6 +201,22 @@ public sealed class HtmlRenderer
             defaultBackgroundColor = ParseColor(styleMap.TryGetValue("background-color", out var backgroundValue) ? backgroundValue : null, defaultBackgroundColor);
         }
 
+        // Built once per render and reused for every element (see GetExplicitDeclarations) rather
+        // than rebuilt from scratch on every single ResolveExplicitPropertyValue call the way it
+        // used to be - GetStyleCollection(window, device) constructs a brand new StyleCollection
+        // object (walks every stylesheet, including the UA sheet) each time it is called, and
+        // CreateStyleMap alone used to call it up to 8 times per element (grid-template-columns/
+        // rows, column-gap/row-gap/gap, grid-column/row, background-image), confirmed via
+        // AngleSharp.Renderer.Benchmarks to be the next-largest cost after per-element style-map
+        // caching. Mirrors the exact per-call device-resolution fallback
+        // ResolveExplicitPropertyValue itself used (window.Document.Context.GetService<IRenderDevice>()
+        // ?? new DefaultRenderDevice()) so this produces the identical collection that logic would
+        // have built on its own, just once instead of thousands of times.
+        var explicitStyleWindow = document.DefaultView;
+        var styleCollection = explicitStyleWindow is not null
+            ? explicitStyleWindow.GetStyleCollection(explicitStyleWindow.Document.Context.GetService<IRenderDevice>() ?? new DefaultRenderDevice())
+            : null;
+
         return new LayoutContext(
             Width: width,
             Height: height,
@@ -218,7 +235,8 @@ public sealed class HtmlRenderer
             // animation-driven style change between two successive renders of the same document
             // must never be answered from a stale map computed on a previous call. See
             // GetOrCreateStyleMap's own remarks for why caching within a single call is safe.
-            StyleMapCache: new Dictionary<IElement, Dictionary<string, string>>(ReferenceEqualityComparer.Instance));
+            StyleMapCache: new Dictionary<IElement, Dictionary<string, string>>(ReferenceEqualityComparer.Instance),
+            StyleCollection: styleCollection);
     }
 
     /// <summary>
@@ -3585,7 +3603,7 @@ public sealed class HtmlRenderer
     {
         if (element is null)
         {
-            return CreateStyleMap(style, element);
+            return CreateStyleMap(style, element, context);
         }
 
         if (context.StyleMapCache.TryGetValue(element, out var cached))
@@ -3593,14 +3611,39 @@ public sealed class HtmlRenderer
             return cached;
         }
 
-        var map = CreateStyleMap(style, element);
+        var map = CreateStyleMap(style, element, context);
         context.StyleMapCache[element] = map;
         return map;
     }
 
-    private static Dictionary<string, string> CreateStyleMap(ICssStyleDeclaration style, IElement? element = null)
+    /// <summary>
+    /// Resolves an element's cascaded-but-uncomputed declaration once (via the render-scoped
+    /// <see cref="LayoutContext.StyleCollection"/>, itself built once per render - see
+    /// <c>CreateLayoutContext</c>'s own remarks) so <see cref="CreateStyleMap"/> can read all of
+    /// its several explicit-declaration properties (grid-template-columns/rows, the gap
+    /// properties, grid-column/row, background-image) from that one object instead of calling
+    /// <see cref="ResolveExplicitPropertyValue"/> - which used to re-run the full ancestor-cascade
+    /// walk (<c>StyleCollectionExtensions.GetDeclarations</c>) completely independently for each
+    /// property name - up to 8 times for the very same element. Returns <see langword="null"/>
+    /// (falling all the way back to <see cref="ResolveExplicitPropertyValue"/>'s own per-call
+    /// resolution in <see cref="CreateStyleMap"/>) whenever no context/style collection is
+    /// available, exactly matching what that function already did for the same case.
+    /// </summary>
+    private static ICssStyleDeclaration? GetExplicitDeclarations(LayoutContext context, IElement? element) =>
+        element is not null && context.StyleCollection is not null
+            ? context.StyleCollection.GetDeclarations(element)
+            : null;
+
+    private static string ReadExplicitOrComputed(ICssStyleDeclaration explicitDeclarations, ICssStyleDeclaration computedStyle, string propertyName)
+    {
+        var explicitValue = explicitDeclarations.GetPropertyValue(propertyName);
+        return string.IsNullOrWhiteSpace(explicitValue) ? computedStyle.GetPropertyValue(propertyName) : explicitValue;
+    }
+
+    private static Dictionary<string, string> CreateStyleMap(ICssStyleDeclaration style, IElement? element = null, LayoutContext? context = null)
     {
         var map = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        var explicitDeclarations = context.HasValue ? GetExplicitDeclarations(context.Value, element) : null;
         var inlineStyle = element?.GetAttribute("style");
 
         var displayValue = style.GetDisplay();
@@ -3673,19 +3716,19 @@ public sealed class HtmlRenderer
         // entirely for the common `<line> / span <n>` form (CssTupleValue<T>.Compute() calling
         // .Compute() on the omitted end line's null entry) - fixed upstream, but reading the
         // explicit declaration sidesteps that whole bug class regardless.
-        var explicitGridTemplateColumns = ResolveExplicitPropertyValue(element, style, "grid-template-columns");
+        var explicitGridTemplateColumns = explicitDeclarations is not null ? ReadExplicitOrComputed(explicitDeclarations, style, "grid-template-columns") : ResolveExplicitPropertyValue(element, style, "grid-template-columns");
         AddIfPresent(map, "grid-template-columns", string.IsNullOrWhiteSpace(explicitGridTemplateColumns) ? ParseStyleAttributeValue(inlineStyle, "grid-template-columns") : explicitGridTemplateColumns);
-        var explicitGridTemplateRows = ResolveExplicitPropertyValue(element, style, "grid-template-rows");
+        var explicitGridTemplateRows = explicitDeclarations is not null ? ReadExplicitOrComputed(explicitDeclarations, style, "grid-template-rows") : ResolveExplicitPropertyValue(element, style, "grid-template-rows");
         AddIfPresent(map, "grid-template-rows", string.IsNullOrWhiteSpace(explicitGridTemplateRows) ? ParseStyleAttributeValue(inlineStyle, "grid-template-rows") : explicitGridTemplateRows);
-        var explicitColumnGap = ResolveExplicitPropertyValue(element, style, "column-gap");
+        var explicitColumnGap = explicitDeclarations is not null ? ReadExplicitOrComputed(explicitDeclarations, style, "column-gap") : ResolveExplicitPropertyValue(element, style, "column-gap");
         AddIfPresent(map, "column-gap", string.IsNullOrWhiteSpace(explicitColumnGap) ? ParseStyleAttributeValue(inlineStyle, "column-gap") : explicitColumnGap);
-        var explicitRowGap = ResolveExplicitPropertyValue(element, style, "row-gap");
+        var explicitRowGap = explicitDeclarations is not null ? ReadExplicitOrComputed(explicitDeclarations, style, "row-gap") : ResolveExplicitPropertyValue(element, style, "row-gap");
         AddIfPresent(map, "row-gap", string.IsNullOrWhiteSpace(explicitRowGap) ? ParseStyleAttributeValue(inlineStyle, "row-gap") : explicitRowGap);
-        var explicitGap = ResolveExplicitPropertyValue(element, style, "gap");
+        var explicitGap = explicitDeclarations is not null ? ReadExplicitOrComputed(explicitDeclarations, style, "gap") : ResolveExplicitPropertyValue(element, style, "gap");
         AddIfPresent(map, "gap", string.IsNullOrWhiteSpace(explicitGap) ? ParseStyleAttributeValue(inlineStyle, "gap") : explicitGap);
-        var explicitGridColumn = ResolveExplicitPropertyValue(element, style, "grid-column");
+        var explicitGridColumn = explicitDeclarations is not null ? ReadExplicitOrComputed(explicitDeclarations, style, "grid-column") : ResolveExplicitPropertyValue(element, style, "grid-column");
         AddIfPresent(map, "grid-column", string.IsNullOrWhiteSpace(explicitGridColumn) ? ParseStyleAttributeValue(inlineStyle, "grid-column") : explicitGridColumn);
-        var explicitGridRow = ResolveExplicitPropertyValue(element, style, "grid-row");
+        var explicitGridRow = explicitDeclarations is not null ? ReadExplicitOrComputed(explicitDeclarations, style, "grid-row") : ResolveExplicitPropertyValue(element, style, "grid-row");
         AddIfPresent(map, "grid-row", string.IsNullOrWhiteSpace(explicitGridRow) ? ParseStyleAttributeValue(inlineStyle, "grid-row") : explicitGridRow);
         AddIfPresent(map, "flex-direction", string.IsNullOrWhiteSpace(style.GetPropertyValue("flex-direction")) ? ParseStyleAttributeValue(inlineStyle, "flex-direction") : style.GetPropertyValue("flex-direction"));
         AddIfPresent(map, "justify-content", string.IsNullOrWhiteSpace(style.GetPropertyValue("justify-content")) ? ParseStyleAttributeValue(inlineStyle, "justify-content") : style.GetPropertyValue("justify-content"));
@@ -3698,7 +3741,7 @@ public sealed class HtmlRenderer
         AddIfPresent(map, "order", string.IsNullOrWhiteSpace(style.GetPropertyValue("order")) ? ParseStyleAttributeValue(inlineStyle, "order") : style.GetPropertyValue("order"));
         AddIfPresent(map, "align-content", string.IsNullOrWhiteSpace(style.GetPropertyValue("align-content")) ? ParseStyleAttributeValue(inlineStyle, "align-content") : style.GetPropertyValue("align-content"));
 
-        var resolvedBackgroundImage = ResolveExplicitBackgroundImage(element, style);
+        var resolvedBackgroundImage = explicitDeclarations is not null ? ReadExplicitOrComputed(explicitDeclarations, style, "background-image") : ResolveExplicitBackgroundImage(element, style);
         AddIfPresent(map, "background-image", string.IsNullOrWhiteSpace(resolvedBackgroundImage)
             ? ParseStyleAttributeValue(inlineStyle, "background-image")
             : resolvedBackgroundImage);

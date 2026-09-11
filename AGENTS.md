@@ -324,12 +324,34 @@ cache that outlived one call would silently serve stale style once the same docu
 computes different style on a later render). Any *new* call site that needs an element's style map
 must go through `GetOrCreateStyleMap`, not `CreateStyleMap` directly, to stay covered by this.
 
-Remaining allocation after that fix is still real (~615 MB for the same ~1500-element page, ~400KB
-per element) - `CreateStyleMap` itself still builds a full `Dictionary<string, string>` plus
-per-property strings for every element exactly once now, which is the natural next target (e.g.
-avoiding the dictionary entirely in favor of typed fields), but is a substantially larger, riskier
-refactor - every `ParseLength`/`GetPropertyValue`-style call site throughout this file reads from
-that dictionary by string key - deliberately not attempted in the same pass as the caching fix.
+A second pass followed immediately: **caching the explicit-declaration style collection**.
+`grid-template-columns`/`-rows`, the three gap properties, `grid-column`/`-row`, and
+`background-image` are all deliberately read from an element's cascaded-but-*uncomputed*
+declaration rather than `ComputeCurrentStyle()` (`ResolveExplicitPropertyValue`'s own remarks
+explain why - a percentage in any of these gets eagerly resolved against the wrong reference
+dimension by AngleSharp.Css's `.Compute()` step otherwise). That path turned out to carry its own,
+independent cost, confirmed by reading `AngleSharp.Css.StyleCollectionExtensions` directly:
+`window.GetStyleCollection(device)` builds a brand new `StyleCollection` - walking every
+stylesheet, including the UA sheet - from scratch on every call, and `GetDeclarations(element)`
+re-walks the element's entire ancestor chain and re-cascades from scratch, also on every call -
+and `CreateStyleMap` was calling this combination up to 8 times per element (once per property
+above), each one redoing both of those from nothing just to read a single property off the
+result. `LayoutContext` gained an `IStyleCollection? StyleCollection`, built once in
+`CreateLayoutContext` (mirroring the exact per-call device-resolution fallback
+`ResolveExplicitPropertyValue` already used, so the result is identical - just computed once
+instead of thousands of times); `GetExplicitDeclarations`/`ReadExplicitOrComputed` resolve an
+element's cascaded declaration once per `CreateStyleMap` call and read all 8 properties off that
+one object. This cut `BuildDisplayList` by a further ~3.5x (~3.1x less allocated). Combined, the
+two fixes together take `BuildDisplayList` from the original baseline to roughly 1/9th its time
+and 1/7th its allocation - see `BASELINE.md`'s `History` section for exact numbers on both passes.
+
+Remaining allocation after both fixes is still real (~201 MB for the same ~1500-element page,
+~135KB per element) - `CreateStyleMap` itself now runs exactly once per element with no redundant
+explicit-declaration walks either, but still builds a full `Dictionary<string, string>` plus
+per-property strings every time. Eliminating that (e.g. avoiding the dictionary entirely in favor
+of typed fields) is the natural next target, but is a substantially larger, riskier refactor than
+either fix above - essentially every `ParseLength`/`GetPropertyValue`-style call site throughout
+this file reads from that dictionary by string key - deliberately not attempted in the same pass.
 
 ## Repository Notes
 
