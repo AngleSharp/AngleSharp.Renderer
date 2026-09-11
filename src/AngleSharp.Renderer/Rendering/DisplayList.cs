@@ -45,6 +45,30 @@ public sealed class DisplayList
     }
 
     /// <summary>
+    /// Moves a contiguous range of already-appended commands to the current end of the list,
+    /// preserving their own relative order. Used for a stuck `position: sticky` element painted as
+    /// a normal, in-sequence page child (so its layout - cursor advancement, margin collapse - stays
+    /// correct) whose final on-screen position can overlap *later* siblings once actually stuck;
+    /// painting it in plain document order would let those later siblings paint over it. Unlike
+    /// <see cref="InsertRange"/> (which shifts everything at and after the target index later), this
+    /// physically relocates the range itself - the commands before/after the moved range close the
+    /// gap it leaves behind.
+    /// </summary>
+    /// <param name="startIndex">The first index of the range to move.</param>
+    /// <param name="count">How many commands, starting at <paramref name="startIndex"/>, to move.</param>
+    public void MoveRangeToEnd(int startIndex, int count)
+    {
+        if (count <= 0)
+        {
+            return;
+        }
+
+        var moved = _commands.GetRange(startIndex, count);
+        _commands.RemoveRange(startIndex, count);
+        _commands.AddRange(moved);
+    }
+
+    /// <summary>
     /// Begins clipping every command up to the matching <see cref="PopClip"/> to a rectangle
     /// (`overflow: hidden`/`scroll`/`auto`). Pairs must nest like a stack, matching how a backend
     /// implements this as a save/clip/restore scope.

@@ -29,7 +29,7 @@ class Build : FalloutBuild
     [Fallout.Common.Parameter("AngleSharp package version override (e.g. 1.8.1 for compatibility checks)")]
     readonly string AngleSharpVersion;
 
-    [Fallout.Common.Parameter("AngleSharp.Css package version override (e.g. 1.1.1 for compatibility checks)")]
+    [Fallout.Common.Parameter("AngleSharp.Css package version override (e.g. 1.1.2 for compatibility checks)")]
     readonly string AngleSharpCssVersion;
 
     [Solution]

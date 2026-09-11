@@ -10,7 +10,7 @@ env:
   # Snapshot baselines are per-platform and committed; a missing one is a gap, never a pass.
   ANGLESHARP_SNAPSHOT_STRICT: 1
   ANGLESHARP_VERSION: 1.8.1
-  ANGLESHARP_CSS_VERSION: 1.1.1
+  ANGLESHARP_CSS_VERSION: 1.1.2
 
 jobs:
   can_document:

@@ -2624,6 +2624,176 @@ public sealed class VisualConformanceTests
           maxDifferentPixels: TextRenderingToleranceMaxPixels);
     }
 
+    [Fact]
+    public async Task RenderToPng_SizesGridTracksWithFrRepeatAndMinMax()
+    {
+        var document = await ParseAsync("""
+            <html>
+              <head>
+                <style>html, body { margin: 0; padding: 0; }</style>
+              </head>
+              <body>
+                <div style="margin:10px; width:160px; height:60px; display:grid; grid-template-columns:minmax(30px, 1fr) repeat(2, 40px); gap:5px; background-color:#eeeeee;">
+                  <div style="height:60px; background-color:rgb(220,50,50);"></div>
+                  <div style="height:60px; background-color:rgb(50,150,220);"></div>
+                  <div style="height:60px; background-color:rgb(80,200,120);"></div>
+                </div>
+              </body>
+            </html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var image = renderer.RenderToPng(document, new DefaultRenderDevice
+        {
+            ViewPortWidth = 200,
+            ViewPortHeight = 100,
+        });
+
+        VisualSnapshotVerifier.VerifyOrCreate(
+          snapshotName: "sizes-grid-tracks-with-fr-repeat-and-minmax.png",
+          actualPng: image.Data,
+          perChannelTolerance: 0,
+          maxDifferentPixels: 0);
+    }
+
+    [Fact]
+    public async Task RenderToPng_TruncatesAndBreaksOverflowingText()
+    {
+        var document = await ParseAsync("""
+            <html>
+              <head>
+                <style>html, body { margin: 0; padding: 0; background-color: white; }</style>
+              </head>
+              <body>
+                <div style="width:120px; margin:8px; padding:4px; overflow:hidden; white-space:nowrap; text-overflow:ellipsis; border:1px solid #333333;">This text is much too long to fit</div>
+                <div style="width:70px; margin:8px; padding:4px; border:1px solid #333333; word-break:break-all;">Supercalifragilisticexpialidocious</div>
+              </body>
+            </html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var image = renderer.RenderToPng(document, new DefaultRenderDevice
+        {
+            ViewPortWidth = 160,
+            ViewPortHeight = 160,
+            FontSize = 16f,
+        });
+
+        VisualSnapshotVerifier.VerifyOrCreate(
+          snapshotName: "truncates-and-breaks-overflowing-text.png",
+          actualPng: image.Data,
+          perChannelTolerance: TextRenderingToleranceChannel,
+          maxDifferentPixels: TextRenderingToleranceMaxPixels);
+    }
+
+    [Fact]
+    public async Task RenderToPng_RendersBeforeAndAfterGeneratedContent()
+    {
+        var document = await ParseAsync("""
+            <html>
+              <head>
+                <style>
+                  html, body { margin: 0; padding: 0; background-color: white; font-family: sans-serif; }
+                  .badge::before { content: "\2605 "; color: rgb(210, 160, 20); }
+                  .badge::after { content: " (NEW)"; color: rgb(200, 30, 30); }
+                </style>
+              </head>
+              <body>
+                <div class="badge" style="margin:10px;" data-label="Widget">Widget</div>
+              </body>
+            </html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var image = renderer.RenderToPng(document, new DefaultRenderDevice
+        {
+            ViewPortWidth = 180,
+            ViewPortHeight = 50,
+            FontSize = 16f,
+        });
+
+        VisualSnapshotVerifier.VerifyOrCreate(
+          snapshotName: "renders-before-and-after-generated-content.png",
+          actualPng: image.Data,
+          perChannelTolerance: TextRenderingToleranceChannel,
+          maxDifferentPixels: TextRenderingToleranceMaxPixels);
+    }
+
+    [Fact]
+    public async Task RenderToPng_StickyHeaderStaysPinnedToTopWhileScrolledPastIt()
+    {
+        var renderDevice = new DefaultRenderDevice
+        {
+            ViewPortWidth = 80,
+            ViewPortHeight = 100,
+            DeviceWidth = 80,
+            DeviceHeight = 100,
+            FontSize = 16,
+        };
+        var configuration = Configuration.Default.WithCss().WithRenderDevice(renderDevice);
+        var document = await ParseAsync("""
+            <html>
+              <head><style>html, body { margin: 0; padding: 0; }</style></head>
+              <body>
+                <div style="position:sticky; top:0; width:80px; height:30px; background-color:rgb(50,50,200);"></div>
+                <div style="width:80px; height:40px; background-color:rgb(255,0,0);"></div>
+                <div style="width:80px; height:40px; background-color:rgb(255,165,0);"></div>
+                <div style="width:80px; height:40px; background-color:rgb(255,255,0);"></div>
+                <div style="width:80px; height:40px; background-color:rgb(0,180,0);"></div>
+                <div style="width:80px; height:40px; background-color:rgb(0,0,255);"></div>
+              </body>
+            </html>
+            """, configuration);
+
+        document.Context.GetDomHarness();
+        document.DocumentElement.SetScrollTop(80);
+
+        var renderer = new HtmlRenderer();
+        var image = renderer.RenderToPng(document, renderDevice);
+
+        VisualSnapshotVerifier.VerifyOrCreate(
+          snapshotName: "sticky-header-stays-pinned-to-top-while-scrolled-past-it.png",
+          actualPng: image.Data,
+          perChannelTolerance: 0,
+          maxDifferentPixels: 0);
+    }
+
+    [Fact]
+    public async Task RenderToPng_BorderBoxSizingKeepsTheDeclaredWidthInsteadOfAddingPaddingAndBorder()
+    {
+        var renderDevice = new DefaultRenderDevice
+        {
+            ViewPortWidth = 200,
+            ViewPortHeight = 80,
+            DeviceWidth = 200,
+            DeviceHeight = 80,
+            FontSize = 16,
+        };
+        var configuration = Configuration.Default.WithCss().WithRenderDevice(renderDevice);
+        var document = await ParseAsync("""
+            <html>
+              <head><style>html, body { margin: 0; padding: 0; }</style></head>
+              <body>
+                <div style="width:60px; height:20px; padding:10px; border:5px solid black; background-color:rgb(0,180,0);"></div>
+                <div style="box-sizing:border-box; width:60px; height:20px; padding:10px; border:5px solid black; background-color:rgb(0,0,255);"></div>
+              </body>
+            </html>
+            """, configuration);
+
+        var renderer = new HtmlRenderer();
+        var image = renderer.RenderToPng(document, renderDevice);
+
+        // The green box (default content-box) grows to 60 + 2*10 (padding) + 2*5 (border) = 90px
+        // wide; the blue box (box-sizing: border-box), authored with the exact same width/padding/
+        // border, stays exactly 60px wide instead - the padding and border eat into its content
+        // area rather than adding to the declared size.
+        VisualSnapshotVerifier.VerifyOrCreate(
+          snapshotName: "border-box-sizing-keeps-the-declared-width.png",
+          actualPng: image.Data,
+          perChannelTolerance: 0,
+          maxDifferentPixels: 0);
+    }
+
     private static async Task<AngleSharp.Dom.IDocument> ParseAsync(string html, IConfiguration? configuration = null)
     {
         var context = BrowsingContext.New(configuration ?? Configuration.Default.WithCss());

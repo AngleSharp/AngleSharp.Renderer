@@ -1,3 +1,15 @@
+# 0.5.0
+
+Released on Friday, September 11 2026.
+
+- Updated to use the AngleSharp.Css gradient model (#10)
+- Updated minimum required AngleSharp.Css version to be 1.1.2
+- Improved rendering of overflow with ellipsis (#11)
+- Improved rendering with non-default `box-sizing` value
+- Added support for CSS grid track sizing (#7)
+- Added support for pseudo elements and `content` declaration (#8)
+- Added support for `position: sticky` (#9)
+
 # 0.4.0
 
 Released on Thursday, September 10 2026.

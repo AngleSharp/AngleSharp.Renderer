@@ -21,7 +21,7 @@
     <IncludeSymbols>true</IncludeSymbols>
     <SymbolPackageFormat>snupkg</SymbolPackageFormat>
     <AngleSharpVersion Condition=" '$(AngleSharpVersion)' == '' ">1.8.1</AngleSharpVersion>
-    <AngleSharpCssVersion Condition=" '$(AngleSharpCssVersion)' == '' ">1.1.1</AngleSharpCssVersion>
+    <AngleSharpCssVersion Condition=" '$(AngleSharpCssVersion)' == '' ">1.1.2</AngleSharpCssVersion>
   </PropertyGroup>
 
   <ItemGroup>

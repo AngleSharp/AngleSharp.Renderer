@@ -330,7 +330,7 @@ public sealed class HtmlRenderer
             return displayList;
         }
 
-        var textStyle = new RenderTextStyle(context.FontSize, context.TextColor, context.FontFamily, context.LineHeightMultiplier, 400f, false, false, false, context.TextColor, global::AngleSharp.Renderer.Rendering.RenderTextDecorationStyle.Solid, TextAlign.Left, 0f, 0f, 0f, [], WhiteSpaceMode.Normal);
+        var textStyle = new RenderTextStyle(context.FontSize, context.TextColor, context.FontFamily, context.LineHeightMultiplier, 400f, false, false, false, context.TextColor, global::AngleSharp.Renderer.Rendering.RenderTextDecorationStyle.Solid, TextAlign.Left, 0f, 0f, 0f, [], WhiteSpaceMode.Normal, WordBreakMode.Normal, OverflowWrapMode.Normal, TextOverflowMode.Clip);
         var cursorY = contentY;
         var previousBlockMarginBottom = 0f;
         var suppressNextBlockTopMargin = false;
@@ -344,8 +344,23 @@ public sealed class HtmlRenderer
         // opposite: the full page, regardless of how tall it is relative to the viewport.
         var maxY = measureFullExtent ? float.MaxValue : viewport.Height - context.Padding;
 
+        // A `position: sticky` page child is laid out right here, in plain document order, like
+        // any other page child - its own cursorY/margin-collapse threading must stay in sequence
+        // for its layout to be correct. But once actually stuck, its final on-screen position
+        // routinely overlaps *later* siblings it would otherwise paint behind in that same document
+        // order - a real, confirmed bug caught by rendering the sticky-header visual test and
+        // seeing the header completely painted over by the content scrolling underneath it. Each
+        // sticky child's own command range is recorded here (by index, since DisplayList is a flat
+        // list) and relocated to the end, in original relative order, only after every page child
+        // has been laid out - see the loop below.
+        var stickyRanges = new List<(int StartIndex, int Count)>();
+
         foreach (var child in OrderChildrenForPainting(root.Children))
         {
+            var isStickyChild = child is ElementRenderNode stickyCandidate &&
+                IsStickyPositioned(CreateStyleMap(stickyCandidate.ComputedStyle, stickyCandidate.Ref));
+            var stickyStartIndex = displayList.Commands.Count;
+
             LayoutNode(
                 node: child,
                 containingX: contentX,
@@ -362,10 +377,26 @@ public sealed class HtmlRenderer
                 displayList: displayList,
                 maxY: maxY);
 
+            if (isStickyChild)
+            {
+                stickyRanges.Add((stickyStartIndex, displayList.Commands.Count - stickyStartIndex));
+            }
+
             if (cursorY > maxY)
             {
                 break;
             }
+        }
+
+        // Each earlier move shifts every later index left by however many commands it removed, so
+        // later ranges (still expressed in their original, pre-move indices) need that same
+        // cumulative shift subtracted before they are moved themselves.
+        var cumulativeShift = 0;
+
+        foreach (var (startIndex, count) in stickyRanges)
+        {
+            displayList.MoveRangeToEnd(startIndex - cumulativeShift, count);
+            cumulativeShift += count;
         }
 
         // The page's own scrolling elements (<html>/<body>) are never laid out as boxes of their
@@ -491,7 +522,12 @@ public sealed class HtmlRenderer
             return;
         }
 
-        var renderAsBlock = ShouldRenderAsBlock(computedStyle) || IsReplacedElementTag(tagName);
+        // IsReplacedElementTag reads the host's own tagName, which a ::before/::after pseudo-element
+        // shares (PseudoElement.LocalName/TagName proxy through) - a real browser gives a generated-
+        // content pseudo its own independent display computation (defaulting to inline, per spec),
+        // entirely unrelated to whatever the host's tag would otherwise force, so this renderer must
+        // not either.
+        var renderAsBlock = ShouldRenderAsBlock(computedStyle) || (element is not IPseudoElement && IsReplacedElementTag(tagName));
         var isInlineBlock = IsInlineBlock(computedStyle);
         var currentTextStyle = ResolveTextStyle(styleMap, inheritedTextStyle);
 
@@ -563,6 +599,7 @@ public sealed class HtmlRenderer
         var isAbsolute = string.Equals(position, "absolute", StringComparison.OrdinalIgnoreCase);
         var isFixed = string.Equals(position, "fixed", StringComparison.OrdinalIgnoreCase);
         var isRelative = string.Equals(position, "relative", StringComparison.OrdinalIgnoreCase);
+        var isSticky = string.Equals(position, "sticky", StringComparison.OrdinalIgnoreCase);
         var isFloatLeft = string.Equals(GetFloat(styleMap), "left", StringComparison.OrdinalIgnoreCase);
 
         if (isAbsolute || isFixed)
@@ -586,6 +623,7 @@ public sealed class HtmlRenderer
             styleMap,
             flowContainingWidth,
             float.NaN,
+            borderLeft + borderRight + paddingLeft + paddingRight,
             isFlexItem,
             isRowDirection,
             flexMainSize,
@@ -625,11 +663,25 @@ public sealed class HtmlRenderer
             : isAbsolute
                 ? containingX + leftOffset
                 : flowBorderBoxX + (isRelative ? leftOffset : 0f);
+        // `position: sticky` stays in normal flow for every other purpose (margins, cursor
+        // advancement, painting order - see the isAbsolute/isFixed checks elsewhere in this
+        // method, none of which match "sticky") - only its own final paint Y is adjusted here.
+        // This renderer already lays out an entire scrolled page in one coordinate space where
+        // Y=context.Padding is the viewport's own top edge (BuildDisplayList shifts the whole
+        // page's starting Y by -scrollOffsetY up front, so flowBorderBoxY arrives already
+        // viewport-relative) - "stick to `top` once scrolled past it" is therefore just clamping
+        // the element's own natural Y to never go above that threshold, with no separate scroll
+        // lookup needed. Only triggers when `top` is actually authored (`styleMap.ContainsKey`,
+        // not just defaulted to 0 via ParseLength's own allowAuto fallback below) - an
+        // unconstrained sticky element (no offset property at all) has nothing to stick to and
+        // behaves exactly like `static`, per spec.
         var borderBoxY = isFixed
             ? context.Padding + topOffset
             : isAbsolute
                 ? containingY + topOffset
-                : flowBorderBoxY + (isRelative ? topOffset : 0f);
+                : isSticky && styleMap.ContainsKey("top")
+                    ? Math.Max(flowBorderBoxY, context.Padding + topOffset)
+                    : flowBorderBoxY + (isRelative ? topOffset : 0f);
         var contentX = borderBoxX + borderLeft + paddingLeft;
         var contentY = borderBoxY + borderTop + paddingTop;
 
@@ -657,6 +709,7 @@ public sealed class HtmlRenderer
                 styleMap,
                 flowContainingWidth,
                 float.NaN,
+                borderTop + borderBottom + paddingTop + paddingBottom,
                 isFlexItem,
                 isRowDirection,
                 flexMainSize,
@@ -690,8 +743,13 @@ public sealed class HtmlRenderer
         // the ordinary block child-layout path below is exactly what a browser's own <textarea>
         // content does, and needed no special-casing at all once the box itself got its default
         // border/padding/background chrome.
-        var orderedChildren = string.Equals(tagName, "svg", StringComparison.OrdinalIgnoreCase) ||
-                               formControlKind is FormControlKind.Select or FormControlKind.Button
+        // A ::before/::after pseudo-element's own tagName proxies through to its host (see the
+        // IsReplacedElementTag/ResolveFormControlKind guards above) - an <svg>'s own generated-content
+        // pseudo is not itself the foreign-namespaced SVG subtree, and must still get to paint its own
+        // single synthetic text child below rather than being emptied out like the real <svg> root is.
+        var orderedChildren = element is not IPseudoElement &&
+                               (string.Equals(tagName, "svg", StringComparison.OrdinalIgnoreCase) ||
+                               formControlKind is FormControlKind.Select or FormControlKind.Button)
             ? []
             : OrderChildrenForPainting(node.Children).ToList();
         // An inline-block child counts as inline content here too (not just plain inline/br) - it
@@ -963,7 +1021,7 @@ public sealed class HtmlRenderer
                         else
                         {
                             var childTextStyle = ResolveTextStyle(CreateStyleMap(inlineElement.ComputedStyle), currentTextStyle);
-                            var inlineText = NormalizeWhitespaceForInlineRun(inlineElement.Ref.TextContent ?? string.Empty, childTextStyle.WhiteSpace);
+                            var inlineText = NormalizeWhitespaceForInlineRun(ResolvePlainInlineElementText(inlineElement), childTextStyle.WhiteSpace);
 
                             if (inlineText.Length > 0)
                             {
@@ -995,6 +1053,7 @@ public sealed class HtmlRenderer
             styleMap,
             flowContainingWidth,
             float.NaN,
+            borderTop + borderBottom + paddingTop + paddingBottom,
             isFlexItem,
             isRowDirection,
             flexMainSize,
@@ -1154,6 +1213,49 @@ public sealed class HtmlRenderer
 
     private readonly record struct GridPlacement(int LineIndex, int Span);
 
+    /// <summary>
+    /// A CSS Grid track's own sizing function, kept unresolved (unlike a plain pixel size) until
+    /// <see cref="LayoutGridContainer"/>'s own two-pass sizing algorithm can run: <see cref="Auto"/>
+    /// tracks are grown by the estimated size of the items placed in them (this renderer's existing
+    /// approximation for content-based sizing - see <see cref="ResolveGridItemEstimatedSize"/>), and
+    /// only once every <see cref="Auto"/>/<see cref="Fixed"/> track is settled can the free space
+    /// left over be distributed across <see cref="Fraction"/> (`fr`) tracks.
+    /// </summary>
+    private sealed class GridTrackSize
+    {
+        public GridTrackSizeKind Kind;
+
+        /// <summary>The resolved pixel size for <see cref="GridTrackSizeKind.Fixed"/>, or the
+        /// working/final grown size for <see cref="GridTrackSizeKind.Auto"/> and (once resolved)
+        /// <see cref="GridTrackSizeKind.Fraction"/>.</summary>
+        public float Pixels;
+
+        /// <summary>The `fr` count, for <see cref="GridTrackSizeKind.Fraction"/> only.</summary>
+        public float FractionValue;
+
+        /// <summary>A `minmax()` floor, honored for both <see cref="GridTrackSizeKind.Auto"/> and
+        /// <see cref="GridTrackSizeKind.Fraction"/> tracks.</summary>
+        public float? MinPixels;
+
+        /// <summary>A `minmax()`/`fit-content()` ceiling, honored for
+        /// <see cref="GridTrackSizeKind.Auto"/> tracks only - a flexible track's own maximum is
+        /// always itself (its `fr` share), matching spec.</summary>
+        public float? MaxPixels;
+
+        public static GridTrackSize Fixed(float pixels) => new() { Kind = GridTrackSizeKind.Fixed, Pixels = Math.Max(0f, pixels) };
+
+        public static GridTrackSize Auto(float? min = null, float? max = null) => new() { Kind = GridTrackSizeKind.Auto, MinPixels = min, MaxPixels = max };
+
+        public static GridTrackSize Fraction(float fr, float? min = null) => new() { Kind = GridTrackSizeKind.Fraction, FractionValue = Math.Max(0f, fr), MinPixels = min };
+    }
+
+    private enum GridTrackSizeKind
+    {
+        Fixed,
+        Auto,
+        Fraction,
+    }
+
     private static void LayoutFlexContainer(
         ElementRenderNode node,
         float containingX,
@@ -1210,9 +1312,12 @@ public sealed class HtmlRenderer
             return;
         }
 
+        var horizontalBorderAndPadding = borderLeft + borderRight + paddingLeft + paddingRight;
+        var verticalBorderAndPadding = borderTop + borderBottom + paddingTop + paddingBottom;
+
         var containerMainSize = isRowDirection
-            ? ParseLength(styleMap, "width", containingWidth, containingWidth, allowAuto: true)
-            : ParseLength(styleMap, "height", containingWidth, containingWidth, allowAuto: true);
+            ? ResolveAuthoredDimension(styleMap, "width", containingWidth, containingWidth, horizontalBorderAndPadding)
+            : ResolveAuthoredDimension(styleMap, "height", containingWidth, containingWidth, verticalBorderAndPadding);
 
         if (float.IsNaN(containerMainSize) || containerMainSize <= 0f)
         {
@@ -1220,8 +1325,8 @@ public sealed class HtmlRenderer
         }
 
         var specifiedCrossSize = isRowDirection
-            ? ParseLength(styleMap, "height", containingWidth, float.NaN, allowAuto: true)
-            : ParseLength(styleMap, "width", containingWidth, float.NaN, allowAuto: true);
+            ? ResolveAuthoredDimension(styleMap, "height", containingWidth, float.NaN, verticalBorderAndPadding)
+            : ResolveAuthoredDimension(styleMap, "width", containingWidth, float.NaN, horizontalBorderAndPadding);
         var containerCrossSize = float.IsNaN(specifiedCrossSize) ? 0f : specifiedCrossSize;
 
         var contentWidth = containingWidth;
@@ -1444,7 +1549,7 @@ public sealed class HtmlRenderer
         }
 
         var autoContentHeight = Math.Max(0f, (isRowDirection ? containerCrossSize : containerMainSize) - 0f);
-        var specifiedContentHeight = ParseLength(styleMap, "height", containingWidth, float.NaN, allowAuto: true);
+        var specifiedContentHeight = ResolveAuthoredDimension(styleMap, "height", containingWidth, float.NaN, verticalBorderAndPadding);
         contentHeight = float.IsNaN(specifiedContentHeight) ? Math.Max(autoContentHeight, totalLineMainSize) : Math.Max(specifiedContentHeight, autoContentHeight);
         var borderBoxWidth = borderLeft + paddingLeft + containingWidth + paddingRight + borderRight;
         var borderBoxHeight = borderTop + paddingTop + contentHeight + paddingBottom + borderBottom;
@@ -1520,6 +1625,7 @@ public sealed class HtmlRenderer
         Dictionary<string, string> styleMap,
         float relativeTo,
         float defaultValue,
+        float borderAndPaddingSum,
         bool isFlexItem,
         bool isRowDirection,
         float? flexMainSize,
@@ -1528,19 +1634,25 @@ public sealed class HtmlRenderer
     {
         if (!isFlexItem)
         {
-            return ParseLength(styleMap, propertyName, relativeTo, defaultValue, allowAuto: true);
+            return ResolveAuthoredDimension(styleMap, propertyName, relativeTo, defaultValue, borderAndPaddingSum);
         }
 
+        // flexMainSize/flexCrossSize already arrive as content-box sizes - LayoutFlexContainer's
+        // own algorithm resolves them from ResolveFlexBaseSize/ResolveFlexCrossSize, which already
+        // apply this same box-sizing conversion using this item's own border/padding before the
+        // flex-grow/shrink distribution ever runs - so they must not be adjusted a second time
+        // here. Only the "no container override" fallback (this property wasn't driven by the flex
+        // algorithm at all) re-reads the raw authored value and needs the adjustment applied fresh.
         if (string.Equals(propertyName, "width", StringComparison.OrdinalIgnoreCase))
         {
             return isRowDirection
-                ? (flexMainSize.HasValue ? flexMainSize.Value : ParseLength(styleMap, propertyName, relativeTo, defaultValue, allowAuto: true))
-                : (flexCrossSize.HasValue ? flexCrossSize.Value : ParseLength(styleMap, propertyName, relativeTo, defaultValue, allowAuto: true));
+                ? (flexMainSize.HasValue ? flexMainSize.Value : ResolveAuthoredDimension(styleMap, propertyName, relativeTo, defaultValue, borderAndPaddingSum))
+                : (flexCrossSize.HasValue ? flexCrossSize.Value : ResolveAuthoredDimension(styleMap, propertyName, relativeTo, defaultValue, borderAndPaddingSum));
         }
 
         return isRowDirection
-            ? (flexCrossSize.HasValue ? flexCrossSize.Value : ParseLength(styleMap, propertyName, relativeTo, defaultValue, allowAuto: true))
-            : (flexMainSize.HasValue ? flexMainSize.Value : ParseLength(styleMap, propertyName, relativeTo, defaultValue, allowAuto: true));
+            ? (flexCrossSize.HasValue ? flexCrossSize.Value : ResolveAuthoredDimension(styleMap, propertyName, relativeTo, defaultValue, borderAndPaddingSum))
+            : (flexMainSize.HasValue ? flexMainSize.Value : ResolveAuthoredDimension(styleMap, propertyName, relativeTo, defaultValue, borderAndPaddingSum));
     }
 
     /// <summary>
@@ -1595,18 +1707,21 @@ public sealed class HtmlRenderer
             ApplyFormControlDefaults(formControlKind, element, styleMap, textStyle, context);
         }
 
-        var specifiedContentWidth = ParseLength(styleMap, "width", containingWidth, float.NaN, allowAuto: true);
-        var specifiedContentHeight = ParseLength(styleMap, "height", containingWidth, float.NaN, allowAuto: true);
+        // Reuses the exact same box-model resolution LayoutElement itself calls for every other
+        // element, rather than re-deriving border/padding/margin independently, so this prediction
+        // can never quietly drift out of sync with what actually gets laid out. Resolved up front
+        // (rather than after width/height, as before) because its own border/padding sums are now
+        // needed to convert an authored border-box width/height into this renderer's content-box
+        // convention, the same way LayoutElement itself does.
+        var box = ResolveBoxStyle(styleMap, element);
+        var specifiedContentWidth = ResolveAuthoredDimension(styleMap, "width", containingWidth, float.NaN, box.BorderWidth.Left + box.BorderWidth.Right + box.Padding.Left + box.Padding.Right);
+        var specifiedContentHeight = ResolveAuthoredDimension(styleMap, "height", containingWidth, float.NaN, box.BorderWidth.Top + box.BorderWidth.Bottom + box.Padding.Top + box.Padding.Bottom);
 
         if (float.IsNaN(specifiedContentWidth) || float.IsNaN(specifiedContentHeight))
         {
             return false;
         }
 
-        // Reuses the exact same box-model resolution LayoutElement itself calls for every other
-        // element, rather than re-deriving border/padding/margin independently, so this prediction
-        // can never quietly drift out of sync with what actually gets laid out.
-        var box = ResolveBoxStyle(styleMap, element);
         width = box.BorderWidth.Left + box.Padding.Left + specifiedContentWidth + box.Padding.Right + box.BorderWidth.Right;
         height = box.BorderWidth.Top + box.Padding.Top + specifiedContentHeight + box.Padding.Bottom + box.BorderWidth.Bottom;
 
@@ -2054,7 +2169,14 @@ public sealed class HtmlRenderer
         // (and appended), so their paint commands are spliced in before this index instead.
         var boxPaintInsertIndex = displayList.Commands.Count;
 
-        var columns = ParseGridTrackList(styleMap, "grid-template-columns", containingWidth, 1);
+        var explicitGridTemplateColumns = ResolveExplicitPropertyValue(node.Ref, node.ComputedStyle, "grid-template-columns");
+        var columns = ParseGridTrackListStructured(explicitGridTemplateColumns, containingWidth);
+
+        if (columns.Count == 0)
+        {
+            columns.Add(GridTrackSize.Fixed(containingWidth));
+        }
+
         var columnGap = ParseGridGap(styleMap, "column-gap", containingWidth, 0)
             ?? ParseGridGap(styleMap, "gap", containingWidth, 0);
         var rowGap = ParseGridGap(styleMap, "row-gap", containingWidth, 0)
@@ -2064,15 +2186,104 @@ public sealed class HtmlRenderer
         var gridItems = node.Children
             .Where(child => child is ElementRenderNode || (child is TextRenderNode textNode && NormalizeWhitespace(textNode.Ref.Data).Length > 0))
             .ToList();
-        var hasExplicitRowTracks = styleMap.TryGetValue("grid-template-rows", out var rowTemplateValue) && !string.IsNullOrWhiteSpace(rowTemplateValue);
-        var containerHeight = ParseLength(styleMap, "height", containingWidth, containingWidth, allowAuto: true);
-        var rows = hasExplicitRowTracks
-            ? ParseGridTrackList(styleMap, "grid-template-rows", containerHeight, 1)
-            : CreateAutoRows(gridItems.Count, columns.Count, containerHeight);
+        var gridVerticalBorderAndPadding = borderTop + borderBottom + paddingTop + paddingBottom;
+        var containerHeight = ResolveAuthoredDimension(styleMap, "height", containingWidth, containingWidth, gridVerticalBorderAndPadding);
+        var explicitGridTemplateRows = ResolveExplicitPropertyValue(node.Ref, node.ComputedStyle, "grid-template-rows");
+        var rows = ParseGridTrackListStructured(explicitGridTemplateRows, containerHeight);
+        var hasExplicitRowTracks = rows.Count > 0;
 
+        if (!hasExplicitRowTracks)
+        {
+            // Implicit rows default to content-sized (Auto), the same way a real browser sizes
+            // them - grown below from each item's own estimated height, exactly like an Auto
+            // column. The row count itself is still only a starting guess (one row per
+            // ceil(itemCount / columnCount)); ResolveGridItemPlacement grows this list further for
+            // any item that lands past it (an explicit grid-row/an oversized span).
+            var rowCount = Math.Max(1, (int)Math.Ceiling((double)gridItems.Count / Math.Max(1, columns.Count)));
+
+            for (var i = 0; i < rowCount; i++)
+            {
+                rows.Add(GridTrackSize.Auto());
+            }
+        }
+
+        // Pass 1: resolve every item's placement once (reused unchanged in pass 2 below, so a
+        // wrapping auto-placement cursor can never land an item in a different cell the second
+        // time around) and grow every Auto column/row to fit its own items' estimated size -
+        // mirroring this renderer's existing, pre-structured-parsing item-estimate approximation
+        // for content sizing (ResolveGridItemEstimatedSize), just now applied through the new
+        // GridTrackSize model instead of a flat pixel list.
+        var itemPlacements = new List<(ElementRenderNode Element, GridPlacement Column, GridPlacement Row)>();
         var currentColumn = 0;
         var currentRow = 0;
 
+        foreach (var child in gridItems)
+        {
+            if (child is not ElementRenderNode elementChild)
+            {
+                continue;
+            }
+
+            var childStyleMap = CreateStyleMap(elementChild.ComputedStyle, elementChild.Ref);
+            var placementColumn = ResolveGridPlacementFromMap(childStyleMap, "grid-column", currentColumn);
+            var placementRow = ResolveGridPlacementFromMap(childStyleMap, "grid-row", currentRow);
+            var hasExplicitPlacement = childStyleMap.ContainsKey("grid-column") || childStyleMap.ContainsKey("grid-row");
+
+            var effectivePlacementColumn = hasExplicitPlacement
+                ? new GridPlacement(Math.Max(0, placementColumn.LineIndex), placementColumn.Span)
+                : new GridPlacement(Math.Max(0, currentColumn), placementColumn.Span);
+            var effectivePlacementRow = hasExplicitPlacement
+                ? new GridPlacement(Math.Max(0, placementRow.LineIndex), placementRow.Span)
+                : new GridPlacement(Math.Max(0, currentRow), placementRow.Span);
+
+            itemPlacements.Add((elementChild, effectivePlacementColumn, effectivePlacementRow));
+
+            // The item's *own* width/height (childStyleMap), not the container's - a real,
+            // confirmed bug in the pre-existing estimate (it read the container's styleMap here,
+            // so every item's estimate was really just re-reading the container's own width/height
+            // regardless of what any individual item was actually styled with).
+            var estimatedItemWidth = ResolveGridItemEstimatedSize(elementChild, childStyleMap, containingWidth, "width");
+            var estimatedItemHeight = ResolveGridItemEstimatedSize(elementChild, childStyleMap, containingWidth, "height");
+            var effectiveColumnCount = Math.Max(columns.Count, effectivePlacementColumn.LineIndex + effectivePlacementColumn.Span);
+            var effectiveRowCount = Math.Max(rows.Count, effectivePlacementRow.LineIndex + effectivePlacementRow.Span);
+
+            while (columns.Count < effectiveColumnCount)
+            {
+                columns.Add(GridTrackSize.Auto());
+            }
+
+            while (rows.Count < effectiveRowCount)
+            {
+                rows.Add(GridTrackSize.Auto());
+            }
+
+            GrowGridTrackSize(columns, effectivePlacementColumn.LineIndex, estimatedItemWidth);
+            GrowGridTrackSize(rows, effectivePlacementRow.LineIndex, estimatedItemHeight);
+
+            currentColumn++;
+            if (currentColumn >= columns.Count)
+            {
+                currentColumn = 0;
+                currentRow++;
+            }
+        }
+
+        // Between passes: distribute each axis's remaining free space across its own `fr` tracks.
+        // Row `fr` tracks only grow when the container has a definite height to distribute - `fr`
+        // rows have no real meaning against an otherwise auto-sized container (there is no "free
+        // space" to speak of), a deliberate, documented scope cut rather than an attempt at the
+        // spec's own intrinsic-sizing fallback for that case.
+        ResolveGridFractionTracks(columns, resolvedColumnGap, containingWidth);
+
+        if (hasExplicitRowTracks && !float.IsNaN(containerHeight))
+        {
+            ResolveGridFractionTracks(rows, resolvedRowGap, containerHeight);
+        }
+
+        var columnSizes = columns.Select(t => t.Pixels).ToList();
+        var rowSizes = rows.Select(t => t.Pixels).ToList();
+
+        // Pass 2: lay out every item for real, against the now-fully-resolved track sizes.
         foreach (var child in gridItems)
         {
             if (child is TextRenderNode textNode)
@@ -2086,48 +2297,14 @@ public sealed class HtmlRenderer
                 continue;
             }
 
-            var placementColumn = ResolveGridPlacement(styleMap, elementChild, "grid-column", currentColumn);
-            var placementRow = ResolveGridPlacement(styleMap, elementChild, "grid-row", currentRow);
-            var effectivePlacementColumn = placementColumn;
-            var effectivePlacementRow = placementRow;
-
-            var hasExplicitColumnPlacement = elementChild.Ref.GetAttribute("data-render-grid-column") is not null;
-            var hasExplicitRowPlacement = elementChild.Ref.GetAttribute("data-render-grid-row") is not null;
-
-            if (hasExplicitColumnPlacement || hasExplicitRowPlacement)
-            {
-                effectivePlacementColumn = new GridPlacement(Math.Max(0, placementColumn.LineIndex), placementColumn.Span);
-                effectivePlacementRow = new GridPlacement(Math.Max(0, placementRow.LineIndex), placementRow.Span);
-            }
-            else
-            {
-                effectivePlacementColumn = new GridPlacement(Math.Max(0, currentColumn), placementColumn.Span);
-                effectivePlacementRow = new GridPlacement(Math.Max(0, currentRow), placementRow.Span);
-            }
-            var estimatedItemWidth = ResolveGridItemEstimatedSize(elementChild, styleMap, containingWidth, "width");
-            var estimatedItemHeight = ResolveGridItemEstimatedSize(elementChild, styleMap, containingWidth, "height");
-            var effectiveColumnCount = Math.Max(columns.Count, effectivePlacementColumn.LineIndex + effectivePlacementColumn.Span);
-            var effectiveRowCount = Math.Max(rows.Count, effectivePlacementRow.LineIndex + effectivePlacementRow.Span);
-
-            if (effectiveColumnCount > columns.Count)
-            {
-                columns.AddRange(Enumerable.Repeat(containingWidth, effectiveColumnCount - columns.Count));
-            }
-
-            if (effectiveRowCount > rows.Count)
-            {
-                rows.AddRange(Enumerable.Repeat(0f, effectiveRowCount - rows.Count));
-            }
-
-            EnsureGridTrackSize(columns, effectivePlacementColumn.LineIndex, estimatedItemWidth, containingWidth);
-            EnsureGridTrackSize(rows, effectivePlacementRow.LineIndex, estimatedItemHeight, 0f);
+            var (_, effectivePlacementColumn, effectivePlacementRow) = itemPlacements.First(p => ReferenceEquals(p.Element, elementChild));
 
             var contentX = borderBoxX + borderLeft + paddingLeft;
             var contentY = borderBoxY + borderTop + paddingTop;
-            var cellX = contentX + GetGridTrackOffset(columns, effectivePlacementColumn.LineIndex, resolvedColumnGap);
-            var cellY = contentY + GetGridTrackOffset(rows, effectivePlacementRow.LineIndex, resolvedRowGap);
-            var cellWidth = GetGridTrackSpanSize(columns, effectivePlacementColumn.LineIndex, effectivePlacementColumn.Span, resolvedColumnGap, containingWidth);
-            var cellHeight = GetGridTrackSpanSize(rows, effectivePlacementRow.LineIndex, effectivePlacementRow.Span, resolvedRowGap, containingWidth);
+            var cellX = contentX + GetGridTrackOffset(columnSizes, effectivePlacementColumn.LineIndex, resolvedColumnGap);
+            var cellY = contentY + GetGridTrackOffset(rowSizes, effectivePlacementRow.LineIndex, resolvedRowGap);
+            var cellWidth = GetGridTrackSpanSize(columnSizes, effectivePlacementColumn.LineIndex, effectivePlacementColumn.Span, resolvedColumnGap, containingWidth);
+            var cellHeight = GetGridTrackSpanSize(rowSizes, effectivePlacementRow.LineIndex, effectivePlacementRow.Span, resolvedRowGap, containingWidth);
 
             var childCursor = cellY;
             var childPreviousBlockMarginBottom = 0f;
@@ -2155,20 +2332,13 @@ public sealed class HtmlRenderer
                 isRowDirection: true,
                 flexMainSize: null,
                 flexCrossSize: null);
-
-            currentColumn++;
-            if (currentColumn >= columns.Count)
-            {
-                currentColumn = 0;
-                currentRow++;
-            }
         }
 
-        var gridContentWidth = GetGridContentSize(columns, resolvedColumnGap, containingWidth);
-        var specifiedHeight = ParseLength(styleMap, "height", containingWidth, containingWidth, allowAuto: true);
-        var gridContentHeight = GetGridContentSize(rows, resolvedRowGap, specifiedHeight);
+        var gridContentWidth = GetGridContentSize(columnSizes, resolvedColumnGap, containingWidth);
+        var specifiedHeight = ResolveAuthoredDimension(styleMap, "height", containingWidth, containingWidth, gridVerticalBorderAndPadding);
+        var gridContentHeight = GetGridContentSize(rowSizes, resolvedRowGap, specifiedHeight);
         var borderBoxWidth = borderLeft + paddingLeft + Math.Max(containingWidth, gridContentWidth) + paddingRight + borderRight;
-        var borderBoxHeight = borderTop + paddingTop + Math.Max(ParseLength(styleMap, "height", containingWidth, containingWidth, allowAuto: true), gridContentHeight) + paddingBottom + borderBottom;
+        var borderBoxHeight = borderTop + paddingTop + Math.Max(specifiedHeight, gridContentHeight) + paddingBottom + borderBottom;
         var canCollapseWithLastChild = borderBottom <= 0f && paddingBottom <= 0f;
         var effectiveMarginBottom = ParseLength(styleMap, "margin-bottom", containingWidth, box.Margin.Bottom, allowAuto: false);
 
@@ -2268,41 +2438,160 @@ public sealed class HtmlRenderer
         return totalSize;
     }
 
-    private static List<float> ParseGridTrackList(Dictionary<string, string> styleMap, string propertyName, float fallbackSize, int minimumCount)
+    /// <summary>
+    /// Parses `grid-template-columns`/`grid-template-rows` into a track-sizing-function list,
+    /// delegating the outer function/list grammar to AngleSharp.Css's own `GridParser.ParseTrackList`
+    /// (mirroring the `transform`/`filter`/gradient precedent: AngleSharp.Css computes the pure-CSS
+    /// structure - `repeat()`, `minmax()`, `fit-content()`, the `fr` unit - this renderer still owns
+    /// turning that into its own backend-agnostic <see cref="GridTrackSize"/> list and, later, the
+    /// actual pixel sizes). Returns an empty list when unset or `none`, matching CSS's own initial
+    /// value - the caller falls back to a single implicit track, the same default a real browser
+    /// gives an unstyled grid container.
+    /// </summary>
+    private static List<GridTrackSize> ParseGridTrackListStructured(string rawValue, float relativeTo)
     {
-        if (!styleMap.TryGetValue(propertyName, out var rawValue) || string.IsNullOrWhiteSpace(rawValue))
-        {
-            var fallbackTracks = new List<float>(Math.Max(1, minimumCount));
-            var fallbackTrackSize = Math.Max(0f, fallbackSize / Math.Max(1, minimumCount));
-            for (var index = 0; index < Math.Max(1, minimumCount); index++)
-            {
-                fallbackTracks.Add(fallbackTrackSize);
-            }
+        var tracks = new List<GridTrackSize>();
 
-            return fallbackTracks;
+        if (string.IsNullOrWhiteSpace(rawValue) || string.Equals(rawValue.Trim(), "none", StringComparison.OrdinalIgnoreCase))
+        {
+            return tracks;
         }
 
-        var tracks = new List<float>();
-        foreach (var token in rawValue.Split(new[] { ' ', '\t', '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
-        {
-            var normalized = token.Trim().ToLowerInvariant();
-            var trackSize = normalized switch
-            {
-                "auto" => Math.Max(0f, fallbackSize),
-                _ => ParseLengthValue(normalized, fallbackSize, allowAuto: false)
-            };
+        var source = new StringSource(rawValue.Trim());
+        var parsed = source.ParseTrackList();
 
-            tracks.Add(float.IsNaN(trackSize) ? Math.Max(0f, fallbackSize) : Math.Max(0f, trackSize));
+        if (parsed is not null)
+        {
+            AppendGridTracks(parsed, relativeTo, tracks);
         }
 
-        return tracks.Count > 0 ? tracks : new List<float> { Math.Max(0f, fallbackSize) };
+        return tracks;
     }
 
-    private static List<float> CreateAutoRows(int itemCount, int columnCount, float containerHeight)
+    private static void AppendGridTracks(ICssValue value, float relativeTo, List<GridTrackSize> tracks)
     {
-        var rowCount = Math.Max(1, (int)Math.Ceiling((double)itemCount / Math.Max(1, columnCount)));
-        var fallbackRowSize = containerHeight > 0f ? containerHeight / rowCount : 0f;
-        return Enumerable.Range(0, rowCount).Select(_ => fallbackRowSize).ToList();
+        switch (value)
+        {
+            case CssLineNamesValue:
+                // Named grid lines (`[name]`) are not represented in this renderer's line-index
+                // placement model (see ResolveGridPlacement, which only understands numeric lines
+                // and spans) - a deliberate, documented scope cut, not a crash or a dropped track.
+                break;
+
+            // CssRepeatValue/CssFitContentValue are both `internal` in AngleSharp.Css (unlike
+            // CssMinMaxValue, which is public) - matched via the public ICssFunctionValue interface
+            // (Name/Arguments) they both implement instead of the concrete type.
+            case ICssFunctionValue repeatFunc when string.Equals(repeatFunc.Name, "repeat", StringComparison.OrdinalIgnoreCase) && repeatFunc.Arguments.Length == 2:
+                var count = ResolveGridRepeatCount(repeatFunc.Arguments[0]);
+
+                for (var i = 0; i < count; i++)
+                {
+                    AppendGridTracks(repeatFunc.Arguments[1], relativeTo, tracks);
+                }
+
+                break;
+
+            case CssTupleValue<ICssValue> tuple:
+                foreach (var item in tuple.Items)
+                {
+                    if (item is not null)
+                    {
+                        AppendGridTracks(item, relativeTo, tracks);
+                    }
+                }
+
+                break;
+
+            default:
+                tracks.Add(ConvertGridTrackSize(value, relativeTo));
+                break;
+        }
+    }
+
+    /// <summary>
+    /// `repeat(auto-fill, ...)`/`repeat(auto-fit, ...)` need the container's own available space to
+    /// compute how many repetitions fit - a genuinely different, container-size-dependent algorithm
+    /// this renderer does not implement. Falls back to a single repetition (the count `1` never
+    /// causes a dropped track or a NaN/absurd count), a deliberate, documented scope cut.
+    /// </summary>
+    private static int ResolveGridRepeatCount(ICssValue countValue)
+    {
+        var text = countValue.CssText;
+
+        if (int.TryParse(text, NumberStyles.Integer, CultureInfo.InvariantCulture, out var count))
+        {
+            return Math.Clamp(count, 1, 1000);
+        }
+
+        return 1;
+    }
+
+    private static GridTrackSize ConvertGridTrackSize(ICssValue value, float relativeTo)
+    {
+        switch (value)
+        {
+            case CssFractionValue fraction:
+                return GridTrackSize.Fraction((float)fraction.Value);
+
+            case CssMinMaxValue minMax:
+                return ConvertGridMinMax(minMax, relativeTo);
+
+            case ICssFunctionValue fitContentFunc when string.Equals(fitContentFunc.Name, "fit-content", StringComparison.OrdinalIgnoreCase) && fitContentFunc.Arguments.Length == 1:
+                return GridTrackSize.Auto(max: ResolveGridTrackLength(fitContentFunc.Arguments[0], relativeTo));
+
+            case CssLengthValue:
+                return GridTrackSize.Fixed(ResolveGridTrackLength(value, relativeTo));
+
+            default:
+                // "auto"/"min-content"/"max-content" and anything else unrecognized - all treated
+                // as content-sized, the same approximation this renderer already used for every
+                // plain "auto" track before structured parsing.
+                return GridTrackSize.Auto();
+        }
+    }
+
+    /// <summary>
+    /// `minmax(min, max)` where `max` is a `&lt;flex&gt;` (`fr`) is the common, important case
+    /// (`minmax(100px, 1fr)` - "at least 100px, then grow to fill") and gets real support: the
+    /// track participates in free-space distribution like any other `fr` track, but never shrinks
+    /// below `min`. Any other combination (`minmax(100px, 300px)`, `minmax(min-content, 1fr)`, ...)
+    /// is approximated as a content-sized track clamped to whichever bounds were themselves plain
+    /// lengths/percentages - not the spec's own iterative clamping algorithm, but consistent with
+    /// this renderer's existing item-estimate-based approximation for content sizing in general.
+    /// </summary>
+    private static GridTrackSize ConvertGridMinMax(CssMinMaxValue minMax, float relativeTo)
+    {
+        if (minMax.Maximum is CssFractionValue maxFraction)
+        {
+            var floorPixels = minMax.Minimum is CssLengthValue ? ResolveGridTrackLength(minMax.Minimum, relativeTo) : (float?)null;
+            return GridTrackSize.Fraction((float)maxFraction.Value, floorPixels);
+        }
+
+        var min = minMax.Minimum is CssLengthValue ? ResolveGridTrackLength(minMax.Minimum, relativeTo) : (float?)null;
+        var max = minMax.Maximum is CssLengthValue ? ResolveGridTrackLength(minMax.Maximum, relativeTo) : (float?)null;
+        return GridTrackSize.Auto(min, max);
+    }
+
+    /// <summary>
+    /// Resolves one already-structured track-size sub-value's own length/percentage into pixels,
+    /// reading its `.CssText` (e.g. "50%", "20px") the same "re-parse the structured value's own
+    /// serialized text with this renderer's existing semantic parsers" pattern already established
+    /// for `filter`/gradients - <see cref="ParseLengthValue"/> itself has no percentage handling
+    /// (every other caller resolves percentages against a styleMap-driven containing dimension it
+    /// doesn't have here), so this adds that one case directly rather than reusing it verbatim.
+    /// </summary>
+    private static float ResolveGridTrackLength(ICssValue value, float relativeTo)
+    {
+        var text = value.CssText.Trim();
+
+        if (text.EndsWith("%", StringComparison.Ordinal) &&
+            float.TryParse(text[..^1], NumberStyles.Float, CultureInfo.InvariantCulture, out var percent))
+        {
+            return Math.Max(0f, relativeTo * percent / 100f);
+        }
+
+        var pixels = ParseLengthValue(text, float.NaN, allowAuto: false);
+        return float.IsNaN(pixels) ? 0f : Math.Max(0f, pixels);
     }
 
     private static float? ParseGridGap(Dictionary<string, string> styleMap, string propertyName, float relativeTo, int tokenIndex)
@@ -2323,9 +2612,8 @@ public sealed class HtmlRenderer
         return float.IsNaN(parsed) ? null : parsed;
     }
 
-    private static GridPlacement ResolveGridPlacement(Dictionary<string, string> styleMap, ElementRenderNode elementChild, string propertyName, int fallbackIndex)
+    private static GridPlacement ResolveGridPlacementFromMap(Dictionary<string, string> childStyleMap, string propertyName, int fallbackIndex)
     {
-        var childStyleMap = CreateStyleMap(elementChild.ComputedStyle, elementChild.Ref);
         if (!childStyleMap.TryGetValue(propertyName, out var rawValue) || string.IsNullOrWhiteSpace(rawValue))
         {
             return new GridPlacement(fallbackIndex, 1);
@@ -2362,16 +2650,69 @@ public sealed class HtmlRenderer
         return float.IsNaN(parsed) ? fallbackSize : Math.Max(0f, parsed);
     }
 
-    private static void EnsureGridTrackSize(List<float> tracks, int index, float size, float fallbackSize)
+    /// <summary>
+    /// Grows an <see cref="GridTrackSizeKind.Auto"/> track to fit an item's own estimated size,
+    /// the same "grow, never shrink" approximation for content-based sizing this renderer already
+    /// used before structured `grid-template-columns`/`rows` parsing - now scoped to `Auto` tracks
+    /// specifically (a `Fixed` track already has its final size; a `Fraction` track's only comes
+    /// from <see cref="ResolveGridFractionTracks"/>, once every `Auto`/`Fixed` track is settled).
+    /// </summary>
+    private static void GrowGridTrackSize(List<GridTrackSize> tracks, int index, float itemEstimate)
     {
         while (tracks.Count <= index)
         {
-            tracks.Add(Math.Max(0f, fallbackSize));
+            tracks.Add(GridTrackSize.Auto());
         }
 
-        if (tracks[index] <= 0f)
+        var track = tracks[index];
+
+        if (track.Kind != GridTrackSizeKind.Auto)
         {
-            tracks[index] = Math.Max(0f, Math.Max(size, fallbackSize));
+            return;
+        }
+
+        var candidate = Math.Max(track.Pixels, itemEstimate);
+
+        if (track.MaxPixels is { } max)
+        {
+            candidate = Math.Min(candidate, max);
+        }
+
+        if (track.MinPixels is { } min)
+        {
+            candidate = Math.Max(candidate, min);
+        }
+
+        track.Pixels = candidate;
+    }
+
+    /// <summary>
+    /// Distributes one axis's remaining free space across its own `fr` tracks, proportional to
+    /// each one's own `fr` count - the CSS Grid spec's own "distribute free space by flex factor"
+    /// step, simplified (not the full spec algorithm's iterative handling of a `minmax()` track
+    /// whose floor alone already exceeds its fair share - a rare, defensible approximation gap).
+    /// A `minmax(floor, 1fr)` track's floor is reserved as already-used space before the remaining
+    /// free space is computed, then added back on top of that track's own distributed share.
+    /// </summary>
+    private static void ResolveGridFractionTracks(List<GridTrackSize> tracks, float gap, float availableSpace)
+    {
+        var totalFraction = tracks.Where(t => t.Kind == GridTrackSizeKind.Fraction).Sum(t => t.FractionValue);
+
+        if (totalFraction <= 0f)
+        {
+            return;
+        }
+
+        var usedSpace = tracks.Sum(t => t.Kind == GridTrackSizeKind.Fraction ? (t.MinPixels ?? 0f) : t.Pixels);
+        var gapSpace = Math.Max(0, tracks.Count - 1) * gap;
+        var freeSpace = Math.Max(0f, availableSpace - usedSpace - gapSpace);
+
+        foreach (var track in tracks)
+        {
+            if (track.Kind == GridTrackSizeKind.Fraction)
+            {
+                track.Pixels = (track.MinPixels ?? 0f) + (freeSpace * (track.FractionValue / totalFraction));
+            }
         }
     }
 
@@ -2466,6 +2807,18 @@ public sealed class HtmlRenderer
 
             var lineWidth = MeasureTextWidth(context, line, textStyle);
             var lineMaxWidth = index == 0 ? Math.Max(0f, maxWidth - firstLineIndent) : maxWidth;
+
+            // `text-overflow: ellipsis` is scoped to the single-line case - by far the dominant
+            // real-world usage (`overflow: hidden; white-space: nowrap; text-overflow: ellipsis`) -
+            // rather than truncating the last of several wrapped lines, which the CSS spec itself
+            // does not define without a non-standard extension (`-webkit-line-clamp`); a genuinely
+            // multi-line result here (`lines.Count > 1`) is left as-is, matching that scope cut.
+            if (textStyle.TextOverflow == TextOverflowMode.Ellipsis && lines.Count == 1 && lineWidth > lineMaxWidth)
+            {
+                line = TruncateWithEllipsis(context, line, lineMaxWidth, textStyle);
+                lineWidth = MeasureTextWidth(context, line, textStyle);
+            }
+
             var lineX = x + (index == 0 ? firstLineIndent : 0f) + ResolveTextAlignmentOffset(textStyle.TextAlign, lineMaxWidth, lineWidth);
             var baselineY = cursorY + textStyle.VerticalAlignOffset;
 
@@ -2548,7 +2901,11 @@ public sealed class HtmlRenderer
         // multi-space preservation and explicit forced breaks are not supported at this level (a
         // deliberate scope cut: the caller already collapsed any literal '\n' in `text` to a plain
         // space before it ever reaches here, since this word-by-word model has no way to represent
-        // one - see the two LayoutNode call sites that build `inlineText`).
+        // one - see the two LayoutNode call sites that build `inlineText`). `word-break: break-all`/
+        // `overflow-wrap: break-word` are the same kind of scope cut, for the same reason: this
+        // model paints one whole word per DrawText call with no sub-word split point, unlike
+        // WrapText's line-based model where a broken chunk can simply become its own line - an
+        // overlong word here still overflows its line whole, exactly like `overflow-wrap: normal`.
         var noWrap = IsNoWrapWhiteSpace(textStyle.WhiteSpace);
 
         foreach (var word in words)
@@ -2683,8 +3040,18 @@ public sealed class HtmlRenderer
         }
 
         var childStyle = CreateStyleMap(elementChild.ComputedStyle, elementChild.Ref);
-        var baseMainSize = ResolveFlexBaseSize(childStyle, isRowDirection, relativeTo);
-        var crossSize = ResolveFlexCrossSize(childStyle, isRowDirection, relativeTo);
+        // Needed so ResolveFlexBaseSize/ResolveFlexCrossSize can convert an authored border-box
+        // width/height/flex-basis into this renderer's content-box convention using *this item's*
+        // own border/padding - not the container's - before flex-grow/shrink ever runs, the same
+        // way LayoutElement resolves its own specifiedContentWidth/Height (see
+        // ResolveAuthoredDimension's remarks). The resulting BaseMainSize/CrossSize therefore
+        // already represent content-box sizes, so LayoutElement's own isFlexItem branch in
+        // ResolveFlexibleContentDimension must not (and does not) adjust them a second time.
+        var childBox = ResolveBoxStyle(childStyle, elementChild.Ref);
+        var horizontalBorderAndPadding = childBox.BorderWidth.Left + childBox.BorderWidth.Right + childBox.Padding.Left + childBox.Padding.Right;
+        var verticalBorderAndPadding = childBox.BorderWidth.Top + childBox.BorderWidth.Bottom + childBox.Padding.Top + childBox.Padding.Bottom;
+        var baseMainSize = ResolveFlexBaseSize(childStyle, isRowDirection, relativeTo, isRowDirection ? horizontalBorderAndPadding : verticalBorderAndPadding);
+        var crossSize = ResolveFlexCrossSize(childStyle, isRowDirection, relativeTo, isRowDirection ? verticalBorderAndPadding : horizontalBorderAndPadding);
         return new FlexItemLayoutInfo(
             child,
             childStyle,
@@ -2696,26 +3063,26 @@ public sealed class HtmlRenderer
             GetAlignSelf(childStyle, "auto"));
     }
 
-    private static float ResolveFlexBaseSize(Dictionary<string, string> styleMap, bool isRowDirection, float relativeTo)
+    private static float ResolveFlexBaseSize(Dictionary<string, string> styleMap, bool isRowDirection, float relativeTo, float mainAxisBorderAndPadding)
     {
-        var flexBasis = ParseLength(styleMap, "flex-basis", relativeTo, float.NaN, allowAuto: true);
+        var flexBasis = ResolveAuthoredDimension(styleMap, "flex-basis", relativeTo, float.NaN, mainAxisBorderAndPadding);
         if (!float.IsNaN(flexBasis))
         {
             return flexBasis;
         }
 
         var mainSize = isRowDirection
-            ? ParseLength(styleMap, "width", relativeTo, float.NaN, allowAuto: true)
-            : ParseLength(styleMap, "height", relativeTo, float.NaN, allowAuto: true);
+            ? ResolveAuthoredDimension(styleMap, "width", relativeTo, float.NaN, mainAxisBorderAndPadding)
+            : ResolveAuthoredDimension(styleMap, "height", relativeTo, float.NaN, mainAxisBorderAndPadding);
 
         return float.IsNaN(mainSize) ? 0f : mainSize;
     }
 
-    private static float ResolveFlexCrossSize(Dictionary<string, string> styleMap, bool isRowDirection, float relativeTo)
+    private static float ResolveFlexCrossSize(Dictionary<string, string> styleMap, bool isRowDirection, float relativeTo, float crossAxisBorderAndPadding)
     {
         var crossSize = isRowDirection
-            ? ParseLength(styleMap, "height", relativeTo, float.NaN, allowAuto: true)
-            : ParseLength(styleMap, "width", relativeTo, float.NaN, allowAuto: true);
+            ? ResolveAuthoredDimension(styleMap, "height", relativeTo, float.NaN, crossAxisBorderAndPadding)
+            : ResolveAuthoredDimension(styleMap, "width", relativeTo, float.NaN, crossAxisBorderAndPadding);
 
         return float.IsNaN(crossSize) ? 0f : crossSize;
     }
@@ -2774,8 +3141,70 @@ public sealed class HtmlRenderer
         var verticalAlignOffset = ParseVerticalAlign(styleMap, fontSize);
         var textShadows = ParseTextShadows(styleMap.TryGetValue("text-shadow", out var textShadowValue) ? textShadowValue : null, inherited.TextShadows);
         var whiteSpace = ParseWhiteSpace(styleMap, inherited.WhiteSpace);
+        var wordBreak = ParseWordBreak(styleMap, inherited.WordBreak);
+        var overflowWrap = ParseOverflowWrap(styleMap, inherited.OverflowWrap);
+        var textOverflow = ParseTextOverflow(styleMap);
 
-        return new RenderTextStyle(fontSize, color, fontFamily, lineHeight, fontWeight, isItalic, underline, strikeThrough, decorationColor, decorationStyle, textAlign, letterSpacing, textIndent, verticalAlignOffset, textShadows, whiteSpace);
+        return new RenderTextStyle(fontSize, color, fontFamily, lineHeight, fontWeight, isItalic, underline, strikeThrough, decorationColor, decorationStyle, textAlign, letterSpacing, textIndent, verticalAlignOffset, textShadows, whiteSpace, wordBreak, overflowWrap, textOverflow);
+    }
+
+    /// <summary>
+    /// <c>word-break</c> is inherited, the same as <c>white-space</c> above.
+    /// </summary>
+    private static WordBreakMode ParseWordBreak(Dictionary<string, string> styleMap, WordBreakMode inherited)
+    {
+        if (!styleMap.TryGetValue("word-break", out var value) || string.IsNullOrWhiteSpace(value))
+        {
+            return inherited;
+        }
+
+        return string.Equals(value.Trim(), "break-all", StringComparison.OrdinalIgnoreCase)
+            ? WordBreakMode.BreakAll
+            : WordBreakMode.Normal;
+    }
+
+    /// <summary>
+    /// <c>overflow-wrap</c>, falling back to its legacy <c>word-wrap</c> alias when the modern
+    /// property was not itself authored - both are inherited, the same as <c>white-space</c> above.
+    /// </summary>
+    private static OverflowWrapMode ParseOverflowWrap(Dictionary<string, string> styleMap, OverflowWrapMode inherited)
+    {
+        var raw = styleMap.TryGetValue("overflow-wrap", out var value) && !string.IsNullOrWhiteSpace(value)
+            ? value
+            : (styleMap.TryGetValue("word-wrap", out var legacyValue) ? legacyValue : null);
+
+        if (string.IsNullOrWhiteSpace(raw))
+        {
+            return inherited;
+        }
+
+        return raw.Trim().ToLowerInvariant() switch
+        {
+            "break-word" or "anywhere" => OverflowWrapMode.BreakWord,
+            _ => OverflowWrapMode.Normal,
+        };
+    }
+
+    /// <summary>
+    /// <c>text-overflow</c>, unlike every other property resolved in <see cref="ResolveTextStyle"/>,
+    /// is deliberately never inherited - every element re-derives it fresh from its own style map,
+    /// defaulting to <see cref="TextOverflowMode.Clip"/> even when an ancestor set
+    /// `text-overflow: ellipsis`, mirroring the same non-inheritance <see cref="RenderTextStyle.TextIndent"/>
+    /// already establishes for itself. It also has no effect unless this element's own `overflow`
+    /// clips (per spec, and matching <see cref="ShouldClipOverflow"/>'s existing "either axis"
+    /// simplification) - `ellipsis` on a box that does not clip is simply ignored, same as a real
+    /// browser.
+    /// </summary>
+    private static TextOverflowMode ParseTextOverflow(Dictionary<string, string> styleMap)
+    {
+        if (!ShouldClipOverflow(styleMap))
+        {
+            return TextOverflowMode.Clip;
+        }
+
+        return styleMap.TryGetValue("text-overflow", out var value) && string.Equals(value.Trim(), "ellipsis", StringComparison.OrdinalIgnoreCase)
+            ? TextOverflowMode.Ellipsis
+            : TextOverflowMode.Clip;
     }
 
     /// <summary>
@@ -2981,29 +3410,11 @@ public sealed class HtmlRenderer
             var currentStyle = styleAttribute;
             var changed = false;
 
-            if (TryExtractGradientBackground(currentStyle, out var gradientValue, out var updatedStyle))
-            {
-                currentStyle = updatedStyle;
-                changed = true;
-                element.SetAttribute("data-render-gradient", gradientValue);
-            }
-
-            if (TryExtractTransformDeclaration(currentStyle, out var transformValue, out updatedStyle))
+            if (TryExtractTransformDeclaration(currentStyle, out var transformValue, out var updatedStyle))
             {
                 currentStyle = updatedStyle;
                 changed = true;
                 element.SetAttribute("data-render-transform", transformValue);
-            }
-
-            if (TryExtractGridDeclarations(currentStyle, out var gridValues, out updatedStyle))
-            {
-                currentStyle = updatedStyle;
-                changed = true;
-
-                foreach (var entry in gridValues)
-                {
-                    element.SetAttribute($"data-render-{entry.Key}", entry.Value);
-                }
             }
 
             if (changed)
@@ -3013,60 +3424,11 @@ public sealed class HtmlRenderer
         }
     }
 
-    private static bool TryExtractGradientBackground(string styleAttribute, out string gradientValue, out string updatedStyle)
-    {
-        gradientValue = string.Empty;
-        updatedStyle = styleAttribute;
-
-        if (!styleAttribute.Contains("background-image", StringComparison.OrdinalIgnoreCase))
-        {
-            return false;
-        }
-
-        var declarations = styleAttribute.Split(';', StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries);
-        var remaining = new List<string>();
-
-        foreach (var declaration in declarations)
-        {
-            var separator = declaration.IndexOf(':');
-            if (separator <= 0)
-            {
-                continue;
-            }
-
-            var property = declaration[..separator].Trim();
-            var value = declaration[(separator + 1)..].Trim();
-
-            if (string.Equals(property, "background-image", StringComparison.OrdinalIgnoreCase) &&
-                (value.StartsWith("linear-gradient", StringComparison.OrdinalIgnoreCase) ||
-                 value.StartsWith("radial-gradient", StringComparison.OrdinalIgnoreCase) ||
-                 value.StartsWith("conic-gradient", StringComparison.OrdinalIgnoreCase) ||
-                 value.StartsWith("repeating-linear-gradient", StringComparison.OrdinalIgnoreCase) ||
-                 value.StartsWith("repeating-radial-gradient", StringComparison.OrdinalIgnoreCase) ||
-                 value.StartsWith("repeating-conic-gradient", StringComparison.OrdinalIgnoreCase)))
-            {
-                gradientValue = value;
-                continue;
-            }
-
-            remaining.Add(declaration);
-        }
-
-        if (string.IsNullOrWhiteSpace(gradientValue))
-        {
-            return false;
-        }
-
-        updatedStyle = string.Join(";", remaining);
-        return true;
-    }
-
     /// <summary>
     /// Extracts a `transform` declaration out of an inline `style` attribute before AngleSharp.Css
-    /// ever sees it, the same "extract to a data-render-* attribute" workaround
-    /// <see cref="TryExtractGradientBackground"/> already established for gradient
-    /// `background-image` values - except here the workaround is for a genuine upstream crash, not
-    /// an unsupported-value gap: AngleSharp.Css's own `CssTranslateValue.Compute()` throws a
+    /// ever sees it (via a `data-render-transform` attribute this renderer reads back in
+    /// `CreateStyleMap` instead) - a workaround for a genuine upstream crash, not an unsupported-
+    /// value gap: AngleSharp.Css's own `CssTranslateValue.Compute()` throws a
     /// `NullReferenceException` - confirmed via a failing test with a minimal repro, not assumed -
     /// for *any* `translate`/`translateX`/`translateY` function, and that crash happens eagerly
     /// while building the render tree (`RenderTreeBuilder.RenderElement` computing the *entire*
@@ -3075,7 +3437,11 @@ public sealed class HtmlRenderer
     /// `translate` - both to keep this single code path simple and because relying on exactly
     /// which other functions are crash-free would be fragile against a future AngleSharp.Css
     /// version. `rotate()`/`scale()` were separately confirmed *not* to crash, but are extracted
-    /// the same way regardless, for that same reason.
+    /// the same way regardless, for that same reason. `background-image` gradients used to need
+    /// this identical extraction pattern too, until AngleSharp.Css's own `GradientParser` shipped
+    /// and computed style started round-tripping the raw gradient text correctly - see the
+    /// `filter`/gradient paragraphs in AGENTS.md for the general "each upstream gap gets its own
+    /// fix, not a shared local workaround" policy this follows.
     /// </summary>
     private static bool TryExtractTransformDeclaration(string styleAttribute, out string transformValue, out string updatedStyle)
     {
@@ -3121,103 +3487,72 @@ public sealed class HtmlRenderer
         return true;
     }
 
-    private static bool TryExtractGridDeclarations(string styleAttribute, out Dictionary<string, string> values, out string updatedStyle)
+    /// <summary>
+    /// Resolves `background-image` from the cascaded but *uncomputed* declaration rather than
+    /// <c>ComputeCurrentStyle()</c>'s normal computed value, a deliberate, narrow exception to how
+    /// every other property in this map is read. AngleSharp.Css's `.Compute()` step eagerly
+    /// resolves a `CssPoint2D`'s percentage/keyword components (a gradient's `at &lt;position&gt;`,
+    /// and equally a radial gradient's explicit percentage size) into absolute pixels using
+    /// whatever `IRenderDimensions` happens to be current at CSSOM-compute time - the *viewport*,
+    /// not the element's own box, since a gradient's box is not a concept the general CSSOM compute
+    /// pass has any way to know about. Confirmed empirically: a `radial-gradient(red, blue)` (no
+    /// `at` clause at all - the default, and by far the most common way one is written) on a
+    /// 200x100px box inside a 300x200px viewport computed to `at 150px 150px` - both axes resolved
+    /// against the *viewport's* 300px width, not each axis against the box's own matching
+    /// dimension, which would already be wrong even before <see cref="CssPoint2D"/>'s own separate
+    /// `Compute()` bug (its `y` local is assigned from `_x.Compute(context)` instead of
+    /// `_y.Compute(context)` - reported upstream) compounds it further. There is no way to recover
+    /// the original percentage/keyword/position from that already-resolved-against-the-wrong-thing
+    /// pixel text, so this renderer cannot use the computed value for `background-image` at all -
+    /// `StyleCollectionExtensions.GetDeclarations` (`ComputeExplicitStyle` under the hood) gives the
+    /// same cascaded, colour-normalized value with none of this resolution applied, matching exactly
+    /// what a plain `style.GetPropertyValue("background-image")` gives for every other case
+    /// (`url(...)`, or a gradient with only non-percentage arguments) where the two do not diverge.
+    /// Falls back to the ordinary computed value if no window/device is available to build the
+    /// style collection from (mirrors the same fallback <c>ComputeCurrentStyle()</c> itself uses
+    /// internally when an element has no `Owner.DefaultView`).
+    /// </summary>
+    private static string ResolveExplicitBackgroundImage(IElement? element, ICssStyleDeclaration computedStyle) =>
+        ResolveExplicitPropertyValue(element, computedStyle, "background-image");
+
+    /// <summary>
+    /// Reads <paramref name="propertyName"/> from the cascaded but *uncomputed* declaration rather
+    /// than <c>ComputeCurrentStyle()</c>'s normal computed value - the same technique
+    /// <see cref="ResolveExplicitBackgroundImage"/> established for `background-image`'s gradient
+    /// percentages, reused here for the CSS Grid properties that hit the identical class of bug:
+    /// `grid-template-columns`/`grid-template-rows` can hold percentage tracks, which AngleSharp.Css's
+    /// `.Compute()` step eagerly resolves against whatever `IRenderDimensions` happens to be current
+    /// at CSSOM-compute time (the *viewport*, confirmed empirically - `grid-template-rows: 30%` on an
+    /// element with no defined height inside a 600x300 viewport computed to `180px`, i.e. 30% of the
+    /// 600px *width*, not the 300px height a row percentage should track) rather than the grid
+    /// container's own box, which is not a concept the general CSSOM compute pass has any way to
+    /// know about - the same root cause `ResolveExplicitBackgroundImage`'s own remarks document in
+    /// full. There is no way to recover the original percentage from that already-resolved-against-
+    /// the-wrong-thing pixel text, so the computed value cannot be used for these properties at all.
+    /// </summary>
+    private static string ResolveExplicitPropertyValue(IElement? element, ICssStyleDeclaration computedStyle, string propertyName)
     {
-        values = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
-        updatedStyle = styleAttribute;
+        var window = element?.Owner?.DefaultView;
 
-        if (string.IsNullOrWhiteSpace(styleAttribute))
+        if (window is not null)
         {
-            return false;
+            var device = window.Document.Context.GetService<IRenderDevice>() ?? new DefaultRenderDevice();
+            var styleCollection = window.GetStyleCollection(device);
+            var explicitValue = styleCollection.GetDeclarations(element!).GetPropertyValue(propertyName);
+
+            if (!string.IsNullOrWhiteSpace(explicitValue))
+            {
+                return explicitValue;
+            }
         }
 
-        var declarations = styleAttribute.Split(';', StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries);
-        var remaining = new List<string>();
-        var strippedAny = false;
-
-        foreach (var declaration in declarations)
-        {
-            var separator = declaration.IndexOf(':');
-            if (separator <= 0)
-            {
-                continue;
-            }
-
-            var property = declaration[..separator].Trim();
-            var value = declaration[(separator + 1)..].Trim();
-
-            if (string.Equals(property, "grid-column", StringComparison.OrdinalIgnoreCase))
-            {
-                values["grid-column"] = value;
-                strippedAny = true;
-                continue;
-            }
-
-            if (string.Equals(property, "grid-row", StringComparison.OrdinalIgnoreCase))
-            {
-                values["grid-row"] = value;
-                strippedAny = true;
-                continue;
-            }
-
-            if (string.Equals(property, "grid-template-columns", StringComparison.OrdinalIgnoreCase))
-            {
-                values["grid-template-columns"] = value;
-                strippedAny = true;
-                continue;
-            }
-
-            if (string.Equals(property, "grid-template-rows", StringComparison.OrdinalIgnoreCase))
-            {
-                values["grid-template-rows"] = value;
-                strippedAny = true;
-                continue;
-            }
-
-            if (string.Equals(property, "column-gap", StringComparison.OrdinalIgnoreCase))
-            {
-                values["column-gap"] = value;
-                strippedAny = true;
-                continue;
-            }
-
-            if (string.Equals(property, "row-gap", StringComparison.OrdinalIgnoreCase))
-            {
-                values["row-gap"] = value;
-                strippedAny = true;
-                continue;
-            }
-
-            if (string.Equals(property, "gap", StringComparison.OrdinalIgnoreCase))
-            {
-                values["gap"] = value;
-                strippedAny = true;
-                continue;
-            }
-
-            remaining.Add(declaration);
-        }
-
-        if (!strippedAny)
-        {
-            return false;
-        }
-
-        updatedStyle = string.Join(";", remaining);
-        return true;
+        return computedStyle.GetPropertyValue(propertyName);
     }
 
     private static Dictionary<string, string> CreateStyleMap(ICssStyleDeclaration style, IElement? element = null)
     {
         var map = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
         var inlineStyle = element?.GetAttribute("style");
-        var gridColumnValue = element?.GetAttribute("data-render-grid-column");
-        var gridRowValue = element?.GetAttribute("data-render-grid-row");
-        var gridTemplateColumnsValue = element?.GetAttribute("data-render-grid-template-columns");
-        var gridTemplateRowsValue = element?.GetAttribute("data-render-grid-template-rows");
-        var columnGapValue = element?.GetAttribute("data-render-column-gap");
-        var rowGapValue = element?.GetAttribute("data-render-row-gap");
-        var gapValue = element?.GetAttribute("data-render-gap");
 
         var displayValue = style.GetDisplay();
         if (string.IsNullOrWhiteSpace(displayValue))
@@ -3229,6 +3564,7 @@ public sealed class HtmlRenderer
         AddIfPresent(map, "visibility", style.GetVisibility());
         AddIfPresent(map, "width", style.GetWidth());
         AddIfPresent(map, "height", style.GetHeight());
+        AddIfPresent(map, "box-sizing", style.GetBoxSizing());
         AddIfPresent(map, "position", style.GetPropertyValue("position"));
         AddIfPresent(map, "left", style.GetPropertyValue("left"));
         AddIfPresent(map, "top", style.GetPropertyValue("top"));
@@ -3280,13 +3616,28 @@ public sealed class HtmlRenderer
         AddIfPresent(map, "outline-color", style.GetPropertyValue("outline-color"));
 
         AddIfPresent(map, "background-color", style.GetBackgroundColor());
-        AddIfPresent(map, "grid-template-columns", !string.IsNullOrWhiteSpace(gridTemplateColumnsValue) ? gridTemplateColumnsValue : (string.IsNullOrWhiteSpace(style.GetPropertyValue("grid-template-columns")) ? ParseStyleAttributeValue(inlineStyle, "grid-template-columns") : style.GetPropertyValue("grid-template-columns")));
-        AddIfPresent(map, "grid-template-rows", !string.IsNullOrWhiteSpace(gridTemplateRowsValue) ? gridTemplateRowsValue : (string.IsNullOrWhiteSpace(style.GetPropertyValue("grid-template-rows")) ? ParseStyleAttributeValue(inlineStyle, "grid-template-rows") : style.GetPropertyValue("grid-template-rows")));
-        AddIfPresent(map, "column-gap", !string.IsNullOrWhiteSpace(columnGapValue) ? columnGapValue : (string.IsNullOrWhiteSpace(style.GetPropertyValue("column-gap")) ? ParseStyleAttributeValue(inlineStyle, "column-gap") : style.GetPropertyValue("column-gap")));
-        AddIfPresent(map, "row-gap", !string.IsNullOrWhiteSpace(rowGapValue) ? rowGapValue : (string.IsNullOrWhiteSpace(style.GetPropertyValue("row-gap")) ? ParseStyleAttributeValue(inlineStyle, "row-gap") : style.GetPropertyValue("row-gap")));
-        AddIfPresent(map, "gap", !string.IsNullOrWhiteSpace(gapValue) ? gapValue : (string.IsNullOrWhiteSpace(style.GetPropertyValue("gap")) ? ParseStyleAttributeValue(inlineStyle, "gap") : style.GetPropertyValue("gap")));
-        AddIfPresent(map, "grid-column", !string.IsNullOrWhiteSpace(gridColumnValue) ? gridColumnValue : ParseStyleAttributeValue(inlineStyle, "grid-column"));
-        AddIfPresent(map, "grid-row", !string.IsNullOrWhiteSpace(gridRowValue) ? gridRowValue : ParseStyleAttributeValue(inlineStyle, "grid-row"));
+        // grid-template-columns/rows, grid-column/row, and the gap properties are all read from
+        // the explicit/cascaded declaration rather than computed style, for the same reason
+        // `background-image` is (see ResolveExplicitPropertyValue's own remarks): a percentage
+        // track/gap gets eagerly resolved against the wrong reference dimension by AngleSharp.Css's
+        // `.Compute()` step. grid-column/grid-row additionally used to crash computed style
+        // entirely for the common `<line> / span <n>` form (CssTupleValue<T>.Compute() calling
+        // .Compute() on the omitted end line's null entry) - fixed upstream, but reading the
+        // explicit declaration sidesteps that whole bug class regardless.
+        var explicitGridTemplateColumns = ResolveExplicitPropertyValue(element, style, "grid-template-columns");
+        AddIfPresent(map, "grid-template-columns", string.IsNullOrWhiteSpace(explicitGridTemplateColumns) ? ParseStyleAttributeValue(inlineStyle, "grid-template-columns") : explicitGridTemplateColumns);
+        var explicitGridTemplateRows = ResolveExplicitPropertyValue(element, style, "grid-template-rows");
+        AddIfPresent(map, "grid-template-rows", string.IsNullOrWhiteSpace(explicitGridTemplateRows) ? ParseStyleAttributeValue(inlineStyle, "grid-template-rows") : explicitGridTemplateRows);
+        var explicitColumnGap = ResolveExplicitPropertyValue(element, style, "column-gap");
+        AddIfPresent(map, "column-gap", string.IsNullOrWhiteSpace(explicitColumnGap) ? ParseStyleAttributeValue(inlineStyle, "column-gap") : explicitColumnGap);
+        var explicitRowGap = ResolveExplicitPropertyValue(element, style, "row-gap");
+        AddIfPresent(map, "row-gap", string.IsNullOrWhiteSpace(explicitRowGap) ? ParseStyleAttributeValue(inlineStyle, "row-gap") : explicitRowGap);
+        var explicitGap = ResolveExplicitPropertyValue(element, style, "gap");
+        AddIfPresent(map, "gap", string.IsNullOrWhiteSpace(explicitGap) ? ParseStyleAttributeValue(inlineStyle, "gap") : explicitGap);
+        var explicitGridColumn = ResolveExplicitPropertyValue(element, style, "grid-column");
+        AddIfPresent(map, "grid-column", string.IsNullOrWhiteSpace(explicitGridColumn) ? ParseStyleAttributeValue(inlineStyle, "grid-column") : explicitGridColumn);
+        var explicitGridRow = ResolveExplicitPropertyValue(element, style, "grid-row");
+        AddIfPresent(map, "grid-row", string.IsNullOrWhiteSpace(explicitGridRow) ? ParseStyleAttributeValue(inlineStyle, "grid-row") : explicitGridRow);
         AddIfPresent(map, "flex-direction", string.IsNullOrWhiteSpace(style.GetPropertyValue("flex-direction")) ? ParseStyleAttributeValue(inlineStyle, "flex-direction") : style.GetPropertyValue("flex-direction"));
         AddIfPresent(map, "justify-content", string.IsNullOrWhiteSpace(style.GetPropertyValue("justify-content")) ? ParseStyleAttributeValue(inlineStyle, "justify-content") : style.GetPropertyValue("justify-content"));
         AddIfPresent(map, "align-items", string.IsNullOrWhiteSpace(style.GetPropertyValue("align-items")) ? ParseStyleAttributeValue(inlineStyle, "align-items") : style.GetPropertyValue("align-items"));
@@ -3298,26 +3649,10 @@ public sealed class HtmlRenderer
         AddIfPresent(map, "order", string.IsNullOrWhiteSpace(style.GetPropertyValue("order")) ? ParseStyleAttributeValue(inlineStyle, "order") : style.GetPropertyValue("order"));
         AddIfPresent(map, "align-content", string.IsNullOrWhiteSpace(style.GetPropertyValue("align-content")) ? ParseStyleAttributeValue(inlineStyle, "align-content") : style.GetPropertyValue("align-content"));
 
-        var backgroundImageValue = element is not null
-            ? element.GetAttribute("data-render-gradient")
-            : null;
-
-        if (!string.IsNullOrWhiteSpace(backgroundImageValue))
-        {
-            AddIfPresent(map, "background-image", backgroundImageValue);
-        }
-        else
-        {
-            // AngleSharp.Css does compute a `url(...)` background-image (unlike the `overflow`
-            // shorthand quirk documented elsewhere), but as a normalized, quoted `url("...")` - the
-            // raw inline `style=""` fallback below matches the pattern the grid/flex properties
-            // above already use for their own AngleSharp.Css computation gaps, kept here as the
-            // same defensive fallback for the rare case computation reports nothing at all.
-            var computedBackgroundImage = style.GetPropertyValue("background-image");
-            AddIfPresent(map, "background-image", string.IsNullOrWhiteSpace(computedBackgroundImage)
-                ? ParseStyleAttributeValue(inlineStyle, "background-image")
-                : computedBackgroundImage);
-        }
+        var resolvedBackgroundImage = ResolveExplicitBackgroundImage(element, style);
+        AddIfPresent(map, "background-image", string.IsNullOrWhiteSpace(resolvedBackgroundImage)
+            ? ParseStyleAttributeValue(inlineStyle, "background-image")
+            : resolvedBackgroundImage);
 
         AddIfPresent(map, "background-repeat", string.IsNullOrWhiteSpace(style.GetPropertyValue("background-repeat")) ? ParseStyleAttributeValue(inlineStyle, "background-repeat") : style.GetPropertyValue("background-repeat"));
         AddIfPresent(map, "background-position", string.IsNullOrWhiteSpace(style.GetPropertyValue("background-position")) ? ParseStyleAttributeValue(inlineStyle, "background-position") : style.GetPropertyValue("background-position"));
@@ -3351,6 +3686,10 @@ public sealed class HtmlRenderer
         AddIfPresent(map, "line-height", style.GetLineHeight());
         AddIfPresent(map, "color", style.GetColor());
         AddIfPresent(map, "white-space", style.GetPropertyValue("white-space"));
+        AddIfPresent(map, "text-overflow", style.GetPropertyValue("text-overflow"));
+        AddIfPresent(map, "word-break", style.GetPropertyValue("word-break"));
+        AddIfPresent(map, "overflow-wrap", style.GetPropertyValue("overflow-wrap"));
+        AddIfPresent(map, "word-wrap", style.GetPropertyValue("word-wrap"));
 
         ApplyActiveTransitionAndAnimationOverrides(map, element);
 
@@ -3536,6 +3875,9 @@ public sealed class HtmlRenderer
         return string.Equals(position, "absolute", StringComparison.OrdinalIgnoreCase) ||
                string.Equals(position, "fixed", StringComparison.OrdinalIgnoreCase);
     }
+
+    private static bool IsStickyPositioned(Dictionary<string, string> styleMap) =>
+        string.Equals(GetPosition(styleMap), "sticky", StringComparison.OrdinalIgnoreCase);
 
     private static int ParseZIndex(Dictionary<string, string> styleMap)
     {
@@ -3837,6 +4179,12 @@ public sealed class HtmlRenderer
             : string.Empty;
     }
 
+    private static bool IsBorderBox(Dictionary<string, string> styleMap)
+    {
+        return styleMap.TryGetValue("box-sizing", out var value) &&
+            string.Equals(value.Trim(), "border-box", StringComparison.OrdinalIgnoreCase);
+    }
+
     private static void PaintOutline(DisplayList displayList, Dictionary<string, string> styleMap, float x, float y, float width, float height)
     {
         if (!styleMap.TryGetValue("outline-width", out var outlineWidthRaw) ||
@@ -3886,7 +4234,11 @@ public sealed class HtmlRenderer
         image = null;
         rect = default;
 
-        if (!string.Equals(node.Ref.LocalName, "img", StringComparison.OrdinalIgnoreCase))
+        // node.Ref.LocalName/GetAttribute("src") proxy through to the host for a ::before/::after
+        // pseudo-element (PseudoElement.cs, AngleSharp.Css) - without this guard, an <img>'s own
+        // generated-content pseudo would be mistaken for the <img> itself and paint the same image
+        // a second time as if the pseudo were a replaced element in its own right.
+        if (node.Ref is IPseudoElement || !string.Equals(node.Ref.LocalName, "img", StringComparison.OrdinalIgnoreCase))
         {
             return false;
         }
@@ -3905,7 +4257,9 @@ public sealed class HtmlRenderer
         image = null;
         rect = default;
 
-        if (!string.Equals(node.Ref.LocalName, "svg", StringComparison.OrdinalIgnoreCase))
+        // Same reasoning as the identical guard in TryResolveImage above - an <svg>'s own
+        // generated-content pseudo aliases its host's LocalName and must not be treated as the SVG.
+        if (node.Ref is IPseudoElement || !string.Equals(node.Ref.LocalName, "svg", StringComparison.OrdinalIgnoreCase))
         {
             return false;
         }
@@ -4342,6 +4696,15 @@ public sealed class HtmlRenderer
 
     private static FormControlKind ResolveFormControlKind(IElement element)
     {
+        // A ::before/::after pseudo-element's LocalName/GetAttribute proxy straight through to its
+        // host (PseudoElement.cs, in AngleSharp.Css) - an <input>/<select>/<textarea>/<button>'s own
+        // generated-content pseudo would otherwise be misidentified as that same form control and
+        // get its default chrome/value painted a second time.
+        if (element is IPseudoElement)
+        {
+            return FormControlKind.None;
+        }
+
         var tagName = element.LocalName;
 
         if (string.Equals(tagName, "textarea", StringComparison.OrdinalIgnoreCase))
@@ -5233,6 +5596,41 @@ public sealed class HtmlRenderer
         marginRight = usedMarginRight + underflow;
     }
 
+    /// <summary>
+    /// Resolves an authored `width`/`height`/`flex-basis` length exactly like
+    /// <see cref="ParseLength"/> does (an unset/`auto` value falls back to
+    /// <paramref name="defaultValue"/>), then - only when this element's own `box-sizing` computes
+    /// to `border-box` - subtracts <paramref name="borderAndPaddingSum"/> (this same axis's own
+    /// border width plus padding) from an actually-authored value, so the result always represents
+    /// this renderer's pre-existing content-box convention regardless of which box model the
+    /// author wrote against. CSS's default box model is content-box, where an authored `width`/
+    /// `height` already *is* the content size - this renderer always assumed that unconditionally
+    /// before `box-sizing` existed anywhere in its style map, so a huge, previously-unflagged gap:
+    /// `box-sizing: border-box` (set globally by nearly every real-world CSS reset - Bootstrap,
+    /// Tailwind's preflight, `* { box-sizing: border-box }`) authors a `width`/`height` that
+    /// instead describes the *border* box, and every downstream computation in this renderer
+    /// (`ResolveHorizontalMetrics`, `borderBoxWidth`/`borderBoxHeight`, the flex/grow-shrink and
+    /// grid track-sizing algorithms, ...) universally assumes it is handed a content size. This is
+    /// the one place that distinction gets resolved, so every other computation can stay unaware
+    /// of `box-sizing` entirely, exactly as before.
+    /// </summary>
+    private static float ResolveAuthoredDimension(Dictionary<string, string> styleMap, string propertyName, float relativeTo, float defaultValue, float borderAndPaddingSum)
+    {
+        var specified = ParseLength(styleMap, propertyName, relativeTo, float.NaN, allowAuto: true);
+
+        if (float.IsNaN(specified))
+        {
+            return defaultValue;
+        }
+
+        if (borderAndPaddingSum <= 0f || !IsBorderBox(styleMap))
+        {
+            return specified;
+        }
+
+        return Math.Max(0f, specified - borderAndPaddingSum);
+    }
+
     private static float ParseLength(Dictionary<string, string> styleMap, string propertyName, float relativeTo, float defaultValue, bool allowAuto)
     {
         if (!styleMap.TryGetValue(propertyName, out var value) || string.IsNullOrWhiteSpace(value))
@@ -5911,226 +6309,111 @@ public sealed class HtmlRenderer
         return new RenderBackgroundSizeAxis(true, false, 0f);
     }
 
+    // AngleSharp.Css now parses gradients into structured values (`GradientParser.ParseGradient`,
+    // mirroring `TransformParser`/`FilterParser` exactly), so this no longer hand-parses the raw
+    // `background-image` text itself - it delegates the outer function/argument grammar and reads
+    // each already-typed piece (angle, stop color/position, center point) off the result, the same
+    // division of labor already established for `transform`/`filter`: AngleSharp.Css computes the
+    // pure-CSS structure, this renderer still owns turning it into its own backend-agnostic
+    // `RenderGradient`. `ParseGradient` returns null cleanly for anything it does not recognize
+    // (including a plain color), so no name-prefix pre-check is needed before calling it.
     private static RenderPaint ParseGradientPaint(string rawValue, RenderColor fallbackColor)
     {
-        var value = rawValue.Trim();
+        var source = new StringSource(rawValue.Trim());
 
-        if (value.StartsWith("repeating-linear-gradient", StringComparison.OrdinalIgnoreCase))
+        return source.ParseGradient() switch
         {
-            return new RenderGradientPaint(ParseLinearGradient(value, "repeating-linear-gradient", repeating: true, fallbackColor));
-        }
-
-        if (value.StartsWith("linear-gradient", StringComparison.OrdinalIgnoreCase))
-        {
-            return new RenderGradientPaint(ParseLinearGradient(value, "linear-gradient", repeating: false, fallbackColor));
-        }
-
-        if (value.StartsWith("repeating-radial-gradient", StringComparison.OrdinalIgnoreCase))
-        {
-            return new RenderGradientPaint(ParseRadialGradient(value, "repeating-radial-gradient", repeating: true, fallbackColor));
-        }
-
-        if (value.StartsWith("radial-gradient", StringComparison.OrdinalIgnoreCase))
-        {
-            return new RenderGradientPaint(ParseRadialGradient(value, "radial-gradient", repeating: false, fallbackColor));
-        }
-
-        if (value.StartsWith("repeating-conic-gradient", StringComparison.OrdinalIgnoreCase))
-        {
-            return new RenderGradientPaint(ParseConicGradient(value, "repeating-conic-gradient", repeating: true, fallbackColor));
-        }
-
-        if (value.StartsWith("conic-gradient", StringComparison.OrdinalIgnoreCase))
-        {
-            return new RenderGradientPaint(ParseConicGradient(value, "conic-gradient", repeating: false, fallbackColor));
-        }
-
-        return new RenderColorPaint(fallbackColor);
+            CssLinearGradientValue linear => new RenderGradientPaint(ConvertLinearGradient(linear, fallbackColor)),
+            CssRadialGradientValue radial => new RenderGradientPaint(ConvertRadialGradient(radial, fallbackColor)),
+            CssConicGradientValue conic => new RenderGradientPaint(ConvertConicGradient(conic, fallbackColor)),
+            _ => new RenderColorPaint(fallbackColor),
+        };
     }
 
-    private static RenderGradient ParseLinearGradient(string rawValue, string functionName, bool repeating, RenderColor fallbackColor)
+    private static RenderGradient ConvertLinearGradient(CssLinearGradientValue gradient, RenderColor fallbackColor)
     {
-        var inner = ExtractGradientInnerExpression(rawValue, functionName);
-        var parts = SplitTopLevelCommaList(inner);
-        var startIndex = 0;
-        var angleDegrees = 90f;
-
-        if (parts.Length > 0)
-        {
-            var first = parts[0].Trim();
-
-            if (TryParseDirection(first, out var parsedAngle))
-            {
-                angleDegrees = parsedAngle;
-                startIndex = 1;
-            }
-        }
-
-        var stops = ParseGradientStops(parts.Skip(startIndex).ToArray(), fallbackColor);
-        return new RenderGradient(RenderGradientKind.Linear, stops, AngleDegrees: angleDegrees, Repeating: repeating);
+        // `.Angle` already defaults correctly to 180deg ("to bottom") when no direction was
+        // authored - confirmed against AngleSharp.Css's own test suite, unlike the conic-gradient
+        // equivalent below. Re-parsing its own `.CssText` (rather than reading a numeric degree
+        // value directly) reuses the exact same deg/grad/turn/rad-unit handling `filter`'s
+        // `hue-rotate` already relies on (`TryParseAngle`), so a keyword direction like "to right"
+        // (which AngleSharp.Css resolves to a plain `CssAngleValue` internally, per `Map.GradientAngles`)
+        // and an explicit `135deg` both flow through the same one conversion path - both are CSS's
+        // own "0deg points up, clockwise" convention. `CreateLinearGradientShader` (unlike its conic
+        // counterpart, which applies this same correction itself via a rotation matrix) expects
+        // `AngleDegrees` pre-converted to its own "0 points right, clockwise" screen convention, so
+        // the -90 shift has to happen here - confirmed by a real, visible bug this surfaced:
+        // `to right` (CSS 90deg) rendered as horizontal stripes instead of vertical ones without it.
+        var angleDegrees = ParseAngle(gradient.Angle.CssText) - 90f;
+        var stops = ConvertGradientStops(gradient.Stops, fallbackColor, isConic: false);
+        return new RenderGradient(RenderGradientKind.Linear, stops, AngleDegrees: angleDegrees, Repeating: gradient.IsRepeating);
     }
 
-    private static RenderGradient ParseRadialGradient(string rawValue, string functionName, bool repeating, RenderColor fallbackColor)
+    private static RenderGradient ConvertRadialGradient(CssRadialGradientValue gradient, RenderColor fallbackColor)
     {
-        var inner = ExtractGradientInnerExpression(rawValue, functionName);
-        var parts = SplitTopLevelCommaList(inner);
-        var startIndex = 0;
-
-        var isCircle = false;
+        var (centerX, centerY) = ParsePosition(gradient.Position.CssText);
         var sizeKind = RenderGradientSizeKind.FarthestCorner;
         float? explicitRadiusX = null;
         float? explicitRadiusY = null;
-        var centerX = 0.5f;
-        var centerY = 0.5f;
 
-        if (parts.Length > 0 && LooksLikeRadialConfiguration(parts[0]))
+        if (gradient.Mode != CssRadialGradientValue.SizeMode.None)
         {
-            var configText = parts[0].Trim();
-            startIndex = 1;
-
-            var atIndex = configText.IndexOf(" at ", StringComparison.OrdinalIgnoreCase);
-            var shapeSizeText = atIndex >= 0 ? configText[..atIndex].Trim() : configText;
-            var positionText = atIndex >= 0 ? configText[(atIndex + 4)..].Trim() : null;
-
-            ParseRadialShapeAndSize(shapeSizeText, out isCircle, out sizeKind, out explicitRadiusX, out explicitRadiusY);
-
-            if (positionText is not null)
+            sizeKind = gradient.Mode switch
             {
-                (centerX, centerY) = ParsePosition(positionText);
+                CssRadialGradientValue.SizeMode.ClosestCorner => RenderGradientSizeKind.ClosestCorner,
+                CssRadialGradientValue.SizeMode.ClosestSide => RenderGradientSizeKind.ClosestSide,
+                CssRadialGradientValue.SizeMode.FarthestSide => RenderGradientSizeKind.FarthestSide,
+                _ => RenderGradientSizeKind.FarthestCorner,
+            };
+        }
+        else if (gradient.MajorRadius.CssText != CssLengthValue.Full.CssText || gradient.MinorRadius.CssText != CssLengthValue.Full.CssText)
+        {
+            // `Mode.None` alone does not distinguish "no size/radius was authored at all" from "an
+            // explicit radius was given" - `CssRadialGradientValue` has no public signal for that
+            // beyond this: an unset radius's own getter substitutes `CssLengthValue.Full` (100%)
+            // for the `null` it actually holds internally, with no way to tell the two apart from
+            // the outside. Comparing against that same sentinel is therefore the only available
+            // signal; the one case it cannot distinguish - an *explicit* ellipse radius that
+            // legitimately happens to be exactly 100% on both axes - is rare enough (and visually
+            // close to `farthest-corner` in most box aspect ratios anyway) to accept as a known,
+            // narrow approximation rather than threading extra state through GradientParser for it.
+            sizeKind = RenderGradientSizeKind.Explicit;
+
+            if (TryParsePixelValue(gradient.MajorRadius.CssText, out var radiusX))
+            {
+                explicitRadiusX = radiusX;
             }
+
+            explicitRadiusY = TryParsePixelValue(gradient.MinorRadius.CssText, out var radiusY) ? radiusY : explicitRadiusX;
         }
 
-        var stops = ParseGradientStops(parts.Skip(startIndex).ToArray(), fallbackColor);
+        var stops = ConvertGradientStops(gradient.Stops, fallbackColor, isConic: false);
         return new RenderGradient(
             RenderGradientKind.Radial,
             stops,
             CenterX: centerX,
             CenterY: centerY,
-            IsCircle: isCircle,
-            Repeating: repeating,
+            IsCircle: gradient.IsCircle,
+            Repeating: gradient.IsRepeating,
             SizeKind: sizeKind,
             ExplicitRadiusX: explicitRadiusX,
             ExplicitRadiusY: explicitRadiusY);
     }
 
-    private static RenderGradient ParseConicGradient(string rawValue, string functionName, bool repeating, RenderColor fallbackColor)
+    private static RenderGradient ConvertConicGradient(CssConicGradientValue gradient, RenderColor fallbackColor)
     {
-        var inner = ExtractGradientInnerExpression(rawValue, functionName);
-        var parts = SplitTopLevelCommaList(inner);
-        var startIndex = 0;
-        var angleDegrees = 0f;
-        var centerX = 0.5f;
-        var centerY = 0.5f;
-
-        if (parts.Length > 0)
-        {
-            var first = parts[0].Trim();
-
-            if (first.StartsWith("from", StringComparison.OrdinalIgnoreCase) || first.StartsWith("at", StringComparison.OrdinalIgnoreCase))
-            {
-                var atIndex = first.IndexOf(" at ", StringComparison.OrdinalIgnoreCase);
-                var fromText = atIndex >= 0 ? first[..atIndex].Trim() : first;
-                var positionText = atIndex >= 0
-                    ? first[(atIndex + 4)..].Trim()
-                    : (first.StartsWith("at", StringComparison.OrdinalIgnoreCase) ? first[2..].Trim() : null);
-
-                if (fromText.StartsWith("from", StringComparison.OrdinalIgnoreCase))
-                {
-                    angleDegrees = ParseAngle(fromText[4..].Trim());
-                }
-
-                if (positionText is not null)
-                {
-                    (centerX, centerY) = ParsePosition(positionText);
-                }
-
-                startIndex = 1;
-            }
-        }
-
-        var stops = ParseGradientStops(parts.Skip(startIndex).ToArray(), fallbackColor, isConic: true);
-        return new RenderGradient(RenderGradientKind.Conic, stops, AngleDegrees: angleDegrees, CenterX: centerX, CenterY: centerY, Repeating: repeating);
+        // Unlike linear's `.Angle`, conic's own default-angle fallback was a confirmed AngleSharp.Css
+        // bug (reported and fixed upstream, AngleSharp.Css.Tests/Values/Gradient.cs
+        // ConicGradientDefaultAngleIsZeroNotHalfCircle) - it used to report 180deg for an omitted
+        // `from` clause instead of the CSS spec's own 0deg default, so this renderer must build
+        // against a version with that fix rather than working around it locally.
+        var angleDegrees = ParseAngle(gradient.Angle.CssText);
+        var (centerX, centerY) = ParsePosition(gradient.Center.CssText);
+        var stops = ConvertGradientStops(gradient.Stops, fallbackColor, isConic: true);
+        return new RenderGradient(RenderGradientKind.Conic, stops, AngleDegrees: angleDegrees, CenterX: centerX, CenterY: centerY, Repeating: gradient.IsRepeating);
     }
 
-    /// <summary>
-    /// Distinguishes a radial-gradient's leading `&lt;ending-shape&gt; || &lt;size&gt; [at
-    /// &lt;position&gt;]` configuration clause from what is actually just its first color stop -
-    /// a color stop never starts with a shape/size keyword, "at", or a bare length.
-    /// </summary>
-    private static bool LooksLikeRadialConfiguration(string part)
-    {
-        var lower = part.Trim().ToLowerInvariant();
-
-        return lower.StartsWith("circle", StringComparison.Ordinal) ||
-               lower.StartsWith("ellipse", StringComparison.Ordinal) ||
-               lower.StartsWith("closest-", StringComparison.Ordinal) ||
-               lower.StartsWith("farthest-", StringComparison.Ordinal) ||
-               lower.StartsWith("at ", StringComparison.Ordinal) ||
-               lower.Contains(" at ", StringComparison.Ordinal) ||
-               (TryParsePixelValue(lower.Split(' ')[0], out _) && !lower.Contains(','));
-    }
-
-    private static void ParseRadialShapeAndSize(string text, out bool isCircle, out RenderGradientSizeKind sizeKind, out float? explicitRadiusX, out float? explicitRadiusY)
-    {
-        isCircle = false;
-        sizeKind = RenderGradientSizeKind.FarthestCorner;
-        explicitRadiusX = null;
-        explicitRadiusY = null;
-
-        if (string.IsNullOrWhiteSpace(text))
-        {
-            return;
-        }
-
-        var tokens = text.Split(' ', StringSplitOptions.RemoveEmptyEntries);
-        var lengths = new List<float>();
-
-        foreach (var token in tokens)
-        {
-            switch (token.ToLowerInvariant())
-            {
-                case "circle":
-                    isCircle = true;
-                    break;
-                case "ellipse":
-                    isCircle = false;
-                    break;
-                case "closest-side":
-                    sizeKind = RenderGradientSizeKind.ClosestSide;
-                    break;
-                case "farthest-side":
-                    sizeKind = RenderGradientSizeKind.FarthestSide;
-                    break;
-                case "closest-corner":
-                    sizeKind = RenderGradientSizeKind.ClosestCorner;
-                    break;
-                case "farthest-corner":
-                    sizeKind = RenderGradientSizeKind.FarthestCorner;
-                    break;
-                default:
-                    if (TryParsePixelValue(token, out var pixels))
-                    {
-                        lengths.Add(pixels);
-                    }
-
-                    break;
-            }
-        }
-
-        if (lengths.Count > 0)
-        {
-            sizeKind = RenderGradientSizeKind.Explicit;
-            explicitRadiusX = lengths[0];
-            explicitRadiusY = lengths.Count > 1 ? lengths[1] : lengths[0];
-
-            if (lengths.Count == 1)
-            {
-                // A single explicit length implies a circle - CSS grammar doesn't allow one
-                // length with an explicit "ellipse" keyword (that needs two lengths).
-                isCircle = true;
-            }
-        }
-    }
+    private static RenderColor ToRenderColor(CssColorValue color) => new(color.R, color.G, color.B, color.A);
 
     private static readonly string[] PositionKeywords = ["left", "right", "top", "bottom", "center"];
 
@@ -6191,24 +6474,6 @@ public sealed class HtmlRenderer
         return (x ?? 0.5f, y ?? 0.5f);
     }
 
-    private static string ExtractGradientInnerExpression(string rawValue, string functionName)
-    {
-        if (!rawValue.StartsWith(functionName, StringComparison.OrdinalIgnoreCase))
-        {
-            return string.Empty;
-        }
-
-        var opening = rawValue.IndexOf('(');
-        var closing = rawValue.LastIndexOf(')');
-
-        if (opening < 0 || closing <= opening)
-        {
-            return string.Empty;
-        }
-
-        return rawValue[(opening + 1)..closing].Trim();
-    }
-
     internal static string[] SplitTopLevelCommaList(string value)
     {
         if (string.IsNullOrWhiteSpace(value))
@@ -6254,48 +6519,54 @@ public sealed class HtmlRenderer
         return parts.ToArray();
     }
 
-    private static IReadOnlyList<RenderGradientStop> ParseGradientStops(string[] parts, RenderColor fallbackColor, bool isConic = false)
+    /// <summary>
+    /// Converts AngleSharp.Css's own <see cref="CssGradientStopValue"/> list (already split and
+    /// individually parsed by <see cref="GradientParser"/>) into this renderer's backend-agnostic
+    /// stops - the counterpart to the old text-splitting version this replaced, kept as narrow a
+    /// change as possible: each stop's own color comes directly off <c>CssGradientStopValue.Color</c>
+    /// (a real, already-resolved <see cref="CssColorValue"/> - no re-parsing needed, unlike before),
+    /// while its position still goes through <see cref="ParseStopPosition"/> exactly as it always
+    /// did, just fed that stop's own <c>Location.CssText</c> instead of a hand-split token.
+    /// </summary>
+    private static IReadOnlyList<RenderGradientStop> ConvertGradientStops(ICssValue[] rawStops, RenderColor fallbackColor, bool isConic)
     {
-        if (parts.Length == 0)
+        var stops = rawStops.OfType<CssGradientStopValue>().ToArray();
+
+        if (stops.Length == 0)
         {
             return [new RenderGradientStop(0f, fallbackColor)];
         }
 
-        var stops = new List<RenderGradientStop>(parts.Length);
+        var result = new List<RenderGradientStop>(stops.Length);
 
-        for (var index = 0; index < parts.Length; index++)
+        for (var index = 0; index < stops.Length; index++)
         {
-            var part = parts[index].Trim();
-            if (part.Length == 0)
+            var stop = stops[index];
+            var color = ToRenderColor(stop.Color);
+            var autoPosition = stops.Length == 1 ? 0f : (index / (float)Math.Max(1, stops.Length - 1));
+
+            if (stop.IsUndetermined)
             {
+                result.Add(new RenderGradientStop(autoPosition, color));
                 continue;
             }
 
-            var separatorIndex = part.IndexOfAny([ ' ', '\t', '\n', '\r' ]);
-            var colorToken = separatorIndex >= 0 ? part[..separatorIndex].Trim() : part;
-            var positionToken = separatorIndex >= 0 ? part[(separatorIndex + 1)..].Trim() : string.Empty;
+            var positionText = stop.Location.CssText;
 
-            var color = ParseColor(colorToken, fallbackColor);
-            var autoPosition = parts.Length == 1 ? 0f : (index / (float)Math.Max(1, parts.Length - 1));
-
-            if (string.IsNullOrWhiteSpace(positionToken))
-            {
-                stops.Add(new RenderGradientStop(autoPosition, color));
-            }
-            else if (!isConic && TryParsePixelValue(positionToken, out var pixels))
+            if (!isConic && TryParsePixelValue(positionText, out var pixels))
             {
                 // An absolute-length stop position ("red 10px") cannot become a fraction until
                 // the gradient's own rendered geometry (line length/radius) is known, so the raw
                 // pixel value is carried through and resolved by the backend at paint time.
-                stops.Add(new RenderGradientStop(autoPosition, color, pixels));
+                result.Add(new RenderGradientStop(autoPosition, color, pixels));
             }
             else
             {
-                stops.Add(new RenderGradientStop(ParseStopPosition(positionToken, isConic), color));
+                result.Add(new RenderGradientStop(ParseStopPosition(positionText, isConic), color));
             }
         }
 
-        return stops;
+        return result;
     }
 
     private static float ParseStopPosition(string rawPosition, bool isConic = false)
@@ -6326,32 +6597,6 @@ public sealed class HtmlRenderer
         }
 
         return 0f;
-    }
-
-    private static bool TryParseDirection(string value, out float angleDegrees)
-    {
-        angleDegrees = 90f;
-        var normalized = value.Trim().ToLowerInvariant();
-
-        if (normalized.StartsWith("to ", StringComparison.Ordinal))
-        {
-            var direction = normalized[3..].Trim();
-            angleDegrees = direction switch
-            {
-                "top" => 270f,
-                "right" => 0f,
-                "bottom" => 90f,
-                "left" => 180f,
-                "top right" or "right top" => 315f,
-                "top left" or "left top" => 225f,
-                "bottom right" or "right bottom" => 45f,
-                "bottom left" or "left bottom" => 135f,
-                _ => 90f,
-            };
-            return true;
-        }
-
-        return TryParseAngle(normalized, out angleDegrees);
     }
 
     private static bool TryParseAngle(string value, out float angleDegrees)
@@ -6727,8 +6972,26 @@ public sealed class HtmlRenderer
         return Math.Max(20f, contentHeight + placement.PaddingTop + placement.PaddingBottom + placement.BorderTopWidth + placement.BorderBottomWidth);
     }
 
+    /// <summary>
+    /// Greedy word-wrapping, extended with `word-break: break-all`/`overflow-wrap: break-word`
+    /// support - both read straight off <paramref name="textStyle"/> rather than as separate
+    /// parameters, since every caller already carries a fully-resolved <see cref="RenderTextStyle"/>.
+    /// `break-all` (<see cref="WrapTextCharacterWise"/>) breaks at any character boundary
+    /// everywhere, matching spec precedence over `overflow-wrap` (a word-break-all element ignores
+    /// `overflow-wrap` entirely, since breaking is already unrestricted). Otherwise, the ordinary
+    /// word-based algorithm below only reaches for character-level breaking (<see cref="SplitOverlongWord"/>)
+    /// as the spec's own "last resort": a single word wider than the *entire* line (not just what is
+    /// left of the current line) that `overflow-wrap: break-word`/`anywhere` explicitly permits
+    /// breaking - a word that merely doesn't fit what's left of the current line still simply wraps
+    /// to a new line whole, exactly like `overflow-wrap: normal`.
+    /// </summary>
     private static IReadOnlyList<string> WrapText(LayoutContext context, string text, float maxWidth, RenderTextStyle textStyle)
     {
+        if (textStyle.WordBreak == WordBreakMode.BreakAll)
+        {
+            return WrapTextCharacterWise(context, text, maxWidth, textStyle);
+        }
+
         var words = text.Split(' ', StringSplitOptions.RemoveEmptyEntries);
 
         if (words.Length == 0)
@@ -6740,16 +7003,24 @@ public sealed class HtmlRenderer
         var current = new StringBuilder();
         var currentWidth = 0f;
 
-        foreach (var word in words)
+        void FlushCurrentLine()
         {
-            var wordWidth = MeasureTextWidth(context, word, textStyle);
-            var separatorWidth = current.Length == 0 ? 0f : MeasureTextWidth(context, " ", textStyle);
-
-            if (current.Length > 0 && currentWidth + separatorWidth + wordWidth > maxWidth)
+            if (current.Length > 0)
             {
                 lines.Add(current.ToString());
                 current.Clear();
                 currentWidth = 0f;
+            }
+        }
+
+        void AppendToken(string token, float tokenWidth)
+        {
+            var separatorWidth = current.Length == 0 ? 0f : MeasureTextWidth(context, " ", textStyle);
+
+            if (current.Length > 0 && currentWidth + separatorWidth + tokenWidth > maxWidth)
+            {
+                FlushCurrentLine();
+                separatorWidth = 0f;
             }
 
             if (current.Length > 0)
@@ -6758,8 +7029,111 @@ public sealed class HtmlRenderer
                 currentWidth += separatorWidth;
             }
 
-            current.Append(word);
-            currentWidth += wordWidth;
+            current.Append(token);
+            currentWidth += tokenWidth;
+        }
+
+        foreach (var word in words)
+        {
+            var wordWidth = MeasureTextWidth(context, word, textStyle);
+
+            if (wordWidth > maxWidth && textStyle.OverflowWrap == OverflowWrapMode.BreakWord)
+            {
+                var chunks = SplitOverlongWord(context, word, maxWidth, textStyle);
+
+                for (var i = 0; i < chunks.Count; i++)
+                {
+                    if (i == 0)
+                    {
+                        // The first chunk of a broken word is still an ordinary word boundary -
+                        // it gets ordinary inter-word wrapping/spacing against the current line.
+                        AppendToken(chunks[i], MeasureTextWidth(context, chunks[i], textStyle));
+                    }
+                    else
+                    {
+                        // A mid-word break always continues on a fresh line - there is no space to
+                        // share the previous chunk's remaining room with.
+                        FlushCurrentLine();
+                        current.Append(chunks[i]);
+                        currentWidth = MeasureTextWidth(context, chunks[i], textStyle);
+                    }
+                }
+
+                continue;
+            }
+
+            AppendToken(word, wordWidth);
+        }
+
+        FlushCurrentLine();
+
+        return lines;
+    }
+
+    /// <summary>
+    /// Splits one overlong word into the largest chunks that each fit within <paramref name="maxWidth"/>,
+    /// for <c>overflow-wrap: break-word</c>/<c>anywhere</c>'s "last resort" mid-word break. Always
+    /// makes progress (appends at least one character per chunk) even if a single character alone
+    /// exceeds <paramref name="maxWidth"/>, so an extreme case (a huge font size in a tiny box) still
+    /// terminates rather than looping.
+    /// </summary>
+    private static List<string> SplitOverlongWord(LayoutContext context, string word, float maxWidth, RenderTextStyle textStyle)
+    {
+        var chunks = new List<string>();
+        var current = new StringBuilder();
+        var currentWidth = 0f;
+
+        foreach (var rune in word.EnumerateRunes())
+        {
+            var chStr = rune.ToString();
+            var chWidth = MeasureTextWidth(context, chStr, textStyle);
+
+            if (current.Length > 0 && currentWidth + chWidth > maxWidth)
+            {
+                chunks.Add(current.ToString());
+                current.Clear();
+                currentWidth = 0f;
+            }
+
+            current.Append(chStr);
+            currentWidth += chWidth;
+        }
+
+        if (current.Length > 0)
+        {
+            chunks.Add(current.ToString());
+        }
+
+        return chunks;
+    }
+
+    /// <summary>
+    /// `word-break: break-all` wrapping: every character (not just every word) is a potential break
+    /// point, so this greedily fills each line character-by-character instead of word-by-word - a
+    /// space is simply a character like any other here (no separator width added around it), which
+    /// reproduces ordinary space-based wrapping for free wherever a line happens to break at one,
+    /// while still allowing a break mid-word wherever it does not.
+    /// </summary>
+    private static IReadOnlyList<string> WrapTextCharacterWise(LayoutContext context, string text, float maxWidth, RenderTextStyle textStyle)
+    {
+        var lines = new List<string>();
+        var current = new StringBuilder();
+        var currentWidth = 0f;
+
+        foreach (var rune in text.EnumerateRunes())
+        {
+            var chStr = rune.ToString();
+            var chWidth = MeasureTextWidth(context, chStr, textStyle);
+
+            if (current.Length > 0 && currentWidth + chWidth > maxWidth)
+            {
+                lines.Add(current.ToString());
+                current.Clear();
+                currentWidth = 0f;
+            }
+
+            current.Append(chStr);
+            currentWidth += chWidth;
         }
 
         if (current.Length > 0)
@@ -6768,6 +7142,48 @@ public sealed class HtmlRenderer
         }
 
         return lines;
+    }
+
+    private const string EllipsisCharacter = "…";
+
+    /// <summary>
+    /// Truncates <paramref name="text"/> to the longest prefix (by rune, not raw UTF-16 char, so a
+    /// truncation point never lands inside a surrogate pair) whose width plus the ellipsis
+    /// character's own width still fits within <paramref name="maxWidth"/>, then appends it - the
+    /// approach every real browser's own `text-overflow: ellipsis` uses (truncate, do not scale or
+    /// reflow). Binary search over rune count, not a linear scan, since <see cref="MeasureTextWidth"/>
+    /// goes through the backend's own font shaping and this runs on already-overflowing text on the
+    /// hot layout path.
+    /// </summary>
+    private static string TruncateWithEllipsis(LayoutContext context, string text, float maxWidth, RenderTextStyle textStyle)
+    {
+        var ellipsisWidth = MeasureTextWidth(context, EllipsisCharacter, textStyle);
+
+        if (ellipsisWidth > maxWidth || text.Length == 0)
+        {
+            return EllipsisCharacter;
+        }
+
+        var runes = text.EnumerateRunes().ToArray();
+        var low = 0;
+        var high = runes.Length;
+
+        while (low < high)
+        {
+            var mid = (low + high + 1) / 2;
+            var prefixWidth = MeasureTextWidth(context, string.Concat(runes.Take(mid).Select(r => r.ToString())), textStyle);
+
+            if (prefixWidth + ellipsisWidth <= maxWidth)
+            {
+                low = mid;
+            }
+            else
+            {
+                high = mid - 1;
+            }
+        }
+
+        return string.Concat(runes.Take(low).Select(r => r.ToString())) + EllipsisCharacter;
     }
 
     private static RenderFont ToRenderFont(RenderTextStyle textStyle, FontFaceSet fonts) => new(
@@ -6884,6 +7300,55 @@ public sealed class HtmlRenderer
         NormalizeWhitespace(value, whiteSpace).Replace('\n', ' ');
 
     /// <summary>
+    /// Resolves the flat text an inline element contributes to a shared line in the "generic plain
+    /// inline element" fallback (an <see cref="ElementRenderNode"/> with no other special-cased
+    /// handling - not a <c>&lt;br&gt;</c>, not inline-block, ...), which otherwise reads
+    /// <c>element.TextContent</c> directly (a flat, whole-subtree DOM accessor - nested real elements
+    /// beyond that are a pre-existing, separate scope cut of this fallback path, unrelated to
+    /// pseudo-elements: it has never recursed into further nested elements via full layout, only
+    /// concatenated their own text). Two related gaps that `.TextContent` alone cannot cover:
+    /// 1. A <c>::before</c>/<c>::after</c> pseudo-element's own <c>TextContent</c> is hardcoded to
+    ///    always be an empty string (<c>PseudoElement.cs</c>, in AngleSharp.Css - it has no real DOM
+    ///    text content of its own to report), so a bare `inlineElement.Ref.TextContent` on the
+    ///    pseudo itself silently produces no text at all.
+    /// 2. A *host* element's own `.TextContent` also cannot see a pseudo child's generated text at
+    ///    all (pseudo-elements exist only in the render tree, never in the DOM `.TextContent` walks),
+    ///    so `<span class="required"></span>` - empty DOM text, all its visible content coming from
+    ///    its own `::after` - previously vanished completely, a real, confirmed bug caught by
+    ///    rendering exactly that pattern and seeing nothing painted.
+    /// Both are fixed the same way: walk this element's own render-tree children in order rather
+    /// than reading `.TextContent` once, appending each child's own contribution - a
+    /// <see cref="TextRenderNode"/>'s data, a pseudo child's own single synthetic text child (see
+    /// AngleSharp.Css's `RenderTreeBuilder`), or (preserving the exact old behavior for anything
+    /// else, i.e. a real nested element) that child's own flat `.TextContent`.
+    /// </summary>
+    private static string ResolvePlainInlineElementText(ElementRenderNode inlineElement)
+    {
+        if (inlineElement.Ref is IPseudoElement)
+        {
+            return string.Concat(inlineElement.Children.OfType<TextRenderNode>().Select(t => t.Ref.Data));
+        }
+
+        var sb = new StringBuilder();
+
+        foreach (var child in inlineElement.Children)
+        {
+            if (child is TextRenderNode textChild)
+            {
+                sb.Append(textChild.Ref.Data);
+            }
+            else if (child is ElementRenderNode elementChild)
+            {
+                sb.Append(elementChild.Ref is IPseudoElement
+                    ? string.Concat(elementChild.Children.OfType<TextRenderNode>().Select(t => t.Ref.Data))
+                    : elementChild.Ref.TextContent ?? string.Empty);
+            }
+        }
+
+        return sb.ToString();
+    }
+
+    /// <summary>
     /// Where a cell's content sits within the box the cell occupies.
     /// </summary>
     /// <remarks>
@@ -6933,7 +7398,10 @@ public sealed class HtmlRenderer
         float TextIndent,
         float VerticalAlignOffset,
         IReadOnlyList<global::AngleSharp.Renderer.Rendering.RenderTextShadow> TextShadows,
-        WhiteSpaceMode WhiteSpace);
+        WhiteSpaceMode WhiteSpace,
+        WordBreakMode WordBreak,
+        OverflowWrapMode OverflowWrap,
+        TextOverflowMode TextOverflow);
 
     private enum TextAlign
     {
@@ -6955,6 +7423,43 @@ public sealed class HtmlRenderer
         PreWrap,
         PreLine,
         BreakSpaces,
+    }
+
+    /// <summary>
+    /// <c>word-break</c>. <c>KeepAll</c> (meant for CJK text, suppressing breaks between ideographic
+    /// characters that <c>Normal</c> would otherwise allow) is folded into <c>Normal</c> - this
+    /// renderer has no CJK-aware line-breaking of any kind to differentiate the two, a deliberate,
+    /// documented scope cut rather than an oversight.
+    /// </summary>
+    private enum WordBreakMode
+    {
+        Normal,
+        BreakAll,
+    }
+
+    /// <summary>
+    /// <c>overflow-wrap</c> (and its legacy <c>word-wrap</c> alias). <c>Anywhere</c> is folded into
+    /// <c>BreakWord</c> - the two keywords only differ in how they affect *intrinsic* (min-content)
+    /// sizing, a concept this renderer's already-approximate, non-intrinsic text layout does not
+    /// model, so both simply mean "break an otherwise-unbreakable word as a last resort" here.
+    /// </summary>
+    private enum OverflowWrapMode
+    {
+        Normal,
+        BreakWord,
+    }
+
+    /// <summary>
+    /// <c>text-overflow</c>. Unlike <see cref="WhiteSpaceMode"/>/<see cref="WordBreakMode"/>/
+    /// <see cref="OverflowWrapMode"/>, this is deliberately never inherited - see
+    /// <see cref="ParseTextOverflow"/>, which mirrors <see cref="RenderTextStyle.TextIndent"/>'s own
+    /// existing non-inheritance for the same reason (it targets this element's own line box, not a
+    /// descendant's).
+    /// </summary>
+    private enum TextOverflowMode
+    {
+        Clip,
+        Ellipsis,
     }
 
     private readonly record struct EdgeSizes(float Top, float Right, float Bottom, float Left);

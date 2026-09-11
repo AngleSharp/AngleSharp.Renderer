@@ -956,15 +956,160 @@ public sealed class HtmlRendererTests
             .ThenBy(command => command.Rect.X)
             .ToArray();
 
+        // gap's two-value form is <row-gap> <column-gap> per spec, so "gap:10px 20px" is
+        // row-gap=10px (second row starts at 20+10=30) and column-gap=20px (second column
+        // starts at 50+20=70) - this used to assert the reverse, matching a real, now-fixed
+        // upstream bug in AngleSharp.Css's GapDeclaration ordering (see AGENTS.md/GapShorthandComputedStyleTests).
         Assert.Equal(4, childBackgrounds.Length);
         Assert.Equal(0f, childBackgrounds[0].Rect.X);
         Assert.Equal(0f, childBackgrounds[0].Rect.Y);
-        Assert.Equal(60f, childBackgrounds[1].Rect.X);
+        Assert.Equal(70f, childBackgrounds[1].Rect.X);
         Assert.Equal(0f, childBackgrounds[1].Rect.Y);
         Assert.Equal(0f, childBackgrounds[2].Rect.X);
         Assert.Equal(30f, childBackgrounds[2].Rect.Y);
-        Assert.Equal(60f, childBackgrounds[3].Rect.X);
+        Assert.Equal(70f, childBackgrounds[3].Rect.X);
         Assert.Equal(30f, childBackgrounds[3].Rect.Y);
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_SizesFractionalTracksProportionally()
+    {
+        var document = await ParseAsync("""
+            <html><body>
+                <div style="display:grid; grid-template-columns:1fr 2fr; width:150px; height:20px;">
+                    <div style="height:20px; background-color:#ff0000;"></div>
+                    <div style="height:20px; background-color:#0000ff;"></div>
+                </div>
+            </body></html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, new DefaultRenderDevice
+        {
+            ViewPortWidth = 200,
+            ViewPortHeight = 120,
+            FontSize = 16f,
+        });
+
+        var childBackgrounds = displayList.Commands
+            .OfType<FillRectCommand>()
+            .Where(command => command.Rect.Height == 20f && command.Rect.Width < 150f)
+            .OrderBy(command => command.Rect.X)
+            .ToArray();
+
+        Assert.Equal(2, childBackgrounds.Length);
+        Assert.Equal(0f, childBackgrounds[0].Rect.X);
+        Assert.Equal(50f, childBackgrounds[0].Rect.Width);
+        Assert.Equal(50f, childBackgrounds[1].Rect.X);
+        Assert.Equal(100f, childBackgrounds[1].Rect.Width);
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_ExpandsRepeatFunctionIntoFixedTracks()
+    {
+        var document = await ParseAsync("""
+            <html><body>
+                <div style="display:grid; grid-template-columns:repeat(3, 40px); gap:5px; width:150px; height:20px;">
+                    <div style="height:20px; background-color:#ff0000;"></div>
+                    <div style="height:20px; background-color:#0000ff;"></div>
+                    <div style="height:20px; background-color:#00ff00;"></div>
+                </div>
+            </body></html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, new DefaultRenderDevice
+        {
+            ViewPortWidth = 200,
+            ViewPortHeight = 120,
+            FontSize = 16f,
+        });
+
+        var childBackgrounds = displayList.Commands
+            .OfType<FillRectCommand>()
+            .Where(command => command.Rect.Height == 20f && command.Rect.Width < 150f)
+            .OrderBy(command => command.Rect.X)
+            .ToArray();
+
+        Assert.Equal(3, childBackgrounds.Length);
+        Assert.Equal(0f, childBackgrounds[0].Rect.X);
+        Assert.Equal(40f, childBackgrounds[0].Rect.Width);
+        Assert.Equal(45f, childBackgrounds[1].Rect.X);
+        Assert.Equal(40f, childBackgrounds[1].Rect.Width);
+        Assert.Equal(90f, childBackgrounds[2].Rect.X);
+        Assert.Equal(40f, childBackgrounds[2].Rect.Width);
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_ClampsMinMaxTrackToItsFractionalMaximum()
+    {
+        var document = await ParseAsync("""
+            <html><body>
+                <div style="display:grid; grid-template-columns:minmax(30px, 1fr) 60px; width:150px; height:20px;">
+                    <div style="height:20px; background-color:#ff0000;"></div>
+                    <div style="height:20px; background-color:#0000ff;"></div>
+                </div>
+            </body></html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, new DefaultRenderDevice
+        {
+            ViewPortWidth = 200,
+            ViewPortHeight = 120,
+            FontSize = 16f,
+        });
+
+        var childBackgrounds = displayList.Commands
+            .OfType<FillRectCommand>()
+            .Where(command => command.Rect.Height == 20f && command.Rect.Width < 150f)
+            .OrderBy(command => command.Rect.X)
+            .ToArray();
+
+        Assert.Equal(2, childBackgrounds.Length);
+        Assert.Equal(0f, childBackgrounds[0].Rect.X);
+        Assert.Equal(90f, childBackgrounds[0].Rect.Width);
+        Assert.Equal(90f, childBackgrounds[1].Rect.X);
+        Assert.Equal(60f, childBackgrounds[1].Rect.Width);
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_ClampsAutoTrackToItsMinMaxLengthBounds()
+    {
+        var document = await ParseAsync("""
+            <html><body>
+                <div style="display:grid; grid-template-columns:minmax(60px, 100px) 30px; width:200px; height:20px;">
+                    <div style="width:20px; height:20px; background-color:#ff0000;"></div>
+                    <div style="height:20px; background-color:#0000ff;"></div>
+                </div>
+                <div style="display:grid; grid-template-columns:minmax(60px, 100px) 30px; width:250px; height:15px;">
+                    <div style="width:150px; height:15px; background-color:#00ff00;"></div>
+                    <div style="height:15px; background-color:#ffff00;"></div>
+                </div>
+            </body></html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, new DefaultRenderDevice
+        {
+            ViewPortWidth = 300,
+            ViewPortHeight = 200,
+            FontSize = 16f,
+        });
+
+        var secondColumnCells = displayList.Commands
+            .OfType<FillRectCommand>()
+            .Where(command => command.Rect.Width == 30f)
+            .OrderBy(command => command.Rect.Y)
+            .ToArray();
+
+        Assert.Equal(2, secondColumnCells.Length);
+        // First grid: the item's estimated size (20px) is below the minmax() floor, so the
+        // Auto track clamps up to its 60px minimum.
+        Assert.Equal(60f, secondColumnCells[0].Rect.X);
+        // Second grid: the item's estimated size (150px) exceeds the minmax() ceiling, so the
+        // Auto track clamps down to its 100px maximum.
+        Assert.Equal(100f, secondColumnCells[1].Rect.X);
     }
 
     [Fact]
@@ -1049,13 +1194,17 @@ public sealed class HtmlRendererTests
             .ThenBy(command => command.Rect.X)
             .ToArray();
 
+        // Implicit auto rows now size to their own content (10px, each item's actual height),
+        // the same way auto columns already did - this used to assert 20 (containerHeight/rowCount,
+        // 40/2), a coarse guess from before implicit rows grew to fit content like explicit Auto
+        // tracks do (see GrowGridTrackSize).
         Assert.Equal(3, childBackgrounds.Length);
         Assert.Equal(0f, childBackgrounds[0].Rect.X);
         Assert.Equal(0f, childBackgrounds[0].Rect.Y);
         Assert.Equal(50f, childBackgrounds[1].Rect.X);
         Assert.Equal(0f, childBackgrounds[1].Rect.Y);
         Assert.Equal(0f, childBackgrounds[2].Rect.X);
-        Assert.Equal(20f, childBackgrounds[2].Rect.Y);
+        Assert.Equal(10f, childBackgrounds[2].Rect.Y);
     }
 
     [Fact]
@@ -2295,14 +2444,7 @@ public sealed class HtmlRendererTests
 
         // A border-radius percentage resolves per-axis against the element's own border box - the
         // horizontal component against its 200px width (10% = 20px), the vertical component
-        // against its 80px height (10% = 8px) - per spec. An older AngleSharp.Css version this
-        // test used to pin (1.1.1) resolved both components against the containing block's width
-        // instead (a confirmed upstream bug, reported with a reproducing test in AngleSharp.Css's
-        // own suite - see BorderRadiusPercentageResolutionTests.cs there); fixed upstream since,
-        // confirmed by this test flipping from the old (wrong) 30px/30px to the correct 20px/8px
-        // with no renderer-side code change of its own. Neither exceeds either edge, so no
-        // overlap-clamping kicks in here (that path is covered separately by the pixel-radius
-        // clamp test below).
+        // against its 80px height (10% = 8px) - per spec.
         Assert.Equal(20f, boxBackground.Radii.TopLeftX);
         Assert.Equal(8f, boxBackground.Radii.TopLeftY);
     }
@@ -4705,6 +4847,567 @@ public sealed class HtmlRendererTests
     // Mirrors the private HtmlRenderer.FormControlAccentColor constant (26, 115, 232) - kept as an
     // independent literal here rather than reflecting into the private field, so a test failure
     // reads as "the painted color changed" rather than needing reflection to even compile.
+    [Fact]
+    public async Task BuildDisplayList_TextOverflowEllipsisTruncatesOverflowingSingleLine()
+    {
+        var document = await ParseAsync("""
+            <html><body>
+                <div style="width:80px; overflow:hidden; white-space:nowrap; text-overflow:ellipsis;">This is a long line of text</div>
+            </body></html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, new DefaultRenderDevice
+        {
+            ViewPortWidth = 200,
+            ViewPortHeight = 120,
+            FontSize = 16f,
+        });
+
+        var text = Assert.Single(displayList.Commands.OfType<DrawTextCommand>());
+        Assert.EndsWith("…", text.Text);
+        Assert.True(text.Text.Length < "This is a long line of text".Length);
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_TextOverflowEllipsisHasNoEffectWithoutClipping()
+    {
+        var document = await ParseAsync("""
+            <html><body>
+                <div style="width:80px; white-space:nowrap; text-overflow:ellipsis;">This is a long line of text</div>
+            </body></html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, new DefaultRenderDevice
+        {
+            ViewPortWidth = 200,
+            ViewPortHeight = 120,
+            FontSize = 16f,
+        });
+
+        var text = Assert.Single(displayList.Commands.OfType<DrawTextCommand>());
+        Assert.Equal("This is a long line of text", text.Text);
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_WordBreakAllWrapsAnOverlongWordAcrossMultipleLines()
+    {
+        var document = await ParseAsync("""
+            <html><body>
+                <div style="width:40px; word-break:break-all;">aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa</div>
+            </body></html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, new DefaultRenderDevice
+        {
+            ViewPortWidth = 200,
+            ViewPortHeight = 200,
+            FontSize = 16f,
+        });
+
+        var lines = displayList.Commands.OfType<DrawTextCommand>().ToArray();
+
+        Assert.True(lines.Length > 1);
+        Assert.Equal("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", string.Concat(lines.Select(line => line.Text)));
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_OverflowWrapBreakWordBreaksAnOverlongWordAsLastResort()
+    {
+        var document = await ParseAsync("""
+            <html><body>
+                <div style="width:40px; overflow-wrap:break-word;">aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa</div>
+            </body></html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, new DefaultRenderDevice
+        {
+            ViewPortWidth = 200,
+            ViewPortHeight = 200,
+            FontSize = 16f,
+        });
+
+        var lines = displayList.Commands.OfType<DrawTextCommand>().ToArray();
+
+        Assert.True(lines.Length > 1);
+        Assert.Equal("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", string.Concat(lines.Select(line => line.Text)));
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_OverflowWrapNormalLeavesAnOverlongWordOnOneOverflowingLine()
+    {
+        var document = await ParseAsync("""
+            <html><body>
+                <div style="width:40px;">aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa</div>
+            </body></html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, new DefaultRenderDevice
+        {
+            ViewPortWidth = 200,
+            ViewPortHeight = 200,
+            FontSize = 16f,
+        });
+
+        var text = Assert.Single(displayList.Commands.OfType<DrawTextCommand>());
+        Assert.Equal("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", text.Text);
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_RendersBeforePseudoElementContentInlineBeforeRealContent()
+    {
+        var document = await ParseAsync("""
+            <html><head><style>#target::before { content: "PREFIX-"; }</style></head>
+            <body><div id="target">middle</div></body></html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, new DefaultRenderDevice
+        {
+            ViewPortWidth = 300,
+            ViewPortHeight = 200,
+            FontSize = 16f,
+        });
+
+        var texts = displayList.Commands.OfType<DrawTextCommand>().ToArray();
+
+        Assert.Equal(2, texts.Length);
+        Assert.Equal("PREFIX-", texts[0].Text);
+        Assert.Equal("middle", texts[1].Text);
+        Assert.Equal(0f, texts[0].X);
+        Assert.Equal(texts[0].Y, texts[1].Y);
+        Assert.True(texts[1].X > texts[0].X);
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_RendersAfterPseudoElementContentInlineAfterRealContent()
+    {
+        var document = await ParseAsync("""
+            <html><head><style>#target::after { content: "-SUFFIX"; }</style></head>
+            <body><div id="target">middle</div></body></html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, new DefaultRenderDevice
+        {
+            ViewPortWidth = 300,
+            ViewPortHeight = 200,
+            FontSize = 16f,
+        });
+
+        var texts = displayList.Commands.OfType<DrawTextCommand>().ToArray();
+
+        Assert.Equal(2, texts.Length);
+        Assert.Equal("middle", texts[0].Text);
+        Assert.Equal("-SUFFIX", texts[1].Text);
+        Assert.True(texts[1].X > texts[0].X);
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_PseudoElementWithNoContentRendersNothingExtra()
+    {
+        var document = await ParseAsync("""
+            <html><body><div id="target">middle</div></body></html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, new DefaultRenderDevice
+        {
+            ViewPortWidth = 300,
+            ViewPortHeight = 200,
+            FontSize = 16f,
+        });
+
+        var text = Assert.Single(displayList.Commands.OfType<DrawTextCommand>());
+        Assert.Equal("middle", text.Text);
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_PseudoElementContentAttrResolvesHostAttribute()
+    {
+        var document = await ParseAsync("""
+            <html><head><style>#target::before { content: attr(data-label); }</style></head>
+            <body><div id="target" data-label="Hello">middle</div></body></html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, new DefaultRenderDevice
+        {
+            ViewPortWidth = 300,
+            ViewPortHeight = 200,
+            FontSize = 16f,
+        });
+
+        var texts = displayList.Commands.OfType<DrawTextCommand>().ToArray();
+
+        Assert.Equal(2, texts.Length);
+        Assert.Equal("Hello", texts[0].Text);
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_PseudoElementInheritsColorFromHostWhenNotItselfSet()
+    {
+        var document = await ParseAsync("""
+            <html><head><style>
+            #target { color: rgb(10, 20, 30); }
+            #target::before { content: "x"; }
+            </style></head>
+            <body><div id="target">middle</div></body></html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, new DefaultRenderDevice
+        {
+            ViewPortWidth = 300,
+            ViewPortHeight = 200,
+            FontSize = 16f,
+        });
+
+        var texts = displayList.Commands.OfType<DrawTextCommand>().ToArray();
+
+        Assert.Equal(2, texts.Length);
+        Assert.Equal(new RenderColor(10, 20, 30), texts[0].Color);
+        Assert.Equal(new RenderColor(10, 20, 30), texts[1].Color);
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_PseudoElementOnFormControlDoesNotDuplicateControlChrome()
+    {
+        var document = await ParseAsync("""
+            <html><head><style>#target::before { content: "*"; }</style></head>
+            <body><input id="target" type="text" value="hi" /></body></html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, new DefaultRenderDevice
+        {
+            ViewPortWidth = 300,
+            ViewPortHeight = 200,
+            FontSize = 16f,
+        });
+
+        // Baseline (the identical markup without the ::before rule) paints exactly 6
+        // FillRectCommands (the input's default chrome, plus page/body backgrounds) and 1
+        // DrawTextCommand (its own "hi" value) - a pseudo-element misidentified as the same form
+        // control would duplicate that chrome and/or the value text. Only the pseudo's own "*"
+        // text should be added on top.
+        Assert.Equal(6, displayList.Commands.OfType<FillRectCommand>().Count());
+        var texts = displayList.Commands.OfType<DrawTextCommand>().ToArray();
+        Assert.Equal(2, texts.Length);
+        Assert.Contains(texts, t => t.Text == "*");
+        Assert.Contains(texts, t => t.Text == "hi");
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_PseudoElementOnImageDoesNotRepaintTheImage()
+    {
+        var document = await ParseAsync("""
+            <html><head><style>#target::before { content: "*"; }</style></head>
+            <body><img id="target" src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAACklEQVR4nGMAAQABAA4A4cQTmwAAAABJRU5ErkJggg==" style="width:40px; height:20px;" /></body></html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, new DefaultRenderDevice
+        {
+            ViewPortWidth = 300,
+            ViewPortHeight = 200,
+            FontSize = 16f,
+        });
+
+        var imageCommands = displayList.Commands.OfType<DrawImageCommand>().ToArray();
+        Assert.Single(imageCommands);
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_StickyElementRendersAtItsNaturalPositionBeforeScrollingPastIt()
+    {
+        var renderDevice = new DefaultRenderDevice
+        {
+            ViewPortWidth = 200,
+            ViewPortHeight = 200,
+            FontSize = 16,
+        };
+        var configuration = Configuration.Default.WithCss().WithRenderDevice(renderDevice);
+        var document = await ParseAsync("""
+            <html>
+              <head><style>html, body { margin: 0; padding: 0; }</style></head>
+              <body>
+                <div style="height:50px;"></div>
+                <div style="position:sticky; top:10px; width:50px; height:30px; background-color:#00ff00;"></div>
+                <div style="height:210px;"></div>
+              </body>
+            </html>
+            """, configuration);
+
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, renderDevice);
+        var fill = Assert.Single(displayList.Commands.OfType<FillRectCommand>().Where(f => f.Color.Equals(new RenderColor(0, 255, 0))));
+
+        Assert.Equal(50f, fill.Rect.Y);
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_StickyElementPinsToTopOnceScrolledPastIt()
+    {
+        var renderDevice = new DefaultRenderDevice
+        {
+            ViewPortWidth = 200,
+            ViewPortHeight = 200,
+            FontSize = 16,
+        };
+        var configuration = Configuration.Default.WithCss().WithRenderDevice(renderDevice);
+        var document = await ParseAsync("""
+            <html>
+              <head><style>html, body { margin: 0; padding: 0; }</style></head>
+              <body>
+                <div style="height:210px;"></div>
+                <div style="position:sticky; top:10px; width:50px; height:30px; background-color:#00ff00;"></div>
+                <div style="height:210px;"></div>
+              </body>
+            </html>
+            """, configuration);
+
+        document.Context.GetDomHarness();
+        document.DocumentElement.SetScrollTop(250);
+
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, renderDevice);
+        var fill = Assert.Single(displayList.Commands.OfType<FillRectCommand>().Where(f => f.Color.Equals(new RenderColor(0, 255, 0))));
+
+        // Natural position (210 - 250 = -40) has scrolled above the 10px sticky threshold, so the
+        // element clamps to top:10px instead of following its natural (now off-screen) position.
+        Assert.Equal(10f, fill.Rect.Y);
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_StickyElementWithoutAnOffsetBehavesLikeStatic()
+    {
+        var renderDevice = new DefaultRenderDevice
+        {
+            ViewPortWidth = 200,
+            ViewPortHeight = 200,
+            FontSize = 16,
+        };
+        var configuration = Configuration.Default.WithCss().WithRenderDevice(renderDevice);
+        var document = await ParseAsync("""
+            <html>
+              <head><style>html, body { margin: 0; padding: 0; }</style></head>
+              <body>
+                <div style="height:210px;"></div>
+                <div style="position:sticky; width:50px; height:30px; background-color:#00ff00;"></div>
+                <div style="height:210px;"></div>
+              </body>
+            </html>
+            """, configuration);
+
+        document.Context.GetDomHarness();
+        document.DocumentElement.SetScrollTop(250);
+
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, renderDevice);
+        var fill = Assert.Single(displayList.Commands.OfType<FillRectCommand>().Where(f => f.Color.Equals(new RenderColor(0, 255, 0))));
+
+        // No offset property at all means nothing to stick to - stays at its natural (now
+        // off-screen, negative-Y) scrolled position, exactly like `position: static` would.
+        Assert.Equal(-40f, fill.Rect.Y);
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_ContentBoxSizingRemainsTheDefaultAndAddsPaddingAndBorderOnTop()
+    {
+        var renderDevice = new DefaultRenderDevice { ViewPortWidth = 300, ViewPortHeight = 200, FontSize = 16 };
+        var configuration = Configuration.Default.WithCss().WithRenderDevice(renderDevice);
+        var document = await ParseAsync("""
+            <html>
+              <head><style>html, body { margin: 0; padding: 0; }</style></head>
+              <body>
+                <div style="width:100px; height:50px; padding:10px; border:5px solid black; background-color:#00ff00;"></div>
+              </body>
+            </html>
+            """, configuration);
+
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, renderDevice);
+        var fill = Assert.Single(displayList.Commands.OfType<FillRectCommand>().Where(f => f.Color.Equals(new RenderColor(0, 255, 0))));
+
+        // Unset box-sizing (content-box, the CSS default) is unaffected by this feature: the
+        // authored width/height already describe the content box, so padding and border are added
+        // on top of it, exactly as this renderer always assumed before box-sizing existed anywhere
+        // in its style map - 100 + 2*10 (padding) + 2*5 (border) = 130.
+        Assert.Equal(130f, fill.Rect.Width);
+        Assert.Equal(80f, fill.Rect.Height);
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_BorderBoxSizingMakesWidthAndHeightIncludePaddingAndBorder()
+    {
+        var renderDevice = new DefaultRenderDevice { ViewPortWidth = 300, ViewPortHeight = 200, FontSize = 16 };
+        var configuration = Configuration.Default.WithCss().WithRenderDevice(renderDevice);
+        var document = await ParseAsync("""
+            <html>
+              <head><style>html, body { margin: 0; padding: 0; }</style></head>
+              <body>
+                <div style="box-sizing:border-box; width:100px; height:50px; padding:10px; border:5px solid black; background-color:#00ff00;"></div>
+              </body>
+            </html>
+            """, configuration);
+
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, renderDevice);
+        var fill = Assert.Single(displayList.Commands.OfType<FillRectCommand>().Where(f => f.Color.Equals(new RenderColor(0, 255, 0))));
+
+        // box-sizing: border-box means the authored width/height already *are* the border-box
+        // size - padding and border eat into the content area instead of being added on top of it,
+        // so the painted border box stays exactly 100x50 regardless of padding/border.
+        Assert.Equal(100f, fill.Rect.Width);
+        Assert.Equal(50f, fill.Rect.Height);
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_BorderBoxSizingClampsContentToZeroWhenPaddingAndBorderExceedTheDeclaredSize()
+    {
+        var renderDevice = new DefaultRenderDevice { ViewPortWidth = 300, ViewPortHeight = 200, FontSize = 16 };
+        var configuration = Configuration.Default.WithCss().WithRenderDevice(renderDevice);
+        var document = await ParseAsync("""
+            <html>
+              <head><style>html, body { margin: 0; padding: 0; }</style></head>
+              <body>
+                <div style="box-sizing:border-box; width:20px; height:20px; padding:20px; border:5px solid black; background-color:#00ff00;"></div>
+              </body>
+            </html>
+            """, configuration);
+
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, renderDevice);
+        var fill = Assert.Single(displayList.Commands.OfType<FillRectCommand>().Where(f => f.Color.Equals(new RenderColor(0, 255, 0))));
+
+        // Padding (20px each side) plus border (5px each side) alone already exceed the declared
+        // 20px border box - ResolveAuthoredDimension clamps the resulting negative content size to
+        // 0 rather than letting it go negative, matching a real browser: the box still cannot be
+        // physically smaller than its own border+padding, so the rendered border box ends up
+        // border+padding (2*5 + 2*20 = 50) rather than the too-small declared 20px, exactly as
+        // borderBoxWidth/Height's own pre-existing bottom-up "border + padding + content" formula
+        // (unchanged by this feature) already produces once content is 0.
+        Assert.Equal(50f, fill.Rect.Width);
+        Assert.Equal(50f, fill.Rect.Height);
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_FlexItemBorderBoxWidthIncludesPaddingAndBorder()
+    {
+        var renderDevice = new DefaultRenderDevice { ViewPortWidth = 300, ViewPortHeight = 200, FontSize = 16 };
+        var configuration = Configuration.Default.WithCss().WithRenderDevice(renderDevice);
+        var document = await ParseAsync("""
+            <html>
+              <head><style>html, body { margin: 0; padding: 0; }</style></head>
+              <body>
+                <div style="display:flex; width:300px;">
+                  <div style="box-sizing:border-box; width:100px; height:40px; padding:10px; border:5px solid black; background-color:#00ff00;"></div>
+                </div>
+              </body>
+            </html>
+            """, configuration);
+
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, renderDevice);
+        var fill = Assert.Single(displayList.Commands.OfType<FillRectCommand>().Where(f => f.Color.Equals(new RenderColor(0, 255, 0))));
+
+        // A flex item's own box-sizing follows the same rule as an ordinary block box -
+        // ResolveFlexBaseSize converts the item's authored border-box width into a content-box
+        // main size, using this item's own (not the container's) border/padding, before the
+        // flex-grow/shrink distribution ever runs.
+        Assert.Equal(100f, fill.Rect.Width);
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_FlexContainerBorderBoxWidthIncludesPaddingAndBorder()
+    {
+        var renderDevice = new DefaultRenderDevice { ViewPortWidth = 300, ViewPortHeight = 200, FontSize = 16 };
+        var configuration = Configuration.Default.WithCss().WithRenderDevice(renderDevice);
+        var document = await ParseAsync("""
+            <html>
+              <head><style>html, body { margin: 0; padding: 0; }</style></head>
+              <body>
+                <div style="display:flex; box-sizing:border-box; width:200px; height:80px; padding:20px; border:10px solid black; background-color:#ff00ff;">
+                  <div style="width:30px; height:30px; background-color:#00ff00;"></div>
+                </div>
+              </body>
+            </html>
+            """, configuration);
+
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, renderDevice);
+        var fill = Assert.Single(displayList.Commands.OfType<FillRectCommand>().Where(f => f.Color.Equals(new RenderColor(255, 0, 255))));
+
+        // The flex container itself is an ordinary box for sizing purposes - its own declared
+        // border-box width/height (200x80) must stay exactly that regardless of its own padding
+        // (20px) and border (10px), with the reduced space left over distributed to items instead.
+        Assert.Equal(200f, fill.Rect.Width);
+        Assert.Equal(80f, fill.Rect.Height);
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_GridContainerBorderBoxHeightIncludesPaddingAndBorder()
+    {
+        var renderDevice = new DefaultRenderDevice { ViewPortWidth = 300, ViewPortHeight = 200, FontSize = 16 };
+        var configuration = Configuration.Default.WithCss().WithRenderDevice(renderDevice);
+        var document = await ParseAsync("""
+            <html>
+              <head><style>html, body { margin: 0; padding: 0; }</style></head>
+              <body>
+                <div style="display:grid; grid-template-columns: 1fr; box-sizing:border-box; width:150px; height:100px; padding:10px; border:5px solid black; background-color:#ff00ff;">
+                  <div style="height:10px; background-color:#00ff00;"></div>
+                </div>
+              </body>
+            </html>
+            """, configuration);
+
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, renderDevice);
+        var fill = Assert.Single(displayList.Commands.OfType<FillRectCommand>().Where(f => f.Color.Equals(new RenderColor(255, 0, 255))));
+
+        // The child is given an explicit, small height so the implicit row's own auto-growth
+        // (ResolveGridItemEstimatedSize's pre-existing, unrelated fallback of the *container's*
+        // content width whenever an item's own height is unset) never dominates over the
+        // container's own specified height - isolating this assertion to the box-sizing
+        // conversion this test actually targets.
+        Assert.Equal(100f, fill.Rect.Height);
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_InlineBlockBorderBoxWidthIsUsedForLineWrapPrediction()
+    {
+        var renderDevice = new DefaultRenderDevice { ViewPortWidth = 300, ViewPortHeight = 200, FontSize = 16 };
+        var configuration = Configuration.Default.WithCss().WithRenderDevice(renderDevice);
+        var document = await ParseAsync("""
+            <html>
+              <head><style>html, body { margin: 0; padding: 0; }</style></head>
+              <body>
+                <div style="width:100px;">
+                  <span style="display:inline-block; box-sizing:border-box; width:50px; height:20px; padding:5px; border:2px solid black; background-color:#00ff00;"></span><span style="display:inline-block; box-sizing:border-box; width:50px; height:20px; padding:5px; border:2px solid black; background-color:#0000ff;"></span>
+                </div>
+              </body>
+            </html>
+            """, configuration);
+
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, renderDevice);
+        var greenFill = Assert.Single(displayList.Commands.OfType<FillRectCommand>().Where(f => f.Color.Equals(new RenderColor(0, 255, 0))));
+        var blueFill = Assert.Single(displayList.Commands.OfType<FillRectCommand>().Where(f => f.Color.Equals(new RenderColor(0, 0, 255))));
+
+        // TryMeasureInlineBlockBoxSize's own prediction must agree with box-sizing too: each
+        // border-box inline-block is exactly 50px wide (not 50+2*5+2*2=64, which its own padding
+        // and border would inflate it to under the old, box-sizing-unaware prediction), so both
+        // fit together in the 100px container on the very same line without wrapping.
+        Assert.Equal(50f, greenFill.Rect.Width);
+        Assert.Equal(greenFill.Rect.Y, blueFill.Rect.Y);
+        Assert.Equal(50f, blueFill.Rect.X);
+    }
+
     private static readonly RenderColor FormControlAccentColorForTests = new(26, 115, 232);
 
     private static async Task<AngleSharp.Dom.IDocument> ParseAsync(string html, IConfiguration? configuration = null, string? address = null)
