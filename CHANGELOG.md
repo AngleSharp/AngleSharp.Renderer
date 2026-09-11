@@ -1,3 +1,9 @@
+# 0.6.0
+
+Released on ?
+
+- Added performance evaluation benchmark
+
 # 0.5.0
 
 Released on Friday, September 11 2026.

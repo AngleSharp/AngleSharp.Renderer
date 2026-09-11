@@ -277,6 +277,38 @@ The regular flow for a renderer change is: change the code, run the tests locall
 own platform's baselines, push, then dispatch **Update Snapshots** on the branch to fill in the
 other two.
 
+## Performance Benchmarks
+
+`src/AngleSharp.Renderer.Benchmarks` is a BenchmarkDotNet project measuring this renderer against
+a single, realistic ~1500-element page (`BenchmarkFixture.BuildLargePageHtml()` - flexbox, CSS
+Grid, floats, a table, sticky positioning, linear/radial/conic gradients, box-shadow, filter,
+transform, opacity, text-overflow ellipsis, all mixed together the way a real page would, not
+isolated per feature). It is a `PackageReference`/`ProjectReference`-only console app (`OutputType`
+`Exe`), never packaged (`IsPackable=false`), and is not part of `dotnet test` - run it explicitly:
+
+```bash
+cd src/AngleSharp.Renderer.Benchmarks
+dotnet run -c Release -f net10.0              # full BenchmarkDotNet default job (most rigorous)
+dotnet run -c Release -f net10.0 -- --job short  # faster, still stable for this fixture
+```
+
+BenchmarkDotNet requires `-c Release` (it will not run - or will loudly warn - under Debug, since
+JIT behavior there is not representative). Three benchmarks are measured: parsing the HTML+CSS
+into a DOM (AngleSharp's own cost, isolated so it is not silently folded into the renderer's own
+numbers), `BuildDisplayList` (pure layout, the baseline), and `RenderToPng` (layout + Skia
+rasterization + PNG encoding) - the document is parsed once in `[GlobalSetup]`, not inside the
+timed methods, since layout never mutates the DOM.
+
+`BASELINE.md` (same directory) records the current baseline numbers and the reasoning for where to
+look first when investigating performance - update it (numbers and date) whenever a meaningful
+optimization lands, so it keeps tracking the current state rather than the day it was first
+written. As of this writing the standout finding is allocation, not raw CPU time: ~1.45 GB managed
+allocation for that one ~1500-element page (roughly 1MB per DOM element laid out) - `CreateStyleMap`
+being rebuilt from scratch on every call, and called more than once per element in some paths
+(flex/grid item size estimation, inline-block size prediction, and an element's own real layout
+pass each build an independent copy of the same element's style map), is the leading suspect and
+the natural place to start.
+
 ## Repository Notes
 
 - The docs live under `docs/general/` and `docs/tutorials/`; they are the best place to document user-facing renderer behavior.
