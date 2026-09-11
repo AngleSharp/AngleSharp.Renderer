@@ -5,6 +5,7 @@ Released on ?.
 - Updated to use the AngleSharp.Css gradient model (#10)
 - Improved rendering of overflow with ellipsis (#11)
 - Added support for CSS grid track sizing (#7)
+- Added support for `position: sticky` (#9)
 
 # 0.4.0
 

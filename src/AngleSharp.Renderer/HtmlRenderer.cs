@@ -344,8 +344,23 @@ public sealed class HtmlRenderer
         // opposite: the full page, regardless of how tall it is relative to the viewport.
         var maxY = measureFullExtent ? float.MaxValue : viewport.Height - context.Padding;
 
+        // A `position: sticky` page child is laid out right here, in plain document order, like
+        // any other page child - its own cursorY/margin-collapse threading must stay in sequence
+        // for its layout to be correct. But once actually stuck, its final on-screen position
+        // routinely overlaps *later* siblings it would otherwise paint behind in that same document
+        // order - a real, confirmed bug caught by rendering the sticky-header visual test and
+        // seeing the header completely painted over by the content scrolling underneath it. Each
+        // sticky child's own command range is recorded here (by index, since DisplayList is a flat
+        // list) and relocated to the end, in original relative order, only after every page child
+        // has been laid out - see the loop below.
+        var stickyRanges = new List<(int StartIndex, int Count)>();
+
         foreach (var child in OrderChildrenForPainting(root.Children))
         {
+            var isStickyChild = child is ElementRenderNode stickyCandidate &&
+                IsStickyPositioned(CreateStyleMap(stickyCandidate.ComputedStyle, stickyCandidate.Ref));
+            var stickyStartIndex = displayList.Commands.Count;
+
             LayoutNode(
                 node: child,
                 containingX: contentX,
@@ -362,10 +377,26 @@ public sealed class HtmlRenderer
                 displayList: displayList,
                 maxY: maxY);
 
+            if (isStickyChild)
+            {
+                stickyRanges.Add((stickyStartIndex, displayList.Commands.Count - stickyStartIndex));
+            }
+
             if (cursorY > maxY)
             {
                 break;
             }
+        }
+
+        // Each earlier move shifts every later index left by however many commands it removed, so
+        // later ranges (still expressed in their original, pre-move indices) need that same
+        // cumulative shift subtracted before they are moved themselves.
+        var cumulativeShift = 0;
+
+        foreach (var (startIndex, count) in stickyRanges)
+        {
+            displayList.MoveRangeToEnd(startIndex - cumulativeShift, count);
+            cumulativeShift += count;
         }
 
         // The page's own scrolling elements (<html>/<body>) are never laid out as boxes of their
@@ -491,7 +522,12 @@ public sealed class HtmlRenderer
             return;
         }
 
-        var renderAsBlock = ShouldRenderAsBlock(computedStyle) || IsReplacedElementTag(tagName);
+        // IsReplacedElementTag reads the host's own tagName, which a ::before/::after pseudo-element
+        // shares (PseudoElement.LocalName/TagName proxy through) - a real browser gives a generated-
+        // content pseudo its own independent display computation (defaulting to inline, per spec),
+        // entirely unrelated to whatever the host's tag would otherwise force, so this renderer must
+        // not either.
+        var renderAsBlock = ShouldRenderAsBlock(computedStyle) || (element is not IPseudoElement && IsReplacedElementTag(tagName));
         var isInlineBlock = IsInlineBlock(computedStyle);
         var currentTextStyle = ResolveTextStyle(styleMap, inheritedTextStyle);
 
@@ -563,6 +599,7 @@ public sealed class HtmlRenderer
         var isAbsolute = string.Equals(position, "absolute", StringComparison.OrdinalIgnoreCase);
         var isFixed = string.Equals(position, "fixed", StringComparison.OrdinalIgnoreCase);
         var isRelative = string.Equals(position, "relative", StringComparison.OrdinalIgnoreCase);
+        var isSticky = string.Equals(position, "sticky", StringComparison.OrdinalIgnoreCase);
         var isFloatLeft = string.Equals(GetFloat(styleMap), "left", StringComparison.OrdinalIgnoreCase);
 
         if (isAbsolute || isFixed)
@@ -625,11 +662,25 @@ public sealed class HtmlRenderer
             : isAbsolute
                 ? containingX + leftOffset
                 : flowBorderBoxX + (isRelative ? leftOffset : 0f);
+        // `position: sticky` stays in normal flow for every other purpose (margins, cursor
+        // advancement, painting order - see the isAbsolute/isFixed checks elsewhere in this
+        // method, none of which match "sticky") - only its own final paint Y is adjusted here.
+        // This renderer already lays out an entire scrolled page in one coordinate space where
+        // Y=context.Padding is the viewport's own top edge (BuildDisplayList shifts the whole
+        // page's starting Y by -scrollOffsetY up front, so flowBorderBoxY arrives already
+        // viewport-relative) - "stick to `top` once scrolled past it" is therefore just clamping
+        // the element's own natural Y to never go above that threshold, with no separate scroll
+        // lookup needed. Only triggers when `top` is actually authored (`styleMap.ContainsKey`,
+        // not just defaulted to 0 via ParseLength's own allowAuto fallback below) - an
+        // unconstrained sticky element (no offset property at all) has nothing to stick to and
+        // behaves exactly like `static`, per spec.
         var borderBoxY = isFixed
             ? context.Padding + topOffset
             : isAbsolute
                 ? containingY + topOffset
-                : flowBorderBoxY + (isRelative ? topOffset : 0f);
+                : isSticky && styleMap.ContainsKey("top")
+                    ? Math.Max(flowBorderBoxY, context.Padding + topOffset)
+                    : flowBorderBoxY + (isRelative ? topOffset : 0f);
         var contentX = borderBoxX + borderLeft + paddingLeft;
         var contentY = borderBoxY + borderTop + paddingTop;
 
@@ -690,8 +741,13 @@ public sealed class HtmlRenderer
         // the ordinary block child-layout path below is exactly what a browser's own <textarea>
         // content does, and needed no special-casing at all once the box itself got its default
         // border/padding/background chrome.
-        var orderedChildren = string.Equals(tagName, "svg", StringComparison.OrdinalIgnoreCase) ||
-                               formControlKind is FormControlKind.Select or FormControlKind.Button
+        // A ::before/::after pseudo-element's own tagName proxies through to its host (see the
+        // IsReplacedElementTag/ResolveFormControlKind guards above) - an <svg>'s own generated-content
+        // pseudo is not itself the foreign-namespaced SVG subtree, and must still get to paint its own
+        // single synthetic text child below rather than being emptied out like the real <svg> root is.
+        var orderedChildren = element is not IPseudoElement &&
+                               (string.Equals(tagName, "svg", StringComparison.OrdinalIgnoreCase) ||
+                               formControlKind is FormControlKind.Select or FormControlKind.Button)
             ? []
             : OrderChildrenForPainting(node.Children).ToList();
         // An inline-block child counts as inline content here too (not just plain inline/br) - it
@@ -963,7 +1019,7 @@ public sealed class HtmlRenderer
                         else
                         {
                             var childTextStyle = ResolveTextStyle(CreateStyleMap(inlineElement.ComputedStyle), currentTextStyle);
-                            var inlineText = NormalizeWhitespaceForInlineRun(inlineElement.Ref.TextContent ?? string.Empty, childTextStyle.WhiteSpace);
+                            var inlineText = NormalizeWhitespaceForInlineRun(ResolvePlainInlineElementText(inlineElement), childTextStyle.WhiteSpace);
 
                             if (inlineText.Length > 0)
                             {
@@ -3792,6 +3848,9 @@ public sealed class HtmlRenderer
                string.Equals(position, "fixed", StringComparison.OrdinalIgnoreCase);
     }
 
+    private static bool IsStickyPositioned(Dictionary<string, string> styleMap) =>
+        string.Equals(GetPosition(styleMap), "sticky", StringComparison.OrdinalIgnoreCase);
+
     private static int ParseZIndex(Dictionary<string, string> styleMap)
     {
         if (!styleMap.TryGetValue("z-index", out var value) || string.IsNullOrWhiteSpace(value))
@@ -4141,7 +4200,11 @@ public sealed class HtmlRenderer
         image = null;
         rect = default;
 
-        if (!string.Equals(node.Ref.LocalName, "img", StringComparison.OrdinalIgnoreCase))
+        // node.Ref.LocalName/GetAttribute("src") proxy through to the host for a ::before/::after
+        // pseudo-element (PseudoElement.cs, AngleSharp.Css) - without this guard, an <img>'s own
+        // generated-content pseudo would be mistaken for the <img> itself and paint the same image
+        // a second time as if the pseudo were a replaced element in its own right.
+        if (node.Ref is IPseudoElement || !string.Equals(node.Ref.LocalName, "img", StringComparison.OrdinalIgnoreCase))
         {
             return false;
         }
@@ -4160,7 +4223,9 @@ public sealed class HtmlRenderer
         image = null;
         rect = default;
 
-        if (!string.Equals(node.Ref.LocalName, "svg", StringComparison.OrdinalIgnoreCase))
+        // Same reasoning as the identical guard in TryResolveImage above - an <svg>'s own
+        // generated-content pseudo aliases its host's LocalName and must not be treated as the SVG.
+        if (node.Ref is IPseudoElement || !string.Equals(node.Ref.LocalName, "svg", StringComparison.OrdinalIgnoreCase))
         {
             return false;
         }
@@ -4597,6 +4662,15 @@ public sealed class HtmlRenderer
 
     private static FormControlKind ResolveFormControlKind(IElement element)
     {
+        // A ::before/::after pseudo-element's LocalName/GetAttribute proxy straight through to its
+        // host (PseudoElement.cs, in AngleSharp.Css) - an <input>/<select>/<textarea>/<button>'s own
+        // generated-content pseudo would otherwise be misidentified as that same form control and
+        // get its default chrome/value painted a second time.
+        if (element is IPseudoElement)
+        {
+            return FormControlKind.None;
+        }
+
         var tagName = element.LocalName;
 
         if (string.Equals(tagName, "textarea", StringComparison.OrdinalIgnoreCase))
@@ -7155,6 +7229,55 @@ public sealed class HtmlRenderer
     /// </summary>
     private static string NormalizeWhitespaceForInlineRun(string value, WhiteSpaceMode whiteSpace) =>
         NormalizeWhitespace(value, whiteSpace).Replace('\n', ' ');
+
+    /// <summary>
+    /// Resolves the flat text an inline element contributes to a shared line in the "generic plain
+    /// inline element" fallback (an <see cref="ElementRenderNode"/> with no other special-cased
+    /// handling - not a <c>&lt;br&gt;</c>, not inline-block, ...), which otherwise reads
+    /// <c>element.TextContent</c> directly (a flat, whole-subtree DOM accessor - nested real elements
+    /// beyond that are a pre-existing, separate scope cut of this fallback path, unrelated to
+    /// pseudo-elements: it has never recursed into further nested elements via full layout, only
+    /// concatenated their own text). Two related gaps that `.TextContent` alone cannot cover:
+    /// 1. A <c>::before</c>/<c>::after</c> pseudo-element's own <c>TextContent</c> is hardcoded to
+    ///    always be an empty string (<c>PseudoElement.cs</c>, in AngleSharp.Css - it has no real DOM
+    ///    text content of its own to report), so a bare `inlineElement.Ref.TextContent` on the
+    ///    pseudo itself silently produces no text at all.
+    /// 2. A *host* element's own `.TextContent` also cannot see a pseudo child's generated text at
+    ///    all (pseudo-elements exist only in the render tree, never in the DOM `.TextContent` walks),
+    ///    so `<span class="required"></span>` - empty DOM text, all its visible content coming from
+    ///    its own `::after` - previously vanished completely, a real, confirmed bug caught by
+    ///    rendering exactly that pattern and seeing nothing painted.
+    /// Both are fixed the same way: walk this element's own render-tree children in order rather
+    /// than reading `.TextContent` once, appending each child's own contribution - a
+    /// <see cref="TextRenderNode"/>'s data, a pseudo child's own single synthetic text child (see
+    /// AngleSharp.Css's `RenderTreeBuilder`), or (preserving the exact old behavior for anything
+    /// else, i.e. a real nested element) that child's own flat `.TextContent`.
+    /// </summary>
+    private static string ResolvePlainInlineElementText(ElementRenderNode inlineElement)
+    {
+        if (inlineElement.Ref is IPseudoElement)
+        {
+            return string.Concat(inlineElement.Children.OfType<TextRenderNode>().Select(t => t.Ref.Data));
+        }
+
+        var sb = new StringBuilder();
+
+        foreach (var child in inlineElement.Children)
+        {
+            if (child is TextRenderNode textChild)
+            {
+                sb.Append(textChild.Ref.Data);
+            }
+            else if (child is ElementRenderNode elementChild)
+            {
+                sb.Append(elementChild.Ref is IPseudoElement
+                    ? string.Concat(elementChild.Children.OfType<TextRenderNode>().Select(t => t.Ref.Data))
+                    : elementChild.Ref.TextContent ?? string.Empty);
+            }
+        }
+
+        return sb.ToString();
+    }
 
     /// <summary>
     /// Where a cell's content sits within the box the cell occupies.

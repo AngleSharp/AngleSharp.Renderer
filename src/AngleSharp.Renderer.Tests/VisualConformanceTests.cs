@@ -2686,6 +2686,78 @@ public sealed class VisualConformanceTests
           maxDifferentPixels: TextRenderingToleranceMaxPixels);
     }
 
+    [Fact]
+    public async Task RenderToPng_RendersBeforeAndAfterGeneratedContent()
+    {
+        var document = await ParseAsync("""
+            <html>
+              <head>
+                <style>
+                  html, body { margin: 0; padding: 0; background-color: white; font-family: sans-serif; }
+                  .badge::before { content: "\2605 "; color: rgb(210, 160, 20); }
+                  .badge::after { content: " (NEW)"; color: rgb(200, 30, 30); }
+                </style>
+              </head>
+              <body>
+                <div class="badge" style="margin:10px;" data-label="Widget">Widget</div>
+              </body>
+            </html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var image = renderer.RenderToPng(document, new DefaultRenderDevice
+        {
+            ViewPortWidth = 180,
+            ViewPortHeight = 50,
+            FontSize = 16f,
+        });
+
+        VisualSnapshotVerifier.VerifyOrCreate(
+          snapshotName: "renders-before-and-after-generated-content.png",
+          actualPng: image.Data,
+          perChannelTolerance: TextRenderingToleranceChannel,
+          maxDifferentPixels: TextRenderingToleranceMaxPixels);
+    }
+
+    [Fact]
+    public async Task RenderToPng_StickyHeaderStaysPinnedToTopWhileScrolledPastIt()
+    {
+        var renderDevice = new DefaultRenderDevice
+        {
+            ViewPortWidth = 80,
+            ViewPortHeight = 100,
+            DeviceWidth = 80,
+            DeviceHeight = 100,
+            FontSize = 16,
+        };
+        var configuration = Configuration.Default.WithCss().WithRenderDevice(renderDevice);
+        var document = await ParseAsync("""
+            <html>
+              <head><style>html, body { margin: 0; padding: 0; }</style></head>
+              <body>
+                <div style="position:sticky; top:0; width:80px; height:30px; background-color:rgb(50,50,200);"></div>
+                <div style="width:80px; height:40px; background-color:rgb(255,0,0);"></div>
+                <div style="width:80px; height:40px; background-color:rgb(255,165,0);"></div>
+                <div style="width:80px; height:40px; background-color:rgb(255,255,0);"></div>
+                <div style="width:80px; height:40px; background-color:rgb(0,180,0);"></div>
+                <div style="width:80px; height:40px; background-color:rgb(0,0,255);"></div>
+              </body>
+            </html>
+            """, configuration);
+
+        document.Context.GetDomHarness();
+        document.DocumentElement.SetScrollTop(80);
+
+        var renderer = new HtmlRenderer();
+        var image = renderer.RenderToPng(document, renderDevice);
+
+        VisualSnapshotVerifier.VerifyOrCreate(
+          snapshotName: "sticky-header-stays-pinned-to-top-while-scrolled-past-it.png",
+          actualPng: image.Data,
+          perChannelTolerance: 0,
+          maxDifferentPixels: 0);
+    }
+
     private static async Task<AngleSharp.Dom.IDocument> ParseAsync(string html, IConfiguration? configuration = null)
     {
         var context = BrowsingContext.New(configuration ?? Configuration.Default.WithCss());
