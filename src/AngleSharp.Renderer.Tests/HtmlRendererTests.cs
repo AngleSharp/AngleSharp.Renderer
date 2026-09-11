@@ -4964,6 +4964,265 @@ public sealed class HtmlRendererTests
         Assert.Equal("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", text.Text);
     }
 
+    [Fact]
+    public async Task BuildDisplayList_RendersBeforePseudoElementContentInlineBeforeRealContent()
+    {
+        var document = await ParseAsync("""
+            <html><head><style>#target::before { content: "PREFIX-"; }</style></head>
+            <body><div id="target">middle</div></body></html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, new DefaultRenderDevice
+        {
+            ViewPortWidth = 300,
+            ViewPortHeight = 200,
+            FontSize = 16f,
+        });
+
+        var texts = displayList.Commands.OfType<DrawTextCommand>().ToArray();
+
+        Assert.Equal(2, texts.Length);
+        Assert.Equal("PREFIX-", texts[0].Text);
+        Assert.Equal("middle", texts[1].Text);
+        Assert.Equal(0f, texts[0].X);
+        Assert.Equal(texts[0].Y, texts[1].Y);
+        Assert.True(texts[1].X > texts[0].X);
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_RendersAfterPseudoElementContentInlineAfterRealContent()
+    {
+        var document = await ParseAsync("""
+            <html><head><style>#target::after { content: "-SUFFIX"; }</style></head>
+            <body><div id="target">middle</div></body></html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, new DefaultRenderDevice
+        {
+            ViewPortWidth = 300,
+            ViewPortHeight = 200,
+            FontSize = 16f,
+        });
+
+        var texts = displayList.Commands.OfType<DrawTextCommand>().ToArray();
+
+        Assert.Equal(2, texts.Length);
+        Assert.Equal("middle", texts[0].Text);
+        Assert.Equal("-SUFFIX", texts[1].Text);
+        Assert.True(texts[1].X > texts[0].X);
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_PseudoElementWithNoContentRendersNothingExtra()
+    {
+        var document = await ParseAsync("""
+            <html><body><div id="target">middle</div></body></html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, new DefaultRenderDevice
+        {
+            ViewPortWidth = 300,
+            ViewPortHeight = 200,
+            FontSize = 16f,
+        });
+
+        var text = Assert.Single(displayList.Commands.OfType<DrawTextCommand>());
+        Assert.Equal("middle", text.Text);
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_PseudoElementContentAttrResolvesHostAttribute()
+    {
+        var document = await ParseAsync("""
+            <html><head><style>#target::before { content: attr(data-label); }</style></head>
+            <body><div id="target" data-label="Hello">middle</div></body></html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, new DefaultRenderDevice
+        {
+            ViewPortWidth = 300,
+            ViewPortHeight = 200,
+            FontSize = 16f,
+        });
+
+        var texts = displayList.Commands.OfType<DrawTextCommand>().ToArray();
+
+        Assert.Equal(2, texts.Length);
+        Assert.Equal("Hello", texts[0].Text);
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_PseudoElementInheritsColorFromHostWhenNotItselfSet()
+    {
+        var document = await ParseAsync("""
+            <html><head><style>
+            #target { color: rgb(10, 20, 30); }
+            #target::before { content: "x"; }
+            </style></head>
+            <body><div id="target">middle</div></body></html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, new DefaultRenderDevice
+        {
+            ViewPortWidth = 300,
+            ViewPortHeight = 200,
+            FontSize = 16f,
+        });
+
+        var texts = displayList.Commands.OfType<DrawTextCommand>().ToArray();
+
+        Assert.Equal(2, texts.Length);
+        Assert.Equal(new RenderColor(10, 20, 30), texts[0].Color);
+        Assert.Equal(new RenderColor(10, 20, 30), texts[1].Color);
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_PseudoElementOnFormControlDoesNotDuplicateControlChrome()
+    {
+        var document = await ParseAsync("""
+            <html><head><style>#target::before { content: "*"; }</style></head>
+            <body><input id="target" type="text" value="hi" /></body></html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, new DefaultRenderDevice
+        {
+            ViewPortWidth = 300,
+            ViewPortHeight = 200,
+            FontSize = 16f,
+        });
+
+        // Baseline (the identical markup without the ::before rule) paints exactly 6
+        // FillRectCommands (the input's default chrome, plus page/body backgrounds) and 1
+        // DrawTextCommand (its own "hi" value) - a pseudo-element misidentified as the same form
+        // control would duplicate that chrome and/or the value text. Only the pseudo's own "*"
+        // text should be added on top.
+        Assert.Equal(6, displayList.Commands.OfType<FillRectCommand>().Count());
+        var texts = displayList.Commands.OfType<DrawTextCommand>().ToArray();
+        Assert.Equal(2, texts.Length);
+        Assert.Contains(texts, t => t.Text == "*");
+        Assert.Contains(texts, t => t.Text == "hi");
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_PseudoElementOnImageDoesNotRepaintTheImage()
+    {
+        var document = await ParseAsync("""
+            <html><head><style>#target::before { content: "*"; }</style></head>
+            <body><img id="target" src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAACklEQVR4nGMAAQABAA4A4cQTmwAAAABJRU5ErkJggg==" style="width:40px; height:20px;" /></body></html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, new DefaultRenderDevice
+        {
+            ViewPortWidth = 300,
+            ViewPortHeight = 200,
+            FontSize = 16f,
+        });
+
+        var imageCommands = displayList.Commands.OfType<DrawImageCommand>().ToArray();
+        Assert.Single(imageCommands);
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_StickyElementRendersAtItsNaturalPositionBeforeScrollingPastIt()
+    {
+        var renderDevice = new DefaultRenderDevice
+        {
+            ViewPortWidth = 200,
+            ViewPortHeight = 200,
+            FontSize = 16,
+        };
+        var configuration = Configuration.Default.WithCss().WithRenderDevice(renderDevice);
+        var document = await ParseAsync("""
+            <html>
+              <head><style>html, body { margin: 0; padding: 0; }</style></head>
+              <body>
+                <div style="height:50px;"></div>
+                <div style="position:sticky; top:10px; width:50px; height:30px; background-color:#00ff00;"></div>
+                <div style="height:210px;"></div>
+              </body>
+            </html>
+            """, configuration);
+
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, renderDevice);
+        var fill = Assert.Single(displayList.Commands.OfType<FillRectCommand>().Where(f => f.Color.Equals(new RenderColor(0, 255, 0))));
+
+        Assert.Equal(50f, fill.Rect.Y);
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_StickyElementPinsToTopOnceScrolledPastIt()
+    {
+        var renderDevice = new DefaultRenderDevice
+        {
+            ViewPortWidth = 200,
+            ViewPortHeight = 200,
+            FontSize = 16,
+        };
+        var configuration = Configuration.Default.WithCss().WithRenderDevice(renderDevice);
+        var document = await ParseAsync("""
+            <html>
+              <head><style>html, body { margin: 0; padding: 0; }</style></head>
+              <body>
+                <div style="height:210px;"></div>
+                <div style="position:sticky; top:10px; width:50px; height:30px; background-color:#00ff00;"></div>
+                <div style="height:210px;"></div>
+              </body>
+            </html>
+            """, configuration);
+
+        document.Context.GetDomHarness();
+        document.DocumentElement.SetScrollTop(250);
+
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, renderDevice);
+        var fill = Assert.Single(displayList.Commands.OfType<FillRectCommand>().Where(f => f.Color.Equals(new RenderColor(0, 255, 0))));
+
+        // Natural position (210 - 250 = -40) has scrolled above the 10px sticky threshold, so the
+        // element clamps to top:10px instead of following its natural (now off-screen) position.
+        Assert.Equal(10f, fill.Rect.Y);
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_StickyElementWithoutAnOffsetBehavesLikeStatic()
+    {
+        var renderDevice = new DefaultRenderDevice
+        {
+            ViewPortWidth = 200,
+            ViewPortHeight = 200,
+            FontSize = 16,
+        };
+        var configuration = Configuration.Default.WithCss().WithRenderDevice(renderDevice);
+        var document = await ParseAsync("""
+            <html>
+              <head><style>html, body { margin: 0; padding: 0; }</style></head>
+              <body>
+                <div style="height:210px;"></div>
+                <div style="position:sticky; width:50px; height:30px; background-color:#00ff00;"></div>
+                <div style="height:210px;"></div>
+              </body>
+            </html>
+            """, configuration);
+
+        document.Context.GetDomHarness();
+        document.DocumentElement.SetScrollTop(250);
+
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, renderDevice);
+        var fill = Assert.Single(displayList.Commands.OfType<FillRectCommand>().Where(f => f.Color.Equals(new RenderColor(0, 255, 0))));
+
+        // No offset property at all means nothing to stick to - stays at its natural (now
+        // off-screen, negative-Y) scrolled position, exactly like `position: static` would.
+        Assert.Equal(-40f, fill.Rect.Y);
+    }
+
     private static readonly RenderColor FormControlAccentColorForTests = new(26, 115, 232);
 
     private static async Task<AngleSharp.Dom.IDocument> ParseAsync(string html, IConfiguration? configuration = null, string? address = null)
