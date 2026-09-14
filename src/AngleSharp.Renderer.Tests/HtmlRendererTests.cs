@@ -5408,6 +5408,178 @@ public sealed class HtmlRendererTests
         Assert.Equal(50f, blueFill.Rect.X);
     }
 
+    // The following battery exercises ParseLength's typed-value fast path (StyleMap/
+    // AddLengthProperty/CssLengthValue - see HtmlRenderer.cs) across the representative value
+    // shapes it has to agree with the old, still-present string-parsing fallback on: a plain
+    // pixel length, a percentage (resolved against a known container size), a negative value,
+    // zero, an "auto" default, and a border-width keyword (thin/medium/thick, which
+    // AngleSharp.Css itself resolves to a concrete CssLengthValue rather than a raw string).
+    // These are ordinary rendering assertions, not a literal side-by-side dual-path comparison -
+    // ParseLength has no public seam to force one path or the other from outside this file - but
+    // they pin down the exact numeric behavior the fast path must reproduce, the same way every
+    // other test in this suite already asserts concrete expected geometry.
+
+    [Fact]
+    public async Task BuildDisplayList_LengthFastPath_PercentageWidthResolvesAgainstContainer()
+    {
+        var renderDevice = new DefaultRenderDevice { ViewPortWidth = 300, ViewPortHeight = 100, FontSize = 16 };
+        var configuration = Configuration.Default.WithCss().WithRenderDevice(renderDevice);
+        var document = await ParseAsync("""
+            <html>
+              <head><style>html, body { margin: 0; padding: 0; }</style></head>
+              <body>
+                <div style="width:50%; height:20px; background-color:#00ff00;"></div>
+              </body>
+            </html>
+            """, configuration);
+
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, renderDevice);
+        var fill = Assert.Single(displayList.Commands.OfType<FillRectCommand>().Where(f => f.Color.Equals(new RenderColor(0, 255, 0))));
+
+        Assert.Equal(150f, fill.Rect.Width);
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_LengthFastPath_NegativeMarginShiftsElementLeft()
+    {
+        var renderDevice = new DefaultRenderDevice { ViewPortWidth = 300, ViewPortHeight = 100, FontSize = 16 };
+        var configuration = Configuration.Default.WithCss().WithRenderDevice(renderDevice);
+        var document = await ParseAsync("""
+            <html>
+              <head><style>html, body { margin: 0; padding: 0; }</style></head>
+              <body>
+                <div style="margin-left:-10px; width:40px; height:20px; background-color:#00ff00;"></div>
+              </body>
+            </html>
+            """, configuration);
+
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, renderDevice);
+        var fill = Assert.Single(displayList.Commands.OfType<FillRectCommand>().Where(f => f.Color.Equals(new RenderColor(0, 255, 0))));
+
+        Assert.Equal(-10f, fill.Rect.X);
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_LengthFastPath_ZeroPaddingAddsNothingToBorderBox()
+    {
+        var renderDevice = new DefaultRenderDevice { ViewPortWidth = 300, ViewPortHeight = 100, FontSize = 16 };
+        var configuration = Configuration.Default.WithCss().WithRenderDevice(renderDevice);
+        var document = await ParseAsync("""
+            <html>
+              <head><style>html, body { margin: 0; padding: 0; }</style></head>
+              <body>
+                <div style="width:40px; height:20px; padding:0; background-color:#00ff00;"></div>
+              </body>
+            </html>
+            """, configuration);
+
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, renderDevice);
+        var fill = Assert.Single(displayList.Commands.OfType<FillRectCommand>().Where(f => f.Color.Equals(new RenderColor(0, 255, 0))));
+
+        Assert.Equal(40f, fill.Rect.Width);
+        Assert.Equal(20f, fill.Rect.Height);
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_LengthFastPath_AutoWidthFillsTheContainer()
+    {
+        var renderDevice = new DefaultRenderDevice { ViewPortWidth = 300, ViewPortHeight = 100, FontSize = 16 };
+        var configuration = Configuration.Default.WithCss().WithRenderDevice(renderDevice);
+        var document = await ParseAsync("""
+            <html>
+              <head><style>html, body { margin: 0; padding: 0; }</style></head>
+              <body>
+                <div style="width:220px;">
+                  <div style="height:20px; background-color:#00ff00;"></div>
+                </div>
+              </body>
+            </html>
+            """, configuration);
+
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, renderDevice);
+        var fill = Assert.Single(displayList.Commands.OfType<FillRectCommand>().Where(f => f.Color.Equals(new RenderColor(0, 255, 0))));
+
+        Assert.Equal(220f, fill.Rect.Width);
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_LengthFastPath_BorderWidthKeywordResolvesToPixels()
+    {
+        var renderDevice = new DefaultRenderDevice { ViewPortWidth = 300, ViewPortHeight = 100, FontSize = 16 };
+        var configuration = Configuration.Default.WithCss().WithRenderDevice(renderDevice);
+        var document = await ParseAsync("""
+            <html>
+              <head><style>html, body { margin: 0; padding: 0; }</style></head>
+              <body>
+                <div style="width:40px; height:20px; border:thick solid black; background-color:#00ff00;"></div>
+              </body>
+            </html>
+            """, configuration);
+
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, renderDevice);
+        var fill = Assert.Single(displayList.Commands.OfType<FillRectCommand>().Where(f => f.Color.Equals(new RenderColor(0, 255, 0))));
+
+        // "thick" is one of the CssLengthValue static keyword lengths (5px) the fast path reads
+        // directly - content-box default means the 40px width is untouched by the border, but the
+        // border box itself grows by 2*5px around it.
+        Assert.Equal(50f, fill.Rect.Width);
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_LengthFastPath_TopPercentageOffsetsARelativeElement()
+    {
+        var renderDevice = new DefaultRenderDevice { ViewPortWidth = 300, ViewPortHeight = 200, FontSize = 16 };
+        var configuration = Configuration.Default.WithCss().WithRenderDevice(renderDevice);
+        var document = await ParseAsync("""
+            <html>
+              <head><style>html, body { margin: 0; padding: 0; }</style></head>
+              <body>
+                <div style="position:relative; top:25%; width:40px; height:20px; background-color:#00ff00;"></div>
+              </body>
+            </html>
+            """, configuration);
+
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, renderDevice);
+        var fill = Assert.Single(displayList.Commands.OfType<FillRectCommand>().Where(f => f.Color.Equals(new RenderColor(0, 255, 0))));
+
+        // top's own percentage resolves against the *containing block's width* per this renderer's
+        // existing (pre-existing, unchanged) convention for offsets - relativeTo is always the
+        // containing width at every ParseLength("top"/"left", ...) call site - so 25% of the 300px
+        // viewport width is 75px, added to the element's natural Y (0).
+        Assert.Equal(75f, fill.Rect.Y);
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_LengthFastPath_UnsetLetterSpacingNormalDefaultDoesNotThrow()
+    {
+        var renderDevice = new DefaultRenderDevice { ViewPortWidth = 300, ViewPortHeight = 100, FontSize = 16 };
+        var configuration = Configuration.Default.WithCss().WithRenderDevice(renderDevice);
+        var document = await ParseAsync("""
+            <html>
+              <head><style>html, body { margin: 0; padding: 0; }</style></head>
+              <body>
+                <p>Hello world</p>
+              </body>
+            </html>
+            """, configuration);
+
+        var renderer = new HtmlRenderer();
+
+        // letter-spacing's own CSS initial value is the literal keyword "normal", which
+        // AngleSharp.Css resolves to a NaN-valued CssLengthValue - the same NaN encoding "auto"
+        // uses for other properties. ParseLength's fast path (allowAuto: false at this call site)
+        // must resolve this to its own default (0), matching the pre-existing string path exactly,
+        // not throw or silently produce a wrong value.
+        var displayList = Xunit.Record.Exception(() => renderer.BuildDisplayList(document, renderDevice));
+        Assert.Null(displayList);
+    }
+
     private static readonly RenderColor FormControlAccentColorForTests = new(26, 115, 232);
 
     private static async Task<AngleSharp.Dom.IDocument> ParseAsync(string html, IConfiguration? configuration = null, string? address = null)

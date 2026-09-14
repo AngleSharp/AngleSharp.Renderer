@@ -3640,9 +3640,76 @@ public sealed class HtmlRenderer
         return string.IsNullOrWhiteSpace(explicitValue) ? computedStyle.GetPropertyValue(propertyName) : explicitValue;
     }
 
+    /// <summary>
+    /// Backs every element's style map. Behaves exactly like a plain
+    /// <see cref="Dictionary{TKey, TValue}"/> of string to string for every existing consumer -
+    /// it *is* one, via inheritance, so no call site anywhere else in this file needs to change -
+    /// but additionally carries, for a handful of length-typed properties, the already-parsed
+    /// <see cref="CssLengthValue"/> straight from AngleSharp.Css, letting <see cref="ParseLength"/>
+    /// skip its own string tokenizing/re-parsing entirely for the common case. See
+    /// <see cref="ParseLength"/>'s own remarks for why this is safe - the two code paths are
+    /// provably computing the same thing from the same underlying value, just skipping the
+    /// string round-trip in the middle for the fast one.
+    /// </summary>
+    private sealed class StyleMap : Dictionary<string, string>
+    {
+        private Dictionary<string, CssLengthValue>? _rawLengths;
+
+        public StyleMap()
+            : base(StringComparer.OrdinalIgnoreCase)
+        {
+        }
+
+        public void SetRawLength(string propertyName, CssLengthValue value) =>
+            (_rawLengths ??= new Dictionary<string, CssLengthValue>(StringComparer.OrdinalIgnoreCase))[propertyName] = value;
+
+        public bool TryGetRawLength(string propertyName, out CssLengthValue value)
+        {
+            if (_rawLengths is not null)
+            {
+                return _rawLengths.TryGetValue(propertyName, out value);
+            }
+
+            value = default;
+            return false;
+        }
+
+        /// <summary>
+        /// Invalidates a captured raw length, if any - required whenever something overwrites this
+        /// map's *string* entry for a property directly (bypassing <see cref="AddLengthProperty"/>),
+        /// the way <see cref="ApplyActiveTransitionAndAnimationOverrides"/> does for a property
+        /// that is mid-`transition`/`animation`. Without this, <see cref="ParseLength"/>'s fast
+        /// path would keep answering from the stale, pre-override raw value instead of the freshly
+        /// interpolated string - a real bug caught by
+        /// <c>BuildDisplayList_HoverTransitionInterpolatesWidthAsANumericLength</c> failing before
+        /// this call was added.
+        /// </summary>
+        public void ClearRawLength(string propertyName) => _rawLengths?.Remove(propertyName);
+    }
+
+    /// <summary>
+    /// Reads a length-typed property the same way <c>AddIfPresent(map, name,
+    /// style.GetXxx())</c> already did for each of these properties (same string stored, same
+    /// `.CssText` cost for now - only <see cref="ParseLength"/>'s own re-parsing is skipped in
+    /// this pass, not AngleSharp.Css's own serialization), but also captures the already-parsed
+    /// <see cref="CssLengthValue"/> - when the property's raw value actually is one - into the
+    /// map's fast-path side channel.
+    /// </summary>
+    private static void AddLengthProperty(StyleMap map, ICssStyleDeclaration style, string propertyName)
+    {
+        var property = style.GetProperty(propertyName);
+
+        if (property?.RawValue is CssLengthValue length)
+        {
+            map.SetRawLength(propertyName, length);
+        }
+
+        AddIfPresent(map, propertyName, property?.Value);
+    }
+
     private static Dictionary<string, string> CreateStyleMap(ICssStyleDeclaration style, IElement? element = null, LayoutContext? context = null)
     {
-        var map = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        var map = new StyleMap();
         var explicitDeclarations = context.HasValue ? GetExplicitDeclarations(context.Value, element) : null;
         var inlineStyle = element?.GetAttribute("style");
 
@@ -3672,29 +3739,29 @@ public sealed class HtmlRenderer
 
         AddIfPresent(map, "display", displayValue);
         AddIfPresent(map, "visibility", style.GetVisibility());
-        AddIfPresent(map, "width", style.GetWidth());
-        AddIfPresent(map, "height", style.GetHeight());
+        AddLengthProperty(map, style, "width");
+        AddLengthProperty(map, style, "height");
         AddIfPresent(map, "box-sizing", style.GetBoxSizing());
         AddIfPresent(map, "position", style.GetPropertyValue("position"));
-        AddIfPresent(map, "left", style.GetPropertyValue("left"));
-        AddIfPresent(map, "top", style.GetPropertyValue("top"));
+        AddLengthProperty(map, style, "left");
+        AddLengthProperty(map, style, "top");
         AddIfPresent(map, "float", style.GetPropertyValue("float"));
         AddIfPresent(map, "z-index", style.GetPropertyValue("z-index"));
 
-        AddIfPresent(map, "margin-top", style.GetMarginTop());
-        AddIfPresent(map, "margin-right", style.GetMarginRight());
-        AddIfPresent(map, "margin-bottom", style.GetMarginBottom());
-        AddIfPresent(map, "margin-left", style.GetMarginLeft());
+        AddLengthProperty(map, style, "margin-top");
+        AddLengthProperty(map, style, "margin-right");
+        AddLengthProperty(map, style, "margin-bottom");
+        AddLengthProperty(map, style, "margin-left");
 
-        AddIfPresent(map, "padding-top", style.GetPaddingTop());
-        AddIfPresent(map, "padding-right", style.GetPaddingRight());
-        AddIfPresent(map, "padding-bottom", style.GetPaddingBottom());
-        AddIfPresent(map, "padding-left", style.GetPaddingLeft());
+        AddLengthProperty(map, style, "padding-top");
+        AddLengthProperty(map, style, "padding-right");
+        AddLengthProperty(map, style, "padding-bottom");
+        AddLengthProperty(map, style, "padding-left");
 
-        AddIfPresent(map, "border-top-width", style.GetBorderTopWidth());
-        AddIfPresent(map, "border-right-width", style.GetBorderRightWidth());
-        AddIfPresent(map, "border-bottom-width", style.GetBorderBottomWidth());
-        AddIfPresent(map, "border-left-width", style.GetBorderLeftWidth());
+        AddLengthProperty(map, style, "border-top-width");
+        AddLengthProperty(map, style, "border-right-width");
+        AddLengthProperty(map, style, "border-bottom-width");
+        AddLengthProperty(map, style, "border-left-width");
         AddIfPresent(map, "border-collapse", style.GetPropertyValue("border-collapse"));
 
         AddIfPresent(map, "border-top-style", style.GetBorderTopStyle());
@@ -3790,7 +3857,7 @@ public sealed class HtmlRenderer
         // property.
         AddIfPresent(map, "filter", style.GetPropertyValue("filter"));
         AddIfPresent(map, "opacity", style.GetOpacity());
-        AddIfPresent(map, "font-size", style.GetFontSize());
+        AddLengthProperty(map, style, "font-size");
         AddIfPresent(map, "font-family", style.GetFontFamily());
         AddIfPresent(map, "font-weight", style.GetPropertyValue("font-weight"));
         AddIfPresent(map, "font-style", style.GetPropertyValue("font-style"));
@@ -3799,9 +3866,9 @@ public sealed class HtmlRenderer
         AddIfPresent(map, "text-decoration-color", style.GetPropertyValue("text-decoration-color"));
         AddIfPresent(map, "text-decoration-style", style.GetPropertyValue("text-decoration-style"));
         AddIfPresent(map, "text-align", style.GetPropertyValue("text-align"));
-        AddIfPresent(map, "text-indent", style.GetTextIndent());
+        AddLengthProperty(map, style, "text-indent");
         AddIfPresent(map, "vertical-align", style.GetVerticalAlign());
-        AddIfPresent(map, "letter-spacing", style.GetPropertyValue("letter-spacing"));
+        AddLengthProperty(map, style, "letter-spacing");
         AddIfPresent(map, "line-height", style.GetLineHeight());
         AddIfPresent(map, "color", style.GetColor());
         AddIfPresent(map, "white-space", style.GetPropertyValue("white-space"));
@@ -3836,6 +3903,8 @@ public sealed class HtmlRenderer
         // ever appears inside a @keyframes block (never as a base/inherited declaration, e.g.
         // `opacity` set solely by an animation) would otherwise have no key in the map at all for
         // this loop to find and override.
+        var styleMap = map as StyleMap;
+
         foreach (var property in CssValueInterpolation.InterpolatableProperties.Keys)
         {
             var animatedValue = harness.GetAnimatedValue(element, property);
@@ -3843,6 +3912,7 @@ public sealed class HtmlRenderer
             if (animatedValue is not null)
             {
                 map[property] = animatedValue;
+                styleMap?.ClearRawLength(property);
                 continue;
             }
 
@@ -3851,6 +3921,7 @@ public sealed class HtmlRenderer
             if (transitioningValue is not null)
             {
                 map[property] = transitioningValue;
+                styleMap?.ClearRawLength(property);
             }
         }
     }
@@ -5750,8 +5821,54 @@ public sealed class HtmlRenderer
         return Math.Max(0f, specified - borderAndPaddingSum);
     }
 
+    /// <summary>
+    /// Reads a length property the same way regardless of which representation the map happens
+    /// to carry for it. When <paramref name="styleMap"/> is a <see cref="StyleMap"/> with a raw
+    /// <see cref="CssLengthValue"/> already captured for <paramref name="propertyName"/> (see
+    /// <see cref="AddLengthProperty"/>), this skips straight to the same arithmetic the string
+    /// path below performs, without ever tokenizing a string - safe because a *computed* length's
+    /// raw value is always exactly `Unit.Px`, `Unit.Percent`, or the NaN auto/normal sentinel
+    /// (confirmed by reading `CssLengthValue.ICssValue.Compute()`: it converts every other unit to
+    /// `Px` before this renderer ever sees a computed value), which is the exact same closed set
+    /// the string path below already handles (it only ever recognizes `"auto"`, a `%` suffix, and
+    /// `px`/bare-unitless text - never em/rem/vw/vh, because AngleSharp.Css's own `.Compute()` step
+    /// already resolved those before serializing to a string). Any raw value shape outside that set
+    /// (there should be none for computed style, but the check costs nothing) simply falls through
+    /// to the untouched string path, so this can never produce a different answer than before -
+    /// only a faster one for the common case.
+    ///
+    /// The NaN case (auto *or* normal - `CssLengthValue`'s own `Equals` treats every NaN-valued
+    /// length as equal regardless of unit, so the two are not distinguishable from the raw value
+    /// alone) resolves the same way the string path's own "auto" handling does:
+    /// `allowAuto ? NaN : defaultValue`. This matches the string path exactly for every call site
+    /// in this file today - the one property here whose initial value is literally the *word*
+    /// "normal" (`letter-spacing`) is always called with `allowAuto: false`, where both
+    /// interpretations already agree (the string path treats any unparseable text, "normal"
+    /// included, as `defaultValue` unconditionally - see the `ParseLengthValue` call below).
+    /// </summary>
     private static float ParseLength(Dictionary<string, string> styleMap, string propertyName, float relativeTo, float defaultValue, bool allowAuto)
     {
+        if (styleMap is StyleMap fastMap && fastMap.TryGetRawLength(propertyName, out var raw))
+        {
+            if (double.IsNaN(raw.Value))
+            {
+                return allowAuto ? float.NaN : defaultValue;
+            }
+
+            if (raw.Type == CssLengthValue.Unit.Px)
+            {
+                return (float)raw.Value;
+            }
+
+            if (raw.Type == CssLengthValue.Unit.Percent)
+            {
+                return (float)(raw.Value / 100.0 * relativeTo);
+            }
+
+            // Any other unit should not occur for already-computed style - fall through to the
+            // string path below rather than risk a wrong answer for a shape this has not verified.
+        }
+
         if (!styleMap.TryGetValue(propertyName, out var value) || string.IsNullOrWhiteSpace(value))
         {
             return defaultValue;

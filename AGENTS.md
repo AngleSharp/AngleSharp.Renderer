@@ -380,7 +380,30 @@ relevant data point for anyone considering it: the remaining cost is now spread 
 across ~80 necessary property reads rather than concentrated in a few hot spots the way the first
 two rounds' costs were, so this refactor's expected further gain is real but more modest than
 either of the first two fixes, for meaningfully higher risk to a shipped, published library.
-Deliberately not attempted here.
+
+That refactor was attempted in narrow form: `ParseLength` (the single most centralized target - all
+42 call sites benefit from one change) gained a typed fast path reading an already-parsed
+`CssLengthValue` directly (via a new `StyleMap : Dictionary<string, string>` with a raw-value side
+channel, populated by `AddLengthProperty` for its highest-traffic ~17 properties) instead of
+tokenizing the string AngleSharp.Css serializes for it - deliberately scoped to change only *how*
+`ParseLength` reads the value, still populating the ordinary string entry exactly as before (via
+`.CssText`) for safety. **Measured result: no meaningful change** - see `BASELINE.md`'s `History`
+section for the numbers and the reason: `.CssText` itself (AngleSharp.Css's own serialization) is the
+dominant cost, not this renderer's own string re-parsing, which this attempt skipped but which was
+never a meaningful fraction of the total to begin with. One real bug was caught and fixed along the
+way: `ApplyActiveTransitionAndAnimationOverrides` overwrites a property's string value directly for a
+mid-`transition`/`animation` property, which needed `StyleMap.ClearRawLength` to invalidate the
+now-stale cached raw value there (caught by the existing `BuildDisplayList_HoverTransitionInterpolatesWidthAsANumericLength`
+test failing) - any *new* code that writes directly into a `StyleMap`'s string entry for one of
+`AddLengthProperty`'s 17 properties must call `ClearRawLength` for that same key, or `ParseLength`'s
+fast path will silently answer from a stale value.
+
+The natural next increment - skip populating the string entry (and therefore the `.CssText` call)
+entirely for the 17 fast-pathed properties, relying on the raw value alone - is what the original
+hypothesis actually needs to be tested against, and is what the `StyleMap` infrastructure above was
+already built to support. Not yet attempted: it first needs confirming nothing outside `ParseLength`
+reads these 17 specific keys as raw strings (a direct `styleMap.TryGetValue("width", ...)` bypassing
+`ParseLength` would silently start seeing nothing for a property that still has a real value).
 
 ## Repository Notes
 

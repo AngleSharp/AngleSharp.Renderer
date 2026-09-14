@@ -139,6 +139,36 @@ the ~80 *necessary* property reads plus the `Dictionary` allocation itself, not 
 handful of skippable/cacheable hot spots the way the first two rounds were - a further "avoid doing
 unnecessary work" pass is unlikely to find another large win the way the previous two did.
 
+### Attempt: `ParseLength` typed-value fast path (`StyleMap`/`CssLengthValue`) - measured, no gain
+
+Added a fast path so `ParseLength` reads an already-parsed `CssLengthValue` (via a new `StyleMap :
+Dictionary<string, string>` carrying a side-channel populated by `AddLengthProperty`) for its 17
+highest-traffic properties (`width`, `height`, the four `margin-*`/`padding-*` properties, the four
+`border-*-width` properties, `top`, `left`, `font-size`, `letter-spacing`, `text-indent`) instead of
+tokenizing the string AngleSharp.Css serializes for it. Caught and fixed one real bug along the way:
+`ApplyActiveTransitionAndAnimationOverrides` overwrites a property's *string* value directly for a
+mid-`transition`/`animation` property without going through `AddLengthProperty` - without
+`StyleMap.ClearRawLength` invalidating the now-stale cached raw value there, `ParseLength`'s fast path
+kept answering from the pre-override value; caught immediately by the existing (not even a new) test
+`BuildDisplayList_HoverTransitionInterpolatesWidthAsANumericLength` failing.
+
+**Measured result: no meaningful change** (net10.0: 255ms/194MB &rarr; 260ms/194MB; net8.0:
+364ms/194MB &rarr; 331ms/195MB - within this benchmark's own run-to-run noise both ways). This was a
+genuinely useful negative result, not a wasted pass: it was deliberately scoped (per the reviewed plan)
+to change *only* how `ParseLength` reads the value - it still calls `.CssText` to populate the
+ordinary string entry exactly as before, for safety, deferring "stop calling `.CssText` at all for
+these properties" to a follow-up specifically so the two changes could be measured independently
+rather than conflated. That measurement confirms `.CssText` itself (AngleSharp.Css's own value-to-
+string serialization, not this renderer's own re-parsing of the resulting string) is the dominant
+cost inside `CreateStyleMap` - `ParseLength`'s own string tokenizing (`.Trim()`/`.ToLowerInvariant()`/
+`EndsWith`/`float.TryParse`, all cheap built-ins) was never a meaningful fraction of the ~115ms to
+begin with, so skipping it alone was never going to move the needle. The natural next increment -
+skip populating the string entry (and therefore the `.CssText` call) entirely for these 17 properties,
+relying on the raw value alone - is what the original hypothesis actually needs to be tested against;
+not yet attempted, since it requires first confirming nothing outside `ParseLength` reads these 17
+specific keys as raw strings (a `StyleMap.TryGetValue("width", ...)` bypassing `ParseLength` would
+silently start seeing nothing for a property that still has a real value).
+
 ## Reading these numbers
 
 - Parsing the HTML+CSS document itself is fast (~1-1.5ms) and allocates almost nothing by
