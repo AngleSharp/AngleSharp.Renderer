@@ -784,8 +784,8 @@ public sealed class HtmlRendererTests
             .ToArray();
 
         Assert.Equal(2, childBackgrounds.Length);
-        Assert.Equal(15f, childBackgrounds[0].Rect.X);
-        Assert.Equal(65f, childBackgrounds[1].Rect.X);
+        Assert.Equal(0f, childBackgrounds[0].Rect.X);
+        Assert.Equal(80f, childBackgrounds[1].Rect.X);
     }
 
     [Fact]

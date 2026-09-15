@@ -1,0 +1,216 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Rendering Test 05 - Positioning and Stacking</title>
+<style>
+* {
+  box-sizing: border-box;
+}
+
+html, body {
+  margin: 0;
+  padding: 0;
+  width: 100%;
+  min-height: 100%;
+}
+
+body {
+  background: #e9e9e9;
+  color: #202020;
+  font-family: Arial, Helvetica, sans-serif;
+  font-size: 15px;
+  line-height: 1.3;
+}
+
+div, h1, p {
+  margin: 0;
+  padding: 0;
+}
+
+.page {
+  width: 900px;
+  min-height: 900px;
+  margin: 0 auto;
+  padding: 24px;
+  background: #ffffff;
+}
+
+h1 {
+  margin-bottom: 20px;
+  font-size: 28px;
+}
+
+.scene {
+  position: relative;
+  width: 100%;
+  height: 330px;
+  margin-bottom: 30px;
+  border: 3px solid #555555;
+  background: #f5f5f5;
+  overflow: visible;
+}
+
+.base {
+  position: absolute;
+  left: 40px;
+  top: 40px;
+  width: 300px;
+  height: 180px;
+  padding: 16px;
+  border: 3px solid #234d70;
+  background: #d7e8f6;
+  z-index: 1;
+}
+
+.relative {
+  position: relative;
+  left: 70px;
+  top: 35px;
+  width: 240px;
+  height: 130px;
+  padding: 14px;
+  border: 3px solid #6e4b22;
+  background: #f0dfc7;
+  z-index: 2;
+}
+
+.absolute-a {
+  position: absolute;
+  left: 210px;
+  top: 100px;
+  width: 220px;
+  height: 120px;
+  padding: 14px;
+  border: 4px solid #6c3f78;
+  background: #eadcf0;
+  z-index: 4;
+}
+
+.absolute-b {
+  position: absolute;
+  left: 340px;
+  top: 150px;
+  width: 220px;
+  height: 120px;
+  padding: 14px;
+  border: 4px solid #42633e;
+  background: #dcebd8;
+  z-index: 3;
+}
+
+.negative {
+  position: absolute;
+  left: 500px;
+  top: 40px;
+  width: 180px;
+  height: 100px;
+  padding: 12px;
+  border: 3px solid #7d3232;
+  background: #f0d7d7;
+  z-index: -1;
+}
+
+.offset {
+  position: relative;
+  left: 20px;
+  top: -12px;
+  width: 260px;
+  height: 70px;
+  padding: 12px;
+  border: 2px dashed #333333;
+  background: #ffffff;
+}
+
+.clip {
+  position: relative;
+  width: 400px;
+  height: 130px;
+  margin-bottom: 24px;
+  padding: 14px;
+  border: 3px solid #333333;
+  background: #eeeeee;
+  overflow: hidden;
+}
+
+.clip-child {
+  position: absolute;
+  left: 300px;
+  top: 60px;
+  width: 220px;
+  height: 90px;
+  padding: 12px;
+  border: 3px solid #8b5b25;
+  background: #f2dfc5;
+}
+
+.stack {
+  position: relative;
+  width: 450px;
+  height: 180px;
+  border: 2px solid #555555;
+}
+
+.stack > div {
+  position: absolute;
+  width: 180px;
+  height: 100px;
+  padding: 12px;
+}
+
+.s1 {
+  left: 30px;
+  top: 25px;
+  z-index: 10;
+  border: 3px solid #222222;
+  background: #dddddd;
+}
+
+.s2 {
+  left: 100px;
+  top: 55px;
+  z-index: 20;
+  border: 3px solid #333333;
+  background: #cfe1ef;
+}
+
+.s3 {
+  left: 170px;
+  top: 85px;
+  z-index: 30;
+  border: 3px solid #444444;
+  background: #ead5e9;
+}
+</style>
+</head>
+<body>
+<div class="page">
+  <h1>Positioning and Stacking</h1>
+
+  <div class="scene">
+    <div class="base">absolute positioned base, z-index 1</div>
+    <div class="relative">relative box with offsets, z-index 2</div>
+    <div class="absolute-a">overlapping absolute box, z-index 4</div>
+    <div class="absolute-b">overlapping absolute box, z-index 3</div>
+    <div class="negative">negative stacking level</div>
+  </div>
+
+  <div class="offset">
+    This relatively positioned element is shifted from its normal location.
+  </div>
+
+  <div class="clip">
+    Clipping container. The child extends outside its right and bottom edges.
+    <div class="clip-child">
+      Absolutely positioned child outside the clipping region.
+    </div>
+  </div>
+
+  <div class="stack">
+    <div class="s1">z-index 10</div>
+    <div class="s2">z-index 20</div>
+    <div class="s3">z-index 30</div>
+  </div>
+</div>
+</body>
+</html>

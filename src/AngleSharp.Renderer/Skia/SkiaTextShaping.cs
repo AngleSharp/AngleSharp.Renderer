@@ -41,6 +41,14 @@ internal static class SkiaTextShaping
             ["ui-monospace"] = "monospace",
         };
 
+    private static readonly IReadOnlyDictionary<string, string[]> PlatformFontAliases =
+        new Dictionary<string, string[]>(StringComparer.OrdinalIgnoreCase)
+        {
+            ["arial"] = ["Liberation Sans"],
+            ["helvetica"] = ["Nimbus Sans", "Liberation Sans"],
+            ["courier new"] = ["Liberation Mono", "Nimbus Mono PS"],
+        };
+
     // CSS family names are case insensitive, but Skia's family lookup is not on every platform:
     // the Linux font manager matches case sensitively, so "arial" resolves on Windows and fails
     // on Linux. Indexing the installed families once gives the same answer everywhere.
@@ -184,8 +192,15 @@ internal static class SkiaTextShaping
     {
         if (!SystemFontFamilies.Value.TryGetValue(family, out var canonicalFamily))
         {
-            typeface = null!;
-            return false;
+            canonicalFamily = PlatformFontAliases.TryGetValue(family, out var aliases)
+                ? aliases.FirstOrDefault(alias => SystemFontFamilies.Value.ContainsKey(alias))
+                : null;
+
+            if (canonicalFamily is null)
+            {
+                typeface = null!;
+                return false;
+            }
         }
 
         var key = new SystemTypefaceKey(canonicalFamily, fontStyle.Weight, fontStyle.Width, fontStyle.Slant);
