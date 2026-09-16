@@ -1,0 +1,218 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Rendering Test 04 - CSS Grid</title>
+<style>
+* {
+  box-sizing: border-box;
+}
+
+html, body {
+  margin: 0;
+  padding: 0;
+}
+
+body {
+  background: #e9edf0;
+  color: #202830;
+  font-family: Arial, Helvetica, sans-serif;
+  font-size: 15px;
+  line-height: 1.35;
+}
+
+div, h1, h2, p {
+  margin: 0;
+  padding: 0;
+}
+
+.page {
+  width: 920px;
+  min-height: 850px;
+  margin: 0 auto;
+  padding: 24px;
+  background: #ffffff;
+}
+
+h1 {
+  margin-bottom: 20px;
+  font-size: 28px;
+}
+
+h2 {
+  margin: 20px 0 10px;
+  font-size: 18px;
+}
+
+.grid {
+  display: grid;
+  width: 100%;
+  gap: 10px;
+  padding: 10px;
+  border: 2px solid #4c5965;
+  background: #f5f6f7;
+}
+
+.basic {
+  grid-template-columns: 120px 1fr 2fr;
+  grid-template-rows: 60px 80px 50px;
+}
+
+.cell {
+  min-width: 0;
+  min-height: 0;
+  padding: 10px;
+  border: 2px solid #315d80;
+  background: #dbeaf5;
+}
+
+.basic .cell:nth-child(2) {
+  background: #f3dfc5;
+}
+
+.basic .cell:nth-child(3) {
+  background: #e6d8ed;
+}
+
+.basic .cell:nth-child(4) {
+  grid-column: 1 / 3;
+  background: #dcebd8;
+}
+
+.basic .cell:nth-child(5) {
+  grid-row: 2 / 4;
+  background: #f1dddd;
+}
+
+.basic .cell:nth-child(6) {
+  grid-column: 2 / 4;
+  background: #e1e1e1;
+}
+
+.areas {
+  grid-template-columns: 1fr 2fr 1fr;
+  grid-template-rows: 70px 120px 60px;
+  grid-template-areas:
+    "header header header"
+    "left main right"
+    "footer footer footer";
+}
+
+.header {
+  grid-area: header;
+  background: #d9e9f8;
+}
+
+.left {
+  grid-area: left;
+  background: #e7dfc9;
+}
+
+.main {
+  grid-area: main;
+  background: #e2d9eb;
+}
+
+.right {
+  grid-area: right;
+  background: #dbe8d8;
+}
+
+.footer {
+  grid-area: footer;
+  background: #ead8d8;
+}
+
+.auto {
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  grid-auto-rows: 55px;
+  grid-auto-flow: dense;
+  align-items: stretch;
+}
+
+.auto .wide {
+  grid-column: span 2;
+}
+
+.auto .tall {
+  grid-row: span 2;
+}
+
+.auto .cell {
+  padding: 8px;
+  font-size: 13px;
+}
+
+.centered {
+  grid-template-columns: 100px 1fr 100px;
+  grid-template-rows: 120px;
+  justify-items: center;
+  align-items: center;
+}
+
+.centered .cell {
+  width: 70%;
+  height: 60%;
+}
+
+.intrinsic {
+  grid-template-columns: max-content 1fr min-content;
+  grid-template-rows: auto auto;
+}
+
+.long {
+  overflow-wrap: anywhere;
+}
+</style>
+</head>
+<body>
+<div class="page">
+  <h1>CSS Grid Layout</h1>
+
+  <h2>Explicit tracks and spanning</h2>
+  <div class="grid basic">
+    <div class="cell">1</div>
+    <div class="cell">2</div>
+    <div class="cell">3</div>
+    <div class="cell">4 — spans columns 1–2</div>
+    <div class="cell">5 — spans rows 2–3</div>
+    <div class="cell">6 — spans columns 2–3</div>
+  </div>
+
+  <h2>Named grid areas</h2>
+  <div class="grid areas">
+    <div class="cell header">HEADER</div>
+    <div class="cell left">LEFT</div>
+    <div class="cell main">MAIN</div>
+    <div class="cell right">RIGHT</div>
+    <div class="cell footer">FOOTER</div>
+  </div>
+
+  <h2>Auto-placement, dense packing, and spans</h2>
+  <div class="grid auto">
+    <div class="cell wide">wide</div>
+    <div class="cell">A</div>
+    <div class="cell tall">tall</div>
+    <div class="cell">B</div>
+    <div class="cell wide">wide 2</div>
+    <div class="cell">C</div>
+    <div class="cell">D</div>
+    <div class="cell tall">tall 2</div>
+  </div>
+
+  <h2>Alignment inside grid cells</h2>
+  <div class="grid centered">
+    <div class="cell">center</div>
+    <div class="cell">center</div>
+    <div class="cell">center</div>
+  </div>
+
+  <h2>Intrinsic track sizing</h2>
+  <div class="grid intrinsic">
+    <div class="cell">MAX-CONTENT</div>
+    <div class="cell long">Flexible track containing a deliberately long piece of content that must wrap.</div>
+    <div class="cell">MIN</div>
+  </div>
+</div>
+</body>
+</html>

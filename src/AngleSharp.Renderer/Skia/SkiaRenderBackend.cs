@@ -816,6 +816,9 @@ public sealed class SkiaRenderBackend : IRenderBackend, ITextMeasurer
     {
         switch (style)
         {
+            case RenderTextDecorationStyle.Wavy:
+                DrawWavyLine(canvas, paint, x, y, width);
+                break;
             case RenderTextDecorationStyle.Dashed:
                 DrawPatternedLine(canvas, paint, x, y, width, dashLength: 6f, gapLength: 4f);
                 break;
@@ -826,6 +829,25 @@ public sealed class SkiaRenderBackend : IRenderBackend, ITextMeasurer
                 canvas.DrawLine(x, y, x + width, y, paint);
                 break;
         }
+    }
+
+    private static void DrawWavyLine(SKCanvas canvas, SKPaint paint, float x, float y, float width)
+    {
+        using var path = new SKPath();
+        var wavelength = 8f;
+        var amplitude = 1.5f;
+        var steps = Math.Max(1, (int)Math.Ceiling(width / 2f));
+
+        path.MoveTo(x, y);
+
+        for (var index = 1; index <= steps; index++)
+        {
+            var position = Math.Min(width, index * 2f);
+            var phase = position / wavelength * MathF.PI * 2f;
+            path.LineTo(x + position, y + MathF.Sin(phase) * amplitude);
+        }
+
+        canvas.DrawPath(path, paint);
     }
 
     private static void DrawPatternedLine(SKCanvas canvas, SKPaint paint, float x, float y, float width, float dashLength, float gapLength)

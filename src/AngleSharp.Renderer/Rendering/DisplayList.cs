@@ -359,4 +359,9 @@ public enum RenderTextDecorationStyle
     /// Draw the decoration using dots.
     /// </summary>
     Dotted,
+
+    /// <summary>
+    /// Draw the decoration as a wave.
+    /// </summary>
+    Wavy,
 }

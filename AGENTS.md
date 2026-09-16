@@ -277,6 +277,134 @@ The regular flow for a renderer change is: change the code, run the tests locall
 own platform's baselines, push, then dispatch **Update Snapshots** on the branch to fill in the
 other two.
 
+## Performance Benchmarks
+
+`src/AngleSharp.Renderer.Benchmarks` is a BenchmarkDotNet project measuring this renderer against
+a single, realistic ~1500-element page (`BenchmarkFixture.BuildLargePageHtml()` - flexbox, CSS
+Grid, floats, a table, sticky positioning, linear/radial/conic gradients, box-shadow, filter,
+transform, opacity, text-overflow ellipsis, all mixed together the way a real page would, not
+isolated per feature). It is a `PackageReference`/`ProjectReference`-only console app (`OutputType`
+`Exe`), never packaged (`IsPackable=false`), and is not part of `dotnet test` - run it explicitly:
+
+```bash
+cd src/AngleSharp.Renderer.Benchmarks
+dotnet run -c Release -f net10.0              # full BenchmarkDotNet default job (most rigorous)
+dotnet run -c Release -f net10.0 -- --job short  # faster, still stable for this fixture
+```
+
+BenchmarkDotNet requires `-c Release` (it will not run - or will loudly warn - under Debug, since
+JIT behavior there is not representative). Three benchmarks are measured: parsing the HTML+CSS
+into a DOM (AngleSharp's own cost, isolated so it is not silently folded into the renderer's own
+numbers), `BuildDisplayList` (pure layout, the baseline), and `RenderToPng` (layout + Skia
+rasterization + PNG encoding) - the document is parsed once in `[GlobalSetup]`, not inside the
+timed methods, since layout never mutates the DOM.
+
+`BASELINE.md` (same directory) records the current baseline numbers, plus a `History` section
+documenting each optimization pass and the before/after it produced - update it (numbers, and a
+new `History` entry) whenever a meaningful optimization lands, so the top-level "current numbers"
+section keeps tracking the current state rather than the day this file was first written.
+
+The first pass already landed: **`CreateStyleMap` result caching**, keyed by element identity for
+the lifetime of a single render. `CreateStyleMap` builds a full ~90-property style map from scratch
+on every call, but was being called more than once for the same element in several places - flex/
+grid item size estimation, inline-block line-flow prediction, a margin-collapse lookahead, and
+(the biggest offender, since it runs for essentially every container's every child)
+`OrderChildrenForPainting`'s own z-index-bucketing pass - all reading a given element's style ahead
+of that same element's own, later, authoritative layout call. `LayoutContext` now carries a
+`Dictionary<IElement, Dictionary<string, string>> StyleMapCache` (`ReferenceEqualityComparer`,
+matching `LayoutCapture`'s own precedent for keying by `IElement`); `GetOrCreateStyleMap(context,
+element, style)` wraps `CreateStyleMap` with a cache check/populate and is now what every call site
+uses instead of calling `CreateStyleMap` directly. This cut `BuildDisplayList` to roughly 40% of its
+original time and allocation (~2.5x faster, ~2.4x less allocated - see `BASELINE.md`'s `History`
+section for exact numbers). Correctness rests entirely on the cache never outliving the single
+`BuildDisplayList`/`RenderToPng`/`CaptureLayoutMetrics` call it was built for - `CreateLayoutContext`
+constructs a brand new, empty cache every call, never reusing one from a previous call, which is
+what keeps this safe for the interactive `:hover`/`transition`/`animation`/caret-blink case (a
+cache that outlived one call would silently serve stale style once the same document legitimately
+computes different style on a later render). Any *new* call site that needs an element's style map
+must go through `GetOrCreateStyleMap`, not `CreateStyleMap` directly, to stay covered by this.
+
+A second pass followed immediately: **caching the explicit-declaration style collection**.
+`grid-template-columns`/`-rows`, the three gap properties, `grid-column`/`-row`, and
+`background-image` are all deliberately read from an element's cascaded-but-*uncomputed*
+declaration rather than `ComputeCurrentStyle()` (`ResolveExplicitPropertyValue`'s own remarks
+explain why - a percentage in any of these gets eagerly resolved against the wrong reference
+dimension by AngleSharp.Css's `.Compute()` step otherwise). That path turned out to carry its own,
+independent cost, confirmed by reading `AngleSharp.Css.StyleCollectionExtensions` directly:
+`window.GetStyleCollection(device)` builds a brand new `StyleCollection` - walking every
+stylesheet, including the UA sheet - from scratch on every call, and `GetDeclarations(element)`
+re-walks the element's entire ancestor chain and re-cascades from scratch, also on every call -
+and `CreateStyleMap` was calling this combination up to 8 times per element (once per property
+above), each one redoing both of those from nothing just to read a single property off the
+result. `LayoutContext` gained an `IStyleCollection? StyleCollection`, built once in
+`CreateLayoutContext` (mirroring the exact per-call device-resolution fallback
+`ResolveExplicitPropertyValue` already used, so the result is identical - just computed once
+instead of thousands of times); `GetExplicitDeclarations`/`ReadExplicitOrComputed` resolve an
+element's cascaded declaration once per `CreateStyleMap` call and read all 8 properties off that
+one object. This cut `BuildDisplayList` by a further ~3.5x (~3.1x less allocated). Combined, the
+two fixes together take `BuildDisplayList` from the original baseline to roughly 1/9th its time
+and 1/7th its allocation - see `BASELINE.md`'s `History` section for exact numbers on both passes.
+
+A third, smaller pass followed: **skipping grid/flex container-only property reads**.
+`grid-template-columns`/`-rows`/the three gap properties, and `flex-direction`/`justify-content`/
+`align-items`/`flex-wrap`/`align-content`, are only ever consulted on the element that is itself
+`display: grid`/`inline-grid` or `flex`/`inline-flex` respectively (confirmed by checking every
+consumer, not assumed - the gap properties specifically are only read by `LayoutGridContainer`'s
+`ParseGridGap` calls in this renderer today, never by flex layout). Since `display` is already
+known first in `CreateStyleMap`, these ten reads are now skipped entirely for the overwhelming
+majority of elements that are provably neither. `grid-column`/`grid-row`/`align-self`/`flex-grow`/
+`flex-shrink`/`flex-basis`/`order` are deliberately *not* skipped this way - those are item-level
+properties read off a child by its parent's container layout, and an item's own `display` is
+typically unset/block, not flex/grid, so there is no cheap way to know from an element's own
+display alone whether some ancestor will need them. This cut `BuildDisplayList` by a further ~5%
+(~3.6% less allocated) - real, but much smaller than either fix above, which is itself a useful
+result: the explicit-declaration caching fix already made the grid/gap trio cheap to read (a
+lookup on an already-cached object, not a full walk), so skipping them saved little; only the five
+plain `flex-*` properties (still an uncached `style.GetPropertyValue()` call each) carried genuine
+per-call cost to avoid.
+
+Combined, all three fixes together take `BuildDisplayList` from the original baseline to roughly
+1/9.5th its time and 1/7.5th its allocation - see `BASELINE.md`'s `History` section for exact
+numbers on all three passes.
+
+Remaining allocation after all three fixes is still real (~194 MB for the same ~1500-element page,
+~130KB per element) - `CreateStyleMap` itself now runs exactly once per element with no redundant
+rebuilds, no redundant explicit-declaration walks, and no unnecessary container-only property
+reads either, but still builds a full `Dictionary<string, string>` plus a separate string for each
+of its remaining necessary properties every time. Eliminating that (e.g. avoiding the dictionary
+entirely in favor of typed fields) is the only lever left with real further headroom, but is a
+substantially larger, riskier refactor than any fix above: **scoped and confirmed, not assumed** -
+62 functions take a style map as a parameter, 42 separate `ParseLength` call sites, 68 direct
+dictionary accesses, spread across this 7,500+ line file. The third fix's own small result is a
+relevant data point for anyone considering it: the remaining cost is now spread fairly evenly
+across ~80 necessary property reads rather than concentrated in a few hot spots the way the first
+two rounds' costs were, so this refactor's expected further gain is real but more modest than
+either of the first two fixes, for meaningfully higher risk to a shipped, published library.
+
+That refactor was attempted in narrow form: `ParseLength` (the single most centralized target - all
+42 call sites benefit from one change) gained a typed fast path reading an already-parsed
+`CssLengthValue` directly (via a new `StyleMap : Dictionary<string, string>` with a raw-value side
+channel, populated by `AddLengthProperty` for its highest-traffic ~17 properties) instead of
+tokenizing the string AngleSharp.Css serializes for it - deliberately scoped to change only *how*
+`ParseLength` reads the value, still populating the ordinary string entry exactly as before (via
+`.CssText`) for safety. **Measured result: no meaningful change** - see `BASELINE.md`'s `History`
+section for the numbers and the reason: `.CssText` itself (AngleSharp.Css's own serialization) is the
+dominant cost, not this renderer's own string re-parsing, which this attempt skipped but which was
+never a meaningful fraction of the total to begin with. One real bug was caught and fixed along the
+way: `ApplyActiveTransitionAndAnimationOverrides` overwrites a property's string value directly for a
+mid-`transition`/`animation` property, which needed `StyleMap.ClearRawLength` to invalidate the
+now-stale cached raw value there (caught by the existing `BuildDisplayList_HoverTransitionInterpolatesWidthAsANumericLength`
+test failing) - any *new* code that writes directly into a `StyleMap`'s string entry for one of
+`AddLengthProperty`'s 17 properties must call `ClearRawLength` for that same key, or `ParseLength`'s
+fast path will silently answer from a stale value.
+
+The natural next increment - skip populating the string entry (and therefore the `.CssText` call)
+entirely for the 17 fast-pathed properties, relying on the raw value alone - is what the original
+hypothesis actually needs to be tested against, and is what the `StyleMap` infrastructure above was
+already built to support. Not yet attempted: it first needs confirming nothing outside `ParseLength`
+reads these 17 specific keys as raw strings (a direct `styleMap.TryGetValue("width", ...)` bypassing
+`ParseLength` would silently start seeing nothing for a property that still has a real value).
+
 ## Repository Notes
 
 - The docs live under `docs/general/` and `docs/tutorials/`; they are the best place to document user-facing renderer behavior.

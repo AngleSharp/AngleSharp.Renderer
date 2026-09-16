@@ -1,3 +1,14 @@
+# 0.6.0
+
+Released on Wednesday, September 16 2026.
+
+- Improved layout performance with caching
+- Fixed treatment of negative z-indices in stacking contexts
+- Fixed display of border-radius with mixed border colors
+- Fixed handling of font weights and unstyled headings
+- Added performance evaluation benchmark
+- Added full real-world rendering scenarios to the test cases
+
 # 0.5.0
 
 Released on Friday, September 11 2026.

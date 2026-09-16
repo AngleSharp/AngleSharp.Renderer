@@ -1505,7 +1505,7 @@ public sealed class VisualConformanceTests
     }
 
     [Fact]
-    public async Task RenderToPng_FallsBackToStraightEdgesForMixedWidthRoundedBorder()
+    public async Task RenderToPng_ClipsMixedWidthBorderEdgesToRoundedOutline()
     {
         var document = await ParseAsync("""
             <html>
