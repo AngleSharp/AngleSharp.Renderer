@@ -2317,10 +2317,13 @@ public sealed class HtmlRenderer
             .Where(child => child is ElementRenderNode || (child is TextRenderNode textNode && NormalizeWhitespace(textNode.Ref.Data).Length > 0))
             .ToList();
         var gridVerticalBorderAndPadding = borderTop + borderBottom + paddingTop + paddingBottom;
-        var containerHeight = ResolveAuthoredDimension(styleMap, "height", containingWidth, containingWidth, gridVerticalBorderAndPadding);
+        var containerHeight = ResolveAuthoredDimension(styleMap, "height", containingWidth, float.NaN, gridVerticalBorderAndPadding);
         var explicitGridTemplateRows = ResolveExplicitPropertyValue(node.Ref, node.ComputedStyle, "grid-template-rows");
         var rows = ParseGridTrackListStructured(explicitGridTemplateRows, containerHeight);
         var hasExplicitRowTracks = rows.Count > 0;
+        var autoRowDefinitions = styleMap.TryGetValue("grid-auto-rows", out var autoRowsValue)
+            ? ParseGridTrackListStructured(autoRowsValue, containerHeight)
+            : [];
 
         if (!hasExplicitRowTracks)
         {
@@ -2333,7 +2336,7 @@ public sealed class HtmlRenderer
 
             for (var i = 0; i < rowCount; i++)
             {
-                rows.Add(GridTrackSize.Auto());
+                rows.Add(autoRowDefinitions.Count > 0 ? CloneGridTrackSize(autoRowDefinitions[i % autoRowDefinitions.Count]) : GridTrackSize.Auto());
             }
         }
 
@@ -2344,10 +2347,52 @@ public sealed class HtmlRenderer
         // for content sizing (ResolveGridItemEstimatedSize), just now applied through the new
         // GridTrackSize model instead of a flat pixel list.
         var itemPlacements = new List<(ElementRenderNode Element, GridPlacement Column, GridPlacement Row)>();
+        var namedAreas = ParseGridTemplateAreas(styleMap.TryGetValue("grid-template-areas", out var areasValue) ? areasValue : null);
+        var occupiedCells = new HashSet<(int Column, int Row)>();
         var currentColumn = 0;
         var currentRow = 0;
 
-        foreach (var child in gridItems)
+        bool CanPlace(int column, int row, int columnSpan, int rowSpan) =>
+            Enumerable.Range(column, columnSpan).All(c => Enumerable.Range(row, rowSpan).All(r => !occupiedCells.Contains((c, r))));
+
+        void MarkPlaced(GridPlacement column, GridPlacement row)
+        {
+            for (var c = column.LineIndex; c < column.LineIndex + column.Span; c++)
+            {
+                for (var r = row.LineIndex; r < row.LineIndex + row.Span; r++)
+                {
+                    occupiedCells.Add((c, r));
+                }
+            }
+        }
+
+        var placementItems = gridItems;
+        var reservedRowPlacements = new Dictionary<ElementRenderNode, (GridPlacement Column, GridPlacement Row)>();
+
+        foreach (var rowItem in placementItems.OfType<ElementRenderNode>())
+        {
+            var rowStyle = GetOrCreateStyleMap(context, rowItem.Ref, rowItem.ComputedStyle);
+            var rowRaw = rowStyle.GetValueOrDefault("grid-row") ?? string.Empty;
+            var columnRaw = rowStyle.GetValueOrDefault("grid-column") ?? string.Empty;
+            var rowTokens = rowRaw.Split(new[] { ' ', '/', '\t', '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+            var hasRowPlacement = rowTokens.Length > 0 && int.TryParse(rowTokens[0], NumberStyles.Integer, CultureInfo.InvariantCulture, out _);
+            var hasColumnPlacement = columnRaw.Split(new[] { ' ', '/', '\t', '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries).Any(token => int.TryParse(token, NumberStyles.Integer, CultureInfo.InvariantCulture, out _));
+            if (hasRowPlacement && !hasColumnPlacement)
+            {
+                var rowPlacement = ResolveGridPlacementFromMap(rowStyle, "grid-row", 0);
+                var column = 0;
+                while (!CanPlace(column, rowPlacement.LineIndex, 1, rowPlacement.Span))
+                {
+                    column++;
+                }
+
+                var reserved = (Column: new GridPlacement(column, 1), Row: rowPlacement);
+                reservedRowPlacements[rowItem] = reserved;
+                MarkPlaced(reserved.Column, reserved.Row);
+            }
+        }
+
+        foreach (var child in placementItems)
         {
             if (child is not ElementRenderNode elementChild)
             {
@@ -2355,18 +2400,100 @@ public sealed class HtmlRenderer
             }
 
             var childStyleMap = GetOrCreateStyleMap(context, elementChild.Ref, elementChild.ComputedStyle);
+            if (childStyleMap.TryGetValue("grid-area", out var areaName) && namedAreas.TryGetValue(areaName.Trim().Trim('"', '\''), out var area))
+            {
+                itemPlacements.Add((elementChild, new GridPlacement(area.Column, area.ColumnSpan), new GridPlacement(area.Row, area.RowSpan)));
+                while (columns.Count < area.Column + area.ColumnSpan)
+                {
+                    columns.Add(GridTrackSize.Auto());
+                }
+
+                while (rows.Count < area.Row + area.RowSpan)
+                {
+                    rows.Add(GridTrackSize.Auto());
+                }
+
+                MarkPlaced(new GridPlacement(area.Column, area.ColumnSpan), new GridPlacement(area.Row, area.RowSpan));
+
+                currentColumn = 0;
+                currentRow = 0;
+                continue;
+            }
             var placementColumn = ResolveGridPlacementFromMap(childStyleMap, "grid-column", currentColumn);
             var placementRow = ResolveGridPlacementFromMap(childStyleMap, "grid-row", currentRow);
-            var hasExplicitPlacement = childStyleMap.ContainsKey("grid-column") || childStyleMap.ContainsKey("grid-row");
+            var hasExplicitColumn = HasGridPlacement(childStyleMap, "grid-column");
+            var hasExplicitRow = HasGridPlacement(childStyleMap, "grid-row");
+            var effectivePlacementColumn = new GridPlacement(Math.Max(0, hasExplicitColumn ? placementColumn.LineIndex : currentColumn), placementColumn.Span);
+            var effectivePlacementRow = new GridPlacement(Math.Max(0, hasExplicitRow ? placementRow.LineIndex : currentRow), placementRow.Span);
 
-            var effectivePlacementColumn = hasExplicitPlacement
-                ? new GridPlacement(Math.Max(0, placementColumn.LineIndex), placementColumn.Span)
-                : new GridPlacement(Math.Max(0, currentColumn), placementColumn.Span);
-            var effectivePlacementRow = hasExplicitPlacement
-                ? new GridPlacement(Math.Max(0, placementRow.LineIndex), placementRow.Span)
-                : new GridPlacement(Math.Max(0, currentRow), placementRow.Span);
+            if (!reservedRowPlacements.ContainsKey(elementChild) && (!hasExplicitColumn || !hasExplicitRow))
+            {
+                var isDense = styleMap.TryGetValue("grid-auto-flow", out var autoFlowValue) && autoFlowValue.Contains("dense", StringComparison.OrdinalIgnoreCase);
+                var searchRow = hasExplicitRow ? effectivePlacementRow.LineIndex : isDense ? 0 : currentRow;
+                var searchColumn = hasExplicitColumn ? effectivePlacementColumn.LineIndex : 0;
+
+                while (!CanPlace(searchColumn, searchRow, effectivePlacementColumn.Span, effectivePlacementRow.Span))
+                {
+                    if (hasExplicitColumn)
+                    {
+                        searchRow++;
+                    }
+                    else
+                    {
+                        searchColumn++;
+                        if (searchColumn + effectivePlacementColumn.Span > columns.Count)
+                        {
+                            searchColumn = 0;
+                            searchRow++;
+                        }
+                    }
+                }
+
+                effectivePlacementColumn = new GridPlacement(searchColumn, effectivePlacementColumn.Span);
+                effectivePlacementRow = new GridPlacement(searchRow, effectivePlacementRow.Span);
+            }
+
+            if (hasExplicitRow && !hasExplicitColumn)
+            {
+                effectivePlacementColumn = new GridPlacement(0, effectivePlacementColumn.Span);
+            }
+
+            if (hasExplicitColumn && !hasExplicitRow)
+            {
+                foreach (var rowOnlyItem in placementItems.OfType<ElementRenderNode>())
+                {
+                    var rowOnlyStyle = GetOrCreateStyleMap(context, rowOnlyItem.Ref, rowOnlyItem.ComputedStyle);
+                    var rowRaw = rowOnlyStyle.GetValueOrDefault("grid-row") ?? string.Empty;
+                    var columnRaw = rowOnlyStyle.GetValueOrDefault("grid-column") ?? string.Empty;
+                    var rowTokens = rowRaw.Split(new[] { ' ', '/', '\t', '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+                    if (rowTokens.Length == 0 || !rowTokens.Any(token => int.TryParse(token, NumberStyles.Integer, CultureInfo.InvariantCulture, out _)) || !string.IsNullOrWhiteSpace(columnRaw) || HasGridPlacement(rowOnlyStyle, "grid-area"))
+                    {
+                        continue;
+                    }
+
+                    var rowOnlyPlacement = ResolveGridPlacementFromMap(rowOnlyStyle, "grid-row", 0);
+                    var columnsOverlap = effectivePlacementColumn.LineIndex < 1 + effectivePlacementColumn.Span &&
+                        0 < effectivePlacementColumn.LineIndex + effectivePlacementColumn.Span;
+                    if (columnsOverlap)
+                    {
+                        effectivePlacementRow = new GridPlacement(Math.Max(effectivePlacementRow.LineIndex, rowOnlyPlacement.LineIndex + rowOnlyPlacement.Span), effectivePlacementRow.Span);
+                    }
+                }
+            }
 
             itemPlacements.Add((elementChild, effectivePlacementColumn, effectivePlacementRow));
+            MarkPlaced(effectivePlacementColumn, effectivePlacementRow);
+
+            if (hasExplicitColumn && !hasExplicitRow)
+            {
+                currentRow = Math.Max(currentRow, effectivePlacementRow.LineIndex);
+                currentColumn = effectivePlacementColumn.LineIndex + effectivePlacementColumn.Span;
+                if (currentColumn >= columns.Count)
+                {
+                    currentColumn = 0;
+                    currentRow++;
+                }
+            }
 
             // The item's *own* width/height (childStyleMap), not the container's - a real,
             // confirmed bug in the pre-existing estimate (it read the container's styleMap here,
@@ -2384,7 +2511,7 @@ public sealed class HtmlRenderer
 
             while (rows.Count < effectiveRowCount)
             {
-                rows.Add(GridTrackSize.Auto());
+                rows.Add(autoRowDefinitions.Count > 0 ? CloneGridTrackSize(autoRowDefinitions[rows.Count % autoRowDefinitions.Count]) : GridTrackSize.Auto());
             }
 
             GrowGridTrackSize(columns, effectivePlacementColumn.LineIndex, estimatedItemWidth);
@@ -2435,8 +2562,28 @@ public sealed class HtmlRenderer
             var cellY = contentY + GetGridTrackOffset(rowSizes, effectivePlacementRow.LineIndex, resolvedRowGap);
             var cellWidth = GetGridTrackSpanSize(columnSizes, effectivePlacementColumn.LineIndex, effectivePlacementColumn.Span, resolvedColumnGap, containingWidth);
             var cellHeight = GetGridTrackSpanSize(rowSizes, effectivePlacementRow.LineIndex, effectivePlacementRow.Span, resolvedRowGap, containingWidth);
+            var childStyleMap = GetOrCreateStyleMap(context, elementChild.Ref, elementChild.ComputedStyle);
+            var childBox = ResolveBoxStyle(childStyleMap, elementChild.Ref);
+            var childHorizontalExtras = childBox.BorderWidth.Left + childBox.BorderWidth.Right + childBox.Padding.Left + childBox.Padding.Right;
+            var childVerticalExtras = childBox.BorderWidth.Top + childBox.BorderWidth.Bottom + childBox.Padding.Top + childBox.Padding.Bottom;
+            var childContentWidth = ResolveAuthoredDimension(childStyleMap, "width", cellWidth, float.NaN, childHorizontalExtras);
+            var childContentHeight = ResolveAuthoredDimension(childStyleMap, "height", cellHeight, float.NaN, childVerticalExtras);
+            var cellContentWidth = Math.Max(0f, cellWidth - childHorizontalExtras);
+            var cellContentHeight = Math.Max(0f, cellHeight - childVerticalExtras);
+            var resolvedChildContentWidth = float.IsNaN(childContentWidth) ? cellContentWidth : childContentWidth;
+            var resolvedChildContentHeight = float.IsNaN(childContentHeight) ? cellContentHeight : childContentHeight;
+            var childBorderBoxWidth = float.IsNaN(childContentWidth) ? cellWidth : childContentWidth + childHorizontalExtras;
+            var childBorderBoxHeight = float.IsNaN(childContentHeight) ? cellHeight : childContentHeight + childVerticalExtras;
+            var justifyItems = styleMap.TryGetValue("justify-items", out var justifyItemsValue) ? justifyItemsValue : "stretch";
+            var alignItemsValue = styleMap.TryGetValue("align-items", out var alignItemsValueRaw) ? alignItemsValueRaw : "stretch";
+            var alignedCellX = string.Equals(justifyItems, "center", StringComparison.OrdinalIgnoreCase) && childBorderBoxWidth < cellWidth
+                ? cellX + (cellWidth - childBorderBoxWidth) / 2f
+                : cellX;
+            var alignedCellY = string.Equals(alignItemsValue, "center", StringComparison.OrdinalIgnoreCase) && childBorderBoxHeight < cellHeight
+                ? cellY + (cellHeight - childBorderBoxHeight) / 2f
+                : cellY;
 
-            var childCursor = cellY;
+            var childCursor = alignedCellY;
             var childPreviousBlockMarginBottom = 0f;
             var childSuppressNextBlockTopMargin = false;
             var childActiveFloatLeftOffset = 0f;
@@ -2445,9 +2592,9 @@ public sealed class HtmlRenderer
 
             LayoutNode(
                 node: elementChild,
-                containingX: cellX,
-                containingY: cellY,
-                containingWidth: Math.Max(0f, cellWidth),
+                containingX: alignedCellX,
+                containingY: alignedCellY,
+                containingWidth: resolvedChildContentWidth,
                 cursorY: ref childCursor,
                 previousBlockMarginBottom: ref childPreviousBlockMarginBottom,
                 suppressNextBlockTopMargin: ref childSuppressNextBlockTopMargin,
@@ -2458,17 +2605,18 @@ public sealed class HtmlRenderer
                 context: context,
                 displayList: displayList,
                 maxY: maxY,
-                isFlexItem: false,
+                isFlexItem: true,
                 isRowDirection: true,
-                flexMainSize: null,
-                flexCrossSize: null);
+                flexMainSize: resolvedChildContentWidth,
+                flexCrossSize: resolvedChildContentHeight);
         }
 
         var gridContentWidth = GetGridContentSize(columnSizes, resolvedColumnGap, containingWidth);
-        var specifiedHeight = ResolveAuthoredDimension(styleMap, "height", containingWidth, containingWidth, gridVerticalBorderAndPadding);
-        var gridContentHeight = GetGridContentSize(rowSizes, resolvedRowGap, specifiedHeight);
+        var specifiedHeight = ResolveAuthoredDimension(styleMap, "height", containingWidth, float.NaN, gridVerticalBorderAndPadding);
+        var gridContentHeight = GetGridContentSize(rowSizes, resolvedRowGap, 0f);
         var borderBoxWidth = borderLeft + paddingLeft + Math.Max(containingWidth, gridContentWidth) + paddingRight + borderRight;
-        var borderBoxHeight = borderTop + paddingTop + Math.Max(specifiedHeight, gridContentHeight) + paddingBottom + borderBottom;
+        var resolvedGridContentHeight = float.IsNaN(specifiedHeight) ? gridContentHeight : Math.Max(specifiedHeight, gridContentHeight);
+        var borderBoxHeight = borderTop + paddingTop + resolvedGridContentHeight + paddingBottom + borderBottom;
         var canCollapseWithLastChild = borderBottom <= 0f && paddingBottom <= 0f;
         var effectiveMarginBottom = ParseLength(styleMap, "margin-bottom", containingWidth, box.Margin.Bottom, allowAuto: false);
 
@@ -2750,11 +2898,20 @@ public sealed class HtmlRenderer
         }
 
         var tokens = rawValue.Split(new[] { ' ', '/', '\t', '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+        if (tokens.Length >= 2 && string.Equals(tokens[0], "span", StringComparison.OrdinalIgnoreCase) && int.TryParse(tokens[1], out var leadingSpan))
+        {
+            return new GridPlacement(Math.Max(0, fallbackIndex), Math.Max(1, leadingSpan));
+        }
+
         var startToken = tokens.FirstOrDefault(token => int.TryParse(token, out _));
 
         if (startToken is not null && int.TryParse(startToken, out var explicitIndex))
         {
-            return new GridPlacement(Math.Max(0, explicitIndex - 1), 1);
+            var spanIndex = Array.FindIndex(tokens, token => string.Equals(token, "span", StringComparison.OrdinalIgnoreCase));
+            var span = spanIndex >= 0 && spanIndex + 1 < tokens.Length && int.TryParse(tokens[spanIndex + 1], out var parsedSpan)
+                ? parsedSpan
+                : tokens.Length > 1 && int.TryParse(tokens[1], out var endLine) ? Math.Max(1, endLine - explicitIndex) : 1;
+            return new GridPlacement(Math.Max(0, explicitIndex - 1), Math.Max(1, span));
         }
 
         if (tokens.Length >= 3 && string.Equals(tokens[1], "span", StringComparison.OrdinalIgnoreCase) && int.TryParse(tokens[2], out var spanCount))
@@ -2765,6 +2922,17 @@ public sealed class HtmlRenderer
         return new GridPlacement(Math.Max(0, fallbackIndex), 1);
     }
 
+    private static bool HasGridPlacement(Dictionary<string, string> styleMap, string propertyName)
+    {
+        if (!styleMap.TryGetValue(propertyName, out var value) || string.IsNullOrWhiteSpace(value))
+        {
+            return false;
+        }
+
+        var tokens = value.Split(new[] { ' ', '/', '\t', '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+        return tokens.Length > 0 && int.TryParse(tokens[0], NumberStyles.Integer, CultureInfo.InvariantCulture, out _);
+    }
+
     private static float ResolveGridItemEstimatedSize(ElementRenderNode elementChild, Dictionary<string, string> styleMap, float fallbackSize, string propertyName)
     {
         var rawValue = styleMap.TryGetValue(propertyName, out var value) && !string.IsNullOrWhiteSpace(value)
@@ -2773,7 +2941,23 @@ public sealed class HtmlRenderer
 
         if (string.IsNullOrWhiteSpace(rawValue))
         {
-            return fallbackSize;
+            var text = NormalizeWhitespace(elementChild.Ref.TextContent ?? string.Empty, WhiteSpaceMode.Normal);
+            if (text.Length == 0)
+            {
+                return 0f;
+            }
+
+            var fontSize = ParseLength(styleMap, "font-size", 16f, 16f, allowAuto: false);
+            var box = ResolveBoxStyle(styleMap, elementChild.Ref);
+            var verticalExtras = box.BorderWidth.Top + box.BorderWidth.Bottom + box.Padding.Top + box.Padding.Bottom;
+            var intrinsicTextWidth = text.Split(' ', StringSplitOptions.RemoveEmptyEntries)
+                .Select(word => word.Length)
+                .DefaultIfEmpty(0)
+                .Max() * fontSize * 0.6f;
+
+            return string.Equals(propertyName, "width", StringComparison.OrdinalIgnoreCase)
+                ? intrinsicTextWidth
+                : fontSize * 1.35f + verticalExtras;
         }
 
         var parsed = ParseLengthValue(rawValue, fallbackSize, allowAuto: false);
@@ -2844,6 +3028,55 @@ public sealed class HtmlRenderer
                 track.Pixels = (track.MinPixels ?? 0f) + (freeSpace * (track.FractionValue / totalFraction));
             }
         }
+    }
+
+    private static GridTrackSize CloneGridTrackSize(GridTrackSize track) => track.Kind switch
+    {
+        GridTrackSizeKind.Fixed => GridTrackSize.Fixed(track.Pixels),
+        GridTrackSizeKind.Fraction => GridTrackSize.Fraction(track.FractionValue, track.MinPixels),
+        _ => GridTrackSize.Auto(track.MinPixels, track.MaxPixels),
+    };
+
+    private static Dictionary<string, (int Row, int Column, int RowSpan, int ColumnSpan)> ParseGridTemplateAreas(string? value)
+    {
+        var areas = new Dictionary<string, (int Row, int Column, int RowSpan, int ColumnSpan)>(StringComparer.OrdinalIgnoreCase);
+        if (string.IsNullOrWhiteSpace(value) || string.Equals(value.Trim(), "none", StringComparison.OrdinalIgnoreCase))
+        {
+            return areas;
+        }
+
+        var rows = value.Split('"', StringSplitOptions.RemoveEmptyEntries)
+            .Select(row => row.Trim())
+            .Where(row => row.Length > 0)
+            .ToArray();
+
+        for (var rowIndex = 0; rowIndex < rows.Length; rowIndex++)
+        {
+            var names = rows[rowIndex].Split(' ', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+            for (var columnIndex = 0; columnIndex < names.Length; columnIndex++)
+            {
+                var name = names[columnIndex];
+                if (name == ".")
+                {
+                    continue;
+                }
+
+                if (areas.TryGetValue(name, out var existing))
+                {
+                    areas[name] = (
+                        Math.Min(existing.Row, rowIndex),
+                        Math.Min(existing.Column, columnIndex),
+                        Math.Max(existing.Row + existing.RowSpan, rowIndex + 1) - Math.Min(existing.Row, rowIndex),
+                        Math.Max(existing.Column + existing.ColumnSpan, columnIndex + 1) - Math.Min(existing.Column, columnIndex));
+                }
+                else
+                {
+                    areas[name] = (rowIndex, columnIndex, 1, 1);
+                }
+            }
+        }
+
+        return areas;
     }
 
     private static float GetGridTrackSize(IReadOnlyList<float> tracks, int index, float fallback)
@@ -4115,6 +4348,16 @@ public sealed class HtmlRenderer
             AddIfPresent(map, "grid-template-columns", string.IsNullOrWhiteSpace(explicitGridTemplateColumns) ? ParseStyleAttributeValue(inlineStyle, "grid-template-columns") : explicitGridTemplateColumns);
             var explicitGridTemplateRows = explicitDeclarations is not null ? ReadExplicitOrComputed(explicitDeclarations, style, "grid-template-rows") : ResolveExplicitPropertyValue(element, style, "grid-template-rows");
             AddIfPresent(map, "grid-template-rows", string.IsNullOrWhiteSpace(explicitGridTemplateRows) ? ParseStyleAttributeValue(inlineStyle, "grid-template-rows") : explicitGridTemplateRows);
+            var explicitGridTemplateAreas = explicitDeclarations is not null ? ReadExplicitOrComputed(explicitDeclarations, style, "grid-template-areas") : ResolveExplicitPropertyValue(element, style, "grid-template-areas");
+            AddIfPresent(map, "grid-template-areas", string.IsNullOrWhiteSpace(explicitGridTemplateAreas) ? ParseStyleAttributeValue(inlineStyle, "grid-template-areas") : explicitGridTemplateAreas);
+            var explicitGridAutoRows = explicitDeclarations is not null ? ReadExplicitOrComputed(explicitDeclarations, style, "grid-auto-rows") : ResolveExplicitPropertyValue(element, style, "grid-auto-rows");
+            AddIfPresent(map, "grid-auto-rows", string.IsNullOrWhiteSpace(explicitGridAutoRows) ? ParseStyleAttributeValue(inlineStyle, "grid-auto-rows") : explicitGridAutoRows);
+            var explicitGridAutoFlow = explicitDeclarations is not null ? ReadExplicitOrComputed(explicitDeclarations, style, "grid-auto-flow") : ResolveExplicitPropertyValue(element, style, "grid-auto-flow");
+            AddIfPresent(map, "grid-auto-flow", string.IsNullOrWhiteSpace(explicitGridAutoFlow) ? ParseStyleAttributeValue(inlineStyle, "grid-auto-flow") : explicitGridAutoFlow);
+            var explicitJustifyItems = explicitDeclarations is not null ? ReadExplicitOrComputed(explicitDeclarations, style, "justify-items") : ResolveExplicitPropertyValue(element, style, "justify-items");
+            AddIfPresent(map, "justify-items", string.IsNullOrWhiteSpace(explicitJustifyItems) ? ParseStyleAttributeValue(inlineStyle, "justify-items") : explicitJustifyItems);
+            var explicitAlignItems = explicitDeclarations is not null ? ReadExplicitOrComputed(explicitDeclarations, style, "align-items") : ResolveExplicitPropertyValue(element, style, "align-items");
+            AddIfPresent(map, "align-items", string.IsNullOrWhiteSpace(explicitAlignItems) ? ParseStyleAttributeValue(inlineStyle, "align-items") : explicitAlignItems);
         }
 
         if (isGridContainer || isFlexContainer)
@@ -4131,6 +4374,8 @@ public sealed class HtmlRenderer
         AddIfPresent(map, "grid-column", string.IsNullOrWhiteSpace(explicitGridColumn) ? ParseStyleAttributeValue(inlineStyle, "grid-column") : explicitGridColumn);
         var explicitGridRow = explicitDeclarations is not null ? ReadExplicitOrComputed(explicitDeclarations, style, "grid-row") : ResolveExplicitPropertyValue(element, style, "grid-row");
         AddIfPresent(map, "grid-row", string.IsNullOrWhiteSpace(explicitGridRow) ? ParseStyleAttributeValue(inlineStyle, "grid-row") : explicitGridRow);
+        var explicitGridArea = explicitDeclarations is not null ? ReadExplicitOrComputed(explicitDeclarations, style, "grid-area") : ResolveExplicitPropertyValue(element, style, "grid-area");
+        AddIfPresent(map, "grid-area", string.IsNullOrWhiteSpace(explicitGridArea) ? ParseStyleAttributeValue(inlineStyle, "grid-area") : explicitGridArea);
 
         if (isFlexContainer)
         {
