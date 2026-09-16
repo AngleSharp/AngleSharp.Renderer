@@ -2253,7 +2253,39 @@ public sealed class HtmlRendererTests
     }
 
     [Fact]
-    public async Task BuildDisplayList_PaintsNegativeZIndexOnTopOfOwnStackingContextBackground()
+    public async Task BuildDisplayList_PaintsRelativeZIndexAboveAbsoluteSiblingWhenHigher()
+    {
+        var document = await ParseAsync("""
+            <html><body>
+                <div style="position:relative; width:200px; height:80px; background-color:#eeeeee;">
+                    <div style="position:absolute; left:10px; top:10px; width:50px; height:30px; background-color:#0000ff; z-index:1;"></div>
+                    <div style="position:relative; left:20px; top:10px; width:80px; height:40px; background-color:#8b5b25; z-index:2;"></div>
+                    <div style="position:absolute; left:0; top:0; width:20px; height:20px; background-color:#ff0000; z-index:-1;"></div>
+                </div>
+            </body></html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, new DefaultRenderDevice
+        {
+            ViewPortWidth = 240,
+            ViewPortHeight = 160,
+        });
+
+        var fills = displayList.Commands.OfType<FillRectCommand>().ToArray();
+        var redIndex = Array.FindIndex(fills, f => f.Color.Equals(new RenderColor(255, 0, 0)));
+        var blueIndex = Array.FindIndex(fills, f => f.Color.Equals(new RenderColor(0, 0, 255)));
+        var brownIndex = Array.FindIndex(fills, f => f.Color.Equals(new RenderColor(139, 91, 37)));
+
+        Assert.True(redIndex >= 0);
+        Assert.True(blueIndex >= 0);
+        Assert.True(brownIndex >= 0);
+        Assert.True(redIndex < blueIndex);
+        Assert.True(brownIndex > blueIndex);
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_PaintsNegativeZIndexBehindOwnBackgroundWhenParentIsNotAStackingContext()
     {
         var document = await ParseAsync("""
             <html><body>
@@ -2277,11 +2309,38 @@ public sealed class HtmlRendererTests
         Assert.True(greenIndex >= 0);
         Assert.True(redIndex >= 0);
 
-        // Per CSS 2.1 Appendix E, a stacking context's own background/border paints first, and
-        // its negative-z-index descendants paint immediately after (on top of) that background -
-        // not before/behind it. So the red z-index:-1 child paints after the green box's own
-        // background, even though it still paints before the green box's normal in-flow content
-        // (there is none here) and before any positive/zero-z-index descendants.
+        // When the parent does not establish a stacking context (z-index: auto on the positioned
+        // box), a negative-z-index descendant is painted behind that parent box's background and
+        // border, matching Chrome and the CSS stacking-order rules. The negative child only paints
+        // on top of the parent's background after the parent itself becomes a stacking context with
+        // an explicit z-index (or other stacking-context trigger).
+        Assert.True(redIndex < greenIndex);
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_PaintsNegativeZIndexAfterOwnBackgroundWhenParentIsAStackingContext()
+    {
+        var document = await ParseAsync("""
+            <html><body>
+                <div style="position:relative; z-index:0; width:120px; height:30px; background-color:#00ff00;">
+                    <div style="position:absolute; left:0; top:0; width:30px; height:10px; background-color:#ff0000; z-index:-1;"></div>
+                </div>
+            </body></html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, new DefaultRenderDevice
+        {
+            ViewPortWidth = 220,
+            ViewPortHeight = 120,
+        });
+
+        var fills = displayList.Commands.OfType<FillRectCommand>().ToArray();
+        var greenIndex = Array.FindIndex(fills, f => f.Color.Equals(new RenderColor(0, 255, 0)));
+        var redIndex = Array.FindIndex(fills, f => f.Color.Equals(new RenderColor(255, 0, 0)));
+
+        Assert.True(greenIndex >= 0);
+        Assert.True(redIndex >= 0);
         Assert.True(redIndex > greenIndex);
     }
 

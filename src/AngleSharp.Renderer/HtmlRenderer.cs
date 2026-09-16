@@ -753,6 +753,7 @@ public sealed class HtmlRenderer
         var childActiveFloatLeftOffset = 0f;
         var childActiveFloatBottom = 0f;
         var childTextIndentConsumed = false;
+        var negativeZIndexRanges = new List<(int StartIndex, int Count)>();
         var inlineLineActive = false;
         var inlineLineTop = contentY;
         var inlineLineHeight = currentTextStyle.FontSize * currentTextStyle.LineHeightMultiplier;
@@ -866,6 +867,7 @@ public sealed class HtmlRenderer
             {
                 if (child is TextRenderNode textNode)
                 {
+                    var childRangeStart = displayList.Commands.Count;
                     LayoutTextNode(
                         textNode.Ref,
                         contentX,
@@ -884,6 +886,7 @@ public sealed class HtmlRenderer
                 else if (child is ElementRenderNode blockChild)
                 {
                     var blockTextIndentConsumed = false;
+                    var childRangeStart = displayList.Commands.Count;
                     LayoutNode(
                         node: blockChild,
                         containingX: contentX,
@@ -899,6 +902,10 @@ public sealed class HtmlRenderer
                         context: context,
                         displayList: displayList,
                         maxY: maxY);
+                                if (IsNegativeZIndexChild(blockChild, context))
+                    {
+                        negativeZIndexRanges.Add((childRangeStart, displayList.Commands.Count - childRangeStart));
+                    }
                 }
 
                 if (childCursorY > maxY)
@@ -1031,6 +1038,7 @@ public sealed class HtmlRenderer
                         var inlineBlockActiveFloatBottom = 0f;
                         var inlineBlockTextIndentConsumed = true;
 
+                        var inlineBlockRangeStart = displayList.Commands.Count;
                         LayoutNode(
                             node: inlineBlockElement,
                             containingX: itemStartX,
@@ -1046,6 +1054,10 @@ public sealed class HtmlRenderer
                             context: context,
                             displayList: displayList,
                             maxY: maxY);
+                        if (IsNegativeZIndexChild(inlineBlockElement, context))
+                        {
+                            negativeZIndexRanges.Add((inlineBlockRangeStart, displayList.Commands.Count - inlineBlockRangeStart));
+                        }
 
                         inlineCursorX = itemStartX + totalAdvance;
                         inlineLineHeight = lineBoxHeight;
@@ -1073,6 +1085,7 @@ public sealed class HtmlRenderer
                                 var childBox = ResolveBoxStyle(childStyleMap, inlineElement.Ref);
                                 var hasInlineBox = childBox.BorderWidth.Top > 0f || childBox.BorderWidth.Right > 0f || childBox.BorderWidth.Bottom > 0f || childBox.BorderWidth.Left > 0f || childBox.Padding.Top > 0f || childBox.Padding.Right > 0f || childBox.Padding.Bottom > 0f || childBox.Padding.Left > 0f || childBox.BackgroundPaint is not RenderColorPaint { Color.A: 0 };
 
+                                var inlineChildRangeStart = displayList.Commands.Count;
                                 if (hasInlineBox)
                                 {
                                     LayoutInlineElementText(
@@ -1101,6 +1114,11 @@ public sealed class HtmlRenderer
                                         ref inlineLineTop,
                                         ref inlineLineHeight,
                                         ref textIndentConsumed);
+                                }
+
+                                if (IsNegativeZIndexChild(inlineElement, context))
+                                {
+                                    negativeZIndexRanges.Add((inlineChildRangeStart, displayList.Commands.Count - inlineChildRangeStart));
                                 }
                             }
                         }
@@ -1163,6 +1181,7 @@ public sealed class HtmlRenderer
         var hasFilter = filterFunctions.Count > 0;
         var opacity = ParseCssOpacity(styleMap);
         var hasOpacity = opacity < 1f;
+        var createsStackingContext = HasExplicitZIndex(styleMap) || hasOpacity || hasTransform || hasFilter;
 
         var boxPaintBuffer = new DisplayList();
 
@@ -1212,7 +1231,14 @@ public sealed class HtmlRenderer
             boxPaintBuffer.PushClip(clipRect, box.BorderRadius.ClampToBox(borderBoxWidth, borderBoxHeight));
         }
 
-        displayList.InsertRange(boxPaintInsertIndex, boxPaintBuffer.Commands);
+        var paintInsertionIndex = boxPaintInsertIndex;
+
+        if (!createsStackingContext && negativeZIndexRanges.Count > 0)
+        {
+            paintInsertionIndex = negativeZIndexRanges.Max(range => range.StartIndex + range.Count);
+        }
+
+        displayList.InsertRange(paintInsertionIndex, boxPaintBuffer.Commands);
 
         if (TryResolveReplacedElementImage(node, styleMap, flowContainingWidth, borderBoxX + borderLeft + paddingLeft, borderBoxY + borderTop + paddingTop, out var image, out var imageRect))
         {
@@ -4583,7 +4609,7 @@ public sealed class HtmlRenderer
             {
                 var childStyleMap = GetOrCreateStyleMap(context, elementChild.Ref, elementChild.ComputedStyle);
 
-                if (IsOutOfFlowPositioned(childStyleMap))
+                if (IsOutOfFlowPositioned(childStyleMap) || HasExplicitZIndex(childStyleMap))
                 {
                     var z = ParseZIndex(childStyleMap);
 
@@ -4626,6 +4652,28 @@ public sealed class HtmlRenderer
         var position = GetPosition(styleMap);
         return string.Equals(position, "absolute", StringComparison.OrdinalIgnoreCase) ||
                string.Equals(position, "fixed", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static bool HasExplicitZIndex(Dictionary<string, string> styleMap)
+    {
+        if (!styleMap.TryGetValue("z-index", out var value) || string.IsNullOrWhiteSpace(value))
+        {
+            return false;
+        }
+
+        var normalized = value.Trim();
+        return !string.Equals(normalized, "auto", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static bool IsNegativeZIndexChild(IRenderNode child, LayoutContext context)
+    {
+        if (child is not ElementRenderNode elementChild)
+        {
+            return false;
+        }
+
+        var styleMap = GetOrCreateStyleMap(context, elementChild.Ref, elementChild.ComputedStyle);
+        return HasExplicitZIndex(styleMap) && ParseZIndex(styleMap) < 0;
     }
 
     private static bool IsStickyPositioned(Dictionary<string, string> styleMap) =>
