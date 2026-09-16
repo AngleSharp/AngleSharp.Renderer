@@ -2,8 +2,9 @@
 
 Released on ?
 
+- Improved layout performance with caching
+- Fixed treatment of negative z-indices in stacking contexts
 - Added performance evaluation benchmark
-- Improved layout performance by caching each element's computed style and explicit-declaration lookups per render, and skipping grid/flex-container-only property reads on elements that cannot need them (~9.5x faster, ~7.5x less allocation - see `docs/benchmarks.md`)
 
 # 0.5.0
 
