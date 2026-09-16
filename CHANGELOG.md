@@ -1,6 +1,6 @@
 # 0.6.0
 
-Released on ?
+Released on Wednesday, September 16 2026.
 
 - Improved layout performance with caching
 - Fixed treatment of negative z-indices in stacking contexts
