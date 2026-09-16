@@ -472,7 +472,8 @@ public sealed class HtmlRenderer
         bool isFlexItem = false,
         bool isRowDirection = true,
         float? flexMainSize = null,
-        float? flexCrossSize = null)
+        float? flexCrossSize = null,
+        float containingHeight = float.NaN)
     {
         switch (node)
         {
@@ -480,7 +481,7 @@ public sealed class HtmlRenderer
                 LayoutTextNode(textNode.Ref, containingX, containingWidth, ref cursorY, ref previousBlockMarginBottom, ref suppressNextBlockTopMargin, ref activeFloatLeftOffset, ref activeFloatBottom, ref textIndentConsumed, textStyle, context, displayList, maxY);
                 return;
             case ElementRenderNode element:
-                LayoutElement(element, containingX, containingY, containingWidth, ref cursorY, ref previousBlockMarginBottom, ref suppressNextBlockTopMargin, ref activeFloatLeftOffset, ref activeFloatBottom, ref textIndentConsumed, textStyle, context, displayList, maxY, isFlexItem, isRowDirection, flexMainSize, flexCrossSize);
+                LayoutElement(element, containingX, containingY, containingWidth, ref cursorY, ref previousBlockMarginBottom, ref suppressNextBlockTopMargin, ref activeFloatLeftOffset, ref activeFloatBottom, ref textIndentConsumed, textStyle, context, displayList, maxY, isFlexItem, isRowDirection, flexMainSize, flexCrossSize, containingHeight);
                 return;
             default:
                 return;
@@ -505,7 +506,8 @@ public sealed class HtmlRenderer
         bool isFlexItem = false,
         bool isRowDirection = true,
         float? flexMainSize = null,
-        float? flexCrossSize = null)
+        float? flexCrossSize = null,
+        float containingHeight = float.NaN)
     {
         var element = node.Ref;
         var computedStyle = node.ComputedStyle;
@@ -553,7 +555,7 @@ public sealed class HtmlRenderer
         // content pseudo its own independent display computation (defaulting to inline, per spec),
         // entirely unrelated to whatever the host's tag would otherwise force, so this renderer must
         // not either.
-        var renderAsBlock = ShouldRenderAsBlock(computedStyle) || (element is not IPseudoElement && IsReplacedElementTag(tagName));
+        var renderAsBlock = ShouldRenderAsBlock(computedStyle, tagName) || (element is not IPseudoElement && IsReplacedElementTag(tagName));
         var isInlineBlock = IsInlineBlock(computedStyle);
         var currentTextStyle = ResolveTextStyle(styleMap, inheritedTextStyle);
 
@@ -710,6 +712,27 @@ public sealed class HtmlRenderer
                     : flowBorderBoxY + (isRelative ? topOffset : 0f);
         var contentX = borderBoxX + borderLeft + paddingLeft;
         var contentY = borderBoxY + borderTop + paddingTop;
+        var verticalBorderAndPadding = borderTop + borderBottom + paddingTop + paddingBottom;
+        var heightReference = float.IsNaN(containingHeight) ? flowContainingWidth : containingHeight;
+        var resolvedContentHeight = ResolveFlexibleContentDimension(
+            styleMap,
+            heightReference,
+            float.NaN,
+            verticalBorderAndPadding,
+            isFlexItem,
+            isRowDirection,
+            flexMainSize,
+            flexCrossSize,
+            propertyName: "height");
+
+        if (float.IsNaN(resolvedContentHeight))
+        {
+            resolvedContentHeight = ResolveAspectRatioContentHeight(
+                styleMap,
+                contentWidth,
+                borderLeft + borderRight + paddingLeft + paddingRight,
+                verticalBorderAndPadding);
+        }
 
         // The box's own background/border/shadow/outline must paint behind its children, but an
         // auto-sized box's height is only known after its children are laid out (and therefore
@@ -731,16 +754,7 @@ public sealed class HtmlRenderer
             // height (falling back to a single line, for an author-supplied "auto") is therefore
             // also this box's final content height, safe to resolve here rather than waiting for
             // the auto-height computation later in this method.
-            var formControlSpecifiedHeight = ResolveFlexibleContentDimension(
-                styleMap,
-                flowContainingWidth,
-                float.NaN,
-                borderTop + borderBottom + paddingTop + paddingBottom,
-                isFlexItem,
-                isRowDirection,
-                flexMainSize,
-                flexCrossSize,
-                propertyName: "height");
+            var formControlSpecifiedHeight = resolvedContentHeight;
             var formControlContentHeight = float.IsNaN(formControlSpecifiedHeight)
                 ? currentTextStyle.FontSize * currentTextStyle.LineHeightMultiplier
                 : formControlSpecifiedHeight;
@@ -789,7 +803,7 @@ public sealed class HtmlRenderer
         var hasDirectInlineText = orderedChildren.Any(child => child is TextRenderNode { Ref.Data: var data } && !string.IsNullOrWhiteSpace(data));
         var hasInlineRun = orderedChildren.Any(child =>
             (child is ElementRenderNode childElement &&
-             (!ShouldRenderAsBlock(childElement.ComputedStyle) || IsInlineBlock(childElement.ComputedStyle) || (!IsInlineBlock(childElement.ComputedStyle) && hasDirectInlineText && IsInlineVisualElement(childElement, context)))) ||
+             (!ShouldRenderAsBlock(childElement.ComputedStyle, childElement.Ref.LocalName) || IsInlineBlock(childElement.ComputedStyle) || (!IsInlineBlock(childElement.ComputedStyle) && hasDirectInlineText && IsInlineVisualElement(childElement, context)))) ||
             (child is ElementRenderNode childElementWithBr && string.Equals(childElementWithBr.Ref.LocalName, "br", StringComparison.OrdinalIgnoreCase)));
 
         if (IsFlexContainer(styleMap))
@@ -901,7 +915,8 @@ public sealed class HtmlRenderer
                         textStyle: currentTextStyle,
                         context: context,
                         displayList: displayList,
-                        maxY: maxY);
+                        maxY: maxY,
+                        containingHeight: resolvedContentHeight);
                                 if (IsNegativeZIndexChild(blockChild, context))
                     {
                         negativeZIndexRanges.Add((childRangeStart, displayList.Commands.Count - childRangeStart));
@@ -934,7 +949,7 @@ public sealed class HtmlRenderer
                     IsInlineBlock(ibCandidate.ComputedStyle) &&
                     TryMeasureInlineBlockBoxSize(ibCandidate, contentWidth, currentTextStyle, context, out ibWidth, out ibHeight, out ibMarginLeft, out ibMarginRight, out ibMarginTop, out ibMarginBottom);
                 var childIsBlock = child is ElementRenderNode childElement &&
-                    ShouldRenderAsBlock(childElement.ComputedStyle) &&
+                    ShouldRenderAsBlock(childElement.ComputedStyle, childElement.Ref.LocalName) &&
                     !canFlowAsInlineBlock &&
                     !string.Equals(childElement.Ref.LocalName, "br", StringComparison.OrdinalIgnoreCase) &&
                     (!hasDirectInlineText || !IsInlineVisualElement(childElement, context) || IsInlineBlock(childElement.ComputedStyle));
@@ -963,7 +978,8 @@ public sealed class HtmlRenderer
                         textStyle: currentTextStyle,
                         context: context,
                         displayList: displayList,
-                        maxY: maxY);
+                        maxY: maxY,
+                        containingHeight: resolvedContentHeight);
                 }
                 else
                 {
@@ -1053,7 +1069,8 @@ public sealed class HtmlRenderer
                             textStyle: currentTextStyle,
                             context: context,
                             displayList: displayList,
-                            maxY: maxY);
+                            maxY: maxY,
+                            containingHeight: resolvedContentHeight);
                         if (IsNegativeZIndexChild(inlineBlockElement, context))
                         {
                             negativeZIndexRanges.Add((inlineBlockRangeStart, displayList.Commands.Count - inlineBlockRangeStart));
@@ -1133,16 +1150,7 @@ public sealed class HtmlRenderer
         }
 
         var autoContentHeight = Math.Max(0f, childCursorY - contentY);
-        var specifiedContentHeight = ResolveFlexibleContentDimension(
-            styleMap,
-            flowContainingWidth,
-            float.NaN,
-            borderTop + borderBottom + paddingTop + paddingBottom,
-            isFlexItem,
-            isRowDirection,
-            flexMainSize,
-            flexCrossSize,
-            propertyName: "height");
+        var specifiedContentHeight = resolvedContentHeight;
         var contentHeight = float.IsNaN(specifiedContentHeight) ? autoContentHeight : specifiedContentHeight;
 
         var borderBoxWidth = borderLeft + paddingLeft + contentWidth + paddingRight + borderRight;
@@ -3543,6 +3551,11 @@ public sealed class HtmlRenderer
         var verticalBorderAndPadding = childBox.BorderWidth.Top + childBox.BorderWidth.Bottom + childBox.Padding.Top + childBox.Padding.Bottom;
         var baseMainSize = ResolveFlexBaseSize(childStyle, isRowDirection, relativeTo, isRowDirection ? horizontalBorderAndPadding : verticalBorderAndPadding);
         var crossSize = ResolveFlexCrossSize(childStyle, isRowDirection, relativeTo, isRowDirection ? verticalBorderAndPadding : horizontalBorderAndPadding);
+        if (isRowDirection && float.IsNaN(ParseLength(childStyle, "width", relativeTo, float.NaN, allowAuto: true)))
+        {
+            baseMainSize = Math.Max(baseMainSize, EstimateFlexItemContentWidth(elementChild, relativeTo, context));
+        }
+
         if (!isRowDirection && float.IsNaN(ParseLength(childStyle, "height", relativeTo, float.NaN, allowAuto: true)))
         {
             baseMainSize = Math.Max(baseMainSize, EstimateFlexItemMainSize(child, crossSize, context));
@@ -3618,6 +3631,19 @@ public sealed class HtmlRenderer
             else if (child is ElementRenderNode childElement)
             {
                 var childStyle = GetOrCreateStyleMap(context, childElement.Ref, childElement.ComputedStyle);
+                if (IsReplacedElementTag(childElement.Ref.LocalName))
+                {
+                    var childBox = ResolveBoxStyle(childStyle, childElement.Ref);
+                    var childVerticalExtras = childBox.BorderWidth.Top + childBox.BorderWidth.Bottom + childBox.Padding.Top + childBox.Padding.Bottom;
+                    var childHeight = ResolveAuthoredDimension(childStyle, "height", contentWidth, float.NaN, childVerticalExtras);
+
+                    if (!float.IsNaN(childHeight))
+                    {
+                        contentHeight += childHeight + childVerticalExtras + childBox.Margin.Top + childBox.Margin.Bottom;
+                        continue;
+                    }
+                }
+
                 var childTextStyle = ResolveTextStyle(childStyle, textStyle);
                 var childText = NormalizeWhitespace(childElement.Ref.TextContent ?? string.Empty, childTextStyle.WhiteSpace);
                 if (childText.Length > 0)
@@ -3646,7 +3672,32 @@ public sealed class HtmlRenderer
         return lineCount * textStyle.FontSize * textStyle.LineHeightMultiplier;
     }
 
-    private static bool ShouldRenderAsBlock(ICssStyleDeclaration computedStyle)
+    private static float EstimateFlexItemContentWidth(ElementRenderNode element, float relativeTo, LayoutContext context)
+    {
+        var contentWidth = 0f;
+
+        foreach (var child in element.Children.OfType<ElementRenderNode>())
+        {
+            if (!IsReplacedElementTag(child.Ref.LocalName))
+            {
+                continue;
+            }
+
+            var childStyle = GetOrCreateStyleMap(context, child.Ref, child.ComputedStyle);
+            var childBox = ResolveBoxStyle(childStyle, child.Ref);
+            var childBorderAndPadding = childBox.BorderWidth.Left + childBox.BorderWidth.Right + childBox.Padding.Left + childBox.Padding.Right;
+            var childWidth = ResolveAuthoredDimension(childStyle, "width", relativeTo, float.NaN, childBorderAndPadding);
+
+            if (!float.IsNaN(childWidth))
+            {
+                contentWidth = Math.Max(contentWidth, childWidth + childBorderAndPadding + childBox.Margin.Left + childBox.Margin.Right);
+            }
+        }
+
+        return contentWidth;
+    }
+
+    private static bool ShouldRenderAsBlock(ICssStyleDeclaration computedStyle, string? tagName = null)
     {
         var display = computedStyle.GetDisplay();
 
@@ -3671,7 +3722,7 @@ public sealed class HtmlRenderer
             };
         }
 
-        return true;
+        return !string.Equals(tagName, "code", StringComparison.OrdinalIgnoreCase);
     }
 
     private static bool IsInlineBlock(ICssStyleDeclaration computedStyle)
@@ -4309,6 +4360,10 @@ public sealed class HtmlRenderer
         AddLengthProperty(map, style, "min-height", explicitDeclarations);
         AddLengthProperty(map, style, "max-height", explicitDeclarations);
         AddIfPresent(map, "box-sizing", style.GetBoxSizing());
+        var explicitAspectRatio = explicitDeclarations?.GetPropertyValue("aspect-ratio");
+        AddIfPresent(map, "aspect-ratio", string.IsNullOrWhiteSpace(explicitAspectRatio)
+            ? style.GetPropertyValue("aspect-ratio")
+            : explicitAspectRatio);
         AddIfPresent(map, "position", style.GetPropertyValue("position"));
         AddLengthProperty(map, style, "left");
         AddLengthProperty(map, style, "top");
@@ -4454,7 +4509,14 @@ public sealed class HtmlRenderer
         AddIfPresent(map, "opacity", style.GetOpacity());
         AddLengthProperty(map, style, "font-size");
         AddIfPresent(map, "font-family", style.GetFontFamily());
-        AddIfPresent(map, "font-weight", style.GetPropertyValue("font-weight"));
+        var fontWeightValue = style.GetPropertyValue("font-weight");
+        if (element?.LocalName.ToLowerInvariant() is "h1" or "h2" or "h3" or "h4" or "h5" or "h6" &&
+            !HasAuthoredProperty(element, "font-weight"))
+        {
+            fontWeightValue = "700";
+        }
+
+        AddIfPresent(map, "font-weight", fontWeightValue);
         AddIfPresent(map, "font-style", style.GetPropertyValue("font-style"));
         AddIfPresent(map, "text-decoration", style.GetPropertyValue("text-decoration"));
         AddIfPresent(map, "text-decoration-line", style.GetPropertyValue("text-decoration-line"));
@@ -4475,6 +4537,24 @@ public sealed class HtmlRenderer
         ApplyActiveTransitionAndAnimationOverrides(map, element);
 
         return map;
+    }
+
+    private static bool HasAuthoredProperty(IElement element, string propertyName)
+    {
+        if (!string.IsNullOrWhiteSpace(ParseStyleAttributeValue(element.GetAttribute("style"), propertyName)))
+        {
+            return true;
+        }
+
+        foreach (var rule in element.Owner?.StyleSheets.OfType<ICssStyleSheet>().SelectMany(sheet => sheet.Rules).OfType<ICssStyleRule>() ?? [])
+        {
+            if (!string.IsNullOrWhiteSpace(rule.Style.GetPropertyValue(propertyName)) && element.Matches(rule.SelectorText))
+            {
+                return true;
+            }
+        }
+
+        return false;
     }
 
     // Overrides every style-map entry that is currently mid-`transition` or mid-`animation` with
@@ -4587,7 +4667,7 @@ public sealed class HtmlRenderer
                 continue;
             }
 
-            if (!ShouldRenderAsBlock(childElement.ComputedStyle))
+            if (!ShouldRenderAsBlock(childElement.ComputedStyle, childElement.Ref.LocalName))
             {
                 marginTop = 0f;
                 return false;
@@ -6519,6 +6599,44 @@ public sealed class HtmlRenderer
         }
 
         return Math.Max(0f, specified - borderAndPaddingSum);
+    }
+
+    private static float ResolveAspectRatioContentHeight(
+        Dictionary<string, string> styleMap,
+        float contentWidth,
+        float horizontalBorderAndPadding,
+        float verticalBorderAndPadding)
+    {
+        if (!styleMap.TryGetValue("aspect-ratio", out var value) || string.IsNullOrWhiteSpace(value))
+        {
+            return float.NaN;
+        }
+
+        var normalized = value.Trim();
+        if (normalized.StartsWith("auto ", StringComparison.OrdinalIgnoreCase))
+        {
+            normalized = normalized[5..].Trim();
+        }
+
+        var parts = normalized.Split('/', StringSplitOptions.TrimEntries);
+        var hasNumerator = float.TryParse(parts[0], NumberStyles.Float, CultureInfo.InvariantCulture, out var numerator);
+        var denominator = 1f;
+        var hasDenominator = parts.Length == 1 ||
+            (parts.Length == 2 && float.TryParse(parts[1], NumberStyles.Float, CultureInfo.InvariantCulture, out denominator));
+
+        if (!hasNumerator || !hasDenominator || numerator <= 0f || denominator <= 0f)
+        {
+            return float.NaN;
+        }
+
+        var ratio = numerator / denominator;
+        if (!IsBorderBox(styleMap))
+        {
+            return contentWidth / ratio;
+        }
+
+        var borderBoxWidth = contentWidth + horizontalBorderAndPadding;
+        return Math.Max(0f, (borderBoxWidth / ratio) - verticalBorderAndPadding);
     }
 
     /// <summary>

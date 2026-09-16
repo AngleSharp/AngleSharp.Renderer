@@ -243,6 +243,96 @@ public sealed class HtmlRendererTests
     }
 
     [Fact]
+    public async Task BuildDisplayList_PaintsSvgImageElementFromPercentEncodedDataUri()
+    {
+        var document = await ParseAsync("""
+            <html><body>
+                <img src="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='240' height='160'%3E%3Crect width='240' height='160' fill='%23d5e8f5'/%3E%3Ccircle cx='75' cy='80' r='45' fill='%23526f8c'/%3E%3C/svg%3E" style="width:180px; height:120px;" />
+            </body></html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, new DefaultRenderDevice
+        {
+            ViewPortWidth = 240,
+            ViewPortHeight = 160,
+            FontSize = 16f,
+        });
+
+        var imageCommand = Assert.Single(displayList.Commands.OfType<DrawImageCommand>());
+        Assert.Equal(180f, imageCommand.Rect.Width);
+        Assert.Equal(120f, imageCommand.Rect.Height);
+        Assert.NotEmpty(imageCommand.Image.Data);
+        Assert.Equal("image/png", imageCommand.Image.MimeType);
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_PaintsPercentEncodedSvgImageInsideFlexItem()
+    {
+        var document = await ParseAsync("""
+            <html>
+            <head><style>
+                * { box-sizing:border-box; }
+                .row { display:flex; gap:20px; }
+                .frame { padding:10px; border:3px solid #40556a; background:#edf3f7; }
+                img { display:block; width:180px; height:120px; }
+            </style></head>
+            <body><div class="row"><div class="frame">
+                <img src="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='240' height='160'%3E%3Crect width='240' height='160' fill='%23d5e8f5'/%3E%3Ccircle cx='75' cy='80' r='45' fill='%23526f8c'/%3E%3C/svg%3E" />
+            </div></div></body>
+            </html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, new DefaultRenderDevice
+        {
+            ViewPortWidth = 960,
+            ViewPortHeight = 720,
+            FontSize = 16f,
+        });
+
+        var imageCommand = Assert.Single(displayList.Commands.OfType<DrawImageCommand>());
+        Assert.Equal(180f, imageCommand.Rect.Width);
+        Assert.Equal(120f, imageCommand.Rect.Height);
+
+        var frameBackground = Assert.Single(displayList.Commands.OfType<FillRectCommand>()
+            .Where(command => command.Color.Equals(new RenderColor(237, 243, 247))));
+        Assert.Equal(146f, frameBackground.Rect.Height);
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_AspectRatioProvidesDefiniteHeightForPercentageChild()
+    {
+        var document = await ParseAsync("""
+            <html><head><style>
+                * { box-sizing:border-box; }
+                .aspect { width:360px; aspect-ratio:3 / 2; padding:15px; border:4px solid #55704e; background:#dcebd8; }
+                .inner { width:50%; height:50%; padding:10px; border:2px solid #333; background:#fff; }
+            </style></head><body>
+                <div class="aspect"><div class="inner">50% x 50%</div></div>
+            </body></html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, new DefaultRenderDevice
+        {
+            ViewPortWidth = 500,
+            ViewPortHeight = 360,
+            FontSize = 16f,
+        });
+
+        var outer = Assert.Single(displayList.Commands.OfType<FillRectCommand>()
+            .Where(command => command.Color.Equals(new RenderColor(220, 235, 216))));
+        var inner = Assert.Single(displayList.Commands.OfType<FillRectCommand>()
+            .Where(command => command.Color.Equals(RenderColor.White) && command.Rect.Width < 300f));
+
+        Assert.Equal(360f, outer.Rect.Width);
+        Assert.Equal(240f, outer.Rect.Height);
+        Assert.Equal(161f, inner.Rect.Width);
+        Assert.Equal(101f, inner.Rect.Height);
+    }
+
+    [Fact]
     public async Task BuildDisplayList_PaintsInlineSvgAsReplacedElement()
     {
         var document = await ParseAsync("""
@@ -415,6 +505,67 @@ public sealed class HtmlRendererTests
         Assert.True(textCommands[1].IsItalic);
         Assert.False(textCommands[1].Underline);
         Assert.True(textCommands[1].StrikeThrough);
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_CodeElementFlowsInlineWithSurroundingText()
+    {
+        var document = await ParseAsync("""
+            <html><body><div style="width:500px;">before <code>aspect-ratio</code> after</div></body></html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, new DefaultRenderDevice
+        {
+            ViewPortWidth = 600,
+            ViewPortHeight = 120,
+            FontSize = 16f,
+        });
+
+        var textCommands = displayList.Commands.OfType<DrawTextCommand>().ToArray();
+        var code = Assert.Single(textCommands.Where(command => command.Text == "aspect-ratio"));
+        Assert.All(textCommands, command => Assert.Equal(code.Y, command.Y));
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_UnstyledHeadingsUseBoldFontWeight()
+    {
+        var document = await ParseAsync("""
+            <html><body><h1>First heading</h1><h2>Second heading</h2></body></html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, new DefaultRenderDevice
+        {
+            ViewPortWidth = 500,
+            ViewPortHeight = 200,
+            FontSize = 16f,
+        });
+
+        var headings = displayList.Commands.OfType<DrawTextCommand>()
+            .Where(command => command.Text.Contains("heading", StringComparison.Ordinal))
+            .ToArray();
+        Assert.Equal(2, headings.Length);
+        Assert.All(headings, command => Assert.Equal(700f, command.FontWeight));
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_AuthoredHeadingFontWeightOverridesDefaultBold()
+    {
+        var document = await ParseAsync("""
+            <html><head><style>h2 { font-weight:500; }</style></head><body><h2>Weighted heading</h2></body></html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, new DefaultRenderDevice
+        {
+            ViewPortWidth = 500,
+            ViewPortHeight = 120,
+            FontSize = 16f,
+        });
+
+        var heading = Assert.Single(displayList.Commands.OfType<DrawTextCommand>());
+        Assert.Equal(500f, heading.FontWeight);
     }
 
     [Fact]
@@ -595,6 +746,33 @@ public sealed class HtmlRendererTests
         Assert.Equal(containerBackground.Rect.Y + 15f, childBackgrounds[0].Rect.Y);
         Assert.Equal(containerBackground.Rect.X + 50f, childBackgrounds[1].Rect.X);
         Assert.Equal(containerBackground.Rect.Y + 15f, childBackgrounds[1].Rect.Y);
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_NestedFlexChildrenDoNotInflateParentCrossSize()
+    {
+        var document = await ParseAsync("""
+            <html><head><style>
+                * { box-sizing:border-box; }
+                .outer { display:flex; width:400px; min-height:130px; padding:12px; border:2px solid #555; background:#f6f6f6; }
+                .nested { display:flex; flex:1 1 auto; align-items:center; padding:10px; border:2px dashed #666; background:#fff; }
+                .nested > div { width:60px; height:36px; padding:8px; border:1px solid #333; }
+            </style></head><body>
+                <div class="outer"><div class="nested"><div>X</div><div>Y</div><div>Z</div></div></div>
+            </body></html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, new DefaultRenderDevice
+        {
+            ViewPortWidth = 500,
+            ViewPortHeight = 240,
+            FontSize = 16f,
+        });
+
+        var outerBackground = Assert.Single(displayList.Commands.OfType<FillRectCommand>()
+            .Where(command => command.Color.Equals(new RenderColor(246, 246, 246))));
+        Assert.Equal(130f, outerBackground.Rect.Height);
     }
 
     [Fact]
