@@ -4,6 +4,7 @@ Released on ?
 
 - Improved layout performance with caching
 - Fixed treatment of negative z-indices in stacking contexts
+- Fixed display of border-radius with mixed border colors
 - Added performance evaluation benchmark
 
 # 0.5.0

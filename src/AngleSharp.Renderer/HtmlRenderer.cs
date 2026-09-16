@@ -4431,14 +4431,21 @@ public sealed class HtmlRenderer
         AddIfPresent(map, "background-repeat", string.IsNullOrWhiteSpace(style.GetPropertyValue("background-repeat")) ? ParseStyleAttributeValue(inlineStyle, "background-repeat") : style.GetPropertyValue("background-repeat"));
         AddIfPresent(map, "background-position", string.IsNullOrWhiteSpace(style.GetPropertyValue("background-position")) ? ParseStyleAttributeValue(inlineStyle, "background-position") : style.GetPropertyValue("background-position"));
         AddIfPresent(map, "background-size", string.IsNullOrWhiteSpace(style.GetPropertyValue("background-size")) ? ParseStyleAttributeValue(inlineStyle, "background-size") : style.GetPropertyValue("background-size"));
-        // Never read from AngleSharp.Css's own computed `transform` (nor even the raw inline style,
-        // since PrepareDocumentForRendering has already stripped it out by this point) -
-        // TryExtractTransformDeclaration moves the raw value to `data-render-transform` before
-        // AngleSharp.Css ever computes anything, working around a confirmed upstream crash in its
-        // `CssTranslateValue.Compute()`. See TryExtractTransformDeclaration's own remarks.
+        // Never read from AngleSharp.Css's computed `transform`. Inline declarations are extracted
+        // to `data-render-transform` before style computation; stylesheet declarations are read
+        // from the cascaded-but-uncomputed declaration so rotate/scale/translate all retain their
+        // authored function list without entering CssTranslateValue.Compute().
         var rawTransformValue = element?.GetAttribute("data-render-transform");
+        if (string.IsNullOrWhiteSpace(rawTransformValue) && explicitDeclarations is not null)
+        {
+            rawTransformValue = explicitDeclarations.GetPropertyValue("transform");
+        }
+
         AddIfPresent(map, "transform", rawTransformValue);
-        AddIfPresent(map, "transform-origin", string.IsNullOrWhiteSpace(style.GetPropertyValue("transform-origin")) ? ParseStyleAttributeValue(inlineStyle, "transform-origin") : style.GetPropertyValue("transform-origin"));
+        var explicitTransformOrigin = explicitDeclarations?.GetPropertyValue("transform-origin");
+        AddIfPresent(map, "transform-origin", string.IsNullOrWhiteSpace(explicitTransformOrigin)
+            ? (string.IsNullOrWhiteSpace(style.GetPropertyValue("transform-origin")) ? ParseStyleAttributeValue(inlineStyle, "transform-origin") : style.GetPropertyValue("transform-origin"))
+            : explicitTransformOrigin);
         // AngleSharp.Css now parses `filter` into a structured CssFilterValue and preserves it
         // through computed style (fixed upstream - it used to always report an empty string here),
         // so this can now read the ordinary computed-style value directly, the same as any other
@@ -4724,13 +4731,11 @@ public sealed class HtmlRenderer
 
         var backgroundColor = ParseColor(styleMap.TryGetValue("background-color", out var background) ? background : null, RenderColor.Transparent);
         var backgroundPaint = ParseBackgroundPaint(styleMap, backgroundColor, element);
-        var borderColor = ParseColor(
-            styleMap.TryGetValue("border-top-color", out var topColor) ? topColor :
-            styleMap.TryGetValue("border-right-color", out var rightColor) ? rightColor :
-            styleMap.TryGetValue("border-bottom-color", out var bottomColor) ? bottomColor :
-            styleMap.TryGetValue("border-left-color", out var leftColor) ? leftColor :
-            null,
-            RenderColor.Black);
+        var borderColor = new EdgeBorderColor(
+            Top: ParseColor(styleMap.TryGetValue("border-top-color", out var topColor) ? topColor : null, RenderColor.Black),
+            Right: ParseColor(styleMap.TryGetValue("border-right-color", out var rightColor) ? rightColor : null, RenderColor.Black),
+            Bottom: ParseColor(styleMap.TryGetValue("border-bottom-color", out var bottomColor) ? bottomColor : null, RenderColor.Black),
+            Left: ParseColor(styleMap.TryGetValue("border-left-color", out var leftColor) ? leftColor : null, RenderColor.Black));
 
         var (topLeftX, topLeftY) = ParseCornerRadius(styleMap, "border-top-left-radius");
         var (topRightX, topRightY) = ParseCornerRadius(styleMap, "border-top-right-radius");
@@ -6275,31 +6280,34 @@ public sealed class HtmlRenderer
         }
     }
 
-    private static void PaintBorder(DisplayList displayList, RenderColor color, float x, float y, float width, float height, EdgeSizes border, RenderCornerRadii radii = default, EdgeBorderStyle styles = default)
+    private static void PaintBorder(DisplayList displayList, RenderColor color, float x, float y, float width, float height, EdgeSizes border, RenderCornerRadii radii = default, EdgeBorderStyle styles = default) =>
+        PaintBorder(displayList, new EdgeBorderColor(color, color, color, color), x, y, width, height, border, radii, styles);
+
+    private static void PaintBorder(DisplayList displayList, EdgeBorderColor color, float x, float y, float width, float height, EdgeSizes border, RenderCornerRadii radii = default, EdgeBorderStyle styles = default)
     {
-        if (color.A == 0 || width <= 0f || height <= 0f)
+        if ((color.Top.A == 0 && color.Right.A == 0 && color.Bottom.A == 0 && color.Left.A == 0) || width <= 0f || height <= 0f)
         {
             return;
         }
 
         var clampedRadii = radii.ClampToBox(width, height);
+        var hasUniformColor = color.Top == color.Right && color.Top == color.Bottom && color.Top == color.Left;
 
-        if (!clampedRadii.IsZero && styles.Top == BorderStyleKind.Double && styles.Right == BorderStyleKind.Double && styles.Bottom == BorderStyleKind.Double && styles.Left == BorderStyleKind.Double && border.Top > 0f && border.Top == border.Right && border.Top == border.Bottom && border.Top == border.Left)
+        if (hasUniformColor && !clampedRadii.IsZero && styles.Top == BorderStyleKind.Double && styles.Right == BorderStyleKind.Double && styles.Bottom == BorderStyleKind.Double && styles.Left == BorderStyleKind.Double && border.Top > 0f && border.Top == border.Right && border.Top == border.Bottom && border.Top == border.Left)
         {
             var strokeWidth = border.Top / 3f;
             var outerInset = strokeWidth / 2f;
             var innerInset = border.Top - outerInset;
 
-            PaintRoundedBorderBand(displayList, color, x, y, width, height, strokeWidth, outerInset, clampedRadii);
-            PaintRoundedBorderBand(displayList, color, x, y, width, height, strokeWidth, innerInset, clampedRadii);
+            PaintRoundedBorderBand(displayList, color.Top, x, y, width, height, strokeWidth, outerInset, clampedRadii);
+            PaintRoundedBorderBand(displayList, color.Top, x, y, width, height, strokeWidth, innerInset, clampedRadii);
             return;
         }
 
-        // A uniform-width border with rounded corners can be drawn as a single stroked ring; a
-        // border whose edges differ in width has no single stroke width to give the ring, so it
-        // falls back to the un-rounded four-rectangle path (a documented limitation - mixed-width
-        // rounded borders are rare enough not to warrant a per-edge rounded-quad implementation).
-        if (!clampedRadii.IsZero && styles.Top == BorderStyleKind.Solid && styles.Right == BorderStyleKind.Solid && styles.Bottom == BorderStyleKind.Solid && styles.Left == BorderStyleKind.Solid && border.Top > 0f && border.Top == border.Right && border.Top == border.Bottom && border.Top == border.Left)
+        // A uniform-width border with rounded corners can be drawn as a single stroked ring. A
+        // mixed-width border still uses the four existing edge rectangles, clipped to the rounded
+        // outer border shape so each independently-sized corner follows its authored radius.
+        if (hasUniformColor && !clampedRadii.IsZero && styles.Top == BorderStyleKind.Solid && styles.Right == BorderStyleKind.Solid && styles.Bottom == BorderStyleKind.Solid && styles.Left == BorderStyleKind.Solid && border.Top > 0f && border.Top == border.Right && border.Top == border.Bottom && border.Top == border.Left)
         {
             var half = border.Top / 2f;
             var strokeRect = new RenderRect(x + half, y + half, width - border.Top, height - border.Top);
@@ -6309,14 +6317,31 @@ public sealed class HtmlRenderer
                 Math.Max(0f, clampedRadii.BottomRightX - half), Math.Max(0f, clampedRadii.BottomRightY - half),
                 Math.Max(0f, clampedRadii.BottomLeftX - half), Math.Max(0f, clampedRadii.BottomLeftY - half));
 
-            displayList.StrokeRoundedRect(strokeRect, color, border.Top, strokeRadii);
+            displayList.StrokeRoundedRect(strokeRect, color.Top, border.Top, strokeRadii);
             return;
         }
 
-        PaintBorderEdge(displayList, color, new RenderRect(x, y, width, border.Top), styles.Top, horizontal: true);
-        PaintBorderEdge(displayList, color, new RenderRect(x + width - border.Right, y, border.Right, height), styles.Right, horizontal: false);
-        PaintBorderEdge(displayList, color, new RenderRect(x, y + height - border.Bottom, width, border.Bottom), styles.Bottom, horizontal: true);
-        PaintBorderEdge(displayList, color, new RenderRect(x, y, border.Left, height), styles.Left, horizontal: false);
+        var hasVisibleBorder =
+            (border.Top > 0f && styles.Top is not (BorderStyleKind.None or BorderStyleKind.Hidden)) ||
+            (border.Right > 0f && styles.Right is not (BorderStyleKind.None or BorderStyleKind.Hidden)) ||
+            (border.Bottom > 0f && styles.Bottom is not (BorderStyleKind.None or BorderStyleKind.Hidden)) ||
+            (border.Left > 0f && styles.Left is not (BorderStyleKind.None or BorderStyleKind.Hidden));
+        var clipsRoundedBorder = !clampedRadii.IsZero && hasVisibleBorder;
+
+        if (clipsRoundedBorder)
+        {
+            displayList.PushClip(new RenderRect(x, y, width, height), clampedRadii);
+        }
+
+        PaintBorderEdge(displayList, color.Top, new RenderRect(x, y, width, border.Top), styles.Top, horizontal: true);
+        PaintBorderEdge(displayList, color.Right, new RenderRect(x + width - border.Right, y, border.Right, height), styles.Right, horizontal: false);
+        PaintBorderEdge(displayList, color.Bottom, new RenderRect(x, y + height - border.Bottom, width, border.Bottom), styles.Bottom, horizontal: true);
+        PaintBorderEdge(displayList, color.Left, new RenderRect(x, y, border.Left, height), styles.Left, horizontal: false);
+
+        if (clipsRoundedBorder)
+        {
+            displayList.PopClip();
+        }
     }
 
     private static void PaintRoundedBorderBand(DisplayList displayList, RenderColor color, float x, float y, float width, float height, float strokeWidth, float inset, RenderCornerRadii outerRadii)
@@ -8432,13 +8457,15 @@ public sealed class HtmlRenderer
 
     private readonly record struct EdgeBorderStyle(BorderStyleKind Top, BorderStyleKind Right, BorderStyleKind Bottom, BorderStyleKind Left);
 
+    private readonly record struct EdgeBorderColor(RenderColor Top, RenderColor Right, RenderColor Bottom, RenderColor Left);
+
     private readonly record struct BoxStyle(
         EdgeSizes Margin,
         EdgeSizes Padding,
         EdgeSizes BorderWidth,
         EdgeBorderStyle BorderStyle,
         RenderPaint BackgroundPaint,
-        RenderColor BorderColor,
+        EdgeBorderColor BorderColor,
         RenderCornerRadii BorderRadius,
         IReadOnlyList<RenderBoxShadow> BoxShadows);
 }

@@ -2429,6 +2429,36 @@ public sealed class HtmlRendererTests
     }
 
     [Fact]
+    public async Task BuildDisplayList_ClipsMixedWidthBorderToAsymmetricCornerRadii()
+    {
+        var document = await ParseAsync("""
+            <html><body>
+                <div style="width:180px; height:100px; border-width:8px 3px 12px 5px; border-style:solid; border-color:#6b4b73 #3c607c #85503c #52704d; border-radius:8px 30px 50px 18px;"></div>
+            </body></html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, new DefaultRenderDevice
+        {
+            ViewPortWidth = 300,
+            ViewPortHeight = 200,
+        });
+
+        var clip = Assert.Single(displayList.Commands.OfType<PushClipCommand>());
+        Assert.Equal(8f, clip.Radii.TopLeftX);
+        Assert.Equal(30f, clip.Radii.TopRightX);
+        Assert.Equal(50f, clip.Radii.BottomRightX);
+        Assert.Equal(18f, clip.Radii.BottomLeftX);
+        Assert.Single(displayList.Commands.OfType<PopClipCommand>());
+
+        var borderColors = displayList.Commands.OfType<FillRectCommand>().Select(command => command.Color).ToArray();
+        Assert.Contains(new RenderColor(107, 75, 115), borderColors);
+        Assert.Contains(new RenderColor(60, 96, 124), borderColors);
+        Assert.Contains(new RenderColor(133, 80, 60), borderColors);
+        Assert.Contains(new RenderColor(82, 112, 77), borderColors);
+    }
+
+    [Fact]
     public async Task BuildDisplayList_ParsesEllipticalBorderRadiusPerCornerLonghand()
     {
         var document = await ParseAsync("""
@@ -2565,7 +2595,7 @@ public sealed class HtmlRendererTests
     }
 
     [Fact]
-    public async Task BuildDisplayList_FallsBackToStraightEdgesForMixedWidthRoundedBorder()
+    public async Task BuildDisplayList_ClipsMixedWidthBorderEdgesToRoundedOutline()
     {
         var document = await ParseAsync("""
             <html><body>
@@ -2580,9 +2610,12 @@ public sealed class HtmlRendererTests
             ViewPortHeight = 200,
         });
 
-        // Mixed edge widths have no single stroke width for a rounded ring, so the renderer falls
-        // back to the un-rounded four-rectangle border path.
+        // Mixed edge widths have no single stroke width for a rounded ring, so the renderer keeps
+        // four edge rectangles but clips their outer silhouette to the rounded border shape.
         Assert.Empty(displayList.Commands.OfType<StrokeRoundedRectCommand>());
+        var clip = Assert.Single(displayList.Commands.OfType<PushClipCommand>());
+        Assert.Equal(12f, clip.Radii.TopLeftX);
+        Assert.Single(displayList.Commands.OfType<PopClipCommand>());
 
         var borderFills = displayList.Commands.OfType<FillRectCommand>()
             .Where(f => f.Color.Equals(new RenderColor(0, 0, 255)))
@@ -4523,6 +4556,35 @@ public sealed class HtmlRendererTests
         Assert.Equal(-1f, t.D, precision: 3);
         Assert.Equal(40f, t.E, precision: 2);
         Assert.Equal(20f, t.F, precision: 2);
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_StylesheetCenterTransformOriginUsesOwnBox()
+    {
+        var explicitCenter = await ParseAsync("""
+            <html>
+            <head><style>.target { position:absolute; left:300px; top:55px; width:200px; height:90px; transform:rotate(-7deg) scale(1.08); transform-origin:center center; }</style></head>
+            <body><div class="target"></div></body>
+            </html>
+            """);
+        var defaultCenter = await ParseAsync("""
+            <html>
+            <head><style>.target { position:absolute; left:300px; top:55px; width:200px; height:90px; transform:rotate(-7deg) scale(1.08); }</style></head>
+            <body><div class="target"></div></body>
+            </html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var device = new DefaultRenderDevice { ViewPortWidth = 960, ViewPortHeight = 720 };
+        var explicitTransform = Assert.Single(renderer.BuildDisplayList(explicitCenter, device).Commands.OfType<PushTransformCommand>()).Transform;
+        var defaultTransform = Assert.Single(renderer.BuildDisplayList(defaultCenter, device).Commands.OfType<PushTransformCommand>()).Transform;
+
+        Assert.Equal(defaultTransform.A, explicitTransform.A, precision: 3);
+        Assert.Equal(defaultTransform.B, explicitTransform.B, precision: 3);
+        Assert.Equal(defaultTransform.C, explicitTransform.C, precision: 3);
+        Assert.Equal(defaultTransform.D, explicitTransform.D, precision: 3);
+        Assert.Equal(defaultTransform.E, explicitTransform.E, precision: 2);
+        Assert.Equal(defaultTransform.F, explicitTransform.F, precision: 2);
     }
 
     [Fact]
