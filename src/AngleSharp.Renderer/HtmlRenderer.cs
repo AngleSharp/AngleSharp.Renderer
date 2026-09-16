@@ -473,7 +473,11 @@ public sealed class HtmlRenderer
         bool isRowDirection = true,
         float? flexMainSize = null,
         float? flexCrossSize = null,
-        float containingHeight = float.NaN)
+        float containingHeight = float.NaN,
+        float positionedContainingX = float.NaN,
+        float positionedContainingY = float.NaN,
+        float positionedContainingWidth = float.NaN,
+        float positionedContainingHeight = float.NaN)
     {
         switch (node)
         {
@@ -481,7 +485,7 @@ public sealed class HtmlRenderer
                 LayoutTextNode(textNode.Ref, containingX, containingWidth, ref cursorY, ref previousBlockMarginBottom, ref suppressNextBlockTopMargin, ref activeFloatLeftOffset, ref activeFloatBottom, ref textIndentConsumed, textStyle, context, displayList, maxY);
                 return;
             case ElementRenderNode element:
-                LayoutElement(element, containingX, containingY, containingWidth, ref cursorY, ref previousBlockMarginBottom, ref suppressNextBlockTopMargin, ref activeFloatLeftOffset, ref activeFloatBottom, ref textIndentConsumed, textStyle, context, displayList, maxY, isFlexItem, isRowDirection, flexMainSize, flexCrossSize, containingHeight);
+                LayoutElement(element, containingX, containingY, containingWidth, ref cursorY, ref previousBlockMarginBottom, ref suppressNextBlockTopMargin, ref activeFloatLeftOffset, ref activeFloatBottom, ref textIndentConsumed, textStyle, context, displayList, maxY, isFlexItem, isRowDirection, flexMainSize, flexCrossSize, containingHeight, positionedContainingX, positionedContainingY, positionedContainingWidth, positionedContainingHeight);
                 return;
             default:
                 return;
@@ -507,7 +511,11 @@ public sealed class HtmlRenderer
         bool isRowDirection = true,
         float? flexMainSize = null,
         float? flexCrossSize = null,
-        float containingHeight = float.NaN)
+        float containingHeight = float.NaN,
+        float positionedContainingX = float.NaN,
+        float positionedContainingY = float.NaN,
+        float positionedContainingWidth = float.NaN,
+        float positionedContainingHeight = float.NaN)
     {
         var element = node.Ref;
         var computedStyle = node.ComputedStyle;
@@ -675,6 +683,8 @@ public sealed class HtmlRenderer
 
         var leftOffset = ParseLength(styleMap, "left", flowContainingWidth, 0f, allowAuto: true);
         var topOffset = ParseLength(styleMap, "top", flowContainingWidth, 0f, allowAuto: true);
+        var rightOffset = ParseLength(styleMap, "right", flowContainingWidth, float.NaN, allowAuto: true);
+        var bottomOffset = ParseLength(styleMap, "bottom", float.IsNaN(positionedContainingHeight) ? flowContainingWidth : positionedContainingHeight, float.NaN, allowAuto: true);
 
         if (float.IsNaN(leftOffset))
         {
@@ -686,10 +696,14 @@ public sealed class HtmlRenderer
             topOffset = 0f;
         }
 
+        var absoluteContainingX = float.IsNaN(positionedContainingX) ? containingX : positionedContainingX;
+        var absoluteContainingY = float.IsNaN(positionedContainingY) ? containingY : positionedContainingY;
+        var absoluteContainingWidth = float.IsNaN(positionedContainingWidth) ? containingWidth : positionedContainingWidth;
+
         var borderBoxX = isFixed
             ? context.Padding + leftOffset
             : isAbsolute
-                ? containingX + leftOffset
+                ? absoluteContainingX + leftOffset
                 : flowBorderBoxX + (isRelative ? leftOffset : 0f);
         // `position: sticky` stays in normal flow for every other purpose (margins, cursor
         // advancement, painting order - see the isAbsolute/isFixed checks elsewhere in this
@@ -706,7 +720,7 @@ public sealed class HtmlRenderer
         var borderBoxY = isFixed
             ? context.Padding + topOffset
             : isAbsolute
-                ? containingY + topOffset
+                ? absoluteContainingY + topOffset
                 : isSticky && styleMap.ContainsKey("top")
                     ? Math.Max(flowBorderBoxY, context.Padding + topOffset)
                     : flowBorderBoxY + (isRelative ? topOffset : 0f);
@@ -733,6 +747,35 @@ public sealed class HtmlRenderer
                 borderLeft + borderRight + paddingLeft + paddingRight,
                 verticalBorderAndPadding);
         }
+
+        var minimumContentHeightForPositioning = ResolveAuthoredDimension(styleMap, "min-height", heightReference, 0f, verticalBorderAndPadding);
+        var positionedContentHeight = float.IsNaN(resolvedContentHeight)
+            ? minimumContentHeightForPositioning > 0f ? minimumContentHeightForPositioning : float.NaN
+            : Math.Max(resolvedContentHeight, minimumContentHeightForPositioning);
+
+        var positionedBorderBoxWidth = borderLeft + paddingLeft + contentWidth + paddingRight + borderRight;
+        var positionedBorderBoxHeight = float.IsNaN(positionedContentHeight)
+            ? float.NaN
+            : borderTop + paddingTop + positionedContentHeight + paddingBottom + borderBottom;
+
+        if (isAbsolute && !styleMap.ContainsKey("left") && !float.IsNaN(rightOffset))
+        {
+            borderBoxX = absoluteContainingX + absoluteContainingWidth - rightOffset - positionedBorderBoxWidth;
+        }
+
+        if (isAbsolute && !styleMap.ContainsKey("top") && !float.IsNaN(bottomOffset) && !float.IsNaN(positionedContainingHeight) && !float.IsNaN(positionedBorderBoxHeight))
+        {
+            borderBoxY = absoluteContainingY + positionedContainingHeight - bottomOffset - positionedBorderBoxHeight;
+        }
+
+        contentX = borderBoxX + borderLeft + paddingLeft;
+        contentY = borderBoxY + borderTop + paddingTop;
+        var childPositionedContainingX = borderBoxX + borderLeft;
+        var childPositionedContainingY = borderBoxY + borderTop;
+        var childPositionedContainingWidth = positionedBorderBoxWidth - borderLeft - borderRight;
+        var childPositionedContainingHeight = float.IsNaN(positionedBorderBoxHeight)
+            ? float.NaN
+            : positionedBorderBoxHeight - borderTop - borderBottom;
 
         // The box's own background/border/shadow/outline must paint behind its children, but an
         // auto-sized box's height is only known after its children are laid out (and therefore
@@ -916,7 +959,11 @@ public sealed class HtmlRenderer
                         context: context,
                         displayList: displayList,
                         maxY: maxY,
-                        containingHeight: resolvedContentHeight);
+                        containingHeight: resolvedContentHeight,
+                        positionedContainingX: childPositionedContainingX,
+                        positionedContainingY: childPositionedContainingY,
+                        positionedContainingWidth: childPositionedContainingWidth,
+                        positionedContainingHeight: childPositionedContainingHeight);
                                 if (IsNegativeZIndexChild(blockChild, context))
                     {
                         negativeZIndexRanges.Add((childRangeStart, displayList.Commands.Count - childRangeStart));
@@ -979,7 +1026,11 @@ public sealed class HtmlRenderer
                         context: context,
                         displayList: displayList,
                         maxY: maxY,
-                        containingHeight: resolvedContentHeight);
+                        containingHeight: resolvedContentHeight,
+                        positionedContainingX: childPositionedContainingX,
+                        positionedContainingY: childPositionedContainingY,
+                        positionedContainingWidth: childPositionedContainingWidth,
+                        positionedContainingHeight: childPositionedContainingHeight);
                 }
                 else
                 {
@@ -1070,7 +1121,11 @@ public sealed class HtmlRenderer
                             context: context,
                             displayList: displayList,
                             maxY: maxY,
-                            containingHeight: resolvedContentHeight);
+                            containingHeight: resolvedContentHeight,
+                            positionedContainingX: childPositionedContainingX,
+                            positionedContainingY: childPositionedContainingY,
+                            positionedContainingWidth: childPositionedContainingWidth,
+                            positionedContainingHeight: childPositionedContainingHeight);
                         if (IsNegativeZIndexChild(inlineBlockElement, context))
                         {
                             negativeZIndexRanges.Add((inlineBlockRangeStart, displayList.Commands.Count - inlineBlockRangeStart));
@@ -1152,6 +1207,13 @@ public sealed class HtmlRenderer
         var autoContentHeight = Math.Max(0f, childCursorY - contentY);
         var specifiedContentHeight = resolvedContentHeight;
         var contentHeight = float.IsNaN(specifiedContentHeight) ? autoContentHeight : specifiedContentHeight;
+        var minimumContentHeight = ResolveAuthoredDimension(styleMap, "min-height", heightReference, 0f, verticalBorderAndPadding);
+        var maximumContentHeight = ResolveAuthoredDimension(styleMap, "max-height", heightReference, float.NaN, verticalBorderAndPadding);
+        contentHeight = Math.Max(contentHeight, minimumContentHeight);
+        if (!float.IsNaN(maximumContentHeight))
+        {
+            contentHeight = Math.Min(contentHeight, maximumContentHeight);
+        }
 
         var borderBoxWidth = borderLeft + paddingLeft + contentWidth + paddingRight + borderRight;
         var borderBoxHeight = borderTop + paddingTop + contentHeight + paddingBottom + borderBottom;
@@ -1430,11 +1492,15 @@ public sealed class HtmlRenderer
 
         var containerMainSize = isRowDirection
             ? containingWidth
-            : ResolveAuthoredDimension(styleMap, "height", containingWidth, containingWidth, verticalBorderAndPadding);
+            : ResolveAuthoredDimension(styleMap, "height", containingWidth, float.NaN, verticalBorderAndPadding);
 
-        if (float.IsNaN(containerMainSize) || containerMainSize <= 0f)
+        if (float.IsNaN(containerMainSize))
         {
-            containerMainSize = isRowDirection ? containingWidth : containingWidth;
+            containerMainSize = flexItems.Sum(item => item.BaseMainSize) + Math.Max(0, flexItems.Count - 1) * mainGap;
+        }
+        else if (containerMainSize <= 0f)
+        {
+            containerMainSize = containingWidth;
         }
 
 
@@ -1627,23 +1693,39 @@ public sealed class HtmlRenderer
 
                 var itemCrossPosition = lineCrossPosition + lineCrossStart;
                 var alignSelf = item.AlignSelf;
+                var hasExplicitAlignSelf = !string.Equals(alignSelf, "auto", StringComparison.OrdinalIgnoreCase);
+                var effectiveAlignment = string.Equals(alignSelf, "auto", StringComparison.OrdinalIgnoreCase)
+                    ? alignItems
+                    : alignSelf;
 
-                if (string.Equals(alignSelf, "center", StringComparison.OrdinalIgnoreCase))
+                if (hasExplicitAlignSelf && string.Equals(effectiveAlignment, "center", StringComparison.OrdinalIgnoreCase))
                 {
-                    itemCrossPosition = containerCrossSize > 0f && resolvedCrossSize < containerCrossSize ? (containerCrossSize - resolvedCrossSize) / 2f : 0f;
+                    itemCrossPosition = containerCrossSize > resolvedCrossSize ? (containerCrossSize - resolvedCrossSize) / 2f : 0f;
                 }
-                else if (string.Equals(alignSelf, "flex-end", StringComparison.OrdinalIgnoreCase))
+                else if (hasExplicitAlignSelf && string.Equals(effectiveAlignment, "flex-end", StringComparison.OrdinalIgnoreCase))
                 {
-                    itemCrossPosition = containerCrossSize > 0f && resolvedCrossSize < containerCrossSize ? containerCrossSize - resolvedCrossSize : 0f;
+                    itemCrossPosition = Math.Max(0f, containerCrossSize - resolvedCrossSize);
                 }
-                else if (string.Equals(alignSelf, "stretch", StringComparison.OrdinalIgnoreCase) && resolvedCrossSize <= 0f && containerCrossSize > 0f)
+                else if (hasExplicitAlignSelf && string.Equals(effectiveAlignment, "flex-start", StringComparison.OrdinalIgnoreCase))
+                {
+                    itemCrossPosition = 0f;
+                }
+                else if (string.Equals(effectiveAlignment, "center", StringComparison.OrdinalIgnoreCase))
+                {
+                    itemCrossPosition = lineCrossPosition + Math.Max(0f, (lineCrossSize - resolvedCrossSize) / 2f) + lineCrossStart;
+                }
+                else if (string.Equals(effectiveAlignment, "flex-end", StringComparison.OrdinalIgnoreCase))
+                {
+                    itemCrossPosition = lineCrossPosition + Math.Max(0f, lineCrossSize - resolvedCrossSize) + lineCrossStart;
+                }
+                else if (string.Equals(effectiveAlignment, "stretch", StringComparison.OrdinalIgnoreCase) && resolvedCrossSize <= 0f && containerCrossSize > 0f)
                 {
                     resolvedCrossSize = containerCrossSize;
                     itemCrossPosition = 0f;
                 }
-                else if (!string.Equals(alignSelf, "auto", StringComparison.OrdinalIgnoreCase))
+                else if (!string.Equals(effectiveAlignment, "auto", StringComparison.OrdinalIgnoreCase))
                 {
-                    itemCrossPosition = 0f;
+                    itemCrossPosition = lineCrossPosition + lineCrossStart;
                 }
 
                 var itemOffset = isReverseDirection
@@ -2566,6 +2648,31 @@ public sealed class HtmlRenderer
         // spec's own intrinsic-sizing fallback for that case.
         ResolveGridFractionTracks(columns, resolvedColumnGap, containingWidth);
 
+        var resolvedColumnSizes = columns.Select(track => track.Pixels).ToList();
+        foreach (var (element, placementColumn, placementRow) in itemPlacements)
+        {
+            if (placementRow.LineIndex >= rows.Count || rows[placementRow.LineIndex].Kind != GridTrackSizeKind.Auto)
+            {
+                continue;
+            }
+
+
+            var itemStyle = GetOrCreateStyleMap(context, element.Ref, element.ComputedStyle);
+            if (!float.IsNaN(ParseLength(itemStyle, "height", containingWidth, float.NaN, allowAuto: true)))
+            {
+                continue;
+            }
+
+            var cellWidth = GetGridTrackSpanSize(
+                resolvedColumnSizes,
+                placementColumn.LineIndex,
+                placementColumn.Span,
+                resolvedColumnGap,
+                containingWidth);
+            var measuredHeight = MeasureGridItemHeight(element, cellWidth, inheritedTextStyle, context, maxY);
+            GrowGridTrackSize(rows, placementRow.LineIndex, measuredHeight);
+        }
+
         if (hasExplicitRowTracks && !float.IsNaN(containerHeight))
         {
             ResolveGridFractionTracks(rows, resolvedRowGap, containerHeight);
@@ -2973,14 +3080,11 @@ public sealed class HtmlRenderer
             ? value
             : null;
 
+        float estimate;
+
         if (string.IsNullOrWhiteSpace(rawValue))
         {
             var text = NormalizeWhitespace(elementChild.Ref.TextContent ?? string.Empty, WhiteSpaceMode.Normal);
-            if (text.Length == 0)
-            {
-                return 0f;
-            }
-
             var fontSize = ParseLength(styleMap, "font-size", 16f, 16f, allowAuto: false);
             var box = ResolveBoxStyle(styleMap, elementChild.Ref);
             var verticalExtras = box.BorderWidth.Top + box.BorderWidth.Bottom + box.Padding.Top + box.Padding.Bottom;
@@ -2989,13 +3093,51 @@ public sealed class HtmlRenderer
                 .DefaultIfEmpty(0)
                 .Max() * fontSize * 0.6f;
 
-            return string.Equals(propertyName, "width", StringComparison.OrdinalIgnoreCase)
+            estimate = string.Equals(propertyName, "width", StringComparison.OrdinalIgnoreCase)
                 ? intrinsicTextWidth
-                : fontSize * 1.35f + verticalExtras;
+                : text.Length == 0 ? 0f : fontSize * 1.35f + verticalExtras;
+        }
+        else
+        {
+            var parsed = ParseLengthValue(rawValue, fallbackSize, allowAuto: false);
+            estimate = float.IsNaN(parsed) ? fallbackSize : Math.Max(0f, parsed);
         }
 
-        var parsed = ParseLengthValue(rawValue, fallbackSize, allowAuto: false);
-        return float.IsNaN(parsed) ? fallbackSize : Math.Max(0f, parsed);
+        if (string.Equals(propertyName, "height", StringComparison.OrdinalIgnoreCase))
+        {
+            estimate = Math.Max(estimate, ParseLength(styleMap, "min-height", fallbackSize, 0f, allowAuto: false));
+        }
+
+        return estimate;
+    }
+
+    private static float MeasureGridItemHeight(ElementRenderNode element, float containingWidth, RenderTextStyle inheritedTextStyle, LayoutContext context, float maxY)
+    {
+        var displayList = new DisplayList();
+        var cursorY = 0f;
+        var previousBlockMarginBottom = 0f;
+        var suppressNextBlockTopMargin = false;
+        var activeFloatLeftOffset = 0f;
+        var activeFloatBottom = 0f;
+        var textIndentConsumed = false;
+
+        LayoutNode(
+            element,
+            0f,
+            0f,
+            containingWidth,
+            ref cursorY,
+            ref previousBlockMarginBottom,
+            ref suppressNextBlockTopMargin,
+            ref activeFloatLeftOffset,
+            ref activeFloatBottom,
+            ref textIndentConsumed,
+            inheritedTextStyle,
+            context,
+            displayList,
+            maxY);
+
+        return cursorY;
     }
 
     /// <summary>
@@ -3675,6 +3817,19 @@ public sealed class HtmlRenderer
     private static float EstimateFlexItemContentWidth(ElementRenderNode element, float relativeTo, LayoutContext context)
     {
         var contentWidth = 0f;
+        var styleMap = GetOrCreateStyleMap(context, element.Ref, element.ComputedStyle);
+        var text = NormalizeWhitespace(element.Ref.TextContent ?? string.Empty, WhiteSpaceMode.Normal);
+
+        if (text.Length > 0)
+        {
+            var textStyle = ResolveTextStyle(styleMap, new RenderTextStyle(16f, RenderColor.Black, "sans-serif", 1.2f, 400f, false, false, false, RenderColor.Black, global::AngleSharp.Renderer.Rendering.RenderTextDecorationStyle.Solid, TextAlign.Left, 0f, 0f, 0f, [], WhiteSpaceMode.Normal, WordBreakMode.Normal, OverflowWrapMode.Normal, TextOverflowMode.Clip));
+            contentWidth = MeasureTextWidth(context, text, textStyle);
+            var maxWidth = ResolveAuthoredDimension(styleMap, "max-width", relativeTo, float.NaN, 0f);
+            if (!float.IsNaN(maxWidth))
+            {
+                contentWidth = Math.Min(contentWidth, maxWidth);
+            }
+        }
 
         foreach (var child in element.Children.OfType<ElementRenderNode>())
         {
@@ -3804,21 +3959,24 @@ public sealed class HtmlRenderer
     /// </summary>
     private static OverflowWrapMode ParseOverflowWrap(Dictionary<string, string> styleMap, OverflowWrapMode inherited)
     {
-        var raw = styleMap.TryGetValue("overflow-wrap", out var value) && !string.IsNullOrWhiteSpace(value)
-            ? value
-            : (styleMap.TryGetValue("word-wrap", out var legacyValue) ? legacyValue : null);
+        var raw = styleMap.TryGetValue("overflow-wrap", out var value) ? value : null;
+        var legacyRaw = styleMap.TryGetValue("word-wrap", out var legacyValue) ? legacyValue : null;
+
+        if (IsBreakingOverflowWrap(raw) || IsBreakingOverflowWrap(legacyRaw))
+        {
+            return OverflowWrapMode.BreakWord;
+        }
 
         if (string.IsNullOrWhiteSpace(raw))
         {
-            return inherited;
+            return string.IsNullOrWhiteSpace(legacyRaw) ? inherited : OverflowWrapMode.Normal;
         }
 
-        return raw.Trim().ToLowerInvariant() switch
-        {
-            "break-word" or "anywhere" => OverflowWrapMode.BreakWord,
-            _ => OverflowWrapMode.Normal,
-        };
+        return OverflowWrapMode.Normal;
     }
+
+    private static bool IsBreakingOverflowWrap(string? value) =>
+        value?.Trim().ToLowerInvariant() is "break-word" or "anywhere";
 
     /// <summary>
     /// <c>text-overflow</c>, unlike every other property resolved in <see cref="ResolveTextStyle"/>,
@@ -4367,6 +4525,8 @@ public sealed class HtmlRenderer
         AddIfPresent(map, "position", style.GetPropertyValue("position"));
         AddLengthProperty(map, style, "left");
         AddLengthProperty(map, style, "top");
+        AddLengthProperty(map, style, "right");
+        AddLengthProperty(map, style, "bottom");
         AddIfPresent(map, "float", style.GetPropertyValue("float"));
         AddIfPresent(map, "z-index", style.GetPropertyValue("z-index"));
 
@@ -4531,8 +4691,15 @@ public sealed class HtmlRenderer
         AddIfPresent(map, "white-space", style.GetPropertyValue("white-space"));
         AddIfPresent(map, "text-overflow", style.GetPropertyValue("text-overflow"));
         AddIfPresent(map, "word-break", style.GetPropertyValue("word-break"));
-        AddIfPresent(map, "overflow-wrap", style.GetPropertyValue("overflow-wrap"));
-        AddIfPresent(map, "word-wrap", style.GetPropertyValue("word-wrap"));
+        var rawOverflowWrap = ResolveRawAuthoredPropertyValue(element, inlineStyle, "overflow-wrap");
+        AddIfPresent(map, "overflow-wrap", !string.IsNullOrWhiteSpace(rawOverflowWrap)
+            ? rawOverflowWrap
+            : explicitDeclarations is not null
+                ? ReadExplicitOrComputed(explicitDeclarations, style, "overflow-wrap")
+                : style.GetPropertyValue("overflow-wrap"));
+        AddIfPresent(map, "word-wrap", explicitDeclarations is not null
+            ? ReadExplicitOrComputed(explicitDeclarations, style, "word-wrap")
+            : style.GetPropertyValue("word-wrap"));
 
         ApplyActiveTransitionAndAnimationOverrides(map, element);
 
@@ -4632,6 +4799,69 @@ public sealed class HtmlRenderer
         }
 
         return null;
+    }
+
+    private static string? ResolveRawAuthoredPropertyValue(IElement? element, string? inlineStyle, string propertyName)
+    {
+        var inlineValue = ParseStyleAttributeValue(inlineStyle, propertyName);
+        if (!string.IsNullOrWhiteSpace(inlineValue))
+        {
+            return inlineValue;
+        }
+
+        if (element?.Owner is null)
+        {
+            return null;
+        }
+
+        string? matchedValue = null;
+        foreach (var styleElement in element.Owner.QuerySelectorAll("style"))
+        {
+            var source = styleElement.TextContent ?? string.Empty;
+            var cursor = 0;
+
+            while (cursor < source.Length)
+            {
+                var blockStart = source.IndexOf('{', cursor);
+                if (blockStart < 0)
+                {
+                    break;
+                }
+
+                var blockEnd = source.IndexOf('}', blockStart + 1);
+                if (blockEnd < 0)
+                {
+                    break;
+                }
+
+                var selectorText = source[cursor..blockStart].Trim();
+                var declarations = source[(blockStart + 1)..blockEnd];
+                var candidateValue = ParseStyleAttributeValue(declarations, propertyName);
+
+                if (!selectorText.StartsWith('@') && !string.IsNullOrWhiteSpace(candidateValue))
+                {
+                    foreach (var selector in selectorText.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+                    {
+                        try
+                        {
+                            if (element.Matches(selector))
+                            {
+                                matchedValue = candidateValue;
+                                break;
+                            }
+                        }
+                        catch
+                        {
+                            // Ignore selectors unsupported by AngleSharp's matcher.
+                        }
+                    }
+                }
+
+                cursor = blockEnd + 1;
+            }
+        }
+
+        return matchedValue;
     }
 
     private static bool TryGetFirstCollapsibleChildTopMargin(ElementRenderNode node, float containingWidth, LayoutContext context, out float marginTop)
@@ -8091,7 +8321,7 @@ public sealed class HtmlRenderer
         {
             var wordWidth = MeasureTextWidth(context, word, textStyle);
 
-            if (wordWidth > maxWidth && (word.Contains('-') || word.Contains('/')))
+            if (wordWidth > maxWidth && textStyle.OverflowWrap == OverflowWrapMode.Normal && (word.Contains('-') || word.Contains('/')))
             {
                 var chunks = SplitBreakableWord(word);
 

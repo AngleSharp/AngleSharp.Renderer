@@ -813,6 +813,52 @@ public sealed class HtmlRendererTests
     }
 
     [Fact]
+    public async Task BuildDisplayList_AutoHeightColumnFlexDoesNotShrinkPaddedItems()
+    {
+        var document = await ParseAsync("""
+            <html><head><style>
+                * { box-sizing:border-box; }
+                .nav { display:flex; flex-direction:column; gap:8px; width:180px; }
+                .item { width:100%; padding:9px; border:1px solid #777; background:#fff; font-size:13px; }
+            </style></head><body>
+                <div class="nav"><div class="item">One</div><div class="item">Two</div><div class="item">Three</div><div class="item">Four</div><div class="item">Five</div><div class="item">Six</div></div>
+            </body></html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, new DefaultRenderDevice { ViewPortWidth = 300, ViewPortHeight = 240, FontSize = 14f });
+        var items = displayList.Commands.OfType<FillRectCommand>()
+            .Where(command => command.Color.Equals(RenderColor.White) && command.Rect.Width == 180f)
+            .OrderBy(command => command.Rect.Y)
+            .ToArray();
+
+        Assert.Equal(6, items.Length);
+        Assert.All(items, item => Assert.Equal(35.6f, item.Rect.Height, precision: 1));
+        Assert.Equal(8f, items[1].Rect.Y - (items[0].Rect.Y + items[0].Rect.Height), precision: 2);
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_CentersFlexItemInsideStretchedGridCard()
+    {
+        var document = await ParseAsync("""
+            <html><head><style>
+                * { box-sizing:border-box; }
+                .grid { display:grid; grid-template-columns:200px; }
+                .card { display:flex; align-items:center; min-height:145px; padding:15px; background:#f1e5d5; }
+                .icon { width:52px; height:52px; border:2px solid #4b6175; background:#fff; }
+                .copy { width:100px; height:100px; }
+            </style></head><body><div class="grid"><div class="card"><div class="icon"></div><div class="copy"></div></div></div></body></html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, new DefaultRenderDevice { ViewPortWidth = 300, ViewPortHeight = 240 });
+        var card = Assert.Single(displayList.Commands.OfType<FillRectCommand>().Where(command => command.Color.Equals(new RenderColor(241, 229, 213))));
+        var icon = Assert.Single(displayList.Commands.OfType<FillRectCommand>().Where(command => command.Color.Equals(RenderColor.White) && command.Rect.Width == 52f));
+
+        Assert.Equal(card.Rect.Y + (card.Rect.Height - icon.Rect.Height) / 2f, icon.Rect.Y, precision: 2);
+    }
+
+    [Fact]
     public async Task BuildDisplayList_AppliesFlexGrowToItems()
     {
         var document = await ParseAsync("""
@@ -2316,6 +2362,60 @@ public sealed class HtmlRendererTests
         Assert.Equal(15f, fixedBox.Rect.X);
         Assert.Equal(8f, fixedBox.Rect.Y);
         Assert.Equal(0f, normalBox.Rect.Y);
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_PositionsAbsoluteBoxFromRightAndBottomEdges()
+    {
+        var document = await ParseAsync("""
+            <html><body>
+                <div style="position:relative; width:200px; height:100px; background:#eeeeee;">
+                    <div style="position:absolute; right:10px; bottom:5px; width:40px; height:20px; background:#ff0000;"></div>
+                </div>
+            </body></html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, new DefaultRenderDevice { ViewPortWidth = 300, ViewPortHeight = 180 });
+        var child = Assert.Single(displayList.Commands.OfType<FillRectCommand>()
+            .Where(command => command.Color.Equals(new RenderColor(255, 0, 0))));
+
+        Assert.Equal(150f, child.Rect.X);
+        Assert.Equal(75f, child.Rect.Y);
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_GridAutoRowUsesDeepItemHeightAndStretchesSiblings()
+    {
+        var document = await ParseAsync("""
+            <html><head><style>
+                * { box-sizing:border-box; }
+                .grid { display:grid; grid-template-columns:100px 200px 100px; gap:10px; }
+                .side { background-color:#ff0000; }
+                .hero { min-height:180px; margin-bottom:18px; }
+                .cards { display:grid; grid-template-columns:repeat(2, 1fr); gap:14px; }
+                .card { min-height:145px; }
+                .right { background-color:#00ff00; }
+                .footer { height:40px; background-color:#0000ff; }
+            </style></head><body>
+                <div class="grid">
+                    <aside class="side"></aside>
+                    <section><div class="hero"></div><div class="cards"><div class="card"></div><div class="card"></div><div class="card"></div><div class="card"></div></div></section>
+                    <aside class="right"></aside>
+                </div>
+                <footer class="footer"></footer>
+            </body></html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, new DefaultRenderDevice { ViewPortWidth = 500, ViewPortHeight = 700 });
+        var side = Assert.Single(displayList.Commands.OfType<FillRectCommand>().Where(command => command.Color.Equals(new RenderColor(255, 0, 0))));
+        var right = Assert.Single(displayList.Commands.OfType<FillRectCommand>().Where(command => command.Color.Equals(new RenderColor(0, 255, 0))));
+        var footer = Assert.Single(displayList.Commands.OfType<FillRectCommand>().Where(command => command.Color.Equals(new RenderColor(0, 0, 255))));
+
+        Assert.Equal(502f, side.Rect.Height);
+        Assert.Equal(502f, right.Rect.Height);
+        Assert.Equal(502f, footer.Rect.Y);
     }
 
     [Fact]
@@ -5233,6 +5333,21 @@ public sealed class HtmlRendererTests
 
         Assert.True(lines.Length > 1);
         Assert.Equal("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", string.Concat(lines.Select(line => line.Text)));
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_OverflowWrapAnywhereBreaksOverlongSlashTokenBeforeOverflow()
+    {
+        var document = await ParseAsync("""
+            <html><body><div style="width:70px; overflow-wrap:anywhere;">ABCDEFGHIJKLMNOPQRSTUVWXYZ/path/to/resource</div></body></html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, new DefaultRenderDevice { ViewPortWidth = 200, ViewPortHeight = 240, FontSize = 16f });
+        var lines = displayList.Commands.OfType<DrawTextCommand>().Select(command => command.Text).ToArray();
+
+        Assert.True(lines.Length > 3, $"Expected more than three wrapped lines, got: {string.Join(" | ", lines)}");
+        Assert.DoesNotContain(lines, line => line.StartsWith("ABCDEFGHIJKLMNOPQRSTUVWXYZ", StringComparison.Ordinal));
     }
 
     [Fact]
