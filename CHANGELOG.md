@@ -7,6 +7,7 @@ Released on ?
 - Fixed display of border-radius with mixed border colors
 - Fixed handling of font weights and unstyled headings
 - Added performance evaluation benchmark
+- Added full real-world rendering scenarios to the test cases
 
 # 0.5.0
 
