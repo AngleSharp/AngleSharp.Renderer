@@ -33,7 +33,8 @@ internal readonly record struct CssAnimationSpec(
     CssTimingFunction TimingFunction,
     double IterationCount,
     CssAnimationDirection Direction,
-    CssAnimationFillMode FillMode);
+    CssAnimationFillMode FillMode,
+    bool IsPaused);
 
 internal sealed record CssKeyframeStop(double Position, IReadOnlyDictionary<string, string> PropertyValues);
 
@@ -51,6 +52,14 @@ internal sealed record CssKeyframeStop(double Position, IReadOnlyDictionary<stri
 internal sealed class CssAnimationTracker
 {
     private readonly Dictionary<(IElement Element, string Name), double> _startTimesMs = [];
+
+    // Total virtual-clock time this (element, animation-name) pair has spent paused since it
+    // started, so it can be subtracted back out of the raw clock to get an "effective" clock that
+    // stays frozen for as long as the animation is paused and resumes in sync with the real clock
+    // once it isn't - the same amount of clock time always elapsing while paused as gets added
+    // here is what keeps the effective clock frozen across any number of paused observations.
+    private readonly Dictionary<(IElement Element, string Name), double> _pausedAccumulatedMs = [];
+    private readonly Dictionary<(IElement Element, string Name), double> _lastObservedClockMs = [];
 
     /// <summary>
     /// Gets the animated value currently in effect for <paramref name="property"/> on
@@ -109,7 +118,8 @@ internal sealed class CssAnimationTracker
         }
 
         var startMs = _startTimesMs[(element, spec.Name)];
-        var elapsedMs = clockMs - startMs - spec.DelayMs;
+        var effectiveClockMs = ResolveEffectiveClockMs(element, spec, clockMs);
+        var elapsedMs = effectiveClockMs - startMs - spec.DelayMs;
         var totalDurationMs = spec.DurationMs * spec.IterationCount;
 
         if (elapsedMs < 0d)
@@ -148,6 +158,39 @@ internal sealed class CssAnimationTracker
         var eased = spec.TimingFunction.Evaluate(progress);
 
         return InterpolateAtKeyframes(keyframes, property, eased);
+    }
+
+    /// <summary>
+    /// `animation-play-state: paused` freezes an animation exactly where it currently is - not by
+    /// stopping the shared virtual clock (other animations/transitions on the same or other
+    /// elements must keep advancing normally), but by tracking how much clock time this specific
+    /// (element, animation-name) pair has spent paused and subtracting that back out of the raw
+    /// clock before the ordinary elapsed-time math runs. Whether the gap since the last observation
+    /// counts as paused time is decided by *this* call's play-state (not the previous one) - the
+    /// only state this tracker ever samples is at call time, so a pause taking effect anywhere
+    /// between two observations is attributed to the whole gap once it is next observed as paused;
+    /// once next observed as running again, no further time is added and the effective clock
+    /// continues advancing in lockstep with the real one from wherever it was left off.
+    /// </summary>
+    private double ResolveEffectiveClockMs(IElement element, CssAnimationSpec spec, double clockMs)
+    {
+        var key = (element, spec.Name);
+
+        if (_lastObservedClockMs.TryGetValue(key, out var lastClockMs))
+        {
+            if (spec.IsPaused)
+            {
+                _pausedAccumulatedMs[key] = _pausedAccumulatedMs.GetValueOrDefault(key) + (clockMs - lastClockMs);
+            }
+        }
+        else
+        {
+            _pausedAccumulatedMs[key] = 0d;
+        }
+
+        _lastObservedClockMs[key] = clockMs;
+
+        return clockMs - _pausedAccumulatedMs.GetValueOrDefault(key);
     }
 
     private static string? InterpolateAtKeyframes(IReadOnlyList<CssKeyframeStop> stops, string property, double position)
@@ -275,6 +318,7 @@ internal sealed class CssAnimationTracker
         var iterationList = HtmlRenderer.SplitTopLevelCommaList(style.GetPropertyValue("animation-iteration-count"));
         var directionList = HtmlRenderer.SplitTopLevelCommaList(style.GetPropertyValue("animation-direction"));
         var fillModeList = HtmlRenderer.SplitTopLevelCommaList(style.GetPropertyValue("animation-fill-mode"));
+        var playStateList = HtmlRenderer.SplitTopLevelCommaList(style.GetPropertyValue("animation-play-state"));
 
         var result = new List<CssAnimationSpec>(nameList.Length);
 
@@ -287,8 +331,9 @@ internal sealed class CssAnimationTracker
             var iterationCount = ParseIterationCount(ResolveListValue(iterationList, i, "1"));
             var direction = ParseDirection(ResolveListValue(directionList, i, "normal"));
             var fillMode = ParseFillMode(ResolveListValue(fillModeList, i, "none"));
+            var isPaused = string.Equals(ResolveListValue(playStateList, i, "running")?.Trim(), "paused", StringComparison.OrdinalIgnoreCase);
 
-            result.Add(new CssAnimationSpec(name, duration, delay, timingFunction, iterationCount, direction, fillMode));
+            result.Add(new CssAnimationSpec(name, duration, delay, timingFunction, iterationCount, direction, fillMode, isPaused));
         }
 
         return result;

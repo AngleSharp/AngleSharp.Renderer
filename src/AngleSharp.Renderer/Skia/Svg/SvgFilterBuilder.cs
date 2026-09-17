@@ -9,13 +9,14 @@ using SkiaSharp;
 
 /// <summary>
 /// Builds an <see cref="SKImageFilter"/> from a &lt;filter&gt; element's primitive chain. Supports
-/// the common `feGaussianBlur`/`feOffset`/`feMerge`/`feColorMatrix`/`feDropShadow` primitives,
-/// each composed via SkiaSharp's own filter graph (<see cref="SKImageFilter"/> is itself a DAG of
+/// the common `feGaussianBlur`/`feOffset`/`feMerge`/`feColorMatrix`/`feDropShadow` primitives plus
+/// `feFlood`/`feComposite`/`feMorphology`/`feComponentTransfer` (linear sub-functions only), each
+/// composed via SkiaSharp's own filter graph (<see cref="SKImageFilter"/> is itself a DAG of
 /// inputs, so this only has to translate primitives one at a time, not build a compositor).
-/// An unsupported primitive (feFlood, feComposite, feTurbulence, feDisplacementMap, feTile,
-/// feImage, feComponentTransfer, feConvolveMatrix, feDiffuseLighting, feSpecularLighting,
-/// feMorphology) passes its resolved input through unchanged rather than being dropped, so later
-/// primitives in the same chain still have something to work with.
+/// An unsupported primitive (feTurbulence, feDisplacementMap, feTile, feImage, feConvolveMatrix,
+/// feDiffuseLighting, feSpecularLighting, or a feComponentTransfer sub-function using `table`/
+/// `discrete`/`gamma` rather than `linear`) passes its resolved input through unchanged rather
+/// than being dropped, so later primitives in the same chain still have something to work with.
 /// </summary>
 internal static class SvgFilterBuilder
 {
@@ -33,6 +34,10 @@ internal static class SvgFilterBuilder
             {
                 last = BuildMerge(primitive, results, last);
             }
+            else if (tag == "fecomposite")
+            {
+                last = BuildComposite(primitive, results, last);
+            }
             else
             {
                 var input = ResolveInput(primitive.GetAttribute("in"), results, last);
@@ -43,6 +48,9 @@ internal static class SvgFilterBuilder
                     "feoffset" => BuildOffset(primitive, input),
                     "fecolormatrix" => BuildColorMatrix(primitive, input),
                     "fedropshadow" => BuildDropShadow(primitive, input),
+                    "feflood" => BuildFlood(primitive, input),
+                    "femorphology" => BuildMorphology(primitive, input),
+                    "fecomponenttransfer" => BuildComponentTransfer(primitive, input),
                     _ => input,
                 };
             }
@@ -132,6 +140,128 @@ internal static class SvgFilterBuilder
         }
 
         return SKImageFilter.CreateDropShadow(dx, dy, sigmaX, sigmaY, color, input);
+    }
+
+    /// <summary>
+    /// `feFlood` fills its output with a solid `flood-color`/`flood-opacity` - since this
+    /// architecture has no "paint an infinite flood, then let the filter region clip it" primitive
+    /// to build on, it is approximated as a color remap of whatever the resolved input already
+    /// covers (`SKColorFilter.CreateBlendMode(color, SKBlendMode.Src)`, replacing every covered
+    /// pixel's color outright while leaving its own alpha/shape as-is) rather than a true
+    /// region-filling flood - close enough for the common case of flooding a shape that already
+    /// has its own opaque coverage (e.g. `feFlood` feeding into `feComposite`/`feBlend` against
+    /// `SourceGraphic`), though not a fully spec-accurate infinite flood.
+    /// </summary>
+    private static SKImageFilter BuildFlood(IElement primitive, SKImageFilter? input)
+    {
+        var floodColorRaw = primitive.GetAttribute("flood-color");
+        var color = SvgColorParsing.TryParsePaint(string.IsNullOrWhiteSpace(floodColorRaw) ? "black" : floodColorRaw, out var parsed) ? parsed : SKColors.Black;
+
+        if (float.TryParse(primitive.GetAttribute("flood-opacity"), NumberStyles.Float, CultureInfo.InvariantCulture, out var floodOpacity))
+        {
+            color = color.WithAlpha((byte)Math.Round(color.Alpha * Math.Clamp(floodOpacity, 0f, 1f)));
+        }
+
+        using var colorFilter = SKColorFilter.CreateBlendMode(color, SKBlendMode.Src);
+        return SKImageFilter.CreateColorFilter(colorFilter, input);
+    }
+
+    /// <summary>
+    /// `feComposite` combines two inputs (`in` over/under `in2`, per the Porter-Duff `operator`,
+    /// or the `arithmetic` operator's own `k1..k4` formula) - the one primitive in this builder
+    /// that genuinely needs a *second* named input, so it bypasses the single-`in`-resolution
+    /// path <see cref="Build"/> uses for every other primitive, mirroring how `feMerge` already
+    /// needed to for the same reason.
+    /// </summary>
+    private static SKImageFilter BuildComposite(IElement primitive, Dictionary<string, SKImageFilter?> results, SKImageFilter? last)
+    {
+        var input = ResolveInput(primitive.GetAttribute("in"), results, last);
+        var input2 = ResolveInput(primitive.GetAttribute("in2"), results, last);
+        var op = primitive.GetAttribute("operator")?.Trim().ToLowerInvariant();
+
+        if (op == "arithmetic")
+        {
+            // SVG's own formula is `result = k1*i1*i2 + k2*i1 + k3*i2 + k4`, i1 = `in`
+            // (foreground), i2 = `in2` (background) - matching CreateArithmetic's own
+            // `k1*foreground*background + k2*foreground + k3*background + k4` exactly.
+            var k1 = ParseFloat(primitive.GetAttribute("k1"), 0f);
+            var k2 = ParseFloat(primitive.GetAttribute("k2"), 0f);
+            var k3 = ParseFloat(primitive.GetAttribute("k3"), 0f);
+            var k4 = ParseFloat(primitive.GetAttribute("k4"), 0f);
+            return SKImageFilter.CreateArithmetic(k1, k2, k3, k4, false, input2, input, null);
+        }
+
+        // `in` (Src) composites *over*/*in*/*out*/*atop*/*xor* `in2` (Dst) - Skia's own
+        // background/foreground blend-mode convention maps directly onto Dst/Src.
+        var blendMode = op switch
+        {
+            "in" => SKBlendMode.SrcIn,
+            "out" => SKBlendMode.SrcOut,
+            "atop" => SKBlendMode.SrcATop,
+            "xor" => SKBlendMode.Xor,
+            _ => SKBlendMode.SrcOver,
+        };
+
+        return SKImageFilter.CreateBlendMode(blendMode, input2, input, null);
+    }
+
+    /// <summary>
+    /// `feMorphology` grows (`dilate`, the default) or shrinks (`erode`) the input's own opaque
+    /// region by `radius` - both map directly onto Skia's own identically-named filters.
+    /// </summary>
+    private static SKImageFilter BuildMorphology(IElement primitive, SKImageFilter? input)
+    {
+        var (radiusX, radiusY) = ParseStdDeviation(primitive.GetAttribute("radius"), defaultValue: 0f);
+        var isErode = string.Equals(primitive.GetAttribute("operator")?.Trim(), "erode", StringComparison.OrdinalIgnoreCase);
+
+        return isErode
+            ? SKImageFilter.CreateErode(radiusX, radiusY, input)
+            : SKImageFilter.CreateDilate(radiusX, radiusY, input);
+    }
+
+    /// <summary>
+    /// `feComponentTransfer` remaps each color channel independently through its own
+    /// `feFuncR`/`feFuncG`/`feFuncB`/`feFuncA` sub-function - only `type="linear"` (`slope`/
+    /// `intercept`, a per-channel scale-and-offset) is implemented, since it maps directly onto a
+    /// single diagonal entry (and its own offset column) of the same color-matrix machinery
+    /// `feColorMatrix` already established above; `table`/`discrete`/`gamma` would each need their
+    /// own genuinely different per-pixel lookup/curve evaluation this renderer does not implement,
+    /// so a sub-function using one of those is simply left as the identity transform for that
+    /// channel (matching this builder's general "leave unsupported constructs as a no-op rather
+    /// than breaking the chain" policy).
+    /// </summary>
+    private static SKImageFilter BuildComponentTransfer(IElement primitive, SKImageFilter? input)
+    {
+        var matrix = (float[])IdentityMatrix.Clone();
+
+        foreach (var functionNode in primitive.Children)
+        {
+            var channelIndex = functionNode.LocalName.ToLowerInvariant() switch
+            {
+                "fefuncr" => 0,
+                "fefuncg" => 1,
+                "fefuncb" => 2,
+                "fefunca" => 3,
+                _ => -1,
+            };
+
+            if (channelIndex < 0 || !string.Equals(functionNode.GetAttribute("type")?.Trim(), "linear", StringComparison.OrdinalIgnoreCase))
+            {
+                continue;
+            }
+
+            var slope = ParseFloat(functionNode.GetAttribute("slope"), 1f);
+            var intercept = ParseFloat(functionNode.GetAttribute("intercept"), 0f);
+
+            matrix[(channelIndex * 5) + channelIndex] = slope;
+            // The matrix's own offset column already operates in 0-255 space (see IdentityMatrix/
+            // LuminanceToAlphaMatrix, whose own offsets are always 0) - `intercept` is SVG's
+            // 0-1 fraction of full range, so it is scaled up to match.
+            matrix[(channelIndex * 5) + 4] = intercept * 255f;
+        }
+
+        using var colorFilter = SKColorFilter.CreateColorMatrix(matrix);
+        return SKImageFilter.CreateColorFilter(colorFilter, input);
     }
 
     private static (float SigmaX, float SigmaY) ParseStdDeviation(string? value, float defaultValue = 2f)

@@ -54,6 +54,147 @@ public sealed class HtmlRendererTests
         Assert.NotEmpty(imageCommand.Image.Data);
     }
 
+    private const string OnePixelPng = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAACklEQVR4nGMAAQABAA4A4cQTmwAAAABJRU5ErkJggg==";
+
+    [Fact]
+    public async Task BuildDisplayList_ObjectFitContainLetterboxesTheImageWithinItsBox()
+    {
+        var document = await ParseAsync($"""
+            <html><body>
+                <img src="{OnePixelPng}" style="width:40px; height:20px; object-fit:contain;" />
+            </body></html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, new DefaultRenderDevice
+        {
+            ViewPortWidth = 240,
+            ViewPortHeight = 160,
+            FontSize = 16f,
+        });
+
+        var imageCommand = Assert.Single(displayList.Commands.OfType<DrawImageCommand>());
+
+        // A 1x1 natural image scaled to `contain` within a 40x20 box uses the smaller axis
+        // (height), so it ends up 20x20 - centered, leaving 10px of empty space on each side.
+        Assert.Equal(20f, imageCommand.Rect.Width, precision: 2);
+        Assert.Equal(20f, imageCommand.Rect.Height, precision: 2);
+        Assert.Equal(10f, imageCommand.Rect.X, precision: 2);
+        Assert.Equal(0f, imageCommand.Rect.Y, precision: 2);
+
+        // Fits entirely within the box - no clipping needed.
+        Assert.Empty(displayList.Commands.OfType<PushClipCommand>());
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_ObjectFitCoverFillsTheBoxAndClipsTheOverflow()
+    {
+        var document = await ParseAsync($"""
+            <html><body>
+                <img src="{OnePixelPng}" style="width:40px; height:20px; object-fit:cover;" />
+            </body></html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, new DefaultRenderDevice
+        {
+            ViewPortWidth = 240,
+            ViewPortHeight = 160,
+            FontSize = 16f,
+        });
+
+        var imageCommand = Assert.Single(displayList.Commands.OfType<DrawImageCommand>());
+
+        // `cover` scales up to the larger axis (width), so the 1x1 image becomes 40x40 - centered
+        // vertically, meaning it overflows the 20px-tall box by 10px on the top and bottom.
+        Assert.Equal(40f, imageCommand.Rect.Width, precision: 2);
+        Assert.Equal(40f, imageCommand.Rect.Height, precision: 2);
+        Assert.Equal(0f, imageCommand.Rect.X, precision: 2);
+        Assert.Equal(-10f, imageCommand.Rect.Y, precision: 2);
+
+        // Overflows the box - must clip to the box bounds so the image does not bleed into
+        // whatever content sits above/below it.
+        var clip = Assert.Single(displayList.Commands.OfType<PushClipCommand>());
+        Assert.Equal(40f, clip.Rect.Width, precision: 2);
+        Assert.Equal(20f, clip.Rect.Height, precision: 2);
+        Assert.Single(displayList.Commands.OfType<PopClipCommand>());
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_ObjectFitNoneUsesNaturalSizeCenteredInTheBox()
+    {
+        var document = await ParseAsync($"""
+            <html><body>
+                <img src="{OnePixelPng}" style="width:40px; height:20px; object-fit:none;" />
+            </body></html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, new DefaultRenderDevice
+        {
+            ViewPortWidth = 240,
+            ViewPortHeight = 160,
+            FontSize = 16f,
+        });
+
+        var imageCommand = Assert.Single(displayList.Commands.OfType<DrawImageCommand>());
+
+        Assert.Equal(1f, imageCommand.Rect.Width, precision: 2);
+        Assert.Equal(1f, imageCommand.Rect.Height, precision: 2);
+        Assert.Equal(19.5f, imageCommand.Rect.X, precision: 2);
+        Assert.Equal(9.5f, imageCommand.Rect.Y, precision: 2);
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_ObjectFitScaleDownPicksTheSmallerOfNoneAndContain()
+    {
+        var document = await ParseAsync($"""
+            <html><body>
+                <img src="{OnePixelPng}" style="width:40px; height:20px; object-fit:scale-down;" />
+            </body></html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, new DefaultRenderDevice
+        {
+            ViewPortWidth = 240,
+            ViewPortHeight = 160,
+            FontSize = 16f,
+        });
+
+        var imageCommand = Assert.Single(displayList.Commands.OfType<DrawImageCommand>());
+
+        // `contain` would scale the 1x1 image up to 20x20; `none` keeps it at its natural 1x1 -
+        // `scale-down` picks whichever is smaller, which is `none` here.
+        Assert.Equal(1f, imageCommand.Rect.Width, precision: 2);
+        Assert.Equal(1f, imageCommand.Rect.Height, precision: 2);
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_ObjectPositionMovesTheFocalPointWithinTheBox()
+    {
+        var document = await ParseAsync($"""
+            <html><body>
+                <img src="{OnePixelPng}" style="width:40px; height:20px; object-fit:contain; object-position: left top;" />
+            </body></html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, new DefaultRenderDevice
+        {
+            ViewPortWidth = 240,
+            ViewPortHeight = 160,
+            FontSize = 16f,
+        });
+
+        var imageCommand = Assert.Single(displayList.Commands.OfType<DrawImageCommand>());
+
+        // `object-position: left top` anchors the (still 20x20, contain-scaled) image to the
+        // box's own top-left corner instead of centering it.
+        Assert.Equal(0f, imageCommand.Rect.X, precision: 2);
+        Assert.Equal(0f, imageCommand.Rect.Y, precision: 2);
+    }
+
     [Fact]
     public async Task BuildDisplayList_CachesHttpImagePayloadPerDocument()
     {
@@ -333,6 +474,33 @@ public sealed class HtmlRendererTests
     }
 
     [Fact]
+    public async Task BuildDisplayList_AspectRatioDerivesWidthFromExplicitHeightWhenWidthIsAuto()
+    {
+        var document = await ParseAsync("""
+            <html><body>
+                <div style="height:100px; aspect-ratio:2 / 1; background-color:#112233;"></div>
+            </body></html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, new DefaultRenderDevice
+        {
+            ViewPortWidth = 500,
+            ViewPortHeight = 360,
+            FontSize = 16f,
+        });
+
+        // Width is unset (auto) and would otherwise fill the whole container - but with an
+        // explicit height and a 2:1 aspect-ratio, the used width must be derived from the height
+        // (200px), not stretched to the container's own width.
+        var fill = Assert.Single(displayList.Commands.OfType<FillRectCommand>()
+            .Where(command => command.Color.Equals(new RenderColor(0x11, 0x22, 0x33))));
+
+        Assert.Equal(200f, fill.Rect.Width);
+        Assert.Equal(100f, fill.Rect.Height);
+    }
+
+    [Fact]
     public async Task BuildDisplayList_PaintsInlineSvgAsReplacedElement()
     {
         var document = await ParseAsync("""
@@ -592,6 +760,129 @@ public sealed class HtmlRendererTests
         Assert.True(textCommands.Length >= 2);
         Assert.True(textCommands[0].X > 0f);
         Assert.True(textCommands[1].Y - textCommands[0].Y >= 20f);
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_DirectionRtlReversesWordOrderWithinALine()
+    {
+        var document = await ParseAsync("""
+            <html><body>
+                <div style="direction:rtl; width:300px;">one two three</div>
+            </body></html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, new DefaultRenderDevice
+        {
+            ViewPortWidth = 400,
+            ViewPortHeight = 120,
+            FontSize = 16f,
+        });
+
+        var text = Assert.Single(displayList.Commands.OfType<DrawTextCommand>());
+
+        // Word order reversed - the first logical word ("one") ends up rightmost, matching the
+        // visual order a real browser lays a pure-RTL paragraph out in.
+        Assert.Equal("three two one", text.Text);
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_DirectionLtrDoesNotReverseWordOrder()
+    {
+        var document = await ParseAsync("""
+            <html><body>
+                <div style="direction:ltr; width:300px;">one two three</div>
+            </body></html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, new DefaultRenderDevice
+        {
+            ViewPortWidth = 400,
+            ViewPortHeight = 120,
+            FontSize = 16f,
+        });
+
+        var text = Assert.Single(displayList.Commands.OfType<DrawTextCommand>());
+        Assert.Equal("one two three", text.Text);
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_DirectionIsInheritedByChildElements()
+    {
+        var document = await ParseAsync("""
+            <html><body>
+                <div style="direction:rtl;"><p>one two three</p></div>
+            </body></html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, new DefaultRenderDevice
+        {
+            ViewPortWidth = 400,
+            ViewPortHeight = 120,
+            FontSize = 16f,
+        });
+
+        var text = Assert.Single(displayList.Commands.OfType<DrawTextCommand>());
+        Assert.Equal("three two one", text.Text);
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_UnsetTextAlignDefaultsToRightUnderRtlDirection()
+    {
+        var document = await ParseAsync("""
+            <html><body>
+                <div style="direction:rtl; width:200px;">hi</div>
+            </body></html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, new DefaultRenderDevice
+        {
+            ViewPortWidth = 400,
+            ViewPortHeight = 120,
+            FontSize = 16f,
+        });
+
+        var text = Assert.Single(displayList.Commands.OfType<DrawTextCommand>());
+
+        // `text-align`'s own CSS initial value is `start`, which resolves to `right` under
+        // `direction: rtl` - the text should hug the box's right edge, not its left.
+        Assert.True(text.X > 100f);
+    }
+
+    [Theory]
+    [InlineData("ltr", "start", false)]
+    [InlineData("ltr", "end", true)]
+    [InlineData("rtl", "start", true)]
+    [InlineData("rtl", "end", false)]
+    public async Task BuildDisplayList_TextAlignStartAndEndResolveAgainstDirection(string direction, string textAlign, bool expectRightAligned)
+    {
+        var document = await ParseAsync($"""
+            <html><body>
+                <div style="direction:{direction}; text-align:{textAlign}; width:200px;">hi</div>
+            </body></html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, new DefaultRenderDevice
+        {
+            ViewPortWidth = 400,
+            ViewPortHeight = 120,
+            FontSize = 16f,
+        });
+
+        var text = Assert.Single(displayList.Commands.OfType<DrawTextCommand>());
+
+        if (expectRightAligned)
+        {
+            Assert.True(text.X > 100f);
+        }
+        else
+        {
+            Assert.True(text.X < 20f);
+        }
     }
 
     [Fact]
@@ -1298,6 +1589,86 @@ public sealed class HtmlRendererTests
     }
 
     [Fact]
+    public async Task BuildDisplayList_RepeatAutoFillComputesFillCountFromAvailableSpace()
+    {
+        var document = await ParseAsync("""
+            <html><body>
+                <div style="display:grid; grid-template-columns:repeat(auto-fill, minmax(100px, 1fr)); gap:10px; width:220px; height:20px;">
+                    <div style="height:20px; background-color:#ff0000;"></div>
+                    <div style="height:20px; background-color:#0000ff;"></div>
+                </div>
+            </body></html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, new DefaultRenderDevice
+        {
+            ViewPortWidth = 300,
+            ViewPortHeight = 120,
+            FontSize = 16f,
+        });
+
+        var childBackgrounds = displayList.Commands
+            .OfType<FillRectCommand>()
+            .Where(command => command.Rect.Height == 20f && command.Rect.Width < 220f)
+            .OrderBy(command => command.Rect.X)
+            .ToArray();
+
+        // 220px available, 10px gap, 100px minimum track: floor((220+10)/(100+10)) = 2 tracks fit,
+        // each stretched to fill the 1fr maximum (105px, splitting the 210px left after one gap).
+        Assert.Equal(2, childBackgrounds.Length);
+        Assert.Equal(0f, childBackgrounds[0].Rect.X);
+        Assert.Equal(105f, childBackgrounds[0].Rect.Width, precision: 2);
+        Assert.Equal(115f, childBackgrounds[1].Rect.X, precision: 2);
+        Assert.Equal(105f, childBackgrounds[1].Rect.Width, precision: 2);
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_RepeatAutoFitCollapsesEmptyTrailingTracksButAutoFillKeepsThem()
+    {
+        async Task<float[]> RenderColumnWidthsAsync(string repeatKeyword)
+        {
+            var document = await ParseAsync($$"""
+                <html><body>
+                    <div style="display:grid; grid-template-columns:repeat({{repeatKeyword}}, minmax(100px, 1fr)); gap:10px; width:320px; height:20px;">
+                        <div style="height:20px; background-color:#ff0000;"></div>
+                        <div style="height:20px; background-color:#0000ff;"></div>
+                    </div>
+                </body></html>
+                """);
+
+            var renderer = new HtmlRenderer();
+            var displayList = renderer.BuildDisplayList(document, new DefaultRenderDevice
+            {
+                ViewPortWidth = 400,
+                ViewPortHeight = 120,
+                FontSize = 16f,
+            });
+
+            return displayList.Commands
+                .OfType<FillRectCommand>()
+                .Where(command => command.Rect.Height == 20f && command.Rect.Width < 320f)
+                .OrderBy(command => command.Rect.X)
+                .Select(command => command.Rect.Width)
+                .ToArray();
+        }
+
+        // 320px available, 10px gap, 100px minimum: floor((320+10)/110) = 3 tracks would fit, but
+        // only 2 items are actually placed. auto-fit collapses the empty trailing track away
+        // entirely, so the 2 real items split the full width between just themselves; auto-fill
+        // keeps all 3 tracks (and their gaps) reserved, leaving each item's track narrower.
+        var autoFitWidths = await RenderColumnWidthsAsync("auto-fit");
+        var autoFillWidths = await RenderColumnWidthsAsync("auto-fill");
+
+        Assert.Equal(2, autoFitWidths.Length);
+        Assert.All(autoFitWidths, width => Assert.Equal(155f, width, precision: 2));
+
+        Assert.Equal(2, autoFillWidths.Length);
+        Assert.All(autoFillWidths, width => Assert.True(width < 155f));
+    }
+
+
+    [Fact]
     public async Task BuildDisplayList_ClampsAutoTrackToItsMinMaxLengthBounds()
     {
         var document = await ParseAsync("""
@@ -1685,10 +2056,20 @@ public sealed class HtmlRendererTests
             FontSize = 16f,
         });
 
-        // The span's own text stays a single, unwrapped DrawText command despite the 80px-wide
-        // container - without `nowrap` this would have been split across several wrapped lines.
-        var run = Assert.Single(displayList.Commands.OfType<DrawTextCommand>().Where(t => t.Text.Contains("nowrap")));
-        Assert.Equal("a long run of nowrap text", run.Text);
+        // The span is correctly inline (see BuildDisplayList_PlainSemanticInlineElementSharesTheLineWithSiblingText
+        // for the bug this depends on being fixed) and shares the line with "before"/"after" -
+        // `white-space: nowrap` only ever means "do not wrap", not "paint as a single atomic
+        // run", so this renderer's ordinary word-by-word inline-run painting still applies: every
+        // word of the nowrap span stays on the same line as "before" (and each other) rather than
+        // wrapping to a new one despite the 80px-wide container, which a `nowrap` word normally
+        // would trigger.
+        var beforeWord = Assert.Single(displayList.Commands.OfType<DrawTextCommand>().Where(t => t.Text == "before"));
+        var nowrapWords = displayList.Commands.OfType<DrawTextCommand>()
+            .Where(t => t.Text is "a" or "long" or "run" or "of" or "nowrap" or "text")
+            .ToList();
+
+        Assert.Equal(6, nowrapWords.Count);
+        Assert.All(nowrapWords, word => Assert.Equal(beforeWord.Y, word.Y));
     }
 
     [Fact]
@@ -1748,12 +2129,18 @@ public sealed class HtmlRendererTests
             FontSize = 16f,
         });
 
-        // The child <span> has no white-space of its own, so it inherits `pre` from its parent - a
-        // single all-inline child with no plain-text siblings routes through the same leaf-text
-        // shortcut a lone inline element with only text content already uses elsewhere in
-        // LayoutNode (the one LayoutWrappedText itself goes through), preserving the run verbatim.
-        var text = Assert.Single(displayList.Commands.OfType<DrawTextCommand>());
-        Assert.Equal("a    b", text.Text);
+        // The child <span> has no white-space of its own, so it inherits `pre` from its parent -
+        // but a <span> is a genuinely inline element (see
+        // BuildDisplayList_PlainSemanticInlineElementSharesTheLineWithSiblingText for the bug that
+        // fixes), so its content is now correctly laid out through the parent's ordinary merged
+        // inline-run painter rather than being misidentified as its own block-level box. That
+        // painter's own word-by-word model has no multi-space-preservation support of its own (a
+        // separate, still-standing, documented scope cut - see LayoutInlineTextRun's own remarks) -
+        // "a" and "b" are painted as two separate words rather than a single run with the interior
+        // whitespace preserved verbatim, but critically both still honor the *inherited* `pre`
+        // value rather than silently falling back to `normal`.
+        var words = displayList.Commands.OfType<DrawTextCommand>().Select(t => t.Text).ToArray();
+        Assert.Equal(["a", "b"], words);
     }
 
     [Fact]
@@ -1822,6 +2209,138 @@ public sealed class HtmlRendererTests
         Assert.Equal((byte)'P', image.Data[1]);
         Assert.Equal((byte)'N', image.Data[2]);
         Assert.Equal((byte)'G', image.Data[3]);
+    }
+
+    [Fact]
+    public async Task RenderToPng_SvgFeFloodFillsTheShapeWithTheFloodColor()
+    {
+        var document = await ParseAsync("""
+            <html><body>
+                <svg width="60" height="60" viewBox="0 0 60 60">
+                    <defs>
+                        <filter id="f" x="0" y="0" width="100%" height="100%">
+                            <feFlood flood-color="rgb(0,255,0)"></feFlood>
+                        </filter>
+                    </defs>
+                    <circle cx="30" cy="30" r="20" fill="rgb(255,0,0)" filter="url(#f)"></circle>
+                </svg>
+            </body></html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var image = renderer.RenderToPng(document, new DefaultRenderDevice { ViewPortWidth = 60, ViewPortHeight = 60 });
+
+        using var bitmap = SkiaSharp.SKBitmap.Decode(image.Data);
+        var pixel = bitmap.GetPixel(30, 30);
+
+        // The circle's own red fill is replaced entirely by the flood's green color.
+        Assert.Equal(0, pixel.Red);
+        Assert.True(pixel.Green > 200);
+    }
+
+    [Fact]
+    public async Task RenderToPng_SvgFeCompositeInOperatorIntersectsTwoShapes()
+    {
+        var document = await ParseAsync("""
+            <html><body>
+                <svg width="60" height="60" viewBox="0 0 60 60">
+                    <defs>
+                        <filter id="f" x="0" y="0" width="100%" height="100%">
+                            <feFlood flood-color="rgb(0,0,255)" result="flood"></feFlood>
+                            <feComposite in="flood" in2="SourceGraphic" operator="in"></feComposite>
+                        </filter>
+                    </defs>
+                    <circle cx="30" cy="30" r="20" fill="rgb(255,0,0)" filter="url(#f)"></circle>
+                </svg>
+            </body></html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var image = renderer.RenderToPng(document, new DefaultRenderDevice { ViewPortWidth = 60, ViewPortHeight = 60 });
+
+        using var bitmap = SkiaSharp.SKBitmap.Decode(image.Data);
+
+        // Inside the circle: the flood's blue "in" the circle's own coverage - blue shows through.
+        var inside = bitmap.GetPixel(30, 30);
+        Assert.True(inside.Blue > 200);
+
+        // Outside the circle (but still within the viewport): neither the flood nor the circle
+        // has any coverage there, so it stays the page's own white background.
+        var outside = bitmap.GetPixel(2, 2);
+        Assert.Equal(255, outside.Red);
+        Assert.Equal(255, outside.Green);
+        Assert.Equal(255, outside.Blue);
+    }
+
+    [Fact]
+    public async Task RenderToPng_SvgFeMorphologyDilateGrowsTheShape()
+    {
+        async Task<int> MeasureShapeWidthAsync(string? filterAttribute)
+        {
+            var document = await ParseAsync($"""
+                <html><body>
+                    <svg width="100" height="60" viewBox="0 0 100 60">
+                        <defs>
+                            <filter id="f" x="-50%" y="-50%" width="200%" height="200%">
+                                <feMorphology operator="dilate" radius="8"></feMorphology>
+                            </filter>
+                        </defs>
+                        <rect x="40" y="20" width="20" height="20" fill="rgb(0,0,0)"{filterAttribute}></rect>
+                    </svg>
+                </body></html>
+                """);
+
+            var renderer = new HtmlRenderer();
+            var image = renderer.RenderToPng(document, new DefaultRenderDevice { ViewPortWidth = 100, ViewPortHeight = 60 });
+            using var bitmap = SkiaSharp.SKBitmap.Decode(image.Data);
+
+            var width = 0;
+            for (var x = 0; x < bitmap.Width; x++)
+            {
+                if (bitmap.GetPixel(x, 30).Red < 128)
+                {
+                    width++;
+                }
+            }
+
+            return width;
+        }
+
+        var plainWidth = await MeasureShapeWidthAsync(null);
+        var dilatedWidth = await MeasureShapeWidthAsync(" filter=\"url(#f)\"");
+
+        // A 20px-wide rect dilated by an 8px radius grows to roughly 20+2*8=36px wide.
+        Assert.True(dilatedWidth > plainWidth);
+    }
+
+    [Fact]
+    public async Task RenderToPng_SvgFeComponentTransferLinearScalesAChannel()
+    {
+        var document = await ParseAsync("""
+            <html><body>
+                <svg width="40" height="40" viewBox="0 0 40 40">
+                    <defs>
+                        <filter id="f" x="0" y="0" width="100%" height="100%">
+                            <feComponentTransfer>
+                                <feFuncR type="linear" slope="0.5" intercept="0"></feFuncR>
+                            </feComponentTransfer>
+                        </filter>
+                    </defs>
+                    <rect x="0" y="0" width="40" height="40" fill="rgb(200,0,0)" filter="url(#f)"></rect>
+                </svg>
+            </body></html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var image = renderer.RenderToPng(document, new DefaultRenderDevice { ViewPortWidth = 40, ViewPortHeight = 40 });
+
+        using var bitmap = SkiaSharp.SKBitmap.Decode(image.Data);
+        var pixel = bitmap.GetPixel(20, 20);
+
+        // slope=0.5 halves the red channel (200 -> ~100); green/blue are untouched (still 0).
+        Assert.InRange(pixel.Red, 90, 110);
+        Assert.Equal(0, pixel.Green);
+        Assert.Equal(0, pixel.Blue);
     }
 
     [Fact]
@@ -2152,6 +2671,64 @@ public sealed class HtmlRendererTests
 
         Assert.Equal(redFill.Rect.Y, greenFill.Rect.Y);
         Assert.Equal(redFill.Rect.X + redFill.Rect.Width, greenFill.Rect.X);
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_PlainSemanticInlineElementSharesTheLineWithSiblingText()
+    {
+        // A plain, zero-CSS <b> (and any other standard semantic inline tag) computes an empty
+        // `display` from AngleSharp.Css - `inline` is CSS's own initial value, so nothing ever
+        // needs to set it explicitly - which a previous version of this renderer's `display`-unset
+        // fallback misread as "block-level" for every tag except <code>. That, in turn, made the
+        // parent's "merge onto a shared line" detection never trigger, so "World" rendered on its
+        // own separate line below "Hello" instead of continuing on the same one beside it.
+        var document = await ParseAsync("""
+            <html><body>
+                <p>Hello <b>World</b></p>
+            </body></html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, new DefaultRenderDevice
+        {
+            ViewPortWidth = 300,
+            ViewPortHeight = 200,
+            FontSize = 16f,
+        });
+
+        var hello = Assert.Single(displayList.Commands.OfType<DrawTextCommand>().Where(t => t.Text == "Hello"));
+        var world = Assert.Single(displayList.Commands.OfType<DrawTextCommand>().Where(t => t.Text == "World"));
+
+        Assert.Equal(hello.Y, world.Y);
+        Assert.True(world.X > hello.X);
+    }
+
+    [Theory]
+    [InlineData("span")]
+    [InlineData("strong")]
+    [InlineData("em")]
+    [InlineData("i")]
+    [InlineData("u")]
+    public async Task BuildDisplayList_OtherPlainSemanticInlineTagsAlsoShareTheLineWithSiblingText(string tagName)
+    {
+        var document = await ParseAsync($"""
+            <html><body>
+                <p>Hello <{tagName}>World</{tagName}></p>
+            </body></html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, new DefaultRenderDevice
+        {
+            ViewPortWidth = 300,
+            ViewPortHeight = 200,
+            FontSize = 16f,
+        });
+
+        var hello = Assert.Single(displayList.Commands.OfType<DrawTextCommand>().Where(t => t.Text == "Hello"));
+        var world = Assert.Single(displayList.Commands.OfType<DrawTextCommand>().Where(t => t.Text == "World"));
+
+        Assert.Equal(hello.Y, world.Y);
     }
 
     [Fact]
@@ -4186,6 +4763,54 @@ public sealed class HtmlRendererTests
         Assert.Null(push);
     }
 
+    [Fact]
+    public async Task BuildDisplayList_AnimationPlayStatePausedFreezesProgressAndResumesFromTheSamePosition()
+    {
+        var renderDevice = new DefaultRenderDevice { ViewPortWidth = 200, ViewPortHeight = 100, FontSize = 16 };
+        var configuration = Configuration.Default.WithCss().WithRenderDevice(renderDevice);
+        var document = await ParseAsync("""
+            <html><head><style>
+                html, body { margin: 0; padding: 0; }
+                @keyframes fade {
+                    0% { opacity: 0; }
+                    100% { opacity: 1; }
+                }
+                #target { width: 40px; height: 40px; background-color: rgb(0, 0, 255); animation: fade 1s linear; }
+            </style></head><body>
+                <div id="target"></div>
+            </body></html>
+            """, configuration);
+        var harness = document.Context.GetDomHarness();
+        var target = document.GetElementById("target")!;
+        var renderer = new HtmlRenderer();
+
+        float CurrentAlpha()
+        {
+            var displayList = renderer.BuildDisplayList(document, renderDevice);
+            var push = displayList.Commands.OfType<PushOpacityCommand>().SingleOrDefault();
+            return push?.Alpha ?? 1f;
+        }
+
+        harness.AdvanceTime(TimeSpan.FromMilliseconds(500));
+        Assert.Equal(0.5f, CurrentAlpha(), precision: 2);
+
+        // Pausing must freeze progress exactly where it was - further time passing while paused
+        // must not advance (or, since the animation would otherwise have finished with no
+        // fill-mode, revert) the interpolated value at all.
+        target.SetAttribute("style", "animation-play-state: paused;");
+        harness.AdvanceTime(TimeSpan.FromMilliseconds(2000));
+        Assert.Equal(0.5f, CurrentAlpha(), precision: 2);
+
+        // Resuming must continue from that same 50% position, not restart from 0% nor jump to
+        // wherever the un-paused virtual clock would otherwise place it.
+        target.SetAttribute("style", "animation-play-state: running;");
+        harness.AdvanceTime(TimeSpan.FromMilliseconds(250));
+        Assert.Equal(0.75f, CurrentAlpha(), precision: 2);
+
+        harness.AdvanceTime(TimeSpan.FromMilliseconds(250));
+        Assert.Equal(1f, CurrentAlpha(), precision: 2);
+    }
+
     [Theory]
     [InlineData("text")]
     [InlineData("number")]
@@ -4362,6 +4987,91 @@ public sealed class HtmlRendererTests
     }
 
     [Fact]
+    public async Task BuildDisplayList_UnfocusedTextAreaPaintsNoCaret()
+    {
+        var document = await ParseAsync("""<html><body><textarea>Hello</textarea></body></html>""");
+
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, new DefaultRenderDevice
+        {
+            ViewPortWidth = 300,
+            ViewPortHeight = 100,
+            FontSize = 16f,
+        });
+
+        Assert.DoesNotContain(displayList.Commands, c => c is FillRectCommand f && f.Rect.Width == 1.5f);
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_FocusedTextAreaPaintsACaretOnTheLastWrappedLine()
+    {
+        var document = await ParseAsync("""<html><body><textarea id="target" style="width:100px;">one two three four five</textarea></body></html>""");
+        var target = (IHtmlElement)document.GetElementById("target")!;
+        target.DoFocus();
+
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, new DefaultRenderDevice
+        {
+            ViewPortWidth = 300,
+            ViewPortHeight = 100,
+            FontSize = 16f,
+        });
+
+        var caret = Assert.Single(displayList.Commands.OfType<FillRectCommand>().Where(f => f.Rect.Width == 1.5f));
+        var textCommands = displayList.Commands.OfType<DrawTextCommand>().OrderBy(t => t.Y).ToList();
+
+        Assert.True(textCommands.Count > 1);
+
+        // The caret sits on the last wrapped line, below where the first line was painted - not
+        // pinned to the first line's own baseline.
+        Assert.True(caret.Rect.Y > textCommands[0].Y);
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_FocusedEmptyTextAreaPaintsACaretAtItsContentEdge()
+    {
+        var document = await ParseAsync("""<html><body><textarea id="target"></textarea></body></html>""");
+        var target = (IHtmlElement)document.GetElementById("target")!;
+        target.DoFocus();
+
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, new DefaultRenderDevice
+        {
+            ViewPortWidth = 300,
+            ViewPortHeight = 100,
+            FontSize = 16f,
+        });
+
+        Assert.Single(displayList.Commands.OfType<FillRectCommand>().Where(f => f.Rect.Width == 1.5f));
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_FocusedTextAreaWithTrailingNewlineMovesCaretToANewEmptyLine()
+    {
+        var document = await ParseAsync("""
+            <html><body><textarea id="target">Hi
+            </textarea></body></html>
+            """);
+        var target = (IHtmlElement)document.GetElementById("target")!;
+        target.DoFocus();
+
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, new DefaultRenderDevice
+        {
+            ViewPortWidth = 300,
+            ViewPortHeight = 100,
+            FontSize = 16f,
+        });
+
+        var caret = Assert.Single(displayList.Commands.OfType<FillRectCommand>().Where(f => f.Rect.Width == 1.5f));
+        var hiText = Assert.Single(displayList.Commands.OfType<DrawTextCommand>().Where(t => t.Text == "Hi"));
+
+        // The trailing newline pushes the caret down onto its own, empty second line rather than
+        // leaving it right after "Hi" on the first line.
+        Assert.True(caret.Rect.Y > hiText.Y);
+    }
+
+    [Fact]
     public async Task BuildDisplayList_FocusedEmptyTextInputPaintsCaretAtTheContentEdge()
     {
         var document = await ParseAsync("""<html><body><input id="target" type="text" /></body></html>""");
@@ -4415,6 +5125,76 @@ public sealed class HtmlRendererTests
 
         harness.AdvanceTime(TimeSpan.FromMilliseconds(250));
         Assert.Equal(255, CurrentCaretAlpha());
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_RangeInputPaintsATrackAndAThumbPositionedByValue()
+    {
+        var document = await ParseAsync("""<html><body><input type="range" min="0" max="100" value="25" style="width:100px;" /></body></html>""");
+
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, new DefaultRenderDevice
+        {
+            ViewPortWidth = 300,
+            ViewPortHeight = 100,
+            FontSize = 16f,
+        });
+
+        // The track: a thin, rounded gray bar spanning the control's own width.
+        var track = Assert.Single(displayList.Commands.OfType<FillRectCommand>()
+            .Where(command => command.Rect.Width == 100f));
+        Assert.False(track.Radii.IsZero);
+
+        // The thumb: a small rounded square, its center at 25% along the track for value=25 out
+        // of a 0-100 range.
+        var thumb = Assert.Single(displayList.Commands.OfType<FillRectCommand>()
+            .Where(command => command.Rect.Width < 100f && !command.Rect.Width.Equals(track.Rect.Width)));
+        var thumbCenterX = thumb.Rect.X + (thumb.Rect.Width / 2f);
+        Assert.Equal(25f, thumbCenterX, precision: 1);
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_RangeInputDefaultsToTheMidpointWhenValueIsUnset()
+    {
+        var document = await ParseAsync("""<html><body><input type="range" style="width:100px;" /></body></html>""");
+
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, new DefaultRenderDevice
+        {
+            ViewPortWidth = 300,
+            ViewPortHeight = 100,
+            FontSize = 16f,
+        });
+
+        var track = Assert.Single(displayList.Commands.OfType<FillRectCommand>().Where(c => c.Rect.Width == 100f));
+        var thumb = Assert.Single(displayList.Commands.OfType<FillRectCommand>().Where(c => c.Rect.Width < 100f && !c.Rect.Width.Equals(track.Rect.Width)));
+        var thumbCenterX = thumb.Rect.X + (thumb.Rect.Width / 2f);
+
+        // No `value` authored - defaults to the (min+max)/2 midpoint (0-100 default range), so
+        // the thumb sits at 50% along the track.
+        Assert.Equal(50f, thumbCenterX, precision: 1);
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_FileInputGetsButtonLikeChromeAndAFixedLabel()
+    {
+        var document = await ParseAsync("""<html><body><input type="file" /></body></html>""");
+
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, new DefaultRenderDevice
+        {
+            ViewPortWidth = 300,
+            ViewPortHeight = 100,
+            FontSize = 16f,
+        });
+
+        var label = Assert.Single(displayList.Commands.OfType<DrawTextCommand>().Where(t => t.Text == "Choose File"));
+        Assert.NotNull(label);
+
+        // Button-like default chrome: a gray background box, matching FormControlKind.Button.
+        var background = Assert.Single(displayList.Commands.OfType<FillRectCommand>()
+            .Where(command => command.Color.Equals(new RenderColor(0xe8, 0xe8, 0xe8))));
+        Assert.True(background.Rect.Width > 0f);
     }
 
     [Fact]
@@ -4908,6 +5688,97 @@ public sealed class HtmlRendererTests
     }
 
     [Fact]
+    public async Task BuildDisplayList_RotateYProducesAnOrthographicHorizontalSquash()
+    {
+        // Without a `perspective` in effect, this renderer flattens a 3D transform to 2D by
+        // evaluating its already-general matrix at z=0 and discarding the z-output - which for
+        // rotateY(theta) (rotation around the vertical axis) works out to a pure horizontal scale
+        // by cos(theta), with no foreshortening (matching how a browser renders 3D transforms with
+        // no perspective ancestor: an orthographic, not a perspective, projection).
+        var document = await ParseAsync("""
+            <html><body>
+                <div style="width:40px; height:20px; transform: rotateY(60deg);"></div>
+            </body></html>
+            """);
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, new DefaultRenderDevice { ViewPortWidth = 200, ViewPortHeight = 200 });
+        var t = Assert.Single(displayList.Commands.OfType<PushTransformCommand>()).Transform;
+
+        Assert.Equal(0.5f, t.A, precision: 2);
+        Assert.Equal(0f, t.B, precision: 2);
+        Assert.Equal(0f, t.C, precision: 2);
+        Assert.Equal(1f, t.D, precision: 2);
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_RotateXProducesAnOrthographicVerticalSquash()
+    {
+        var document = await ParseAsync("""
+            <html><body>
+                <div style="width:40px; height:20px; transform: rotateX(60deg);"></div>
+            </body></html>
+            """);
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, new DefaultRenderDevice { ViewPortWidth = 200, ViewPortHeight = 200 });
+        var t = Assert.Single(displayList.Commands.OfType<PushTransformCommand>()).Transform;
+
+        Assert.Equal(1f, t.A, precision: 2);
+        Assert.Equal(0f, t.B, precision: 2);
+        Assert.Equal(0f, t.C, precision: 2);
+        Assert.Equal(0.5f, t.D, precision: 2);
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_TranslateZHasNoVisibleEffectWithoutPerspective()
+    {
+        // translateZ alone moves an element only along the axis perpendicular to the screen -
+        // with no perspective in effect to project that depth back onto the 2D plane, it has
+        // (correctly, matching a real browser with no `perspective` ancestor) no visible effect.
+        var document = await ParseAsync("""
+            <html><body>
+                <div style="width:40px; height:20px; transform: translateZ(200px);"></div>
+            </body></html>
+            """);
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, new DefaultRenderDevice { ViewPortWidth = 200, ViewPortHeight = 200 });
+
+        Assert.Empty(displayList.Commands.OfType<PushTransformCommand>());
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_Translate3DAppliesItsXAndYComponents()
+    {
+        var document = await ParseAsync("""
+            <html><body>
+                <div style="width:40px; height:20px; transform: translate3d(12px, 6px, 200px);"></div>
+            </body></html>
+            """);
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, new DefaultRenderDevice { ViewPortWidth = 200, ViewPortHeight = 200 });
+        var t = Assert.Single(displayList.Commands.OfType<PushTransformCommand>()).Transform;
+
+        Assert.Equal(new RenderTransform2D(1f, 0f, 0f, 1f, 12f, 6f), t);
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_Scale3DAppliesItsXAndYComponents()
+    {
+        var document = await ParseAsync("""
+            <html><body>
+                <div style="width:40px; height:20px; transform: scale3d(2, 3, 4);"></div>
+            </body></html>
+            """);
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, new DefaultRenderDevice { ViewPortWidth = 200, ViewPortHeight = 200 });
+        var t = Assert.Single(displayList.Commands.OfType<PushTransformCommand>()).Transform;
+
+        Assert.Equal(2f, t.A, precision: 2);
+        Assert.Equal(0f, t.B, precision: 2);
+        Assert.Equal(0f, t.C, precision: 2);
+        Assert.Equal(3f, t.D, precision: 2);
+    }
+
+    [Fact]
     public async Task BuildDisplayList_MatrixFunctionPreservesAllSixComponents()
     {
         // The plain 6-value 2D matrix() form was previously confirmed to compute *wrong* values in
@@ -5010,6 +5881,125 @@ public sealed class HtmlRendererTests
         var displayList = renderer.BuildDisplayList(document, new DefaultRenderDevice { ViewPortWidth = 200, ViewPortHeight = 200 });
         Assert.Empty(displayList.Commands.OfType<PushFilterCommand>());
         Assert.Empty(displayList.Commands.OfType<PopFilterCommand>());
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_ClipPathCircleClipsAnOrdinaryDivToACircleShape()
+    {
+        var document = await ParseAsync("""
+            <html><body>
+                <div style="width:100px; height:60px; clip-path: circle(20px at 50% 50%); background-color:#ff0000;"></div>
+            </body></html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, new DefaultRenderDevice { ViewPortWidth = 200, ViewPortHeight = 200 });
+
+        var push = Assert.Single(displayList.Commands.OfType<PushClipShapeCommand>());
+        var circle = Assert.IsType<RenderClipCircle>(push.Shape);
+
+        Assert.Equal(50f, circle.CenterX, precision: 1);
+        Assert.Equal(30f, circle.CenterY, precision: 1);
+        Assert.Equal(20f, circle.Radius, precision: 1);
+        Assert.Single(displayList.Commands.OfType<PopClipCommand>());
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_ClipPathCircleDefaultsToCenteredClosestSideRadius()
+    {
+        var document = await ParseAsync("""
+            <html><body>
+                <div style="width:100px; height:60px; clip-path: circle(); background-color:#ff0000;"></div>
+            </body></html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, new DefaultRenderDevice { ViewPortWidth = 200, ViewPortHeight = 200 });
+
+        var push = Assert.Single(displayList.Commands.OfType<PushClipShapeCommand>());
+        var circle = Assert.IsType<RenderClipCircle>(push.Shape);
+
+        // No "at" clause -> centered (50,30); no explicit radius -> closest-side, which for a
+        // 100x60 box centered at (50,30) is the vertical distance to the nearest edge (30px).
+        Assert.Equal(50f, circle.CenterX, precision: 1);
+        Assert.Equal(30f, circle.CenterY, precision: 1);
+        Assert.Equal(30f, circle.Radius, precision: 1);
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_ClipPathEllipseResolvesIndependentXAndYRadii()
+    {
+        var document = await ParseAsync("""
+            <html><body>
+                <div style="width:100px; height:60px; clip-path: ellipse(40px 20px at center); background-color:#ff0000;"></div>
+            </body></html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, new DefaultRenderDevice { ViewPortWidth = 200, ViewPortHeight = 200 });
+
+        var push = Assert.Single(displayList.Commands.OfType<PushClipShapeCommand>());
+        var ellipse = Assert.IsType<RenderClipEllipse>(push.Shape);
+
+        Assert.Equal(50f, ellipse.CenterX, precision: 1);
+        Assert.Equal(30f, ellipse.CenterY, precision: 1);
+        Assert.Equal(40f, ellipse.RadiusX, precision: 1);
+        Assert.Equal(20f, ellipse.RadiusY, precision: 1);
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_ClipPathInsetShrinksTheClipRectFromEachEdge()
+    {
+        var document = await ParseAsync("""
+            <html><body>
+                <div style="width:100px; height:60px; clip-path: inset(10px 20px 5px 15px); background-color:#ff0000;"></div>
+            </body></html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, new DefaultRenderDevice { ViewPortWidth = 200, ViewPortHeight = 200 });
+
+        var push = Assert.Single(displayList.Commands.OfType<PushClipShapeCommand>());
+        var inset = Assert.IsType<RenderClipInset>(push.Shape);
+
+        Assert.Equal(15f, inset.Rect.X, precision: 1);
+        Assert.Equal(10f, inset.Rect.Y, precision: 1);
+        Assert.Equal(65f, inset.Rect.Width, precision: 1);
+        Assert.Equal(45f, inset.Rect.Height, precision: 1);
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_ClipPathPolygonProducesVerticesResolvedAgainstTheBox()
+    {
+        var document = await ParseAsync("""
+            <html><body>
+                <div style="width:100px; height:60px; clip-path: polygon(0 0, 100% 0, 50% 100%); background-color:#ff0000;"></div>
+            </body></html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, new DefaultRenderDevice { ViewPortWidth = 200, ViewPortHeight = 200 });
+
+        var push = Assert.Single(displayList.Commands.OfType<PushClipShapeCommand>());
+        var polygon = Assert.IsType<RenderClipPolygon>(push.Shape);
+
+        Assert.Equal(3, polygon.Points.Count);
+        Assert.Equal((0f, 0f), polygon.Points[0]);
+        Assert.Equal((100f, 0f), polygon.Points[1]);
+        Assert.Equal((50f, 60f), polygon.Points[2]);
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_NoClipPathProducesNoClipShapeCommands()
+    {
+        var document = await ParseAsync("""
+            <html><body>
+                <div style="width:10px; height:10px;"></div>
+            </body></html>
+            """);
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, new DefaultRenderDevice { ViewPortWidth = 200, ViewPortHeight = 200 });
+        Assert.Empty(displayList.Commands.OfType<PushClipShapeCommand>());
     }
 
     [Fact]
@@ -5290,6 +6280,98 @@ public sealed class HtmlRendererTests
     }
 
     [Fact]
+    public async Task BuildDisplayList_WebkitLineClampTruncatesToNLinesWithEllipsisOnTheLast()
+    {
+        var document = await ParseAsync("""
+            <html><body>
+                <div style="width:60px; overflow:hidden; -webkit-line-clamp:2;">one two three four five six seven eight</div>
+            </body></html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, new DefaultRenderDevice
+        {
+            ViewPortWidth = 200,
+            ViewPortHeight = 120,
+            FontSize = 16f,
+        });
+
+        var textCommands = displayList.Commands.OfType<DrawTextCommand>().OrderBy(t => t.Y).ToList();
+
+        // Clamped to exactly 2 lines - the remaining wrapped lines are dropped entirely, not just
+        // clipped/hidden.
+        Assert.Equal(2, textCommands.Count);
+        Assert.EndsWith("…", textCommands[1].Text);
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_WebkitLineClampHasNoEffectWhenTextFitsWithinTheLimit()
+    {
+        var document = await ParseAsync("""
+            <html><body>
+                <div style="width:200px; overflow:hidden; -webkit-line-clamp:3;">Short text</div>
+            </body></html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, new DefaultRenderDevice
+        {
+            ViewPortWidth = 300,
+            ViewPortHeight = 120,
+            FontSize = 16f,
+        });
+
+        var text = Assert.Single(displayList.Commands.OfType<DrawTextCommand>());
+        Assert.Equal("Short text", text.Text);
+        Assert.DoesNotContain("…", text.Text);
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_WebkitLineClampHasNoEffectWithoutOverflowClipping()
+    {
+        var document = await ParseAsync("""
+            <html><body>
+                <div style="width:60px; -webkit-line-clamp:2;">one two three four five six seven eight</div>
+            </body></html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, new DefaultRenderDevice
+        {
+            ViewPortWidth = 200,
+            ViewPortHeight = 120,
+            FontSize = 16f,
+        });
+
+        // No `overflow: hidden` - the clamp must not apply, matching the same "text-overflow has no
+        // effect without clipping" precedent already established for the single-line case.
+        var textCommands = displayList.Commands.OfType<DrawTextCommand>().ToList();
+        Assert.True(textCommands.Count > 2);
+        Assert.DoesNotContain(textCommands, t => t.Text.Contains('…'));
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_WebkitLineClampWorksAcrossDifferentWidthsAndLineHeights()
+    {
+        var document = await ParseAsync("""
+            <html><body>
+                <div style="width:100px; line-height:2; overflow:hidden; -webkit-line-clamp:1;">one two three four five six</div>
+            </body></html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, new DefaultRenderDevice
+        {
+            ViewPortWidth = 200,
+            ViewPortHeight = 120,
+            FontSize = 16f,
+        });
+
+        var text = Assert.Single(displayList.Commands.OfType<DrawTextCommand>());
+        Assert.EndsWith("…", text.Text);
+    }
+
+    [Fact]
     public async Task BuildDisplayList_WordBreakAllWrapsAnOverlongWordAcrossMultipleLines()
     {
         var document = await ParseAsync("""
@@ -5460,6 +6542,113 @@ public sealed class HtmlRendererTests
 
         Assert.Equal(2, texts.Length);
         Assert.Equal("Hello", texts[0].Text);
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_CounterIncrementNumbersSiblingElementsSequentially()
+    {
+        var document = await ParseAsync("""
+            <html><head><style>
+                body { counter-reset: item; }
+                .item { counter-increment: item; }
+                .item::before { content: counter(item) ". "; }
+            </style></head><body>
+                <div class="item">Alpha</div>
+                <div class="item">Bravo</div>
+                <div class="item">Charlie</div>
+            </body></html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, new DefaultRenderDevice
+        {
+            ViewPortWidth = 300,
+            ViewPortHeight = 200,
+            FontSize = 16f,
+        });
+
+        var texts = displayList.Commands.OfType<DrawTextCommand>().OrderBy(t => t.Y).Select(t => t.Text).ToArray();
+
+        // The trailing space in `". "` is trimmed away by the default `white-space: normal`
+        // rendering (the same trimming any other painted text gets), leaving just "N.".
+        Assert.Equal(["1.", "Alpha", "2.", "Bravo", "3.", "Charlie"], texts);
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_NestedCounterResetRestartsAndRestoresTheOuterCounter()
+    {
+        var document = await ParseAsync("""
+            <html><head><style>
+                ol { counter-reset: item; list-style: none; }
+                li { counter-increment: item; }
+                li::before { content: counter(item) ". "; }
+            </style></head><body>
+                <ol>
+                    <li>One
+                        <ol>
+                            <li>One-A</li>
+                            <li>One-B</li>
+                        </ol>
+                    </li>
+                    <li>Two</li>
+                </ol>
+            </body></html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, new DefaultRenderDevice
+        {
+            ViewPortWidth = 300,
+            ViewPortHeight = 300,
+            FontSize = 16f,
+        });
+
+        var markerTexts = displayList.Commands.OfType<DrawTextCommand>()
+            .Where(t => t.Text.EndsWith('.'))
+            .OrderBy(t => t.Y)
+            .Select(t => t.Text)
+            .ToArray();
+
+        // The nested <ol> restarts its own "item" counter at 1 independently of the outer list,
+        // and the outer list's own counter correctly resumes at 2 for its second <li> once the
+        // nested list's subtree has ended - not left at whatever value the nested list reached.
+        Assert.Equal(["1.", "1.", "2.", "2."], markerTexts);
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_CountersFunctionJoinsNestedCounterValuesWithASeparator()
+    {
+        var document = await ParseAsync("""
+            <html><head><style>
+                ol { counter-reset: item; list-style: none; }
+                li { counter-increment: item; }
+                li::before { content: counters(item, "."); }
+            </style></head><body>
+                <ol>
+                    <li>One
+                        <ol>
+                            <li>One-A</li>
+                        </ol>
+                    </li>
+                </ol>
+            </body></html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, new DefaultRenderDevice
+        {
+            ViewPortWidth = 300,
+            ViewPortHeight = 300,
+            FontSize = 16f,
+        });
+
+        var markerTexts = displayList.Commands.OfType<DrawTextCommand>()
+            .Where(t => t.Text is not ("One" or "One-A"))
+            .OrderBy(t => t.Y)
+            .Select(t => t.Text)
+            .ToArray();
+
+        Assert.Equal(["1", "1.1"], markerTexts);
     }
 
     [Fact]

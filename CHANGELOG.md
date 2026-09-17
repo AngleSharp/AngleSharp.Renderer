@@ -2,7 +2,19 @@
 
 Released on ?.
 
-- (tbd)
+- Improved regression test coverage for 3D CSS transform functions (`rotateX`/`rotateY`/`rotate3d`/`translate3d`/`scale3d`/`matrix3d`) (#16)
+- Fixed `repeat(auto-fill/auto-fit)` fill-count resolution to use available space, gap, and track minimum size (#20)
+- Fixed a pre-existing inline layout bug where plain, unstyled semantic inline elements (`<b>`, `<span>`, `<strong>`, `<em>`, ...) were misidentified as block-level, preventing them from sharing a line with sibling text (#23)
+- Added support for `animation-play-state: paused` (#17)
+- Added `aspect-ratio` width-from-height derivation for boxes with an auto width and definite height (#14)
+- Added `object-fit` (`fill`/`contain`/`cover`/`none`/`scale-down`) and `object-position` support for replaced elements (#13)
+- Added rendering support for `input[type=range]` (track + thumb) and `input[type=file]` (#21)
+- Added `clip-path` support for ordinary HTML boxes (`circle()`, `ellipse()`, `inset()`, `polygon()`) (#12)
+- Added `<textarea>` caret rendering (#22)
+- Added multi-line `text-overflow` via `-webkit-line-clamp` support (#18)
+- Added general CSS counters `counter-reset`, `counter-increment`, `counter-set`, and `counter()`/`counters()` (#19)
+- Added SVG filter primitives `feFlood`, `feComposite`, `feMorphology`, and `feComponentTransfer` (`linear` sub-functions) (#24)
+- Added basic RTL/bidi support via `direction: rtl` (#15)
 
 # 0.6.0
 

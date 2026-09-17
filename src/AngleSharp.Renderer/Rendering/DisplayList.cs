@@ -81,6 +81,21 @@ public sealed class DisplayList
     public void PopClip() => Add(new PopClipCommand());
 
     /// <summary>
+    /// Begins clipping every command up to the matching <see cref="PopClip"/> to an arbitrary CSS
+    /// `clip-path` basic shape (`circle()`/`ellipse()`/`inset()`/`polygon()`) - unlike
+    /// <see cref="PushClip"/>'s plain rounded rectangle, this wraps the *whole* element (including
+    /// its own background/border/outline), matching how `clip-path` behaves in a real browser.
+    /// Closed with the same <see cref="PopClip"/>/<see cref="PopClipCommand"/> every other clip
+    /// scope already uses, since ending a clip scope is always just a backend "restore", regardless
+    /// of what shape was clipped to.
+    /// </summary>
+    public void PushClipShape(RenderClipShape shape)
+    {
+        ArgumentNullException.ThrowIfNull(shape);
+        Add(new PushClipShapeCommand(shape));
+    }
+
+    /// <summary>
     /// Begins applying a CSS `transform` to every command up to the matching <see cref="PopTransform"/>
     /// - background, border, outline, and children all paint under it, since `transform` affects
     /// the whole element it is set on, not just its content (unlike `overflow` clipping, which
@@ -258,6 +273,12 @@ public sealed record PushClipCommand(RenderRect Rect, RenderCornerRadii Radii) :
 /// Ends the clip scope started by the matching <see cref="PushClipCommand"/>.
 /// </summary>
 public sealed record PopClipCommand : RenderCommand;
+
+/// <summary>
+/// Begins clipping every following command, up to the matching <see cref="PopClipCommand"/>, to
+/// an arbitrary CSS `clip-path` basic shape.
+/// </summary>
+public sealed record PushClipShapeCommand(RenderClipShape Shape) : RenderCommand;
 
 /// <summary>
 /// Begins applying a CSS `transform` to every following command, up to the matching
