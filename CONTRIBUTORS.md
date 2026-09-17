@@ -6,6 +6,6 @@ AngleSharp.Renderer contains code written by (in order of first pull request / c
 
 * [Florian Rappl](https://github.com/FlorianRappl)
 
-Without these awesome people AngleSharp.Css could not exist. Thanks to everyone for your contributions! :beers:
+Without these awesome people AngleSharp.Renderer could not exist. Thanks to everyone for your contributions! :beers:
 
 Missing you? Please contact us! Potentially, the simplest way is to file a PR with your name / GitHub profile link added to this file.
