@@ -1,3 +1,9 @@
+# 0.7.0
+
+Released on ?.
+
+- (tbd)
+
 # 0.6.0
 
 Released on Wednesday, September 16 2026.
