@@ -1,6 +1,6 @@
 # 0.7.0
 
-Released on ?.
+Released on Monday, October 19 2026.
 
 - Improved regression test coverage for 3D CSS transform functions (`rotateX`/`rotateY`/`rotate3d`/`translate3d`/`scale3d`/`matrix3d`) (#16)
 - Fixed `repeat(auto-fill/auto-fit)` fill-count resolution to use available space, gap, and track minimum size (#20)
