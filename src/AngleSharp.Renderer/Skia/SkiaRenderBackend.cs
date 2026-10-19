@@ -73,6 +73,9 @@ public sealed class SkiaRenderBackend : IRenderBackend, ITextMeasurer
             case PushClipCommand pushClip:
                 PushClip(canvas, pushClip);
                 break;
+            case PushClipShapeCommand pushClipShape:
+                PushClipShape(canvas, pushClipShape);
+                break;
             case PopClipCommand:
                 canvas.Restore();
                 break;
@@ -281,6 +284,74 @@ public sealed class SkiaRenderBackend : IRenderBackend, ITextMeasurer
             roundRect.SetRectRadii(rect, ToSkPoints(command.Radii));
             canvas.ClipRoundRect(roundRect, SKClipOperation.Intersect, antialias: true);
         }
+    }
+
+    /// <summary>
+    /// `clip-path`'s basic shapes each map to a single `SKPath` built directly from its own
+    /// already-resolved geometry (see <see cref="RenderClipShape"/>'s own remarks) - a circle/
+    /// ellipse becomes an oval path, `inset()` a rounded-rect path (reusing the exact
+    /// `RenderCornerRadii`/`SKRoundRect` machinery `border-radius`/`PushClip` already established),
+    /// and `polygon()` a straight-edged path connecting its own vertices in order.
+    /// </summary>
+    private static void PushClipShape(SKCanvas canvas, PushClipShapeCommand command)
+    {
+        canvas.Save();
+
+        using var path = new SKPath();
+
+        switch (command.Shape)
+        {
+            case RenderClipCircle circle:
+                path.AddOval(new SKRect(
+                    circle.CenterX - circle.Radius,
+                    circle.CenterY - circle.Radius,
+                    circle.CenterX + circle.Radius,
+                    circle.CenterY + circle.Radius));
+                break;
+
+            case RenderClipEllipse ellipse:
+                path.AddOval(new SKRect(
+                    ellipse.CenterX - ellipse.RadiusX,
+                    ellipse.CenterY - ellipse.RadiusY,
+                    ellipse.CenterX + ellipse.RadiusX,
+                    ellipse.CenterY + ellipse.RadiusY));
+                break;
+
+            case RenderClipInset inset:
+            {
+                var rect = new SKRect(
+                    inset.Rect.X,
+                    inset.Rect.Y,
+                    inset.Rect.X + inset.Rect.Width,
+                    inset.Rect.Y + inset.Rect.Height);
+
+                if (inset.Radii.IsZero)
+                {
+                    path.AddRect(rect);
+                }
+                else
+                {
+                    using var roundRect = new SKRoundRect();
+                    roundRect.SetRectRadii(rect, ToSkPoints(inset.Radii));
+                    path.AddRoundRect(roundRect);
+                }
+
+                break;
+            }
+
+            case RenderClipPolygon polygon when polygon.Points.Count > 0:
+                path.MoveTo(polygon.Points[0].X, polygon.Points[0].Y);
+
+                for (var i = 1; i < polygon.Points.Count; i++)
+                {
+                    path.LineTo(polygon.Points[i].X, polygon.Points[i].Y);
+                }
+
+                path.Close();
+                break;
+        }
+
+        canvas.ClipPath(path, SKClipOperation.Intersect, antialias: true);
     }
 
     private static void DrawBoxShadow(SKCanvas canvas, DrawBoxShadowCommand command)

@@ -72,7 +72,8 @@ public sealed class HtmlRenderer
         ITextMeasurer TextMeasurer,
         FontFaceSet Fonts,
         Dictionary<IElement, Dictionary<string, string>> StyleMapCache,
-        IStyleCollection? StyleCollection);
+        IStyleCollection? StyleCollection,
+        Dictionary<string, Stack<int>> Counters);
 
     private sealed class LayoutCapture
     {
@@ -236,7 +237,13 @@ public sealed class HtmlRenderer
             // must never be answered from a stale map computed on a previous call. See
             // GetOrCreateStyleMap's own remarks for why caching within a single call is safe.
             StyleMapCache: new Dictionary<IElement, Dictionary<string, string>>(ReferenceEqualityComparer.Instance),
-            StyleCollection: styleCollection);
+            StyleCollection: styleCollection,
+            // CSS counters (`counter-reset`/`counter-increment`/`counter-set`, read by `counter()`/
+            // `counters()` in `content`) are scoped to a single render exactly like StyleMapCache
+            // above - a fresh, empty stack set every call, never persisted across renders, so a
+            // counter's value can never leak between two separate BuildDisplayList calls for the
+            // same document (interactive re-renders included).
+            Counters: new Dictionary<string, Stack<int>>());
     }
 
     /// <summary>
@@ -339,6 +346,16 @@ public sealed class HtmlRenderer
         PrepareDocumentForRendering(document);
 
         var renderTree = window.Render(renderDevice);
+
+        // CSS counters (`counter-reset`/`counter-increment`/`counter-set`, read back by
+        // `counter()`/`counters()` in generated `content`) are resolved in a dedicated pre-pass
+        // over the already-built render tree, entirely independent of the actual layout walk below
+        // - plain recursive function calls give correct, automatic push/pop scoping for free (a
+        // counter-reset's own new instance is naturally "popped" back to whatever the enclosing
+        // scope had once this call returns), which the layout pass itself cannot offer cheaply
+        // given how many early-return paths LayoutElement has. See ProcessCounters' own remarks.
+        ProcessCounters(renderTree, context);
+
         var body = document.Body;
         var root = body is null ? renderTree : renderTree.Find(body) ?? renderTree;
 
@@ -356,7 +373,7 @@ public sealed class HtmlRenderer
             return displayList;
         }
 
-        var textStyle = new RenderTextStyle(context.FontSize, context.TextColor, context.FontFamily, context.LineHeightMultiplier, 400f, false, false, false, context.TextColor, global::AngleSharp.Renderer.Rendering.RenderTextDecorationStyle.Solid, TextAlign.Left, 0f, 0f, 0f, [], WhiteSpaceMode.Normal, WordBreakMode.Normal, OverflowWrapMode.Normal, TextOverflowMode.Clip);
+        var textStyle = new RenderTextStyle(context.FontSize, context.TextColor, context.FontFamily, context.LineHeightMultiplier, 400f, false, false, false, context.TextColor, global::AngleSharp.Renderer.Rendering.RenderTextDecorationStyle.Solid, TextAlign.Left, 0f, 0f, 0f, [], WhiteSpaceMode.Normal, WordBreakMode.Normal, OverflowWrapMode.Normal, TextOverflowMode.Clip, 0, TextDirection.Ltr);
         var cursorY = contentY;
         var previousBlockMarginBottom = 0f;
         var suppressNextBlockTopMargin = false;
@@ -665,6 +682,34 @@ public sealed class HtmlRenderer
             flexMainSize,
             flexCrossSize,
             propertyName: "width");
+
+        if (float.IsNaN(specifiedContentWidth) && !isFlexItem)
+        {
+            // A definite height plus `aspect-ratio` overrides a block-level box's normal
+            // "auto width fills the container" default - matching real browsers, and the same
+            // used-width/used-height "transferred size" relationship `aspect-ratio` already
+            // establishes in the other direction (see ResolveAspectRatioContentHeight, called
+            // further down once `height` is auto instead). Only applies when `width` is genuinely
+            // unauthored (not merely resolved to NaN through a flex/grid override, which already
+            // has its own, more specific sizing story this must not second-guess).
+            var heightReferenceForAspectRatio = float.IsNaN(containingHeight) ? flowContainingWidth : containingHeight;
+            var explicitContentHeight = ResolveAuthoredDimension(
+                styleMap,
+                "height",
+                heightReferenceForAspectRatio,
+                float.NaN,
+                borderTop + borderBottom + paddingTop + paddingBottom);
+
+            if (!float.IsNaN(explicitContentHeight))
+            {
+                specifiedContentWidth = ResolveAspectRatioContentWidth(
+                    styleMap,
+                    explicitContentHeight,
+                    borderLeft + borderRight + paddingLeft + paddingRight,
+                    borderTop + borderBottom + paddingTop + paddingBottom);
+            }
+        }
+
         ResolveHorizontalMetrics(
             flowContainingWidth,
             specifiedContentWidth,
@@ -1251,7 +1296,9 @@ public sealed class HtmlRenderer
         var hasFilter = filterFunctions.Count > 0;
         var opacity = ParseCssOpacity(styleMap);
         var hasOpacity = opacity < 1f;
-        var createsStackingContext = HasExplicitZIndex(styleMap) || hasOpacity || hasTransform || hasFilter;
+        var clipPathShape = ParseClipPath(styleMap, borderBoxWidth, borderBoxHeight);
+        var hasClipPath = clipPathShape is not null;
+        var createsStackingContext = HasExplicitZIndex(styleMap) || hasOpacity || hasTransform || hasFilter || hasClipPath;
 
         var boxPaintBuffer = new DisplayList();
 
@@ -1282,6 +1329,18 @@ public sealed class HtmlRenderer
             boxPaintBuffer.PushFilter(filterFunctions);
         }
 
+        // `clip-path` wraps the whole element too - background, border, outline, and every
+        // descendant are all clipped to the shape (unlike the overflow clip below, which excludes
+        // the border/outline it is nested inside) - nested innermost of the four whole-element
+        // scopes above, since its shape is expressed in the element's own already-transformed
+        // local space and should clip the filtered/opacity-composited result, not the other way
+        // around.
+        if (hasClipPath)
+        {
+            boxPaintBuffer.PushClipShape(clipPathShape!);
+        }
+
+
         PaintBackground(boxPaintBuffer, box.BackgroundPaint, borderBoxX, borderBoxY, borderBoxWidth, borderBoxHeight, box.BorderRadius);
         PaintBoxShadows(boxPaintBuffer, box.BoxShadows, borderBoxX, borderBoxY, borderBoxWidth, borderBoxHeight, box.BorderRadius);
         PaintBorder(boxPaintBuffer, box.BorderColor, borderBoxX, borderBoxY, borderBoxWidth, borderBoxHeight, box.BorderWidth, box.BorderRadius, box.BorderStyle);
@@ -1310,12 +1369,30 @@ public sealed class HtmlRenderer
 
         displayList.InsertRange(paintInsertionIndex, boxPaintBuffer.Commands);
 
-        if (TryResolveReplacedElementImage(node, styleMap, flowContainingWidth, borderBoxX + borderLeft + paddingLeft, borderBoxY + borderTop + paddingTop, out var image, out var imageRect))
+        if (TryResolveReplacedElementImage(node, styleMap, flowContainingWidth, borderBoxX + borderLeft + paddingLeft, borderBoxY + borderTop + paddingTop, out var image, out var imageRect, out var objectFitClipRect))
         {
+            if (objectFitClipRect is { } objectFitClip)
+            {
+                displayList.PushClip(objectFitClip, RenderCornerRadii.Zero);
+            }
+
             displayList.DrawImage(imageRect, image!);
+
+            if (objectFitClipRect is not null)
+            {
+                displayList.PopClip();
+            }
         }
 
         if (clipsOverflow)
+        {
+            displayList.PopClip();
+        }
+
+        // Closes the clip-path scope opened above, once children (and, for a replaced element,
+        // its image) have all been emitted - the innermost of the four whole-element scopes, so it
+        // closes before filter/opacity/transform do.
+        if (hasClipPath)
         {
             displayList.PopClip();
         }
@@ -1852,9 +1929,19 @@ public sealed class HtmlRenderer
 
         displayList.InsertRange(boxPaintInsertIndex, boxPaintBuffer.Commands);
 
-        if (TryResolveReplacedElementImage(node, styleMap, containingWidth, borderBoxX + borderLeft + paddingLeft, borderBoxY + borderTop + paddingTop, out var image, out var imageRect))
+        if (TryResolveReplacedElementImage(node, styleMap, containingWidth, borderBoxX + borderLeft + paddingLeft, borderBoxY + borderTop + paddingTop, out var image, out var imageRect, out var objectFitClipRect))
         {
+            if (objectFitClipRect is { } objectFitClip)
+            {
+                displayList.PushClip(objectFitClip, RenderCornerRadii.Zero);
+            }
+
             displayList.DrawImage(imageRect, image!);
+
+            if (objectFitClipRect is not null)
+            {
+                displayList.PopClip();
+            }
         }
 
         if (clipsOverflow)
@@ -2415,14 +2502,6 @@ public sealed class HtmlRenderer
         // (and appended), so their paint commands are spliced in before this index instead.
         var boxPaintInsertIndex = displayList.Commands.Count;
 
-        var explicitGridTemplateColumns = ResolveExplicitPropertyValue(node.Ref, node.ComputedStyle, "grid-template-columns");
-        var columns = ParseGridTrackListStructured(explicitGridTemplateColumns, containingWidth);
-
-        if (columns.Count == 0)
-        {
-            columns.Add(GridTrackSize.Fixed(containingWidth));
-        }
-
         var columnGap = ParseGridGap(styleMap, "column-gap", containingWidth, 0)
             ?? ParseGridGap(styleMap, "gap", containingWidth, 0);
         var rowGap = ParseGridGap(styleMap, "row-gap", containingWidth, 0)
@@ -2432,6 +2511,15 @@ public sealed class HtmlRenderer
         var gridItems = node.Children
             .Where(child => child is ElementRenderNode || (child is TextRenderNode textNode && NormalizeWhitespace(textNode.Ref.Data).Length > 0))
             .ToList();
+
+        var explicitGridTemplateColumns = ResolveExplicitPropertyValue(node.Ref, node.ComputedStyle, "grid-template-columns");
+        var columns = ParseGridTrackListStructured(explicitGridTemplateColumns, containingWidth, resolvedColumnGap, gridItems.Count);
+
+        if (columns.Count == 0)
+        {
+            columns.Add(GridTrackSize.Fixed(containingWidth));
+        }
+
         var gridVerticalBorderAndPadding = borderTop + borderBottom + paddingTop + paddingBottom;
         var containerHeight = ResolveAuthoredDimension(styleMap, "height", containingWidth, float.NaN, gridVerticalBorderAndPadding);
         var explicitGridTemplateRows = ResolveExplicitPropertyValue(node.Ref, node.ComputedStyle, "grid-template-rows");
@@ -2867,27 +2955,128 @@ public sealed class HtmlRenderer
     /// value - the caller falls back to a single implicit track, the same default a real browser
     /// gives an unstyled grid container.
     /// </summary>
-    private static List<GridTrackSize> ParseGridTrackListStructured(string rawValue, float relativeTo)
+    private static List<GridTrackSize> ParseGridTrackListStructured(string rawValue, float relativeTo, float gap = 0f, int itemCount = 0)
     {
         var tracks = new List<GridTrackSize>();
+        var trimmed = rawValue?.Trim() ?? string.Empty;
 
-        if (string.IsNullOrWhiteSpace(rawValue) || string.Equals(rawValue.Trim(), "none", StringComparison.OrdinalIgnoreCase))
+        if (trimmed.Length == 0 || string.Equals(trimmed, "none", StringComparison.OrdinalIgnoreCase))
         {
             return tracks;
         }
 
-        var source = new StringSource(rawValue.Trim());
+        var source = new StringSource(trimmed);
         var parsed = source.ParseTrackList();
 
         if (parsed is not null)
         {
-            AppendGridTracks(parsed, relativeTo, tracks);
+            AppendGridTracks(parsed, relativeTo, tracks, gap, itemCount);
+            return tracks;
+        }
+
+        // AngleSharp.Css's own GridParser does not currently recognize the `auto-fill`/`auto-fit`
+        // repeat-count keywords at all (confirmed empirically: ParseTrackList returns null for the
+        // whole value, not just that one token) - a genuine upstream gap, worth reporting there,
+        // but one this renderer still needs to work around locally to support the single most
+        // common real-world use of `repeat()` (`repeat(auto-fill/auto-fit, ...)` as the entire
+        // track list). TryParseAutoRepeatTrackList hand-parses just that one shape; anything else
+        // that also failed to parse (a genuinely malformed value) still falls through to the empty
+        // list the caller already treats as "no explicit tracks".
+        if (TryParseAutoRepeatTrackList(trimmed, relativeTo, gap, itemCount, tracks))
+        {
+            return tracks;
         }
 
         return tracks;
     }
 
-    private static void AppendGridTracks(ICssValue value, float relativeTo, List<GridTrackSize> tracks)
+    /// <summary>
+    /// Hand-parses `repeat(auto-fill, &lt;track-list&gt;)`/`repeat(auto-fit, &lt;track-list&gt;)` as
+    /// the entire `grid-template-columns`/`-rows` value - locating the keyword by splitting on the
+    /// first top-level comma (one that is not itself nested inside the repeated track list's own
+    /// parentheses, e.g. `minmax(100px, 1fr)`'s comma), then delegating the repeated track list's
+    /// own structural parsing back to AngleSharp.Css's `GridParser` exactly as the normal path does -
+    /// only the outer auto-fill/auto-fit keyword recognition itself is hand-rolled.
+    /// </summary>
+    private static bool TryParseAutoRepeatTrackList(string trimmed, float relativeTo, float gap, int itemCount, List<GridTrackSize> tracks)
+    {
+        if (!trimmed.StartsWith("repeat(", StringComparison.OrdinalIgnoreCase) || !trimmed.EndsWith(")", StringComparison.Ordinal))
+        {
+            return false;
+        }
+
+        var inner = trimmed[7..^1];
+        var depth = 0;
+        var commaIndex = -1;
+
+        for (var i = 0; i < inner.Length; i++)
+        {
+            switch (inner[i])
+            {
+                case '(':
+                    depth++;
+                    break;
+                case ')':
+                    depth--;
+                    break;
+                case ',' when depth == 0:
+                    commaIndex = i;
+                    break;
+            }
+
+            if (commaIndex >= 0)
+            {
+                break;
+            }
+        }
+
+        if (commaIndex < 0)
+        {
+            return false;
+        }
+
+        var keyword = inner[..commaIndex].Trim();
+        var isAutoFill = string.Equals(keyword, "auto-fill", StringComparison.OrdinalIgnoreCase);
+        var isAutoFit = string.Equals(keyword, "auto-fit", StringComparison.OrdinalIgnoreCase);
+
+        if (!isAutoFill && !isAutoFit)
+        {
+            return false;
+        }
+
+        var trackListText = inner[(commaIndex + 1)..].Trim();
+        var trackSource = new StringSource(trackListText);
+        var trackDefinition = trackSource.ParseTrackList();
+
+        if (trackDefinition is null)
+        {
+            return false;
+        }
+
+        var groupMinSize = ResolveGridRepeatGroupMinSize(trackDefinition, relativeTo);
+
+        if (groupMinSize <= 0f || float.IsNaN(relativeTo) || relativeTo <= 0f)
+        {
+            AppendGridTracks(trackDefinition, relativeTo, tracks, gap, itemCount);
+            return true;
+        }
+
+        var fillCount = Math.Max(1, (int)Math.Floor((relativeTo + gap) / (groupMinSize + gap)));
+
+        if (isAutoFit && itemCount > 0)
+        {
+            fillCount = Math.Max(1, Math.Min(fillCount, itemCount));
+        }
+
+        for (var i = 0; i < fillCount; i++)
+        {
+            AppendGridTracks(trackDefinition, relativeTo, tracks, gap, itemCount);
+        }
+
+        return true;
+    }
+
+    private static void AppendGridTracks(ICssValue value, float relativeTo, List<GridTrackSize> tracks, float gap, int itemCount)
     {
         switch (value)
         {
@@ -2901,11 +3090,11 @@ public sealed class HtmlRenderer
             // CssMinMaxValue, which is public) - matched via the public ICssFunctionValue interface
             // (Name/Arguments) they both implement instead of the concrete type.
             case ICssFunctionValue repeatFunc when string.Equals(repeatFunc.Name, "repeat", StringComparison.OrdinalIgnoreCase) && repeatFunc.Arguments.Length == 2:
-                var count = ResolveGridRepeatCount(repeatFunc.Arguments[0]);
+                var count = ResolveGridRepeatCount(repeatFunc.Arguments[0], repeatFunc.Arguments[1], relativeTo, gap, itemCount);
 
                 for (var i = 0; i < count; i++)
                 {
-                    AppendGridTracks(repeatFunc.Arguments[1], relativeTo, tracks);
+                    AppendGridTracks(repeatFunc.Arguments[1], relativeTo, tracks, gap, itemCount);
                 }
 
                 break;
@@ -2915,7 +3104,7 @@ public sealed class HtmlRenderer
                 {
                     if (item is not null)
                     {
-                        AppendGridTracks(item, relativeTo, tracks);
+                        AppendGridTracks(item, relativeTo, tracks, gap, itemCount);
                     }
                 }
 
@@ -2928,14 +3117,45 @@ public sealed class HtmlRenderer
     }
 
     /// <summary>
-    /// `repeat(auto-fill, ...)`/`repeat(auto-fit, ...)` need the container's own available space to
-    /// compute how many repetitions fit - a genuinely different, container-size-dependent algorithm
-    /// this renderer does not implement. Falls back to a single repetition (the count `1` never
-    /// causes a dropped track or a NaN/absurd count), a deliberate, documented scope cut.
+    /// `repeat(auto-fill, ...)`/`repeat(auto-fit, ...)` resolve their true fill count from the
+    /// container's own available space, the axis gap, and the repeated track group's own minimum
+    /// size - the same formula browsers use: <c>floor((available + gap) / (groupMinSize + gap))</c>,
+    /// clamped to at least one repetition. `auto-fit` additionally collapses empty trailing tracks:
+    /// the full spec algorithm does this after item placement (an empty track becomes a literal
+    /// zero-width, gap-less track), which this renderer approximates by capping the fill count at
+    /// the actual item count up front - close enough for the common single-row/auto-placement case,
+    /// though it does not reclaim space for an item that itself spans multiple tracks. `auto-fill`
+    /// keeps every computed track (empty or not), which is the whole difference between the two.
     /// </summary>
-    private static int ResolveGridRepeatCount(ICssValue countValue)
+    private static int ResolveGridRepeatCount(ICssValue countValue, ICssValue trackDefinition, float availableSize, float gap, int itemCount)
     {
-        var text = countValue.CssText;
+        var text = countValue.CssText.Trim();
+        var isAutoFill = string.Equals(text, "auto-fill", StringComparison.OrdinalIgnoreCase);
+        var isAutoFit = string.Equals(text, "auto-fit", StringComparison.OrdinalIgnoreCase);
+
+        if (isAutoFill || isAutoFit)
+        {
+            if (float.IsNaN(availableSize) || availableSize <= 0f)
+            {
+                return 1;
+            }
+
+            var groupMinSize = ResolveGridRepeatGroupMinSize(trackDefinition, availableSize);
+
+            if (groupMinSize <= 0f)
+            {
+                return 1;
+            }
+
+            var fillCount = Math.Max(1, (int)Math.Floor((availableSize + gap) / (groupMinSize + gap)));
+
+            if (isAutoFit && itemCount > 0)
+            {
+                fillCount = Math.Max(1, Math.Min(fillCount, itemCount));
+            }
+
+            return fillCount;
+        }
 
         if (int.TryParse(text, NumberStyles.Integer, CultureInfo.InvariantCulture, out var count))
         {
@@ -2944,6 +3164,27 @@ public sealed class HtmlRenderer
 
         return 1;
     }
+
+    /// <summary>
+    /// The minimum pixel footprint of one repetition of a `repeat(auto-fill/auto-fit, ...)`'s own
+    /// track list - a fixed length contributes its own size, `minmax(min, max)` contributes `min`
+    /// when it is itself a plain length (0 otherwise), and an `fr`/`auto` track contributes 0 (it
+    /// has no definite minimum to anchor the fill-count formula to) - a deliberate approximation of
+    /// the spec's own (considerably more involved) automatic-repeat-count algorithm, matching the
+    /// overwhelmingly common real-world pattern of `repeat(auto-fill/auto-fit, minmax(&lt;length&gt;, ...))`.
+    /// </summary>
+    private static float ResolveGridRepeatGroupMinSize(ICssValue trackDefinition, float relativeTo) => trackDefinition switch
+    {
+        CssTupleValue<ICssValue> tuple => tuple.Items.Where(item => item is not null).Sum(item => ResolveGridTrackMinContribution(item!, relativeTo)),
+        _ => ResolveGridTrackMinContribution(trackDefinition, relativeTo),
+    };
+
+    private static float ResolveGridTrackMinContribution(ICssValue value, float relativeTo) => value switch
+    {
+        CssMinMaxValue minMax => minMax.Minimum is CssLengthValue ? ResolveGridTrackLength(minMax.Minimum, relativeTo) : 0f,
+        CssLengthValue => ResolveGridTrackLength(value, relativeTo),
+        _ => 0f,
+    };
 
     private static GridTrackSize ConvertGridTrackSize(ICssValue value, float relativeTo)
     {
@@ -3327,6 +3568,19 @@ public sealed class HtmlRenderer
         var lineHeight = textStyle.FontSize * textStyle.LineHeightMultiplier;
         var lines = WrapTextRespectingWhiteSpace(context, text, maxWidth, textStyle);
 
+        // `-webkit-line-clamp: N` truncates to at most N lines, with an ellipsis appended to the
+        // last kept line whenever there was more text than fit - the multi-line counterpart to
+        // `text-overflow: ellipsis`'s single-line truncation just above. The clamped-away lines
+        // are dropped entirely (not laid out at all, not just clipped/hidden), matching how a real
+        // browser's `-webkit-line-clamp` removes them from the box's own content height too.
+        var isClampedLastLine = false;
+
+        if (textStyle.LineClamp > 0 && lines.Count > textStyle.LineClamp)
+        {
+            lines = [.. lines.Take(textStyle.LineClamp)];
+            isClampedLastLine = true;
+        }
+
         for (var index = 0; index < lines.Count; index++)
         {
             var line = lines[index];
@@ -3338,21 +3592,35 @@ public sealed class HtmlRenderer
             }
 
             // An empty line (a blank `pre`/`pre-wrap`/`pre-line` row from a run of consecutive
-            // forced breaks) still needs to advance cursorY above, but has nothing to measure/paint.
-            if (line.Length == 0)
+            // forced breaks) still needs to advance cursorY above, but has nothing to measure/paint
+            // - unless it is itself the clamped-to line, which still needs its own ellipsis.
+            if (line.Length == 0 && !(isClampedLastLine && index == lines.Count - 1))
             {
                 continue;
             }
 
+            // `direction: rtl`'s own visual-order reversal (see ParseTextDirection's remarks for
+            // this renderer's bidi scope) - reversing an already-wrapped line's own word sequence
+            // so the first logical word ends up rightmost, matching how a real browser lays out a
+            // pure-RTL paragraph. Deliberately word-level, not full UAX#9 character reordering:
+            // each word's own internal character order is left untouched, which is correct for a
+            // non-cursive script and a reasonable approximation for any other.
+            if (textStyle.Direction == TextDirection.Rtl)
+            {
+                line = ReverseWordOrder(line);
+            }
+
             var lineWidth = MeasureTextWidth(context, line, textStyle);
             var lineMaxWidth = index == 0 ? Math.Max(0f, maxWidth - firstLineIndent) : maxWidth;
+            var isLastLine = index == lines.Count - 1;
 
             // `text-overflow: ellipsis` is scoped to the single-line case - by far the dominant
             // real-world usage (`overflow: hidden; white-space: nowrap; text-overflow: ellipsis`) -
             // rather than truncating the last of several wrapped lines, which the CSS spec itself
-            // does not define without a non-standard extension (`-webkit-line-clamp`); a genuinely
-            // multi-line result here (`lines.Count > 1`) is left as-is, matching that scope cut.
-            if (textStyle.TextOverflow == TextOverflowMode.Ellipsis && lines.Count == 1 && lineWidth > lineMaxWidth)
+            // does not define without the non-standard `-webkit-line-clamp` extension handled
+            // separately above; a genuinely multi-line, non-clamped result here is left as-is.
+            if ((isClampedLastLine && isLastLine) ||
+                (textStyle.TextOverflow == TextOverflowMode.Ellipsis && lines.Count == 1 && lineWidth > lineMaxWidth))
             {
                 line = TruncateWithEllipsis(context, line, lineMaxWidth, textStyle);
                 lineWidth = MeasureTextWidth(context, line, textStyle);
@@ -3377,6 +3645,24 @@ public sealed class HtmlRenderer
                 textStyle.DecorationStyle,
                 textStyle.LetterSpacing);
         }
+    }
+
+    /// <summary>
+    /// Reverses a single already-wrapped line's own word sequence, for `direction: rtl`'s
+    /// word-level visual reordering - see <see cref="LayoutWrappedText"/>'s own call site remarks
+    /// for the scope this covers (and does not).
+    /// </summary>
+    private static string ReverseWordOrder(string line)
+    {
+        var words = line.Split(' ', StringSplitOptions.RemoveEmptyEntries);
+
+        if (words.Length <= 1)
+        {
+            return line;
+        }
+
+        Array.Reverse(words);
+        return string.Join(' ', words);
     }
 
     /// <summary>
@@ -3808,7 +4094,7 @@ public sealed class HtmlRenderer
         var styleMap = GetOrCreateStyleMap(context, element.Ref, element.ComputedStyle);
         var box = ResolveBoxStyle(styleMap, element.Ref);
         var contentWidth = Math.Max(1f, crossSize - box.BorderWidth.Left - box.BorderWidth.Right - box.Padding.Left - box.Padding.Right);
-        var textStyle = ResolveTextStyle(styleMap, new RenderTextStyle(16f, RenderColor.Black, "sans-serif", 1.2f, 400f, false, false, false, RenderColor.Black, global::AngleSharp.Renderer.Rendering.RenderTextDecorationStyle.Solid, TextAlign.Left, 0f, 0f, 0f, [], WhiteSpaceMode.Normal, WordBreakMode.Normal, OverflowWrapMode.Normal, TextOverflowMode.Clip));
+        var textStyle = ResolveTextStyle(styleMap, new RenderTextStyle(16f, RenderColor.Black, "sans-serif", 1.2f, 400f, false, false, false, RenderColor.Black, global::AngleSharp.Renderer.Rendering.RenderTextDecorationStyle.Solid, TextAlign.Left, 0f, 0f, 0f, [], WhiteSpaceMode.Normal, WordBreakMode.Normal, OverflowWrapMode.Normal, TextOverflowMode.Clip, 0, TextDirection.Ltr));
         var text = NormalizeWhitespace(element.Ref.TextContent ?? string.Empty, textStyle.WhiteSpace);
         var lineCount = text.Length == 0 ? 0 : WrapTextRespectingWhiteSpace(context, text, contentWidth, textStyle).Count;
         return lineCount * textStyle.FontSize * textStyle.LineHeightMultiplier;
@@ -3822,7 +4108,7 @@ public sealed class HtmlRenderer
 
         if (text.Length > 0)
         {
-            var textStyle = ResolveTextStyle(styleMap, new RenderTextStyle(16f, RenderColor.Black, "sans-serif", 1.2f, 400f, false, false, false, RenderColor.Black, global::AngleSharp.Renderer.Rendering.RenderTextDecorationStyle.Solid, TextAlign.Left, 0f, 0f, 0f, [], WhiteSpaceMode.Normal, WordBreakMode.Normal, OverflowWrapMode.Normal, TextOverflowMode.Clip));
+            var textStyle = ResolveTextStyle(styleMap, new RenderTextStyle(16f, RenderColor.Black, "sans-serif", 1.2f, 400f, false, false, false, RenderColor.Black, global::AngleSharp.Renderer.Rendering.RenderTextDecorationStyle.Solid, TextAlign.Left, 0f, 0f, 0f, [], WhiteSpaceMode.Normal, WordBreakMode.Normal, OverflowWrapMode.Normal, TextOverflowMode.Clip, 0, TextDirection.Ltr));
             contentWidth = MeasureTextWidth(context, text, textStyle);
             var maxWidth = ResolveAuthoredDimension(styleMap, "max-width", relativeTo, float.NaN, 0f);
             if (!float.IsNaN(maxWidth))
@@ -3877,7 +4163,23 @@ public sealed class HtmlRenderer
             };
         }
 
-        return !string.Equals(tagName, "code", StringComparison.OrdinalIgnoreCase);
+        // AngleSharp.Css's own UA stylesheet does not give every semantic inline tag (`<b>`,
+        // `<span>`, `<strong>`, `<em>`, ...) an explicit `display: inline` rule - `inline` is
+        // simply CSS's own initial value, so nothing ever needs to set it - which means
+        // `GetDisplay()` reports an empty string for a plain, unstyled one of these (the same
+        // "never serialized when nothing in the cascade set it explicitly" pattern already
+        // documented elsewhere in this file for `list-style-type`/`white-space`/etc.), not the
+        // literal word "inline". A real, confirmed bug (not hypothetical) fell out of that: this
+        // fallback used to treat every tag except `<code>` as block-level whenever `display` came
+        // back empty, so a plain, zero-CSS `<b>`/`<span>`/`<strong>`/... was misidentified as
+        // block, which in turn made a parent's `hasInlineRun` merge-onto-shared-lines check (see
+        // `LayoutElement`) never trigger for it - `<p>Hello <b>World</b></p>` rendered "World" on
+        // its own separate line instead of beside "Hello". `IsKnownInlineElement` already
+        // enumerates every standard semantic inline tag (including `<code>`, so that tag's own
+        // prior special case is now fully subsumed) for exactly this "no explicit display, still
+        // inline by default" situation - reusing it here, rather than only ever excluding `<code>`,
+        // fixes every one of them at once.
+        return !(tagName is not null && IsKnownInlineElement(tagName));
     }
 
     private static bool IsInlineBlock(ICssStyleDeclaration computedStyle)
@@ -3925,7 +4227,8 @@ public sealed class HtmlRenderer
         var (underline, strikeThrough) = ParseTextDecoration(styleMap, inherited.Underline, inherited.StrikeThrough);
         var decorationColor = ParseColor(styleMap.TryGetValue("text-decoration-color", out var decorationColorValue) ? decorationColorValue : null, color);
         var decorationStyle = ParseTextDecorationStyle(styleMap, inherited.DecorationStyle);
-        var textAlign = ParseTextAlign(styleMap, inherited.TextAlign);
+        var direction = ParseTextDirection(styleMap, inherited.Direction);
+        var textAlign = ParseTextAlign(styleMap, inherited.TextAlign, direction);
         var letterSpacing = ParseLength(styleMap, "letter-spacing", inherited.FontSize, inherited.LetterSpacing, allowAuto: false);
         var textIndent = ParseLength(styleMap, "text-indent", inherited.FontSize, 0f, allowAuto: false);
         var verticalAlignOffset = ParseVerticalAlign(styleMap, fontSize);
@@ -3934,8 +4237,28 @@ public sealed class HtmlRenderer
         var wordBreak = ParseWordBreak(styleMap, inherited.WordBreak);
         var overflowWrap = ParseOverflowWrap(styleMap, inherited.OverflowWrap);
         var textOverflow = ParseTextOverflow(styleMap);
+        var lineClamp = ParseLineClamp(styleMap);
 
-        return new RenderTextStyle(fontSize, color, fontFamily, lineHeight, fontWeight, isItalic, underline, strikeThrough, decorationColor, decorationStyle, textAlign, letterSpacing, textIndent, verticalAlignOffset, textShadows, whiteSpace, wordBreak, overflowWrap, textOverflow);
+        return new RenderTextStyle(fontSize, color, fontFamily, lineHeight, fontWeight, isItalic, underline, strikeThrough, decorationColor, decorationStyle, textAlign, letterSpacing, textIndent, verticalAlignOffset, textShadows, whiteSpace, wordBreak, overflowWrap, textOverflow, lineClamp, direction);
+    }
+
+    /// <summary>
+    /// `direction` (`ltr`/`rtl`) is inherited, the same as `white-space`/`word-break` above.
+    /// `unicode-bidi` (which controls whether `direction` establishes a new embedding level versus
+    /// only affecting the current one) is not separately modeled - this renderer's own bidi support
+    /// is a single, document-wide-per-element `direction` flag driving word-order reversal and the
+    /// `start`/`end` text-align resolution below, not a full Unicode Bidirectional Algorithm (UAX#9)
+    /// implementation with embedding levels/overrides - a deliberate, documented scope cut matching
+    /// "supported by current architecture" rather than a from-scratch bidi engine.
+    /// </summary>
+    private static TextDirection ParseTextDirection(Dictionary<string, string> styleMap, TextDirection inherited)
+    {
+        if (!styleMap.TryGetValue("direction", out var value) || string.IsNullOrWhiteSpace(value))
+        {
+            return inherited;
+        }
+
+        return string.Equals(value.Trim(), "rtl", StringComparison.OrdinalIgnoreCase) ? TextDirection.Rtl : TextDirection.Ltr;
     }
 
     /// <summary>
@@ -3998,6 +4321,36 @@ public sealed class HtmlRenderer
         return styleMap.TryGetValue("text-overflow", out var value) && string.Equals(value.Trim(), "ellipsis", StringComparison.OrdinalIgnoreCase)
             ? TextOverflowMode.Ellipsis
             : TextOverflowMode.Clip;
+    }
+
+    /// <summary>
+    /// `-webkit-line-clamp: &lt;N&gt;` (a long-standing, still-`-webkit-`-prefixed-only de facto
+    /// standard for multi-line truncation with an ellipsis on the final visible line - there is no
+    /// unprefixed equivalent in wide use, and it is what `text-overflow: ellipsis` itself has no
+    /// standard multi-line behavior without) - like `text-overflow`, never inherited (re-derived
+    /// fresh per element) and only meaningful on a box that itself clips overflow; unlike
+    /// `text-overflow`, this renderer does not additionally require `display: -webkit-box`/
+    /// `-webkit-box-orient: vertical` (the other two properties real browsers also require) - a
+    /// deliberate, documented simplification, since this renderer has no multi-column/flex-like
+    /// `-webkit-box` layout mode of its own for those to meaningfully interact with; `overflow:
+    /// hidden` plus a positive integer is treated as sufficient signal on its own. Returns 0
+    /// (unclamped) when unset, non-positive, or not a plain integer.
+    /// </summary>
+    private static int ParseLineClamp(Dictionary<string, string> styleMap)
+    {
+        if (!ShouldClipOverflow(styleMap))
+        {
+            return 0;
+        }
+
+        if (!styleMap.TryGetValue("-webkit-line-clamp", out var value) || string.IsNullOrWhiteSpace(value))
+        {
+            return 0;
+        }
+
+        return int.TryParse(value.Trim(), NumberStyles.Integer, CultureInfo.InvariantCulture, out var lineClamp) && lineClamp > 0
+            ? lineClamp
+            : 0;
     }
 
     /// <summary>
@@ -4084,11 +4437,19 @@ public sealed class HtmlRenderer
         };
     }
 
-    private static TextAlign ParseTextAlign(Dictionary<string, string> styleMap, TextAlign defaultValue)
+    private static TextAlign ParseTextAlign(Dictionary<string, string> styleMap, TextAlign defaultValue, TextDirection direction)
     {
+        var startAlign = direction == TextDirection.Rtl ? TextAlign.Right : TextAlign.Left;
+        var endAlign = direction == TextDirection.Rtl ? TextAlign.Left : TextAlign.Right;
+
         if (!styleMap.TryGetValue("text-align", out var value) || string.IsNullOrWhiteSpace(value))
         {
-            return defaultValue;
+            // `text-align`'s own CSS initial value is `start`, which - unlike this map's other
+            // properties - genuinely depends on `direction` rather than always meaning "left":
+            // `defaultValue` here is really only ever `TextAlign.Left`, the hardcoded assumption
+            // every call site made before `direction` was resolved at all, so it is superseded by
+            // `startAlign` whenever this element's own resolved direction is `rtl`.
+            return direction == TextDirection.Rtl ? startAlign : defaultValue;
         }
 
         var normalized = value.Trim().ToLowerInvariant();
@@ -4097,9 +4458,9 @@ public sealed class HtmlRenderer
         {
             "center" => TextAlign.Center,
             "right" => TextAlign.Right,
-            "end" => TextAlign.Right,
+            "end" => endAlign,
             "left" => TextAlign.Left,
-            "start" => TextAlign.Left,
+            "start" => startAlign,
             _ => defaultValue,
         };
     }
@@ -4518,6 +4879,9 @@ public sealed class HtmlRenderer
         AddLengthProperty(map, style, "min-height", explicitDeclarations);
         AddLengthProperty(map, style, "max-height", explicitDeclarations);
         AddIfPresent(map, "box-sizing", style.GetBoxSizing());
+        AddIfPresent(map, "object-fit", style.GetPropertyValue("object-fit"));
+        AddIfPresent(map, "object-position", style.GetPropertyValue("object-position"));
+        AddIfPresent(map, "clip-path", style.GetPropertyValue("clip-path"));
         var explicitAspectRatio = explicitDeclarations?.GetPropertyValue("aspect-ratio");
         AddIfPresent(map, "aspect-ratio", string.IsNullOrWhiteSpace(explicitAspectRatio)
             ? style.GetPropertyValue("aspect-ratio")
@@ -4566,6 +4930,9 @@ public sealed class HtmlRenderer
 
         AddIfPresent(map, "list-style-type", style.GetPropertyValue("list-style-type"));
         AddIfPresent(map, "list-style-position", style.GetPropertyValue("list-style-position"));
+        AddIfPresent(map, "counter-reset", style.GetPropertyValue("counter-reset"));
+        AddIfPresent(map, "counter-increment", style.GetPropertyValue("counter-increment"));
+        AddIfPresent(map, "counter-set", style.GetPropertyValue("counter-set"));
 
         AddIfPresent(map, "overflow-x", style.GetPropertyValue("overflow-x"));
         AddIfPresent(map, "overflow-y", style.GetPropertyValue("overflow-y"));
@@ -4683,13 +5050,31 @@ public sealed class HtmlRenderer
         AddIfPresent(map, "text-decoration-color", style.GetPropertyValue("text-decoration-color"));
         AddIfPresent(map, "text-decoration-style", style.GetPropertyValue("text-decoration-style"));
         AddIfPresent(map, "text-align", style.GetPropertyValue("text-align"));
+        AddIfPresent(map, "direction", style.GetPropertyValue("direction"));
         AddLengthProperty(map, style, "text-indent");
         AddIfPresent(map, "vertical-align", style.GetVerticalAlign());
         AddLengthProperty(map, style, "letter-spacing");
         AddIfPresent(map, "line-height", style.GetLineHeight());
         AddIfPresent(map, "color", style.GetColor());
-        AddIfPresent(map, "white-space", style.GetPropertyValue("white-space"));
+        // A real <textarea> preserves whitespace/newlines verbatim regardless of the cascade -
+        // browsers give it `white-space: pre-wrap` via their own UA stylesheet, which AngleSharp.Css's
+        // UA stylesheet does not (verified empirically: GetPropertyValue("white-space") for a plain,
+        // unstyled <textarea> reports empty, unlike its correct "inline-block" display). Applied here
+        // (not in ApplyFormControlDefaults, which runs after RenderTextStyle/WhiteSpace is already
+        // resolved) so the caret placement and the flowed text content both see the same wrapping.
+        var whiteSpaceValue = style.GetPropertyValue("white-space");
+        if (string.IsNullOrWhiteSpace(whiteSpaceValue) && string.Equals(element?.LocalName, "textarea", StringComparison.OrdinalIgnoreCase))
+        {
+            whiteSpaceValue = "pre-wrap";
+        }
+        AddIfPresent(map, "white-space", whiteSpaceValue);
         AddIfPresent(map, "text-overflow", style.GetPropertyValue("text-overflow"));
+        // Not a property AngleSharp.Css's own declaration factory necessarily recognizes (a
+        // long-standing `-webkit-`-only vendor extension, never standardized under an unprefixed
+        // name) - read via the same raw cascaded-declaration fallback `background-image`/gradients
+        // already use for a related reason, so it works regardless of whether the computed style
+        // pipeline itself understands the property.
+        AddIfPresent(map, "-webkit-line-clamp", ResolveRawAuthoredPropertyValue(element, inlineStyle, "-webkit-line-clamp"));
         AddIfPresent(map, "word-break", style.GetPropertyValue("word-break"));
         var rawOverflowWrap = ResolveRawAuthoredPropertyValue(element, inlineStyle, "overflow-wrap");
         AddIfPresent(map, "overflow-wrap", !string.IsNullOrWhiteSpace(rawOverflowWrap)
@@ -5342,14 +5727,15 @@ public sealed class HtmlRenderer
         string.Equals(tagName, "img", StringComparison.OrdinalIgnoreCase) ||
         string.Equals(tagName, "svg", StringComparison.OrdinalIgnoreCase);
 
-    private static bool TryResolveReplacedElementImage(ElementRenderNode node, Dictionary<string, string> styleMap, float containingWidth, float x, float y, out RenderedImage? image, out RenderRect rect) =>
-        TryResolveImage(node, styleMap, containingWidth, x, y, out image, out rect) ||
-        TryResolveInlineSvg(node, styleMap, containingWidth, x, y, out image, out rect);
+    private static bool TryResolveReplacedElementImage(ElementRenderNode node, Dictionary<string, string> styleMap, float containingWidth, float x, float y, out RenderedImage? image, out RenderRect rect, out RenderRect? clipRect) =>
+        TryResolveImage(node, styleMap, containingWidth, x, y, out image, out rect, out clipRect) ||
+        TryResolveInlineSvg(node, styleMap, containingWidth, x, y, out image, out rect, out clipRect);
 
-    private static bool TryResolveImage(ElementRenderNode node, Dictionary<string, string> styleMap, float containingWidth, float x, float y, out RenderedImage? image, out RenderRect rect)
+    private static bool TryResolveImage(ElementRenderNode node, Dictionary<string, string> styleMap, float containingWidth, float x, float y, out RenderedImage? image, out RenderRect rect, out RenderRect? clipRect)
     {
         image = null;
         rect = default;
+        clipRect = null;
 
         // node.Ref.LocalName/GetAttribute("src") proxy through to the host for a ::before/::after
         // pseudo-element (PseudoElement.cs, AngleSharp.Css) - without this guard, an <img>'s own
@@ -5366,13 +5752,14 @@ public sealed class HtmlRenderer
             return false;
         }
 
-        return TryResolveReplacedElementRect(imageResource, styleMap, containingWidth, x, y, out image, out rect);
+        return TryResolveReplacedElementRect(imageResource, styleMap, containingWidth, x, y, out image, out rect, out clipRect);
     }
 
-    private static bool TryResolveInlineSvg(ElementRenderNode node, Dictionary<string, string> styleMap, float containingWidth, float x, float y, out RenderedImage? image, out RenderRect rect)
+    private static bool TryResolveInlineSvg(ElementRenderNode node, Dictionary<string, string> styleMap, float containingWidth, float x, float y, out RenderedImage? image, out RenderRect rect, out RenderRect? clipRect)
     {
         image = null;
         rect = default;
+        clipRect = null;
 
         // Same reasoning as the identical guard in TryResolveImage above - an <svg>'s own
         // generated-content pseudo aliases its host's LocalName and must not be treated as the SVG.
@@ -5386,13 +5773,14 @@ public sealed class HtmlRenderer
             return false;
         }
 
-        return TryResolveReplacedElementRect(imageResource, styleMap, containingWidth, x, y, out image, out rect);
+        return TryResolveReplacedElementRect(imageResource, styleMap, containingWidth, x, y, out image, out rect, out clipRect);
     }
 
-    private static bool TryResolveReplacedElementRect(CachedImageResource imageResource, Dictionary<string, string> styleMap, float containingWidth, float x, float y, out RenderedImage? image, out RenderRect rect)
+    private static bool TryResolveReplacedElementRect(CachedImageResource imageResource, Dictionary<string, string> styleMap, float containingWidth, float x, float y, out RenderedImage? image, out RenderRect rect, out RenderRect? clipRect)
     {
         image = null;
         rect = default;
+        clipRect = null;
 
         var width = ParseLength(styleMap, "width", containingWidth, float.NaN, allowAuto: true);
         var height = ParseLength(styleMap, "height", containingWidth, float.NaN, allowAuto: true);
@@ -5420,9 +5808,118 @@ public sealed class HtmlRenderer
             height = naturalHeight;
         }
 
+        var boxRect = new RenderRect(x, y, width, height);
+        var (paintRect, needsClip) = ResolveObjectFitRect(boxRect, naturalWidth, naturalHeight, styleMap);
+
         image = new RenderedImage(imageResource.Bytes, (int)Math.Max(1, Math.Round(width)), (int)Math.Max(1, Math.Round(height)), imageResource.MimeType);
-        rect = new RenderRect(x, y, width, height);
+        rect = paintRect;
+        clipRect = needsClip ? boxRect : null;
         return true;
+    }
+
+    /// <summary>
+    /// `object-fit`/`object-position` resolve a replaced element's own paint rect - where the
+    /// natural image is actually drawn - separately from its layout box (`box`, already resolved
+    /// from `width`/`height` the ordinary way). `fill` (the CSS default, and the only mode this
+    /// renderer previously supported) stretches the image to exactly cover the box with no
+    /// cropping/letterboxing, so it is left as a no-op fast path identical to the pre-existing
+    /// behavior. The other four modes uniformly scale the natural image and reposition it per
+    /// `object-position` (defaulting to centered, unlike `background-position`'s top-left
+    /// default) - `contain` scales to the smaller axis (letterboxing, never cropping), `cover`
+    /// scales to the larger axis (filling the box, cropping via the returned clip flag whenever
+    /// the scaled image exceeds the box on either axis), `none` uses the natural size outright,
+    /// and `scale-down` is `none` unless `contain` would end up smaller. The caller is expected to
+    /// clip to `box` around the paint whenever this returns <see langword="true"/> - this method
+    /// only decides *whether* clipping is needed, not how to perform it, keeping this renderer's
+    /// existing `PushClip`/`PopClip` display-list primitives as the single place clip painting
+    /// itself is implemented.
+    /// </summary>
+    private static (RenderRect PaintRect, bool NeedsClip) ResolveObjectFitRect(RenderRect box, float naturalWidth, float naturalHeight, Dictionary<string, string> styleMap)
+    {
+        var objectFit = styleMap.TryGetValue("object-fit", out var fitValue) ? fitValue.Trim().ToLowerInvariant() : "fill";
+
+        if (objectFit is not ("contain" or "cover" or "none" or "scale-down") ||
+            naturalWidth <= 0f || naturalHeight <= 0f || box.Width <= 0f || box.Height <= 0f)
+        {
+            return (box, false);
+        }
+
+        var containScale = Math.Min(box.Width / naturalWidth, box.Height / naturalHeight);
+        var coverScale = Math.Max(box.Width / naturalWidth, box.Height / naturalHeight);
+
+        var scale = objectFit switch
+        {
+            "contain" => containScale,
+            "cover" => coverScale,
+            "none" => 1f,
+            "scale-down" => Math.Min(1f, containScale),
+            _ => 1f,
+        };
+
+        var paintWidth = naturalWidth * scale;
+        var paintHeight = naturalHeight * scale;
+
+        var (positionXFraction, positionXOffset, positionYFraction, positionYOffset) = ParseObjectPosition(styleMap);
+
+        var paintX = box.X + ((box.Width - paintWidth) * positionXFraction) + positionXOffset;
+        var paintY = box.Y + ((box.Height - paintHeight) * positionYFraction) + positionYOffset;
+
+        var paintRect = new RenderRect(paintX, paintY, paintWidth, paintHeight);
+        var needsClip = paintRect.X < box.X - 0.01f ||
+            paintRect.Y < box.Y - 0.01f ||
+            paintRect.X + paintRect.Width > box.X + box.Width + 0.01f ||
+            paintRect.Y + paintRect.Height > box.Y + box.Height + 0.01f;
+
+        return (paintRect, needsClip);
+    }
+
+    /// <summary>
+    /// Parses `object-position`, reusing `background-position`'s own single-axis keyword/
+    /// percentage/length grammar (<see cref="ParsePositionComponent"/>) - the two properties share
+    /// an identical grammar, differing only in their CSS initial value: `background-position`
+    /// defaults to `0% 0%` (top-left) while `object-position` defaults to `50% 50%` (centered).
+    /// </summary>
+    private static (float PositionXFraction, float PositionXOffset, float PositionYFraction, float PositionYOffset) ParseObjectPosition(Dictionary<string, string> styleMap)
+    {
+        var center = new RenderBackgroundPositionComponent(0.5f, 0f);
+
+        if (!styleMap.TryGetValue("object-position", out var value) || string.IsNullOrWhiteSpace(value))
+        {
+            return (center.Percentage, center.OffsetPixels, center.Percentage, center.OffsetPixels);
+        }
+
+        var tokens = value.Trim().Split(' ', StringSplitOptions.RemoveEmptyEntries);
+
+        if (tokens.Length == 0)
+        {
+            return (center.Percentage, center.OffsetPixels, center.Percentage, center.OffsetPixels);
+        }
+
+        RenderBackgroundPositionComponent xComponent;
+        RenderBackgroundPositionComponent yComponent;
+
+        if (tokens.Length == 1)
+        {
+            var only = tokens[0].ToLowerInvariant();
+
+            if (only is "top" or "bottom")
+            {
+                xComponent = center;
+                yComponent = ParsePositionComponent(only);
+            }
+            else
+            {
+                xComponent = ParsePositionComponent(only);
+                yComponent = center;
+            }
+        }
+        else
+        {
+            xComponent = ParsePositionComponent(tokens[0]);
+            yComponent = ParsePositionComponent(tokens[1]);
+        }
+
+        return (xComponent.Percentage, xComponent.OffsetPixels, yComponent.Percentage, yComponent.OffsetPixels);
     }
 
     private static bool TryGetOrLoadInlineSvgResource(IElement element, out CachedImageResource? imageResource)
@@ -5736,6 +6233,12 @@ public sealed class HtmlRenderer
         /// <summary>`&lt;select&gt;` - shows only its selected `&lt;option&gt;`'s text, never every option.</summary>
         Select,
 
+        /// <summary>`input[type=range]` - a track with a positioned thumb, no text/value shown.</summary>
+        Range,
+
+        /// <summary>`input[type=file]` - a button-like box showing a fixed "Choose File" label.</summary>
+        File,
+
         /// <summary>`&lt;textarea&gt;` - gets the same box chrome as a text input, but keeps its real
         /// child text node flowing through the ordinary block child-layout path for its content.</summary>
         TextArea,
@@ -5855,6 +6358,8 @@ public sealed class HtmlRenderer
             "checkbox" => FormControlKind.Checkbox,
             "radio" => FormControlKind.Radio,
             "color" => FormControlKind.Color,
+            "range" => FormControlKind.Range,
+            "file" => FormControlKind.File,
             "button" or "submit" or "reset" => FormControlKind.Button,
             "hidden" => FormControlKind.Hidden,
             _ => FormControlKind.TextLike,
@@ -5989,6 +6494,32 @@ public sealed class HtmlRenderer
                 SetDefault("height", FormatPixelValue(lineHeight));
                 break;
 
+            case FormControlKind.Range:
+                // A native range slider has no visible border/background box of its own - only
+                // the track/thumb PaintFormControl draws directly - so, unlike every other text-ish
+                // control above, this deliberately does not set a default border or background.
+                SetDefault("width", "150px");
+                SetDefault("height", FormatPixelValue(Math.Max(16f, lineHeight * 0.6f)));
+                break;
+
+            case FormControlKind.File:
+            {
+                SetDefaultBorder();
+                SetDefault("padding-top", "2px");
+                SetDefault("padding-bottom", "2px");
+                SetDefault("padding-left", "10px");
+                SetDefault("padding-right", "10px");
+                SetDefault("background-color", "#e8e8e8");
+                SetDefault("height", FormatPixelValue(lineHeight));
+
+                // Shrinks to fit its own fixed label, the same shrink-to-fit approach a <button>
+                // already uses for its own (also fixed-at-paint-time) label.
+                var fileLabel = ResolveFormControlLabel(FormControlKind.File, element);
+                var fileLabelWidth = MeasureTextWidth(context, fileLabel, textStyle);
+                SetDefault("width", FormatPixelValue(Math.Max(20f, fileLabelWidth)));
+                break;
+            }
+
             case FormControlKind.Checkbox:
             case FormControlKind.Radio:
             {
@@ -6117,6 +6648,12 @@ public sealed class HtmlRenderer
                 return selected is not null ? NormalizeWhitespace(selected.TextContent ?? string.Empty) : string.Empty;
             }
 
+            case FormControlKind.File:
+                // No filename-tracking model (this renderer does not simulate a real file picker
+                // dialog or an `IElement.Files` selection) - always the fixed label a real browser
+                // shows before any file has been chosen.
+                return "Choose File";
+
             default:
                 return string.Empty;
         }
@@ -6146,6 +6683,7 @@ public sealed class HtmlRenderer
             case FormControlKind.TextLike:
             case FormControlKind.Select:
             case FormControlKind.Button:
+            case FormControlKind.File:
             {
                 var label = ResolveFormControlLabel(kind, element);
 
@@ -6171,9 +6709,9 @@ public sealed class HtmlRenderer
                 if (label.Length > 0)
                 {
                     // A text input's typed value and a select's selected option are both
-                    // left-aligned, matching how browsers show them; only a button's own label is
-                    // centered in its box.
-                    var labelX = kind == FormControlKind.Button
+                    // left-aligned, matching how browsers show them; a button's and a file input's
+                    // own (fixed) label are both centered in their box instead.
+                    var labelX = kind is FormControlKind.Button or FormControlKind.File
                         ? contentX + Math.Max(0f, (contentWidth - labelWidth) / 2f)
                         : contentX;
 
@@ -6243,7 +6781,75 @@ public sealed class HtmlRenderer
                 displayList.FillRect(new RenderRect(contentX, contentY, contentWidth, contentHeight), color);
                 break;
             }
+
+            case FormControlKind.Range:
+            {
+                // `min`/`max`/`value` default to 0/100/(min+max)/2 per the HTML spec's own
+                // input[type=range] defaults, used whenever the corresponding attribute is absent
+                // or unparsable rather than left at 0 (which would visually look like an
+                // always-empty slider for the common case of an author never authoring `value`).
+                var min = ParseRangeAttribute(element, "min", 0d);
+                var max = ParseRangeAttribute(element, "max", 100d);
+
+                if (max <= min)
+                {
+                    max = min + 1d;
+                }
+
+                var value = Math.Clamp(ParseRangeAttribute(element, "value", (min + max) / 2d), min, max);
+                var fraction = (float)((value - min) / (max - min));
+
+                var trackHeight = Math.Max(2f, contentHeight * 0.2f);
+                var trackY = contentY + ((contentHeight - trackHeight) / 2f);
+                displayList.FillRect(
+                    new RenderRect(contentX, trackY, contentWidth, trackHeight),
+                    new RenderColor(0xc0, 0xc0, 0xc0),
+                    new RenderCornerRadii(trackHeight / 2f, trackHeight / 2f, trackHeight / 2f, trackHeight / 2f, trackHeight / 2f, trackHeight / 2f, trackHeight / 2f, trackHeight / 2f));
+
+                var thumbSize = Math.Max(trackHeight, Math.Min(contentHeight, 16f));
+                var thumbX = contentX + (fraction * contentWidth) - (thumbSize / 2f);
+                var thumbY = contentY + ((contentHeight - thumbSize) / 2f);
+                displayList.FillRect(
+                    new RenderRect(thumbX, thumbY, thumbSize, thumbSize),
+                    FormControlAccentColor,
+                    new RenderCornerRadii(thumbSize / 2f, thumbSize / 2f, thumbSize / 2f, thumbSize / 2f, thumbSize / 2f, thumbSize / 2f, thumbSize / 2f, thumbSize / 2f));
+                break;
+            }
+
+            case FormControlKind.TextArea:
+            {
+                // A <textarea>'s real child text node flows through the ordinary block
+                // child-layout path (see this method's own remarks) - only its focused caret is
+                // painted here, at the end of its own text, on whichever wrapped line that text
+                // ends up ending on. Reproduces the exact same wrapping the real content is laid
+                // out with (same text, same `white-space`-aware splitting, same content width) so
+                // the caret never drifts out of sync with what is actually painted.
+                if (!element.IsFocused)
+                {
+                    break;
+                }
+
+                var normalizedText = NormalizeWhitespace(element.TextContent ?? string.Empty, textStyle.WhiteSpace);
+                var lines = WrapTextRespectingWhiteSpace(context, normalizedText, contentWidth, textStyle);
+                var lineHeight = textStyle.FontSize * textStyle.LineHeightMultiplier;
+                var lastLineIndex = Math.Max(0, lines.Count - 1);
+                var lastLine = lines.Count > 0 ? lines[^1] : string.Empty;
+                var lastLineWidth = lastLine.Length > 0 ? MeasureTextWidth(context, lastLine, textStyle) : 0f;
+
+                var caretBaselineY = contentY + (lastLineIndex * lineHeight) + ResolveTextBaselineOffset(lineHeight, textStyle.FontSize) + textStyle.VerticalAlignOffset;
+                PaintFormControlCaret(displayList, element, textStyle, contentX + lastLineWidth, caretBaselineY);
+                break;
+            }
         }
+    }
+
+
+    private static double ParseRangeAttribute(IElement element, string attributeName, double defaultValue)
+    {
+        var raw = element.GetAttribute(attributeName);
+        return !string.IsNullOrWhiteSpace(raw) && double.TryParse(raw, NumberStyles.Float, CultureInfo.InvariantCulture, out var parsed)
+            ? parsed
+            : defaultValue;
     }
 
     /// <summary>
@@ -6257,9 +6863,11 @@ public sealed class HtmlRenderer
     /// delegates to it (see AGENTS.md's `:hover` section for the equivalent story with
     /// <c>SetPseudoClass</c>), so a plain <c>element.Focus()</c> or
     /// <c>element.SetPseudoClass("focus")</c> is already enough to make a caret appear, with no
-    /// extra wiring needed here. `&lt;textarea&gt;` is a deliberate, documented scope cut - unlike
-    /// a single-line input's fixed baseline, its caret position would depend on which wrapped line
-    /// its real child text node currently ends on, which this renderer does not track.
+    /// extra wiring needed here. `&lt;textarea&gt;` reuses this same helper (see the
+    /// <see cref="FormControlKind.TextArea"/> case in <see cref="PaintFormControl"/>) - its own
+    /// caret position is computed by re-wrapping its text the same way its real content is laid
+    /// out, since unlike a single-line input's fixed baseline, a textarea's caret depends on
+    /// whichever wrapped line its text currently ends on.
     /// </summary>
     private static void PaintFormControlCaret(
         DisplayList displayList,
@@ -6480,6 +7088,365 @@ public sealed class HtmlRenderer
 
         var result = builder.ToString();
         return upper ? result : result.ToLowerInvariant();
+    }
+
+    /// <summary>
+    /// Resolves CSS `counter-reset`/`counter-increment`/`counter-set` and rewrites any `::before`/
+    /// `::after` pseudo-element's generated content that reads it back via `counter()`/
+    /// `counters()` - a full, general implementation deliberately layered independently of
+    /// `ResolveListItemOrdinal`'s own narrower `&lt;ol&gt;`/`&lt;li&gt;`-specific counting model,
+    /// which remains unchanged and does not use this machinery.
+    ///
+    /// AngleSharp.Css's own generated-content pipeline (`RenderTreeBuilder.RenderElement`) already
+    /// synthesizes a `::before`/`::after` pseudo's single text child from `ContentDeclaration.Stringify`,
+    /// but that method always stringifies a `counter()`/`counters()` segment to an empty string (a
+    /// documented, deliberate scope cut in AngleSharp.Css itself - see this file's own remarks on
+    /// generated content) - by the time this renderer's layout pass ever sees that synthesized text,
+    /// the fact that it came from `counter()` at all is already lost, with nothing left to
+    /// substitute a computed value into. Recovering it requires re-reading the pseudo-element's own
+    /// *raw*, uncomputed `content` declaration text directly (still available via
+    /// `ComputeCurrentStyle().GetPropertyValue("content")`, since that only serializes the parsed
+    /// value back to text - it does not stringify it) and re-deriving the final string here,
+    /// independently of AngleSharp.Css's own (necessarily different, since it has no counter model)
+    /// resolution.
+    ///
+    /// A single pre-order pass over the already-built render tree, entirely separate from the
+    /// actual layout walk (see the call site in <c>BuildDisplayList</c>) - counter scoping (a
+    /// `counter-reset` on one element must not leak its own new instance to siblings outside that
+    /// element's own subtree, but must still be visible again once that subtree ends) is
+    /// notoriously easy to get wrong if threaded through <c>LayoutElement</c> itself, which has
+    /// many early-return paths that would each need to remember to pop whatever this element
+    /// pushed. A plain recursive function call sidesteps that entirely: whatever this call pushes
+    /// onto <paramref name="context"/>'s counter stacks is always popped again right before this
+    /// call itself returns, regardless of how the recursive `foreach` over children unwinds.
+    /// </summary>
+    private static void ProcessCounters(IRenderNode node, LayoutContext context)
+    {
+        if (node is not ElementRenderNode elementNode)
+        {
+            return;
+        }
+
+        var styleMap = GetOrCreateStyleMap(context, elementNode.Ref, elementNode.ComputedStyle);
+
+        // A pseudo-element's computed style reports its host's own `counter-increment`/
+        // `counter-reset`/`counter-set` even when only a plain (non-`::before`/`::after`) selector
+        // declared it (confirmed empirically: a `.item { counter-increment: item }` rule with no
+        // pseudo-element in its own selector at all still shows up here for `.item`'s own `::before`)
+        // - applying it a second time here would double-count every such counter. Mutations are
+        // therefore only ever applied for a real element, never a pseudo-element, a deliberate,
+        // narrow scope cut rather than an attempt to distinguish "genuinely redeclared on the
+        // pseudo's own selector" from "inherited from the host" after the fact.
+        var introducedCounterNames = elementNode.Ref is IPseudoElement
+            ? []
+            : ApplyCounterDeclarations(styleMap, context.Counters);
+
+        if (elementNode.Ref is IPseudoElement &&
+            TryEvaluateCounterContent(elementNode.ComputedStyle.GetPropertyValue("content"), context.Counters, out var evaluatedContent))
+        {
+            var textChild = elementNode.Children.OfType<TextRenderNode>().FirstOrDefault();
+
+            if (textChild is not null)
+            {
+                textChild.Ref.Data = evaluatedContent;
+            }
+        }
+
+        foreach (var child in elementNode.Children)
+        {
+            ProcessCounters(child, context);
+        }
+
+        // Pop in reverse order of introduction - matters only for the rare case of the same
+        // counter name appearing more than once in a single element's own `counter-reset` list,
+        // where popping out of order would restore the wrong intermediate value.
+        for (var i = introducedCounterNames.Count - 1; i >= 0; i--)
+        {
+            var name = introducedCounterNames[i];
+
+            if (context.Counters.TryGetValue(name, out var stack) && stack.Count > 0)
+            {
+                stack.Pop();
+
+                if (stack.Count == 0)
+                {
+                    context.Counters.Remove(name);
+                }
+            }
+        }
+    }
+
+    /// <summary>
+    /// Applies this element's own `counter-reset`/`counter-set`/`counter-increment` declarations,
+    /// in that order (matching the CSS Lists spec's own processing order for a single element),
+    /// and returns the counter names this element's own `counter-reset` introduced a *new* stacked
+    /// instance for - the only ones <see cref="ProcessCounters"/> needs to pop again once this
+    /// element's subtree is done. `counter-set`/`counter-increment` on a name with no existing
+    /// instance anywhere both create one too (per spec), which is also tracked here so it gets
+    /// popped at the same point - otherwise it would permanently leak into every following sibling.
+    /// </summary>
+    private static List<string> ApplyCounterDeclarations(Dictionary<string, string> styleMap, Dictionary<string, Stack<int>> counters)
+    {
+        var introduced = new List<string>();
+
+        void CreateOrUpdate(string name, int value, bool replaceTop)
+        {
+            if (counters.TryGetValue(name, out var stack) && stack.Count > 0)
+            {
+                if (replaceTop)
+                {
+                    stack.Pop();
+                    stack.Push(value);
+                }
+                else
+                {
+                    stack.Push(value);
+                    introduced.Add(name);
+                }
+
+                return;
+            }
+
+            var newStack = new Stack<int>();
+            newStack.Push(value);
+            counters[name] = newStack;
+            introduced.Add(name);
+        }
+
+        if (styleMap.TryGetValue("counter-reset", out var resetRaw))
+        {
+            foreach (var (name, value) in ParseCounterDeclarationList(resetRaw, defaultValue: 0))
+            {
+                CreateOrUpdate(name, value, replaceTop: false);
+            }
+        }
+
+        if (styleMap.TryGetValue("counter-set", out var setRaw))
+        {
+            foreach (var (name, value) in ParseCounterDeclarationList(setRaw, defaultValue: 0))
+            {
+                CreateOrUpdate(name, value, replaceTop: true);
+            }
+        }
+
+        if (styleMap.TryGetValue("counter-increment", out var incrementRaw))
+        {
+            foreach (var (name, incrementBy) in ParseCounterDeclarationList(incrementRaw, defaultValue: 1))
+            {
+                if (counters.TryGetValue(name, out var stack) && stack.Count > 0)
+                {
+                    var current = stack.Pop();
+                    stack.Push(current + incrementBy);
+                }
+                else
+                {
+                    CreateOrUpdate(name, incrementBy, replaceTop: false);
+                }
+            }
+        }
+
+        return introduced;
+    }
+
+    /// <summary>
+    /// Parses `counter-reset`/`counter-set`/`counter-increment`'s shared grammar - a whitespace-
+    /// separated (not comma-separated) list of `&lt;counter-name&gt; &lt;integer&gt;?` pairs, or
+    /// the keyword `none` - into (name, value) pairs, substituting <paramref name="defaultValue"/>
+    /// for any name with no following integer, exactly as the property's own initial/omitted value
+    /// dictates (0 for reset/set, 1 for increment).
+    /// </summary>
+    private static IEnumerable<(string Name, int Value)> ParseCounterDeclarationList(string raw, int defaultValue)
+    {
+        if (string.IsNullOrWhiteSpace(raw) || string.Equals(raw.Trim(), "none", StringComparison.OrdinalIgnoreCase))
+        {
+            yield break;
+        }
+
+        var tokens = raw.Split(' ', StringSplitOptions.RemoveEmptyEntries);
+        string? pendingName = null;
+
+        foreach (var token in tokens)
+        {
+            if (pendingName is not null && int.TryParse(token, NumberStyles.Integer, CultureInfo.InvariantCulture, out var explicitValue))
+            {
+                yield return (pendingName, explicitValue);
+                pendingName = null;
+                continue;
+            }
+
+            if (pendingName is not null)
+            {
+                yield return (pendingName, defaultValue);
+            }
+
+            pendingName = token;
+        }
+
+        if (pendingName is not null)
+        {
+            yield return (pendingName, defaultValue);
+        }
+    }
+
+    /// <summary>
+    /// Re-derives a `::before`/`::after` pseudo-element's generated text from its own *raw*
+    /// `content` declaration text, for the one case AngleSharp.Css's own generated-content
+    /// resolution cannot handle: `counter()`/`counters()`. Scoped to a `content` value composed
+    /// entirely of quoted string literals and `counter()`/`counters()` calls (the overwhelmingly
+    /// common way either is actually used - `content: counter(item) ". "` style) - a value mixing
+    /// in anything else this parser does not recognize (`attr()`, nested quotes/functions, ...)
+    /// returns <see langword="false"/> so the caller leaves AngleSharp.Css's own synthesized text
+    /// (which drops just the counter segment, not the whole value) untouched rather than replacing
+    /// it with something wrong. Only the `decimal` counter style is supported - a `list-style-type`-
+    /// style second argument to `counter()`/`counters()` (`upper-roman`, `disc`, ...) is read only
+    /// far enough to be skipped over, not interpreted.
+    /// </summary>
+    private static bool TryEvaluateCounterContent(string? rawContent, Dictionary<string, Stack<int>> counters, out string result)
+    {
+        result = string.Empty;
+
+        if (string.IsNullOrWhiteSpace(rawContent) ||
+            !(rawContent.Contains("counter(", StringComparison.OrdinalIgnoreCase) || rawContent.Contains("counters(", StringComparison.OrdinalIgnoreCase)))
+        {
+            return false;
+        }
+
+        var builder = new StringBuilder();
+        var i = 0;
+
+        while (i < rawContent.Length)
+        {
+            if (char.IsWhiteSpace(rawContent[i]))
+            {
+                i++;
+                continue;
+            }
+
+            if (rawContent[i] is '"' or '\'')
+            {
+                var quote = rawContent[i];
+                var closingQuoteIndex = rawContent.IndexOf(quote, i + 1);
+
+                if (closingQuoteIndex < 0)
+                {
+                    return false;
+                }
+
+                builder.Append(rawContent[(i + 1)..closingQuoteIndex]);
+                i = closingQuoteIndex + 1;
+                continue;
+            }
+
+            var openParenIndex = rawContent.IndexOf('(', i);
+
+            if (openParenIndex < 0)
+            {
+                return false;
+            }
+
+            var functionName = rawContent[i..openParenIndex].Trim().ToLowerInvariant();
+            var closeParenIndex = rawContent.IndexOf(')', openParenIndex);
+
+            if (closeParenIndex < 0)
+            {
+                return false;
+            }
+
+            // AngleSharp.Css's own serialization of a function's arguments is not guaranteed to
+            // preserve the author's original comma - `counters(item, ".")` round-trips through
+            // `GetPropertyValue` as `counters(item .)`, space-separated with no comma at all
+            // (confirmed empirically, not assumed) - so arguments have to be tokenized respecting
+            // quoted strings and treating both `,` and whitespace as equally valid separators,
+            // rather than a naive `Split(',')`.
+            var arguments = TokenizeFunctionArguments(rawContent[(openParenIndex + 1)..closeParenIndex])
+                .Select(StripQuotes)
+                .ToArray();
+
+            if (functionName == "counter" && arguments.Length > 0)
+            {
+                var value = counters.TryGetValue(arguments[0], out var stack) && stack.Count > 0 ? stack.Peek() : 0;
+                builder.Append(value.ToString(CultureInfo.InvariantCulture));
+            }
+            else if (functionName == "counters" && arguments.Length > 0)
+            {
+                var separator = arguments.Length > 1 ? arguments[1] : string.Empty;
+                var value = counters.TryGetValue(arguments[0], out var stack) && stack.Count > 0
+                    ? string.Join(separator, stack.Reverse())
+                    : "0";
+                builder.Append(value);
+            }
+            else
+            {
+                // An unrecognized function (attr(), url(), ...) mixed into the same value - bail
+                // out entirely rather than guessing, per this method's own scope-cut remarks.
+                return false;
+            }
+
+            i = closeParenIndex + 1;
+        }
+
+        result = builder.ToString();
+        return true;
+    }
+
+    private static string StripQuotes(string token)
+    {
+        var trimmed = token.Trim();
+        return trimmed.Length >= 2 && (trimmed[0] is '"' or '\'') && trimmed[^1] == trimmed[0]
+            ? trimmed[1..^1]
+            : trimmed;
+    }
+
+    /// <summary>
+    /// Splits a CSS function's already-extracted argument text into individual argument tokens,
+    /// treating both `,` and plain whitespace as valid separators (see the call site's own remarks
+    /// for why) and keeping a quoted string's own contents - including any comma or whitespace
+    /// inside it - together as a single token rather than splitting on separators found within it.
+    /// </summary>
+    private static List<string> TokenizeFunctionArguments(string args)
+    {
+        var tokens = new List<string>();
+        var i = 0;
+
+        while (i < args.Length)
+        {
+            while (i < args.Length && (char.IsWhiteSpace(args[i]) || args[i] == ','))
+            {
+                i++;
+            }
+
+            if (i >= args.Length)
+            {
+                break;
+            }
+
+            if (args[i] is '"' or '\'')
+            {
+                var quote = args[i];
+                var closingQuoteIndex = args.IndexOf(quote, i + 1);
+
+                if (closingQuoteIndex < 0)
+                {
+                    tokens.Add(args[i..]);
+                    break;
+                }
+
+                tokens.Add(args[i..(closingQuoteIndex + 1)]);
+                i = closingQuoteIndex + 1;
+                continue;
+            }
+
+            var start = i;
+
+            while (i < args.Length && args[i] != ',' && !char.IsWhiteSpace(args[i]))
+            {
+                i++;
+            }
+
+            tokens.Add(args[start..i]);
+        }
+
+        return tokens;
     }
 
     /// <summary>
@@ -6837,6 +7804,60 @@ public sealed class HtmlRenderer
         float horizontalBorderAndPadding,
         float verticalBorderAndPadding)
     {
+        var ratio = ParseAspectRatio(styleMap);
+
+        if (float.IsNaN(ratio))
+        {
+            return float.NaN;
+        }
+
+        if (!IsBorderBox(styleMap))
+        {
+            return contentWidth / ratio;
+        }
+
+        var borderBoxWidth = contentWidth + horizontalBorderAndPadding;
+        return Math.Max(0f, (borderBoxWidth / ratio) - verticalBorderAndPadding);
+    }
+
+    /// <summary>
+    /// The inverse of <see cref="ResolveAspectRatioContentHeight"/> - derives a used content width
+    /// from an already-definite content height plus `aspect-ratio`, for the case where `width` is
+    /// auto but `height` is not (e.g. `height: 100px; aspect-ratio: 2 / 1;` with no `width`
+    /// authored at all). Shares the exact same ratio parsing as the height direction.
+    /// </summary>
+    private static float ResolveAspectRatioContentWidth(
+        Dictionary<string, string> styleMap,
+        float contentHeight,
+        float horizontalBorderAndPadding,
+        float verticalBorderAndPadding)
+    {
+        var ratio = ParseAspectRatio(styleMap);
+
+        if (float.IsNaN(ratio))
+        {
+            return float.NaN;
+        }
+
+        if (!IsBorderBox(styleMap))
+        {
+            return contentHeight * ratio;
+        }
+
+        var borderBoxHeight = contentHeight + verticalBorderAndPadding;
+        return Math.Max(0f, (borderBoxHeight * ratio) - horizontalBorderAndPadding);
+    }
+
+    /// <summary>
+    /// Parses the `aspect-ratio` property's `&lt;width&gt; / &lt;height&gt;` (or bare
+    /// `&lt;width&gt;`, `/ 1` implied) syntax into a single width-over-height ratio, ignoring the
+    /// property's own optional leading `auto` keyword (this renderer has no intrinsic-size concept
+    /// for non-replaced elements to fall back to, so `auto` and a bare ratio behave identically
+    /// here). Returns NaN when unset or malformed, the same "no override" signal every other
+    /// aspect-ratio consumer already expects.
+    /// </summary>
+    private static float ParseAspectRatio(Dictionary<string, string> styleMap)
+    {
         if (!styleMap.TryGetValue("aspect-ratio", out var value) || string.IsNullOrWhiteSpace(value))
         {
             return float.NaN;
@@ -6859,14 +7880,7 @@ public sealed class HtmlRenderer
             return float.NaN;
         }
 
-        var ratio = numerator / denominator;
-        if (!IsBorderBox(styleMap))
-        {
-            return contentWidth / ratio;
-        }
-
-        var borderBoxWidth = contentWidth + horizontalBorderAndPadding;
-        return Math.Max(0f, (borderBoxWidth / ratio) - verticalBorderAndPadding);
+        return numerator / denominator;
     }
 
     /// <summary>
@@ -7123,6 +8137,224 @@ public sealed class HtmlRenderer
         }
 
         return RenderBackgroundPositionComponent.Zero;
+    }
+
+    /// <summary>
+    /// Parses CSS `clip-path`'s basic-shape functional notations - `circle()`, `ellipse()`,
+    /// `inset()`, `polygon()` - into a <see cref="RenderClipShape"/> already fully resolved
+    /// against the element's own border box (this renderer's reference box for `clip-path`;
+    /// `margin-box`/`padding-box`/`content-box`/`fill-box`/etc. box-selection keywords are not
+    /// recognized, a deliberate, documented scope cut). Hand-rolled directly in this renderer
+    /// rather than delegated to AngleSharp.Css (unlike `transform`/`filter`/gradients) - reflecting
+    /// over that assembly finds no `clip-path`/basic-shape parser to delegate to at all, and each
+    /// of these four grammars is small enough that a small local parser is proportionate. `url(#id)`
+    /// (an SVG clip-path reference), `path()`, and the box-selection keywords alone are not
+    /// recognized and simply disable clipping (as if `clip-path` were unset) rather than clipping
+    /// to nothing - the same "recognized shapes only, everything else silently unsupported" scope
+    /// cut already established for SVG filter primitives and 3D transform functions elsewhere in
+    /// this renderer.
+    /// </summary>
+    private static RenderClipShape? ParseClipPath(Dictionary<string, string> styleMap, float boxWidth, float boxHeight)
+    {
+        if (!styleMap.TryGetValue("clip-path", out var value) || string.IsNullOrWhiteSpace(value))
+        {
+            return null;
+        }
+
+        var text = value.Trim();
+
+        if (string.Equals(text, "none", StringComparison.OrdinalIgnoreCase))
+        {
+            return null;
+        }
+
+        if (TryExtractShapeArguments(text, "circle", out var circleArgs))
+        {
+            return ParseCircleClipShape(circleArgs, boxWidth, boxHeight);
+        }
+
+        if (TryExtractShapeArguments(text, "ellipse", out var ellipseArgs))
+        {
+            return ParseEllipseClipShape(ellipseArgs, boxWidth, boxHeight);
+        }
+
+        if (TryExtractShapeArguments(text, "inset", out var insetArgs))
+        {
+            return ParseInsetClipShape(insetArgs, boxWidth, boxHeight);
+        }
+
+        if (TryExtractShapeArguments(text, "polygon", out var polygonArgs))
+        {
+            return ParsePolygonClipShape(polygonArgs, boxWidth, boxHeight);
+        }
+
+        return null;
+    }
+
+    private static bool TryExtractShapeArguments(string text, string functionName, out string arguments)
+    {
+        arguments = string.Empty;
+        var prefix = functionName + "(";
+
+        if (!text.StartsWith(prefix, StringComparison.OrdinalIgnoreCase) || !text.EndsWith(")", StringComparison.Ordinal))
+        {
+            return false;
+        }
+
+        arguments = text[prefix.Length..^1].Trim();
+        return true;
+    }
+
+    private static (string ShapeArgs, string PositionArgs) SplitAtKeyword(string args)
+    {
+        var atIndex = args.IndexOf(" at ", StringComparison.OrdinalIgnoreCase);
+        return atIndex < 0 ? (args.Trim(), string.Empty) : (args[..atIndex].Trim(), args[(atIndex + 4)..].Trim());
+    }
+
+    private static (float CenterX, float CenterY) ResolveClipShapePosition(string positionArgs, float boxWidth, float boxHeight)
+    {
+        if (positionArgs.Length == 0)
+        {
+            return (boxWidth / 2f, boxHeight / 2f);
+        }
+
+        var tokens = positionArgs.Split(' ', StringSplitOptions.RemoveEmptyEntries);
+        var xComponent = tokens.Length > 0 ? ParsePositionComponent(tokens[0]) : new RenderBackgroundPositionComponent(0.5f, 0f);
+        var yComponent = tokens.Length > 1 ? ParsePositionComponent(tokens[1]) : new RenderBackgroundPositionComponent(0.5f, 0f);
+
+        return (
+            (xComponent.Percentage * boxWidth) + xComponent.OffsetPixels,
+            (yComponent.Percentage * boxHeight) + yComponent.OffsetPixels);
+    }
+
+    private static RenderClipShape ParseCircleClipShape(string args, float boxWidth, float boxHeight)
+    {
+        var (radiusText, positionArgs) = SplitAtKeyword(args);
+        var (centerX, centerY) = ResolveClipShapePosition(positionArgs, boxWidth, boxHeight);
+
+        var closestSide = Math.Min(Math.Min(centerX, boxWidth - centerX), Math.Min(centerY, boxHeight - centerY));
+        var farthestSide = Math.Max(Math.Max(centerX, boxWidth - centerX), Math.Max(centerY, boxHeight - centerY));
+        var diagonalReference = (float)Math.Sqrt(((boxWidth * boxWidth) + (boxHeight * boxHeight)) / 2.0);
+
+        var radius = radiusText.ToLowerInvariant() switch
+        {
+            "" or "closest-side" => closestSide,
+            "farthest-side" => farthestSide,
+            _ => ResolveClipShapeLength(radiusText, diagonalReference, closestSide),
+        };
+
+        return new RenderClipCircle(centerX, centerY, Math.Max(0f, radius));
+    }
+
+    private static RenderClipShape ParseEllipseClipShape(string args, float boxWidth, float boxHeight)
+    {
+        var (radiiText, positionArgs) = SplitAtKeyword(args);
+        var (centerX, centerY) = ResolveClipShapePosition(positionArgs, boxWidth, boxHeight);
+
+        var closestSideX = Math.Min(centerX, boxWidth - centerX);
+        var closestSideY = Math.Min(centerY, boxHeight - centerY);
+        var farthestSideX = Math.Max(centerX, boxWidth - centerX);
+        var farthestSideY = Math.Max(centerY, boxHeight - centerY);
+
+        var radiiTokens = radiiText.Split(' ', StringSplitOptions.RemoveEmptyEntries);
+        var radiusXText = radiiTokens.Length > 0 ? radiiTokens[0].ToLowerInvariant() : string.Empty;
+        var radiusYText = radiiTokens.Length > 1 ? radiiTokens[1].ToLowerInvariant() : string.Empty;
+
+        var radiusX = radiusXText switch
+        {
+            "" or "closest-side" => closestSideX,
+            "farthest-side" => farthestSideX,
+            _ => ResolveClipShapeLength(radiusXText, boxWidth, closestSideX),
+        };
+
+        var radiusY = radiusYText switch
+        {
+            "" or "closest-side" => closestSideY,
+            "farthest-side" => farthestSideY,
+            _ => ResolveClipShapeLength(radiusYText, boxHeight, closestSideY),
+        };
+
+        return new RenderClipEllipse(centerX, centerY, Math.Max(0f, radiusX), Math.Max(0f, radiusY));
+    }
+
+    private static RenderClipShape ParseInsetClipShape(string args, float boxWidth, float boxHeight)
+    {
+        var roundIndex = args.IndexOf(" round ", StringComparison.OrdinalIgnoreCase);
+        var offsetsText = roundIndex < 0 ? args : args[..roundIndex];
+        var radiusText = roundIndex < 0 ? string.Empty : args[(roundIndex + 7)..].Trim();
+
+        var offsetTokens = offsetsText.Split(' ', StringSplitOptions.RemoveEmptyEntries);
+        var top = offsetTokens.Length > 0 ? ResolveClipShapeLength(offsetTokens[0], boxHeight, 0f) : 0f;
+        var right = offsetTokens.Length > 1 ? ResolveClipShapeLength(offsetTokens[1], boxWidth, 0f) : top;
+        var bottom = offsetTokens.Length > 2 ? ResolveClipShapeLength(offsetTokens[2], boxHeight, 0f) : top;
+        var left = offsetTokens.Length > 3 ? ResolveClipShapeLength(offsetTokens[3], boxWidth, 0f) : right;
+
+        var rect = new RenderRect(left, top, Math.Max(0f, boxWidth - left - right), Math.Max(0f, boxHeight - top - bottom));
+
+        // Only a single, uniform corner radius is supported (applied to all four corners) - a
+        // deliberate, documented scope cut compared to `inset()`'s full per-corner/elliptical
+        // `round <border-radius>` grammar, mirroring how a mixed-width `border` similarly falls
+        // back to a simpler approximation elsewhere in this renderer rather than attempting every
+        // combination the full spec grammar allows.
+        var radii = RenderCornerRadii.Zero;
+
+        if (radiusText.Length > 0)
+        {
+            var uniformRadius = Math.Max(0f, ResolveClipShapeLength(radiusText.Split(' ', StringSplitOptions.RemoveEmptyEntries)[0], Math.Min(boxWidth, boxHeight), 0f));
+            radii = new RenderCornerRadii(uniformRadius, uniformRadius, uniformRadius, uniformRadius, uniformRadius, uniformRadius, uniformRadius, uniformRadius);
+        }
+
+        return new RenderClipInset(rect, radii.ClampToBox(rect.Width, rect.Height));
+    }
+
+    private static RenderClipShape ParsePolygonClipShape(string args, float boxWidth, float boxHeight)
+    {
+        var segments = args.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+        var points = new List<(float X, float Y)>();
+
+        foreach (var segment in segments)
+        {
+            // The optional leading `nonzero`/`evenodd` fill-rule keyword shares a segment with the
+            // first vertex (`"polygon(nonzero, 0 0, ...)"` splits its first comma-separated part as
+            // `"nonzero 0 0"`) - this renderer's polygon clip fills unconditionally (Skia's default
+            // fill rule), so the keyword itself is simply skipped rather than affecting rendering.
+            var tokens = segment.Split(' ', StringSplitOptions.RemoveEmptyEntries)
+                .Where(token => !token.Equals("nonzero", StringComparison.OrdinalIgnoreCase) && !token.Equals("evenodd", StringComparison.OrdinalIgnoreCase))
+                .ToArray();
+
+            if (tokens.Length < 2)
+            {
+                continue;
+            }
+
+            var x = ResolveClipShapeLength(tokens[0], boxWidth, 0f);
+            var y = ResolveClipShapeLength(tokens[1], boxHeight, 0f);
+            points.Add((x, y));
+        }
+
+        return new RenderClipPolygon(points);
+    }
+
+    /// <summary>
+    /// Resolves a single `clip-path` shape length token - a percentage (against
+    /// <paramref name="percentageReference"/>, which differs per shape/axis: a circle's radius
+    /// resolves against the box diagonal, an ellipse's/`inset()`'s/`polygon()`'s against the
+    /// relevant single axis) or a plain pixel length - falling back to
+    /// <paramref name="fallback"/> for anything unparseable (an unsupported keyword like
+    /// `closest-corner`, or a malformed token) rather than defaulting to zero, which would
+    /// otherwise silently collapse the shape.
+    /// </summary>
+    private static float ResolveClipShapeLength(string token, float percentageReference, float fallback)
+    {
+        var trimmed = token.Trim();
+
+        if (trimmed.EndsWith("%", StringComparison.Ordinal) &&
+            float.TryParse(trimmed[..^1], NumberStyles.Float, CultureInfo.InvariantCulture, out var percent))
+        {
+            return percent / 100f * percentageReference;
+        }
+
+        return TryParsePixelValue(trimmed, out var pixels) ? pixels : fallback;
     }
 
     /// <summary>
@@ -8731,13 +9963,26 @@ public sealed class HtmlRenderer
         WhiteSpaceMode WhiteSpace,
         WordBreakMode WordBreak,
         OverflowWrapMode OverflowWrap,
-        TextOverflowMode TextOverflow);
+        TextOverflowMode TextOverflow,
+        int LineClamp,
+        TextDirection Direction);
 
     private enum TextAlign
     {
         Left,
         Center,
         Right,
+    }
+
+    /// <summary>
+    /// CSS `direction` (`ltr`/`rtl`) - see `ParseTextDirection`'s own remarks for the scope of what
+    /// this renderer's RTL support actually covers (word-order reversal and `start`/`end`
+    /// text-align resolution, not a full Unicode Bidirectional Algorithm implementation).
+    /// </summary>
+    private enum TextDirection
+    {
+        Ltr,
+        Rtl,
     }
 
     /// <summary>
