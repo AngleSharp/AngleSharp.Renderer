@@ -41,11 +41,56 @@ public sealed class FontFaceTests
         Assert.Equal(await MeasureAsync(string.Empty, "serif"), width, tolerance: 0.01f);
     }
 
+    [Theory]
+    [InlineData("DejaVuSerif-Latin1.woff", "woff")]
+    [InlineData("DejaVuSerif-Latin1.woff2", "woff2")]
+    [InlineData("DejaVuSerif-Latin1-hmtx.woff2", "woff2")]
+    public async Task WebFontFace_MeasuresLikeTheFontItWraps(string fileName, string format)
+    {
+        // The fixtures are an ASCII/Latin-1 subset of the bundled DejaVu Serif, saved as TTF,
+        // WOFF, and WOFF2 by fontTools (with the transformed glyf/loca tables, and in the -hmtx
+        // file also the transformed hmtx table).
+        var width = await MeasureAsync(
+            $"@font-face {{ font-family: 'Embedded'; src: url({FixtureDataUri(fileName, format)}) format('{format}'); }}",
+            "Embedded");
+
+        Assert.Equal(await MeasureAsync(string.Empty, "serif"), width, tolerance: 0.01f);
+    }
+
+    [Theory]
+    [InlineData("DejaVuSerif-Latin1.woff", "woff")]
+    [InlineData("DejaVuSerif-Latin1.woff2", "woff2")]
+    [InlineData("DejaVuSerif-Latin1-hmtx.woff2", "woff2")]
+    public async Task WebFontFace_RendersTheSameGlyphsAsTheFontItWraps(string fileName, string format)
+    {
+        // Identical pixels mean the decoded outlines, hinting instructions and metrics match the
+        // original font, including the composite glyphs of the accented letters.
+        var reference = await RenderSampleAsync(FixtureDataUri("DejaVuSerif-Latin1.ttf", "truetype"), "truetype");
+        var decoded = await RenderSampleAsync(FixtureDataUri(fileName, format), format);
+
+        Assert.Equal(reference, decoded);
+    }
+
+    private static string FixtureDataUri(string fileName, string format) =>
+        $"data:font/{format};base64,{Convert.ToBase64String(File.ReadAllBytes(Path.Combine(AppContext.BaseDirectory, "fonts", fileName)))}";
+
+    private static async Task<byte[]> RenderSampleAsync(string dataUri, string format)
+    {
+        var html =
+            "<html><head><style>" +
+            $"@font-face {{ font-family: 'Embedded'; src: url({dataUri}) format('{format}'); }}" +
+            "body { margin: 0; font-family: 'Embedded'; font-size: 24px; }" +
+            "</style></head><body>Handgloves {}[] àéîõü ÅÇÑØ ß 0123</body></html>";
+        var document = await BrowsingContext.New(Configuration.Default.WithCss()).OpenAsync(request => request.Content(html));
+        var image = new HtmlRenderer().RenderToPng(document, new DefaultRenderDevice { ViewPortWidth = 420, ViewPortHeight = 40 });
+        return image.Data;
+    }
+
     [Fact]
     public async Task UnsupportedFormat_FallsThroughToTheNextSource()
     {
-        // Skia cannot decode the compressed wrappers, so a woff2 source has to be skipped rather
-        // than claim the family and leave it unrenderable.
+        // A woff2 source that cannot be decoded has to be skipped rather than claim the family
+        // and leave it unrenderable.
         var width = await MeasureAsync(
             "@font-face { font-family: 'Embedded'; " +
             $"src: url(data:font/woff2;base64,{Convert.ToBase64String("wOF2padding"u8.ToArray())}) format('woff2'), " +

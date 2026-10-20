@@ -26,4 +26,8 @@
     <ProjectReference Include="..\AngleSharp.Renderer\AngleSharp.Renderer.csproj" />
   </ItemGroup>
 
+  <ItemGroup>
+    <None Include="fonts\**" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+
 </Project>

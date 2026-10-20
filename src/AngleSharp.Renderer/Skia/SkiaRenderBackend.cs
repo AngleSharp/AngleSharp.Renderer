@@ -12,7 +12,7 @@ namespace AngleSharp.Renderer.Skia;
 /// The backend also measures text, so a renderer using it lays out against the same advance
 /// widths it paints with.
 /// </remarks>
-public sealed class SkiaRenderBackend : IRenderBackend, ITextMeasurer
+public sealed partial class SkiaRenderBackend : IRenderBackend, ITextMeasurer
 {
     private readonly SkiaTextMeasurer _textMeasurer = new();
 
@@ -36,9 +36,11 @@ public sealed class SkiaRenderBackend : IRenderBackend, ITextMeasurer
         var canvas = surface.Canvas;
         canvas.Clear(SKColors.Transparent);
 
+        var state = new DrawState(surface);
+
         foreach (var command in displayList.Commands)
         {
-            DrawCommand(canvas, command, displayList.Fonts);
+            DrawCommand(canvas, command, displayList.Fonts, state);
         }
 
         using var image = surface.Snapshot();
@@ -48,15 +50,31 @@ public sealed class SkiaRenderBackend : IRenderBackend, ITextMeasurer
         return new RenderedImage(data.ToArray(), viewport.Width, viewport.Height, "image/png");
     }
 
-    private static void DrawCommand(SKCanvas canvas, RenderCommand command, FontFaceSet fonts)
+    private static void DrawCommand(SKCanvas canvas, RenderCommand command, FontFaceSet fonts, DrawState state)
     {
         switch (command)
         {
+            case DrawBorderImageCommand borderImage:
+                DrawBorderImage(canvas, borderImage);
+                break;
+            case DrawBackdropFilterCommand backdropFilter:
+                DrawBackdropFilter(canvas, state.Surface, backdropFilter);
+                break;
+            case PushMaskCommand pushMask:
+                canvas.SaveLayer();
+                state.Masks.Push(pushMask);
+                break;
+            case PopMaskCommand:
+                ApplyMask(canvas, state.Masks.Pop());
+                break;
             case FillRectCommand fill:
                 DrawFillRect(canvas, fill);
                 break;
             case StrokeRoundedRectCommand strokeRoundedRect:
                 DrawStrokeRoundedRect(canvas, strokeRoundedRect);
+                break;
+            case FillRingCommand fillRing:
+                DrawFillRing(canvas, fillRing);
                 break;
             case DrawBoxShadowCommand boxShadow:
                 DrawBoxShadow(canvas, boxShadow);
@@ -97,6 +115,12 @@ public sealed class SkiaRenderBackend : IRenderBackend, ITextMeasurer
             case PopOpacityCommand:
                 canvas.Restore();
                 break;
+            case PushBlendModeCommand pushBlendMode:
+                PushBlendMode(canvas, pushBlendMode);
+                break;
+            case PopBlendModeCommand:
+                canvas.Restore();
+                break;
         }
     }
 
@@ -119,6 +143,34 @@ public sealed class SkiaRenderBackend : IRenderBackend, ITextMeasurer
         using var paint = new SKPaint { Color = new SKColor(255, 255, 255, alpha) };
         canvas.SaveLayer(paint);
     }
+
+    private static void PushBlendMode(SKCanvas canvas, PushBlendModeCommand command)
+    {
+        // The layer collects the group in isolation; restoring it composites the group onto the
+        // backdrop with the paint's blend mode.
+        using var paint = new SKPaint { BlendMode = ToSkiaBlendMode(command.Mode) };
+        canvas.SaveLayer(paint);
+    }
+
+    private static SKBlendMode ToSkiaBlendMode(RenderBlendMode mode) => mode switch
+    {
+        RenderBlendMode.Multiply => SKBlendMode.Multiply,
+        RenderBlendMode.Screen => SKBlendMode.Screen,
+        RenderBlendMode.Overlay => SKBlendMode.Overlay,
+        RenderBlendMode.Darken => SKBlendMode.Darken,
+        RenderBlendMode.Lighten => SKBlendMode.Lighten,
+        RenderBlendMode.ColorDodge => SKBlendMode.ColorDodge,
+        RenderBlendMode.ColorBurn => SKBlendMode.ColorBurn,
+        RenderBlendMode.HardLight => SKBlendMode.HardLight,
+        RenderBlendMode.SoftLight => SKBlendMode.SoftLight,
+        RenderBlendMode.Difference => SKBlendMode.Difference,
+        RenderBlendMode.Exclusion => SKBlendMode.Exclusion,
+        RenderBlendMode.Hue => SKBlendMode.Hue,
+        RenderBlendMode.Saturation => SKBlendMode.Saturation,
+        RenderBlendMode.Color => SKBlendMode.Color,
+        RenderBlendMode.Luminosity => SKBlendMode.Luminosity,
+        _ => SKBlendMode.SrcOver,
+    };
 
     private static void PushFilter(SKCanvas canvas, PushFilterCommand command)
     {
@@ -453,7 +505,7 @@ public sealed class SkiaRenderBackend : IRenderBackend, ITextMeasurer
             return;
         }
 
-        using var paint = CreateFillPaint(command.Paint, command.Rect);
+        using var paint = CreateFillPaint(command.Paint, command.PaintArea ?? command.Rect);
 
         var rect = new SKRect(
             command.Rect.X,
@@ -472,6 +524,31 @@ public sealed class SkiaRenderBackend : IRenderBackend, ITextMeasurer
             canvas.DrawRoundRect(roundRect, paint);
         }
     }
+
+    private static void DrawFillRing(SKCanvas canvas, FillRingCommand command)
+    {
+        if (command.Outer.IsEmpty || command.Color.A == 0)
+        {
+            return;
+        }
+
+        using var outer = new SKRoundRect();
+        outer.SetRectRadii(ToSkRect(command.Outer), ToSkPoints(command.OuterRadii));
+        using var paint = new SKPaint { Color = ToSkColor(command.Color), IsAntialias = true, Style = SKPaintStyle.Fill };
+
+        if (command.Inner.Width <= 0f || command.Inner.Height <= 0f)
+        {
+            canvas.DrawRoundRect(outer, paint);
+            return;
+        }
+
+        using var inner = new SKRoundRect();
+        inner.SetRectRadii(ToSkRect(command.Inner), ToSkPoints(command.InnerRadii));
+        canvas.DrawRoundRectDifference(outer, inner, paint);
+    }
+
+    private static SKRect ToSkRect(RenderRect rect) =>
+        new(rect.X, rect.Y, rect.X + rect.Width, rect.Y + rect.Height);
 
     private static void DrawStrokeRoundedRect(SKCanvas canvas, StrokeRoundedRectCommand command)
     {
@@ -518,7 +595,11 @@ public sealed class SkiaRenderBackend : IRenderBackend, ITextMeasurer
                 IsAntialias = true,
                 Style = SKPaintStyle.Fill,
             },
+            RenderGradientPaint { Tile: { } tile } gradientPaint => CreateTiledPaint(gradientPaint, rect, tile.Size, tile.PositionX, tile.PositionY, tile.RepeatX, tile.RepeatY),
             RenderGradientPaint gradientPaint => CreateGradientPaint(gradientPaint.Gradient, rect),
+            RenderImagePaint imagePaint when imagePaint.EffectiveRepeatX is RenderBackgroundRepeat.Space or RenderBackgroundRepeat.Round ||
+                                             imagePaint.EffectiveRepeatY is RenderBackgroundRepeat.Space or RenderBackgroundRepeat.Round =>
+                CreateTiledPaint(imagePaint, rect, imagePaint.Size, imagePaint.PositionX, imagePaint.PositionY, imagePaint.EffectiveRepeatX, imagePaint.EffectiveRepeatY),
             RenderImagePaint imagePaint => CreateImagePaint(imagePaint, rect),
             _ => throw new NotSupportedException($"Unsupported paint type: {paint.GetType().Name}"),
         };
@@ -828,7 +909,8 @@ public sealed class SkiaRenderBackend : IRenderBackend, ITextMeasurer
             command.FontWeight,
             command.IsItalic,
             command.LetterSpacing,
-            fonts);
+            fonts,
+            command.FontStretch);
 
         using var paint = SkiaTextShaping.CreateTextPaint(font);
         paint.Color = ToSkColor(command.Color);
@@ -869,7 +951,8 @@ public sealed class SkiaRenderBackend : IRenderBackend, ITextMeasurer
             command.FontWeight,
             command.IsItalic,
             command.LetterSpacing,
-            fonts);
+            fonts,
+            command.FontStretch);
 
         using var paint = SkiaTextShaping.CreateTextPaint(font);
         paint.Color = ToSkColor(command.Color);

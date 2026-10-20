@@ -1,3 +1,42 @@
+# 0.8.0
+
+Released on Wednesday, October 21 2026.
+
+- Improved inline-blocks, floats and absolutely positioned boxes with an auto width, which now shrink to fit their content
+- Improved inline backgrounds and borders, which are painted per line fragment
+- Updated the required AngleSharp.Css version to 1.1.4-beta.341 (pre-release)
+- Improved images, which are now inline boxes sized from their natural size, with the background color painted under background images
+- Updated styling to come only from the computed style: removed the tag-name fallbacks for inline display, heading weight, hidden `<script>`/`<style>`/`input[type=hidden]`, `<textarea>` white-space and the form-control look (the missing default-stylesheet rules are reported to AngleSharp.Css)
+- Updated `FillRectCommand` to carry an optional `PaintArea` (the box a gradient or image paint is sized in), with a matching `DisplayList.FillRect` overload
+- Updated table layout to detect rows and cells by their `display` value instead of tag names
+- Updated `RenderGradientPaint` and `RenderImagePaint` to carry optional tiling and repeat modes
+- Removed a hard-coded `justify-content` for elements with the `nested` class
+- Fixed inline layout: inline content now forms real line boxes, so inline siblings directly in `<body>` share a line, adjacent inline elements are no longer separated by a spurious space, mixed sizes share one baseline, nested inline styles are kept, and `white-space` preservation, `word-break`, `overflow-wrap` and `text-align` apply to mixed inline content
+- Fixed `font-weight: bolder`/`lighter` being ignored (so `<b>`, `<strong>` and headings render bold via the default stylesheet)
+- Fixed percentage `border-radius` values, which now resolve against the border box
+- Fixed `vertical-align` on a box shifting the text inside it
+- Fixed `min-width`/`max-width` being ignored for block widths
+- Added the border styles `dotted`, `groove`, `ridge`, `inset` and `outset`
+- Added correct rounded borders with differing widths, colors or styles (new `FillRingCommand`)
+- Added multiple background layers, `background-repeat: space | round`, and sized/positioned/repeated gradient backgrounds
+- Added `border-image` (new `DrawBorderImageCommand`)
+- Added CSS masks via `mask-image` and its companion properties (new `PushMaskCommand`/`PopMaskCommand`)
+- Added `backdrop-filter` (new `DrawBackdropFilterCommand`)
+- Added the individual transform properties `translate`, `rotate` and `scale`
+- Added `float: right` and `clear`, with floats shared across a block formatting context: text in following blocks wraps around them line by line, and `overflow`/`flow-root` containers enclose their floats
+- Added `text-transform` and `word-spacing`
+- Added `outline-offset`, `background-clip` and `background-origin` (images and gradients now start inside the border by default, as `background-origin: padding-box` specifies)
+- Added `mix-blend-mode`, `isolation` and `background-blend-mode`
+- Added multi-column layout (`column-count`, `column-width`, `column-gap`, `column-rule`)
+- Added the Unicode Bidirectional Algorithm (UAX #9) with `unicode-bidi`, replacing the word-order reversal for `direction: rtl`
+- Added WOFF and WOFF2 web fonts in `@font-face`
+- Added `text-align: justify` and `text-align-last`
+- Added soft-hyphen line breaking and `hyphens` (`auto` behaves like `manual`)
+- Added `tab-size`
+- Added synthesized small capitals for `font-variant: small-caps`/`all-small-caps`
+- Added `font-stretch` for installed and `@font-face` fonts (new optional `FontStretch` on `RenderFont`, `DrawTextCommand` and `DrawTextShadowCommand`)
+- Added `text-overflow: ellipsis` and `-webkit-line-clamp` for mixed inline content
+
 # 0.7.0
 
 Released on Monday, October 19 2026.

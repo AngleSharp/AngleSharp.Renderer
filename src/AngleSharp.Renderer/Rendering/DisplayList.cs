@@ -134,6 +134,20 @@ public sealed class DisplayList
     public void PopOpacity() => Add(new PopOpacityCommand());
 
     /// <summary>
+    /// Starts compositing every following command, up to the matching <see cref="PopBlendMode"/>,
+    /// as one group that is blended onto what was painted before it with <paramref name="mode"/>
+    /// (CSS `mix-blend-mode`). With <see cref="RenderBlendMode.Normal"/> the scope is simply an
+    /// isolated group (CSS `isolation: isolate`), which bounds the backdrop that blend modes
+    /// inside it can see. Pairs must nest like a stack.
+    /// </summary>
+    public void PushBlendMode(RenderBlendMode mode) => Add(new PushBlendModeCommand(mode));
+
+    /// <summary>
+    /// Ends the blend scope started by the matching <see cref="PushBlendMode"/>.
+    /// </summary>
+    public void PopBlendMode() => Add(new PopBlendModeCommand());
+
+    /// <summary>
     /// Ends the filter scope started by the matching <see cref="PushFilter"/>.
     /// </summary>
     public void PopFilter() => Add(new PopFilterCommand());
@@ -168,12 +182,66 @@ public sealed class DisplayList
     }
 
     /// <summary>
+    /// Adds a filled rectangle command whose gradient or image paint is sized and positioned in
+    /// <paramref name="paintArea"/> (CSS `background-origin`) while only <paramref name="rect"/>
+    /// is painted (CSS `background-clip`).
+    /// </summary>
+    public void FillRect(RenderRect rect, RenderPaint paint, RenderCornerRadii radii, RenderRect paintArea)
+    {
+        ArgumentNullException.ThrowIfNull(paint);
+        Add(new FillRectCommand(rect, paint, radii, paintArea));
+    }
+
+    /// <summary>
     /// Adds a stroked rounded rectangle command - used to paint a `border-radius` box's border
     /// when all four edges share the same width, so the border can be drawn as a single ring
     /// rather than four separate straight edges.
     /// </summary>
     public void StrokeRoundedRect(RenderRect rect, RenderColor color, float strokeWidth, RenderCornerRadii radii) =>
         Add(new StrokeRoundedRectCommand(rect, color, strokeWidth, radii));
+
+    /// <summary>
+    /// Fills the ring between two (rounded) rectangles - the area inside <paramref name="outer"/>
+    /// but outside <paramref name="inner"/>, which is how a border with rounded corners and
+    /// differing edge widths is painted.
+    /// </summary>
+    public void FillRing(RenderRect outer, RenderCornerRadii outerRadii, RenderRect inner, RenderCornerRadii innerRadii, RenderColor color) =>
+        Add(new FillRingCommand(outer, outerRadii, inner, innerRadii, color));
+
+    /// <summary>
+    /// Draws a nine-slice `border-image` into <paramref name="area"/> (the border box grown by
+    /// `border-image-outset`).
+    /// </summary>
+    public void DrawBorderImage(RenderRect area, RenderBorderImage image)
+    {
+        ArgumentNullException.ThrowIfNull(image);
+        Add(new DrawBorderImageCommand(area, image));
+    }
+
+    /// <summary>
+    /// Replaces what is already painted inside the rounded <paramref name="rect"/> with a filtered
+    /// copy of itself (CSS `backdrop-filter`).
+    /// </summary>
+    public void DrawBackdropFilter(RenderRect rect, RenderCornerRadii radii, IReadOnlyList<RenderFilterFunction> functions)
+    {
+        ArgumentNullException.ThrowIfNull(functions);
+        Add(new DrawBackdropFilterCommand(rect, radii, functions));
+    }
+
+    /// <summary>
+    /// Starts a group that is masked by <paramref name="layers"/> (CSS `mask`) when the matching
+    /// <see cref="PopMask"/> ends it. The layers are listed topmost first and add up.
+    /// </summary>
+    public void PushMask(IReadOnlyList<RenderMaskLayer> layers)
+    {
+        ArgumentNullException.ThrowIfNull(layers);
+        Add(new PushMaskCommand(layers));
+    }
+
+    /// <summary>
+    /// Ends the mask scope started by the matching <see cref="PushMask"/>.
+    /// </summary>
+    public void PopMask() => Add(new PopMaskCommand());
 
     /// <summary>
     /// Adds a `box-shadow` layer, painted relative to an element's border box.
@@ -206,12 +274,13 @@ public sealed class DisplayList
         bool strikeThrough = false,
         RenderColor? decorationColor = null,
         RenderTextDecorationStyle decorationStyle = RenderTextDecorationStyle.Solid,
-        float letterSpacing = 0f)
+        float letterSpacing = 0f,
+        float fontStretch = 100f)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(text);
         ArgumentException.ThrowIfNullOrWhiteSpace(fontFamily);
 
-        Add(new DrawTextCommand(text, x, y, color, fontSize, fontFamily, fontWeight, isItalic, underline, strikeThrough, decorationColor ?? color, decorationStyle, letterSpacing));
+        Add(new DrawTextCommand(text, x, y, color, fontSize, fontFamily, fontWeight, isItalic, underline, strikeThrough, decorationColor ?? color, decorationStyle, letterSpacing, fontStretch));
     }
 
     /// <summary>
@@ -227,12 +296,13 @@ public sealed class DisplayList
         float fontWeight,
         bool isItalic,
         float blurRadius,
-        float letterSpacing)
+        float letterSpacing,
+        float fontStretch = 100f)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(text);
         ArgumentException.ThrowIfNullOrWhiteSpace(fontFamily);
 
-        Add(new DrawTextShadowCommand(text, x, y, color, fontSize, fontFamily, fontWeight, isItalic, blurRadius, letterSpacing));
+        Add(new DrawTextShadowCommand(text, x, y, color, fontSize, fontFamily, fontWeight, isItalic, blurRadius, letterSpacing, fontStretch));
     }
 }
 
@@ -244,7 +314,14 @@ public abstract record RenderCommand;
 /// <summary>
 /// Draws a filled rectangle, optionally with rounded corners (`border-radius`).
 /// </summary>
-public sealed record FillRectCommand(RenderRect Rect, RenderPaint Paint, RenderCornerRadii Radii = default) : RenderCommand
+/// <param name="Rect">The painted area (the `background-clip` box).</param>
+/// <param name="Paint">The paint to fill with.</param>
+/// <param name="Radii">The corner radii of <paramref name="Rect"/>.</param>
+/// <param name="PaintArea">
+/// The area a gradient or image paint is sized and positioned in (the `background-origin` box),
+/// when it differs from <paramref name="Rect"/>. A solid color ignores it.
+/// </param>
+public sealed record FillRectCommand(RenderRect Rect, RenderPaint Paint, RenderCornerRadii Radii = default, RenderRect? PaintArea = null) : RenderCommand
 {
     /// <summary>
     /// Gets the solid color for this command when it uses a simple color paint.
@@ -257,6 +334,34 @@ public sealed record FillRectCommand(RenderRect Rect, RenderPaint Paint, RenderC
 /// edge shares the same width.
 /// </summary>
 public sealed record StrokeRoundedRectCommand(RenderRect Rect, RenderColor Color, float StrokeWidth, RenderCornerRadii Radii) : RenderCommand;
+
+/// <summary>
+/// Draws a nine-slice `border-image` into <see cref="Area"/>.
+/// </summary>
+public sealed record DrawBorderImageCommand(RenderRect Area, RenderBorderImage Image) : RenderCommand;
+
+/// <summary>
+/// Replaces what is painted inside the rounded <see cref="Rect"/> with a copy filtered by
+/// <see cref="Functions"/> (CSS `backdrop-filter`).
+/// </summary>
+public sealed record DrawBackdropFilterCommand(RenderRect Rect, RenderCornerRadii Radii, IReadOnlyList<RenderFilterFunction> Functions) : RenderCommand;
+
+/// <summary>
+/// Begins a group that is masked by <see cref="Layers"/> once the matching
+/// <see cref="PopMaskCommand"/> ends it (CSS `mask`). Layers are listed topmost first.
+/// </summary>
+public sealed record PushMaskCommand(IReadOnlyList<RenderMaskLayer> Layers) : RenderCommand;
+
+/// <summary>
+/// Ends the mask scope started by the matching <see cref="PushMaskCommand"/>.
+/// </summary>
+public sealed record PopMaskCommand : RenderCommand;
+
+/// <summary>
+/// Fills the area inside <see cref="Outer"/> but outside <see cref="Inner"/>, both optionally
+/// with rounded corners - a border ring whose edges may differ in width.
+/// </summary>
+public sealed record FillRingCommand(RenderRect Outer, RenderCornerRadii OuterRadii, RenderRect Inner, RenderCornerRadii InnerRadii, RenderColor Color) : RenderCommand;
 
 /// <summary>
 /// Paints one `box-shadow` layer relative to an element's border box.
@@ -315,6 +420,17 @@ public sealed record PushOpacityCommand(float Alpha) : RenderCommand;
 public sealed record PopOpacityCommand : RenderCommand;
 
 /// <summary>
+/// Begins compositing every following command, up to the matching <see cref="PopBlendModeCommand"/>,
+/// as one group blended onto the backdrop with <see cref="Mode"/> (CSS `mix-blend-mode`).
+/// </summary>
+public sealed record PushBlendModeCommand(RenderBlendMode Mode) : RenderCommand;
+
+/// <summary>
+/// Ends the blend scope started by the matching <see cref="PushBlendModeCommand"/>.
+/// </summary>
+public sealed record PopBlendModeCommand : RenderCommand;
+
+/// <summary>
 /// Draws a single line of text at a baseline position.
 /// </summary>
 public sealed record DrawTextCommand(
@@ -330,7 +446,8 @@ public sealed record DrawTextCommand(
     bool StrikeThrough,
     RenderColor DecorationColor,
     RenderTextDecorationStyle DecorationStyle,
-    float LetterSpacing) : RenderCommand
+    float LetterSpacing,
+    float FontStretch = 100f) : RenderCommand
 {
     /// <summary>
     /// Indicates whether the command should be rendered with a bold typeface.
@@ -353,7 +470,8 @@ public sealed record DrawTextShadowCommand(
     float FontWeight,
     bool IsItalic,
     float BlurRadius,
-    float LetterSpacing) : RenderCommand
+    float LetterSpacing,
+    float FontStretch = 100f) : RenderCommand
 {
     /// <summary>
     /// Indicates whether the command should be rendered with a bold typeface.

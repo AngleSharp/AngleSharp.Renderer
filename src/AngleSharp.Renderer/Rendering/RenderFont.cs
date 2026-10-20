@@ -9,10 +9,12 @@ namespace AngleSharp.Renderer.Rendering;
 /// <param name="IsItalic">Whether the run is italic or oblique.</param>
 /// <param name="LetterSpacing">The additional spacing between characters in pixels.</param>
 /// <param name="Faces">The <c>@font-face</c> declarations in scope, if any.</param>
+/// <param name="FontStretch">The CSS <c>font-stretch</c> as a percentage (100 = normal).</param>
 public readonly record struct RenderFont(
     string FontFamily,
     float FontSize,
     float FontWeight,
     bool IsItalic,
     float LetterSpacing,
-    FontFaceSet? Faces = null);
+    FontFaceSet? Faces = null,
+    float FontStretch = 100f);

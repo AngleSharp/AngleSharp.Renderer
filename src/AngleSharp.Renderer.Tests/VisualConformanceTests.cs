@@ -2720,6 +2720,326 @@ public sealed class VisualConformanceTests
     }
 
     [Fact]
+    public async Task RenderToPng_RendersInlineFormattingContext()
+    {
+        var document = await ParseAsync("""
+            <html>
+              <head>
+                <style>
+                  html, body { margin: 0; padding: 0; background-color: white; font-family: sans-serif; font-size: 14px; }
+                  p { margin: 4px 6px; }
+                  .pill { display: inline-block; padding: 2px 6px; border-radius: 8px; background-color: rgb(220, 235, 250); }
+                  mark { background-color: rgb(255, 230, 120); padding: 0 2px; }
+                </style>
+              </head>
+              <body>
+                <p>Plain, <b>bold <i>bold italic</i></b>, <u>underlined words</u> and a <span class="pill">pill box</span> inline.</p>
+                <p style="width:170px">A <mark>highlight that wraps across more than one line</mark> of text.</p>
+                <p style="white-space:pre; font-family:monospace">pre   kept
+            <b>next</b> line</p>
+                <p style="text-align:center; text-transform:uppercase; word-spacing:6px">centered caps</p>
+              </body>
+            </html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var image = renderer.RenderToPng(document, new DefaultRenderDevice
+        {
+            ViewPortWidth = 300,
+            ViewPortHeight = 180,
+            FontSize = 14f,
+        });
+
+        VisualSnapshotVerifier.VerifyOrCreate(
+          snapshotName: "renders-inline-formatting-context.png",
+          actualPng: image.Data,
+          perChannelTolerance: TextRenderingToleranceChannel,
+          maxDifferentPixels: TextRenderingToleranceMaxPixels);
+    }
+
+    [Fact]
+    public async Task RenderToPng_RendersMultiColumnLayout()
+    {
+        var document = await ParseAsync("""
+            <html>
+              <head>
+                <style>
+                  html, body { margin: 0; padding: 0; background-color: white; font-family: sans-serif; font-size: 13px; }
+                  .columns { margin: 8px; column-count: 3; column-gap: 18px; column-rule: 1px solid rgb(180, 180, 180); }
+                  .columns p { margin: 0 0 6px 0; }
+                </style>
+              </head>
+              <body>
+                <div class="columns">
+                  <p>First paragraph of text that flows into the first column.</p>
+                  <p>Second paragraph continues the article in balanced columns.</p>
+                  <p>Third paragraph closes it.</p>
+                </div>
+              </body>
+            </html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var image = renderer.RenderToPng(document, new DefaultRenderDevice
+        {
+            ViewPortWidth = 320,
+            ViewPortHeight = 110,
+            FontSize = 13f,
+        });
+
+        VisualSnapshotVerifier.VerifyOrCreate(
+          snapshotName: "renders-multi-column-layout.png",
+          actualPng: image.Data,
+          perChannelTolerance: TextRenderingToleranceChannel,
+          maxDifferentPixels: TextRenderingToleranceMaxPixels);
+    }
+
+    [Fact]
+    public async Task RenderToPng_RendersBlendModesBackgroundClipAndOutlineOffset()
+    {
+        var document = await ParseAsync("""
+            <html>
+              <head>
+                <style>
+                  html, body { margin: 0; padding: 0; background-color: white; }
+                  .backdrop { position: relative; width: 300px; height: 90px; background-image: linear-gradient(to right, rgb(255, 80, 80), rgb(80, 80, 255)); }
+                  .blend { position: absolute; top: 15px; width: 60px; height: 60px; background-color: rgb(80, 220, 80); }
+                  .clip { position: absolute; top: 15px; left: 200px; width: 30px; height: 30px; padding: 10px; border: 5px dashed rgb(40, 40, 40); background-color: rgb(255, 210, 0); background-clip: content-box; outline: 2px solid rgb(0, 0, 0); outline-offset: 4px; }
+                </style>
+              </head>
+              <body>
+                <div class="backdrop">
+                  <div class="blend" style="left:15px; mix-blend-mode:multiply"></div>
+                  <div class="blend" style="left:95px; mix-blend-mode:screen"></div>
+                  <div class="clip"></div>
+                </div>
+                <div style="margin-top:6px; width:300px; height:30px; background-color:rgb(255, 120, 0); background-image:linear-gradient(to right, rgb(0, 0, 0), rgb(255, 255, 255)); background-blend-mode:multiply"></div>
+              </body>
+            </html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var image = renderer.RenderToPng(document, new DefaultRenderDevice
+        {
+            ViewPortWidth = 300,
+            ViewPortHeight = 130,
+        });
+
+        VisualSnapshotVerifier.VerifyOrCreate(
+          snapshotName: "renders-blend-modes-background-clip-and-outline-offset.png",
+          actualPng: image.Data);
+    }
+
+    [Fact]
+    public async Task RenderToPng_RendersLeftAndRightFloatsWithWrappingTextAndClear()
+    {
+        var document = await ParseAsync("""
+            <html>
+              <head>
+                <style>
+                  html, body { margin: 0; padding: 0; background-color: white; font-family: sans-serif; font-size: 12px; }
+                  .page { margin: 6px; }
+                  .left { float: left; width: 60px; height: 50px; margin: 0 8px 4px 0; background-color: rgb(120, 170, 230); }
+                  .right { float: right; width: 70px; height: 80px; margin: 0 0 4px 8px; background-color: rgb(240, 170, 110); }
+                  p { margin: 0 0 6px 0; }
+                  .footer { clear: both; padding: 4px; background-color: rgb(220, 220, 220); }
+                </style>
+              </head>
+              <body>
+                <div class="page">
+                  <div class="left"></div>
+                  <div class="right"></div>
+                  <p>Text flows between a left and a right float, line by line, until the floats end.</p>
+                  <p>A second paragraph keeps wrapping beside the taller right float.</p>
+                  <div class="footer">Cleared footer</div>
+                </div>
+              </body>
+            </html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var image = renderer.RenderToPng(document, new DefaultRenderDevice
+        {
+            ViewPortWidth = 300,
+            ViewPortHeight = 150,
+            FontSize = 12f,
+        });
+
+        VisualSnapshotVerifier.VerifyOrCreate(
+          snapshotName: "renders-left-and-right-floats.png",
+          actualPng: image.Data,
+          perChannelTolerance: TextRenderingToleranceChannel,
+          maxDifferentPixels: TextRenderingToleranceMaxPixels);
+    }
+
+    [Fact]
+    public async Task RenderToPng_RendersBackgroundOrigin()
+    {
+        var document = await ParseAsync("""
+            <html>
+              <head>
+                <style>
+                  html, body { margin: 0; padding: 0; background-color: white; }
+                  div { float: left; margin: 8px; width: 50px; height: 50px; padding: 8px; border: 8px dashed rgb(40, 40, 40); background-image: linear-gradient(to right, rgb(255, 60, 60), rgb(60, 60, 255)); }
+                </style>
+              </head>
+              <body>
+                <div style="background-origin: border-box"></div>
+                <div></div>
+                <div style="background-origin: content-box"></div>
+              </body>
+            </html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var image = renderer.RenderToPng(document, new DefaultRenderDevice
+        {
+            ViewPortWidth = 300,
+            ViewPortHeight = 100,
+        });
+
+        VisualSnapshotVerifier.VerifyOrCreate(
+          snapshotName: "renders-background-origin.png",
+          actualPng: image.Data);
+    }
+
+    private const string TilePng = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAoAAAAKCAYAAACNMs+9AAAAFklEQVR4nGNgoBm4o6HxHxse3gqpBgB9dk4ND7V9KQAAAABJRU5ErkJggg==";
+
+    [Fact]
+    public async Task RenderToPng_RendersBorderStyles()
+    {
+        var document = await ParseAsync("""
+            <html>
+              <head>
+                <style>
+                  html, body { margin: 0; padding: 0; background-color: white; }
+                  div { float: left; margin: 6px; width: 40px; height: 30px; border: 6px solid rgb(70, 130, 200); }
+                </style>
+              </head>
+              <body>
+                <div style="border-style: dotted"></div>
+                <div style="border-style: dashed"></div>
+                <div style="border-style: double"></div>
+                <div style="border-style: groove"></div>
+                <div style="border-style: ridge"></div>
+                <div style="border-style: inset"></div>
+                <div style="border-style: outset"></div>
+                <div style="border-width: 3px 12px 6px 2px; border-radius: 16px"></div>
+                <div style="border-color: rgb(220, 60, 60) rgb(60, 160, 60) rgb(60, 60, 220) rgb(230, 170, 30); border-radius: 14px"></div>
+                <div style="border-style: groove; border-width: 8px; border-radius: 18px"></div>
+              </body>
+            </html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var image = renderer.RenderToPng(document, new DefaultRenderDevice
+        {
+            ViewPortWidth = 330,
+            ViewPortHeight = 110,
+        });
+
+        VisualSnapshotVerifier.VerifyOrCreate(
+          snapshotName: "renders-border-styles.png",
+          actualPng: image.Data);
+    }
+
+    [Fact]
+    public async Task RenderToPng_RendersLayeredAndTiledBackgrounds()
+    {
+        var document = await ParseAsync($$"""
+            <html>
+              <head>
+                <style>
+                  html, body { margin: 0; padding: 0; background-color: white; }
+                  div { float: left; margin: 6px; width: 90px; height: 70px; border: 1px solid rgb(120, 120, 120); }
+                </style>
+              </head>
+              <body>
+                <div style="background-color: rgb(250, 240, 200); background-image: radial-gradient(circle, rgba(255, 0, 0, 0.6) 30%, transparent 31%), linear-gradient(to right, rgb(80, 150, 230), rgb(250, 240, 200))"></div>
+                <div style="background-image: linear-gradient(45deg, rgb(60, 60, 60) 25%, transparent 25%); background-size: 20px 20px"></div>
+                <div style="background-image: url({{TilePng}}); background-size: 20px 20px; background-repeat: space"></div>
+                <div style="background-image: url({{TilePng}}); background-size: 20px 20px; background-repeat: round"></div>
+              </body>
+            </html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var image = renderer.RenderToPng(document, new DefaultRenderDevice
+        {
+            ViewPortWidth = 420,
+            ViewPortHeight = 90,
+        });
+
+        VisualSnapshotVerifier.VerifyOrCreate(
+          snapshotName: "renders-layered-and-tiled-backgrounds.png",
+          actualPng: image.Data);
+    }
+
+    [Fact]
+    public async Task RenderToPng_RendersBorderImageAndMasks()
+    {
+        var document = await ParseAsync("""
+            <html>
+              <head>
+                <style>
+                  html, body { margin: 0; padding: 0; background-color: white; }
+                  div { float: left; margin: 12px; width: 70px; height: 60px; }
+                </style>
+              </head>
+              <body>
+                <div style="border: 12px solid black; border-image: repeating-linear-gradient(45deg, rgb(220, 60, 60) 0, rgb(220, 60, 60) 6px, rgb(250, 220, 80) 6px, rgb(250, 220, 80) 12px) 12 12 12 12 / 12px round; background-color: rgb(240, 240, 240)"></div>
+                <div style="background-color: rgb(40, 120, 220); mask-image: linear-gradient(to bottom, black, transparent)"></div>
+                <div style="background-color: rgb(40, 160, 90); mask-image: radial-gradient(circle, black 40%, transparent 41%)"></div>
+              </body>
+            </html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var image = renderer.RenderToPng(document, new DefaultRenderDevice
+        {
+            ViewPortWidth = 330,
+            ViewPortHeight = 120,
+        });
+
+        VisualSnapshotVerifier.VerifyOrCreate(
+          snapshotName: "renders-border-image-and-masks.png",
+          actualPng: image.Data);
+    }
+
+    [Fact]
+    public async Task RenderToPng_RendersJustificationHyphensSmallCapsAndEllipsis()
+    {
+        var document = await ParseAsync("""
+            <html>
+              <head>
+                <style>
+                  html, body { margin: 0; padding: 0; background-color: white; font-family: sans-serif; font-size: 14px; }
+                  div { float: left; margin: 8px; width: 140px; }
+                </style>
+              </head>
+              <body>
+                <div style="text-align: justify">The quick brown fox jumps over the <b>lazy</b> dog and keeps on running far away.</div>
+                <div>Extra&shy;ordinary in&shy;com&shy;pre&shy;hen&shy;si&shy;bil&shy;i&shy;ties</div>
+                <div style="font-variant: small-caps">Small Caps <i>Heading</i></div>
+                <div style="overflow: hidden; -webkit-line-clamp: 2">One two <b>three</b> four five six seven eight nine ten eleven twelve.</div>
+                <div style="white-space: pre; tab-size: 4">a&#9;b&#9;c<span>&#9;d</span></div>
+              </body>
+            </html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var image = renderer.RenderToPng(document, new DefaultRenderDevice
+        {
+            ViewPortWidth = 480,
+            ViewPortHeight = 170,
+        });
+
+        VisualSnapshotVerifier.VerifyOrCreate(
+          snapshotName: "renders-justification-hyphens-small-caps-and-ellipsis.png",
+          actualPng: image.Data);
+    }
+
+    [Fact]
     public async Task RenderToPng_StickyHeaderStaysPinnedToTopWhileScrolledPastIt()
     {
         var renderDevice = new DefaultRenderDevice

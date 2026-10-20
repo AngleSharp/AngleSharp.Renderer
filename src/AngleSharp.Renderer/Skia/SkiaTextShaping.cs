@@ -61,10 +61,31 @@ internal static class SkiaTextShaping
     // kept alongside the face itself rather than rebuilt per paint.
     private static readonly ConcurrentDictionary<byte[], SKTypeface?> EmbeddedTypefaces = new(ReferenceEqualityComparer.Instance);
 
-    public static SKFontStyle CreateFontStyle(float fontWeight, bool isItalic) =>
+    public static SKFontStyle CreateFontStyle(float fontWeight, bool isItalic, float fontStretch = 100f) =>
         new(fontWeight >= 600f ? SKFontStyleWeight.Bold : SKFontStyleWeight.Normal,
-            SKFontStyleWidth.Normal,
+            ToFontStyleWidth(fontStretch),
             isItalic ? SKFontStyleSlant.Italic : SKFontStyleSlant.Upright);
+
+    /// <summary>
+    /// Maps a <c>font-stretch</c> percentage to the nearest OpenType width class (CSS Fonts 4,
+    /// 50% = ultra-condensed ... 200% = ultra-expanded). Only installed and <c>@font-face</c>
+    /// families can honour it; the bundled fonts have a single width and nothing is synthesized.
+    /// </summary>
+    public static SKFontStyleWidth ToFontStyleWidth(float fontStretch)
+    {
+        ReadOnlySpan<float> classes = [50f, 62.5f, 75f, 87.5f, 100f, 112.5f, 125f, 150f, 200f];
+        var best = 4;
+
+        for (var index = 0; index < classes.Length; index++)
+        {
+            if (Math.Abs(classes[index] - fontStretch) < Math.Abs(classes[best] - fontStretch))
+            {
+                best = index;
+            }
+        }
+
+        return (SKFontStyleWidth)(best + 1);
+    }
 
     /// <summary>
     /// Creates the paint used for both measuring and drawing a text run. The caller assigns the
@@ -74,7 +95,7 @@ internal static class SkiaTextShaping
     {
         var typeface = CreateTypeface(
             font.FontFamily,
-            CreateFontStyle(font.FontWeight, font.IsItalic),
+            CreateFontStyle(font.FontWeight, font.IsItalic, font.FontStretch),
             font.Faces ?? FontFaceSet.Empty,
             font.FontWeight);
 
