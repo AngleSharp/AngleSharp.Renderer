@@ -1,0 +1,108 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Rendering Test 09 - Writing Modes</title>
+<style>
+* {
+  box-sizing: border-box;
+}
+
+html, body {
+  margin: 0;
+  padding: 0;
+}
+
+body {
+  background: #eef0f4;
+  color: #1c2430;
+  font-family: Arial, Helvetica, sans-serif;
+  font-size: 16px;
+  line-height: 1.4;
+}
+
+.page {
+  width: 900px;
+  margin: 0 auto;
+  padding: 24px;
+  background: #ffffff;
+}
+
+h1 {
+  margin: 0 0 16px 0;
+  font-size: 28px;
+}
+
+.row {
+  margin-bottom: 20px;
+}
+
+.card {
+  display: inline-block;
+  height: 220px;
+  margin: 0 12px 0 0;
+  padding: 10px 8px;
+  border: 2px solid #3c5a78;
+  border-top: 6px solid #d9534f;
+  background: #f4f8fc;
+  vertical-align: top;
+}
+
+.label {
+  display: block;
+  margin: 0 0 6px 0;
+  padding: 2px 4px;
+  background: #1c2430;
+  color: #ffffff;
+  font-size: 12px;
+}
+
+.note {
+  width: 60px;
+  height: 18px;
+  margin-top: 8px;
+  background: #ffd27f;
+}
+
+.horizontal {
+  margin: 8px 0;
+  padding: 4px;
+  border: 1px dashed #3c5a78;
+  font-size: 12px;
+}
+</style>
+</head>
+<body>
+<div class="page">
+  <h1>Writing Modes</h1>
+
+  <div class="row">
+    <div class="card" style="writing-mode: vertical-rl">
+      <span class="label">vertical-rl</span>
+      Lines start at the right edge and run downward.
+      <div class="note"></div>
+    </div>
+    <div class="card" style="writing-mode: vertical-lr">
+      <span class="label">vertical-lr</span>
+      Lines start at the left edge and run downward.
+      <div class="note"></div>
+    </div>
+    <div class="card" style="writing-mode: sideways-rl">
+      <span class="label">sideways-rl</span>
+      Every glyph is turned clockwise.
+    </div>
+    <div class="card" style="writing-mode: sideways-lr">
+      <span class="label">sideways-lr</span>
+      Every glyph is turned counter-clockwise.
+    </div>
+    <div class="card" style="writing-mode: vertical-rl">
+      <span class="label">mixed</span>
+      日本語の縦書き with Latin words.
+      <div class="horizontal" style="writing-mode: horizontal-tb">horizontal</div>
+    </div>
+  </div>
+
+  <p>A horizontal paragraph follows the vertical cards and wraps normally across the page width.</p>
+</div>
+</body>
+</html>

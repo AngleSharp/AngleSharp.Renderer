@@ -259,19 +259,44 @@ public sealed partial class HtmlRenderer
     /// </summary>
     private static void DrawStyledText(LayoutContext context, DisplayList displayList, string text, float x, float y, RenderTextStyle style, bool decorate = true)
     {
+        if (style.IsHidden)
+        {
+            return;
+        }
+
         text = StripSoftHyphens(text);
+
+        // Vertical text: upright glyphs are placed one by one, sideways runs of `vertical-lr`
+        // are flipped back (see HtmlRenderer.WritingModes.cs).
+        if (TryDrawOrientedText(context, displayList, text, x, y, style, decorate))
+        {
+            return;
+        }
+
+        var flip = NeedsGlyphFlip(style) && !string.IsNullOrWhiteSpace(text);
+
+        if (flip)
+        {
+            displayList.PushTransform(GlyphFlip(y, style.FontSize));
+        }
 
         if (style.VariantCaps == FontVariantCapsMode.Normal)
         {
             DrawPlainText(displayList, text, x, y, style, decorate);
-            return;
+        }
+        else
+        {
+            foreach (var (run, reduced) in SplitSmallCaps(text, style.VariantCaps))
+            {
+                var runStyle = reduced ? WithSmallCapsSize(style) : style with { VariantCaps = FontVariantCapsMode.Normal };
+                DrawPlainText(displayList, run, x, y, runStyle, decorate);
+                x += MeasureTextWidth(context, run, runStyle);
+            }
         }
 
-        foreach (var (run, reduced) in SplitSmallCaps(text, style.VariantCaps))
+        if (flip)
         {
-            var runStyle = reduced ? WithSmallCapsSize(style) : style with { VariantCaps = FontVariantCapsMode.Normal };
-            DrawPlainText(displayList, run, x, y, runStyle, decorate);
-            x += MeasureTextWidth(context, run, runStyle);
+            displayList.PopTransform();
         }
     }
 

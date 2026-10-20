@@ -45,8 +45,7 @@ public sealed partial class HtmlRenderer
         float positionedContainingY,
         float positionedContainingWidth,
         float positionedContainingHeight,
-        List<(int StartIndex, int Count)> negativeZIndexRanges,
-        List<(int StartIndex, int Count)>? stickyRanges = null)
+        List<(int StartIndex, int Count)> negativeZIndexRanges)
     {
         var run = new List<IRenderNode>();
         var runHasInlineContent = false;
@@ -94,8 +93,9 @@ public sealed partial class HtmlRenderer
             runHasInlineContent = false;
         }
 
-        foreach (var child in children)
+        for (var index = 0; index < children.Count; index++)
         {
+            var child = children[index];
             var classification = ClassifyFlowChild(child, context);
 
             if (classification == FlowChildKind.Ignored)
@@ -120,8 +120,6 @@ public sealed partial class HtmlRenderer
 
             FlushRun(ref cursorY, ref previousBlockMarginBottom, ref suppressNextBlockTopMargin, floats, ref textIndentConsumed);
 
-            var isSticky = stickyRanges is not null && child is ElementRenderNode stickyCandidate &&
-                IsStickyPositioned(GetOrCreateStyleMap(context, stickyCandidate.Ref, stickyCandidate.ComputedStyle));
             var blockTextIndentConsumed = false;
             var childRangeStart = displayList.Commands.Count;
 
@@ -147,11 +145,7 @@ public sealed partial class HtmlRenderer
 
             RecordColumnBreakCandidate(cursorY);
 
-            if (isSticky)
-            {
-                stickyRanges!.Add((childRangeStart, displayList.Commands.Count - childRangeStart));
-            }
-            else if (IsNegativeZIndexChild(child, context))
+            if (IsNegativeZIndexChild(child, context) && !IsStickyElement(child, context))
             {
                 negativeZIndexRanges.Add((childRangeStart, displayList.Commands.Count - childRangeStart));
             }
@@ -162,7 +156,9 @@ public sealed partial class HtmlRenderer
                 textIndentConsumed = true;
             }
 
-            if (cursorY > maxY)
+            // Content below the viewport is not laid out, unless a `bottom`-sticky box further
+            // down could still be pulled up into view.
+            if (cursorY > maxY && !ContainsBottomStickyBox(children.Skip(index + 1), context))
             {
                 return;
             }
@@ -191,7 +187,7 @@ public sealed partial class HtmlRenderer
             return FlowChildKind.Ignored;
         }
 
-        if (!element.IsVisible())
+        if (!GeneratesBoxes(element))
         {
             return FlowChildKind.Ignored;
         }
@@ -447,7 +443,7 @@ public sealed partial class HtmlRenderer
 
         private void CollectElement(ElementRenderNode element, RenderTextStyle parentStyle, InlineBox? parentBox)
         {
-            if (!element.IsVisible())
+            if (!GeneratesBoxes(element))
             {
                 return;
             }
@@ -757,7 +753,7 @@ public sealed partial class HtmlRenderer
             // Each line box is shortened by the floats beside it.
             var (lineLeft, lineRight) = floats.GetBand(lineTop, textStyle.FontSize * textStyle.LineHeightMultiplier, contentX, contentX + contentWidth);
             var lineAvailable = Math.Max(0f, lineRight - lineLeft);
-            var indent = !textIndentConsumed ? textStyle.TextIndent : 0f;
+            var indent = !textIndentConsumed ? textStyle.TextIndent + textStyle.MarkerIndent : 0f;
             var available = Math.Max(0f, lineAvailable - indent);
 
             // A block-level box nested in inline content gets a line of its own.
@@ -1778,7 +1774,7 @@ public sealed partial class HtmlRenderer
             box.BoundsTop = Math.Min(box.BoundsTop, top);
             box.BoundsBottom = Math.Max(box.BoundsBottom, bottom);
 
-            if (!box.IsDecorated || width <= 0f)
+            if (!box.IsDecorated || width <= 0f || box.TextStyle.IsHidden)
             {
                 continue;
             }
@@ -1903,7 +1899,7 @@ public sealed partial class HtmlRenderer
     /// its own border box and the last text baseline painted inside it. Layout metrics recorded
     /// during the trial never reach a real <see cref="CaptureLayoutMetrics"/> capture.
     /// </summary>
-    private static (ElementLayoutMetrics? Metrics, float? LastBaselineY) TrialLayout(
+    private static (ElementLayoutMetrics? Metrics, float? LastBaselineY, float? FirstBaselineY) TrialLayout(
         ElementRenderNode element,
         float containingWidth,
         RenderTextStyle inheritedStyle,
@@ -1941,7 +1937,7 @@ public sealed partial class HtmlRenderer
                 isAtomicInline: isAtomicInline);
 
             var snapshot = capture.Snapshot();
-            return (snapshot.TryGetValue(element.Ref, out var metrics) ? metrics : null, capture.LastBaselineY);
+            return (snapshot.TryGetValue(element.Ref, out var metrics) ? metrics : null, capture.LastBaselineY, capture.FirstBaselineY);
         }
         finally
         {
@@ -1958,6 +1954,7 @@ public sealed partial class HtmlRenderer
         if (s_layoutCapture.Value is { } capture)
         {
             capture.LastBaselineY = baselineY;
+            capture.FirstBaselineY ??= baselineY;
         }
     }
 
@@ -1975,6 +1972,11 @@ public sealed partial class HtmlRenderer
         if (formControlKind != FormControlKind.None)
         {
             ApplyFormControlDefaults(formControlKind, element.Ref, styleMap, textStyle, context);
+        }
+
+        if (IsTableDisplay(styleMap))
+        {
+            GetTableStructure(element, context);
         }
 
         var box = ResolveBoxStyle(styleMap, element.Ref);
@@ -2058,7 +2060,7 @@ public sealed partial class HtmlRenderer
     /// </summary>
     private static IntrinsicWidths ComputeOuterIntrinsicWidths(ElementRenderNode element, RenderTextStyle inheritedStyle, float percentageBase, LayoutContext context)
     {
-        if (!element.IsVisible())
+        if (!GeneratesBoxes(element))
         {
             return IntrinsicWidths.Zero;
         }
@@ -2079,6 +2081,12 @@ public sealed partial class HtmlRenderer
             ApplyFormControlDefaults(formControlKind, element.Ref, styleMap, textStyle, context);
         }
 
+        if (IsTableDisplay(styleMap))
+        {
+            // Resolves a collapsed table's borders before its box is read.
+            GetTableStructure(element, context);
+        }
+
         var box = ResolveBoxStyle(styleMap, element.Ref);
         var marginLeft = ParseLength(styleMap, "margin-left", percentageBase, 0f, allowAuto: true);
         var marginRight = ParseLength(styleMap, "margin-right", percentageBase, 0f, allowAuto: true);
@@ -2086,7 +2094,11 @@ public sealed partial class HtmlRenderer
                                ParseLength(styleMap, "padding-left", percentageBase, box.Padding.Left, allowAuto: false) +
                                ParseLength(styleMap, "padding-right", percentageBase, box.Padding.Right, allowAuto: false);
         var margins = (float.IsNaN(marginLeft) ? 0f : marginLeft) + (float.IsNaN(marginRight) ? 0f : marginRight);
-        var authored = ResolveAuthoredDimension(styleMap, "width", percentageBase, float.NaN, horizontalExtras);
+        // A percentage width would refer to the very size being computed, so it counts as auto in
+        // an intrinsic contribution.
+        var authored = styleMap.TryGetValue("width", out var rawWidth) && rawWidth.TrimEnd().EndsWith('%')
+            ? float.NaN
+            : ResolveAuthoredDimension(styleMap, "width", percentageBase, float.NaN, horizontalExtras);
         IntrinsicWidths content;
 
         if (!float.IsNaN(authored))
@@ -2124,6 +2136,19 @@ public sealed partial class HtmlRenderer
             children = [];
         }
 
+        if (IsTableDisplay(styleMap))
+        {
+            return ComputeTableIntrinsicWidths(element, styleMap, textStyle, percentageBase, context);
+        }
+
+        // An orthogonal flow is as wide as its content's block size.
+        if (IsVerticalMode(textStyle.WritingMode) != IsVerticalMode(textStyle.FlowMode) && formControlKind == FormControlKind.None &&
+            !(element.Ref is not IPseudoElement && IsReplacedElementTag(element.Ref.LocalName)))
+        {
+            var blockSize = MeasureOrthogonalBlockSize(element, styleMap, textStyle, percentageBase, context);
+            return new IntrinsicWidths(blockSize, blockSize);
+        }
+
         if (formControlKind == FormControlKind.Button)
         {
             // A button's label is painted by PaintFormControl rather than laid out as children.
@@ -2138,7 +2163,8 @@ public sealed partial class HtmlRenderer
             var min = 0f;
             var max = 0f;
             var wraps = !string.Equals(GetFlexWrap(styleMap), "nowrap", StringComparison.OrdinalIgnoreCase);
-            var gap = ParseLength(styleMap, "column-gap", percentageBase, 0f, allowAuto: false);
+            // `column-gap` or the `gap` shorthand; percentage gaps contribute nothing here.
+            var gap = ResolveColumnGap(styleMap, 0f) ?? 0f;
             var itemCount = 0;
 
             foreach (var child in children)
@@ -2197,7 +2223,7 @@ public sealed partial class HtmlRenderer
                 }
                 case ElementRenderNode child:
                 {
-                    if (!child.IsVisible())
+                    if (!GeneratesBoxes(child))
                     {
                         break;
                     }

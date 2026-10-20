@@ -33,7 +33,6 @@ public sealed partial class HtmlRenderer
     private static readonly AsyncLocal<LayoutCapture?> s_layoutCapture = new();
     private static readonly ITextMeasurer s_defaultTextMeasurer = new SkiaTextMeasurer();
 
-    private const float CollapsedBorderWidth = 1f;
 
     private readonly IRenderBackend _backend;
     private readonly ITextMeasurer _textMeasurer;
@@ -73,7 +72,12 @@ public sealed partial class HtmlRenderer
         FontFaceSet Fonts,
         Dictionary<IElement, Dictionary<string, string>> StyleMapCache,
         IStyleCollection? StyleCollection,
-        Dictionary<string, Stack<int>> Counters);
+        Dictionary<string, Stack<int>> Counters,
+        Dictionary<IElement, TableStructure> TableStructures,
+        Stack<List<StickyBox>> StickyScopes,
+        Dictionary<(IElement Element, float Width), float> MeasuredHeights,
+        Dictionary<IElement, WritingModeKind> BoxSystems,
+        Dictionary<IElement, WritingModeKind> ContentSystems);
 
     private sealed class LayoutCapture
     {
@@ -81,6 +85,9 @@ public sealed partial class HtmlRenderer
 
         /// <summary>The baseline of the last line of text laid out while this capture was active.</summary>
         public float? LastBaselineY { get; set; }
+
+        /// <summary>The baseline of the first line of text laid out while this capture was active.</summary>
+        public float? FirstBaselineY { get; set; }
 
         public void Record(IElement element, ElementLayoutMetrics metrics)
         {
@@ -130,6 +137,11 @@ public sealed partial class HtmlRenderer
         float paddingTop,
         float paddingBottom)
     {
+        if (s_stickyProbe is { } probe && ReferenceEquals(probe.Element, element))
+        {
+            probe.Metrics = new ElementLayoutMetrics(borderBoxX, borderBoxY, borderBoxWidth, borderBoxHeight, borderLeft, borderRight, borderTop, borderBottom, paddingLeft, paddingRight, paddingTop, paddingBottom);
+        }
+
         var capture = s_layoutCapture.Value;
         if (capture is null)
         {
@@ -246,7 +258,16 @@ public sealed partial class HtmlRenderer
             // above - a fresh, empty stack set every call, never persisted across renders, so a
             // counter's value can never leak between two separate BuildDisplayList calls for the
             // same document (interactive re-renders included).
-            Counters: new Dictionary<string, Stack<int>>());
+            Counters: new Dictionary<string, Stack<int>>(),
+            // The cell grid of each table, built once per render (see GetTableStructure).
+            TableStructures: new Dictionary<IElement, TableStructure>(ReferenceEqualityComparer.Instance),
+            // One scope per container being laid out; see LayoutStickyAwareElement.
+            StickyScopes: new Stack<List<StickyBox>>(),
+            // Trial-layout heights per element and width, for this render only.
+            MeasuredHeights: new Dictionary<(IElement Element, float Width), float>(),
+            // The vertical writing-mode systems of boxes and their content (ResolveWritingModeSystems).
+            BoxSystems: new Dictionary<IElement, WritingModeKind>(ReferenceEqualityComparer.Instance),
+            ContentSystems: new Dictionary<IElement, WritingModeKind>(ReferenceEqualityComparer.Instance));
     }
 
     /// <summary>
@@ -349,6 +370,7 @@ public sealed partial class HtmlRenderer
         PrepareDocumentForRendering(document);
 
         var renderTree = window.Render(renderDevice);
+        ResolveWritingModeSystems(renderTree, WritingModeKind.HorizontalTb, context);
 
         // CSS counters (`counter-reset`/`counter-increment`/`counter-set`, read back by
         // `counter()`/`counters()` in generated `content`) are resolved in a dedicated pre-pass
@@ -398,41 +420,52 @@ public sealed partial class HtmlRenderer
         // sticky child's own command range is recorded here (by index, since DisplayList is a flat
         // list) and relocated to the end, in original relative order, only after every page child
         // has been laid out - see the loop below.
-        var stickyRanges = new List<(int StartIndex, int Count)>();
         var negativeZIndexRanges = new List<(int StartIndex, int Count)>();
+        context.StickyScopes.Push([]);
 
-        LayoutFlowChildren(
-            OrderChildrenForPainting(root.Children, context).ToList(),
-            contentX,
-            contentY,
-            contentWidth,
-            ref cursorY,
-            ref previousBlockMarginBottom,
-            ref suppressNextBlockTopMargin,
-            floats,
-            ref textIndentConsumed,
-            textStyle,
-            context,
-            displayList,
-            maxY,
-            containingHeight: float.NaN,
-            positionedContainingX: float.NaN,
-            positionedContainingY: float.NaN,
-            positionedContainingWidth: float.NaN,
-            positionedContainingHeight: float.NaN,
-            negativeZIndexRanges,
-            stickyRanges);
+        var pageSystem = body is null ? WritingModeKind.HorizontalTb : GetContentSystem(body, context);
 
-        // Each earlier move shifts every later index left by however many commands it removed, so
-        // later ranges (still expressed in their original, pre-move indices) need that same
-        // cumulative shift subtracted before they are moved themselves.
-        var cumulativeShift = 0;
-
-        foreach (var (startIndex, count) in stickyRanges)
+        if (IsVerticalMode(pageSystem))
         {
-            displayList.MoveRangeToEnd(startIndex - cumulativeShift, count);
-            cumulativeShift += count;
+            // A vertical page: its content runs down the viewport and is placed by a transform.
+            var pageStyle = textStyle with { WritingMode = pageSystem, FlowMode = pageSystem };
+            var inlineSize = Math.Max(0f, viewport.Height - (2f * context.Padding));
+            var flowStart = displayList.Commands.Count;
+            LayoutOrthogonalFlowContent(OrderChildrenForPainting(root.Children, context).ToList(), pageStyle, inlineSize, context, displayList);
+            displayList.InsertRange(flowStart, [new PushTransformCommand(ResolveOrthogonalFlowTransform(pageSystem, WritingModeKind.HorizontalTb, contentX, contentY, contentWidth, inlineSize))]);
+            displayList.PopTransform();
+            context.StickyScopes.Peek().Clear();
         }
+        else
+        {
+            LayoutFlowChildren(
+                OrderChildrenForPainting(root.Children, context).ToList(),
+                contentX,
+                contentY,
+                contentWidth,
+                ref cursorY,
+                ref previousBlockMarginBottom,
+                ref suppressNextBlockTopMargin,
+                floats,
+                ref textIndentConsumed,
+                textStyle,
+                context,
+                displayList,
+                maxY,
+                containingHeight: float.NaN,
+                positionedContainingX: float.NaN,
+                positionedContainingY: float.NaN,
+                positionedContainingWidth: float.NaN,
+                positionedContainingHeight: float.NaN,
+                negativeZIndexRanges);
+        }
+
+        // Sticky page children stick within the page's content (at least the viewport tall).
+        ResolveStickyBoxes(
+            displayList,
+            context.StickyScopes.Pop(),
+            new RenderRect(contentX, contentY, contentWidth, Math.Max(cursorY, viewport.Height - context.Padding) - contentY),
+            context);
 
         // The page's own scrolling elements (<html>/<body>) are never laid out as boxes of their
         // own - the loop above only ever lays out *their children* directly onto the page canvas -
@@ -487,7 +520,9 @@ public sealed partial class HtmlRenderer
         float positionedContainingWidth = float.NaN,
         float positionedContainingHeight = float.NaN,
         float forcedBorderBoxWidth = float.NaN,
-        bool isAtomicInline = false)
+        bool isAtomicInline = false,
+        float forcedBorderBoxHeight = float.NaN,
+        float contentOffsetY = 0f)
     {
         switch (node)
         {
@@ -495,7 +530,7 @@ public sealed partial class HtmlRenderer
                 LayoutTextNode(textNode.Ref, containingX, containingWidth, ref cursorY, ref previousBlockMarginBottom, ref suppressNextBlockTopMargin, floats, ref textIndentConsumed, textStyle, context, displayList, maxY);
                 return;
             case ElementRenderNode element:
-                LayoutElement(element, containingX, containingY, containingWidth, ref cursorY, ref previousBlockMarginBottom, ref suppressNextBlockTopMargin, floats, ref textIndentConsumed, textStyle, context, displayList, maxY, isFlexItem, isRowDirection, flexMainSize, flexCrossSize, containingHeight, positionedContainingX, positionedContainingY, positionedContainingWidth, positionedContainingHeight, forcedBorderBoxWidth, isAtomicInline);
+                LayoutStickyAwareElement(element, containingX, containingY, containingWidth, ref cursorY, ref previousBlockMarginBottom, ref suppressNextBlockTopMargin, floats, ref textIndentConsumed, textStyle, context, displayList, maxY, isFlexItem, isRowDirection, flexMainSize, flexCrossSize, containingHeight, positionedContainingX, positionedContainingY, positionedContainingWidth, positionedContainingHeight, forcedBorderBoxWidth, isAtomicInline, forcedBorderBoxHeight, contentOffsetY);
                 return;
             default:
                 return;
@@ -526,13 +561,15 @@ public sealed partial class HtmlRenderer
         float positionedContainingWidth = float.NaN,
         float positionedContainingHeight = float.NaN,
         float forcedBorderBoxWidth = float.NaN,
-        bool isAtomicInline = false)
+        bool isAtomicInline = false,
+        float forcedBorderBoxHeight = float.NaN,
+        float contentOffsetY = 0f)
     {
         var element = node.Ref;
         var computedStyle = node.ComputedStyle;
         var styleMap = GetOrCreateStyleMap(context, node.Ref, node.ComputedStyle);
 
-        if (!node.IsVisible())
+        if (!GeneratesBoxes(node))
         {
             return;
         }
@@ -552,7 +589,7 @@ public sealed partial class HtmlRenderer
         if (string.Equals(display, "table", StringComparison.OrdinalIgnoreCase) ||
             string.Equals(display, "inline-table", StringComparison.OrdinalIgnoreCase))
         {
-            LayoutTable(node, containingX, containingY, containingWidth, ref cursorY, ref previousBlockMarginBottom, ref suppressNextBlockTopMargin, floats, ref textIndentConsumed, inheritedTextStyle, context, displayList, maxY);
+            LayoutTable(node, containingX, containingWidth, ref cursorY, ref previousBlockMarginBottom, ref suppressNextBlockTopMargin, floats, inheritedTextStyle, context, displayList, maxY, positionedContainingX, positionedContainingY, positionedContainingWidth, positionedContainingHeight, forcedBorderBoxWidth);
             return;
         }
 
@@ -610,7 +647,9 @@ public sealed partial class HtmlRenderer
         var floatSide = GetFloat(styleMap);
         var isFloat = floatSide is "left" or "right";
         var isOutOfFlow = IsOutOfFlowPositioned(styleMap);
-        var establishesContext = EstablishesBlockFormattingContext(styleMap, isFloat, isOutOfFlow, isAtomicInline, isFlexItem);
+        // An orthogonal flow (see HtmlRenderer.WritingModes.cs) is always a formatting context of its own.
+        var establishesContext = EstablishesBlockFormattingContext(styleMap, isFloat, isOutOfFlow, isAtomicInline, isFlexItem) ||
+                                 IsVerticalMode(currentTextStyle.WritingMode) != IsVerticalMode(inheritedTextStyle.FlowMode);
 
         // `clear` moves a box below the floats on the side(s) it must not sit next to.
         var clearance = isOutOfFlow ? float.NaN : floats.GetClearance(GetClear(styleMap));
@@ -633,7 +672,9 @@ public sealed partial class HtmlRenderer
             flowContainingWidth = Math.Max(0f, bandRight - bandLeft);
         }
 
-        if (flowContainingWidth <= 0f)
+        // A box whose width is already decided (a table cell, an atomic inline) is laid out even
+        // when that width is zero: its height still counts.
+        if (flowContainingWidth <= 0f && float.IsNaN(forcedBorderBoxWidth))
         {
             return;
         }
@@ -664,7 +705,6 @@ public sealed partial class HtmlRenderer
         var isAbsolute = string.Equals(position, "absolute", StringComparison.OrdinalIgnoreCase);
         var isFixed = string.Equals(position, "fixed", StringComparison.OrdinalIgnoreCase);
         var isRelative = string.Equals(position, "relative", StringComparison.OrdinalIgnoreCase);
-        var isSticky = string.Equals(position, "sticky", StringComparison.OrdinalIgnoreCase);
 
         if (isAbsolute || isFixed)
         {
@@ -844,25 +884,13 @@ public sealed partial class HtmlRenderer
             : isAbsolute
                 ? absoluteContainingX + leftOffset
                 : flowBorderBoxX + (isRelative ? leftOffset : 0f);
-        // `position: sticky` stays in normal flow for every other purpose (margins, cursor
-        // advancement, painting order - see the isAbsolute/isFixed checks elsewhere in this
-        // method, none of which match "sticky") - only its own final paint Y is adjusted here.
-        // This renderer already lays out an entire scrolled page in one coordinate space where
-        // Y=context.Padding is the viewport's own top edge (BuildDisplayList shifts the whole
-        // page's starting Y by -scrollOffsetY up front, so flowBorderBoxY arrives already
-        // viewport-relative) - "stick to `top` once scrolled past it" is therefore just clamping
-        // the element's own natural Y to never go above that threshold, with no separate scroll
-        // lookup needed. Only triggers when `top` is actually authored (`styleMap.ContainsKey`,
-        // not just defaulted to 0 via ParseLength's own allowAuto fallback below) - an
-        // unconstrained sticky element (no offset property at all) has nothing to stick to and
-        // behaves exactly like `static`, per spec.
+        // `position: sticky` is laid out at its natural position; its container shifts it once
+        // its own box is known (see ResolveStickyBoxes).
         var borderBoxY = isFixed
             ? context.Padding + topOffset
             : isAbsolute
                 ? absoluteContainingY + topOffset
-                : isSticky && styleMap.ContainsKey("top")
-                    ? Math.Max(flowBorderBoxY, context.Padding + topOffset)
-                    : flowBorderBoxY + (isRelative ? topOffset : 0f);
+                : flowBorderBoxY + (isRelative ? topOffset : 0f);
         var contentX = borderBoxX + borderLeft + paddingLeft;
         var contentY = borderBoxY + borderTop + paddingTop;
         var verticalBorderAndPadding = borderTop + borderBottom + paddingTop + paddingBottom;
@@ -885,6 +913,12 @@ public sealed partial class HtmlRenderer
                 contentWidth,
                 borderLeft + borderRight + paddingLeft + paddingRight,
                 verticalBorderAndPadding);
+        }
+
+        // A table cell is stretched to the rows it spans.
+        if (!float.IsNaN(forcedBorderBoxHeight))
+        {
+            resolvedContentHeight = Math.Max(0f, forcedBorderBoxHeight - verticalBorderAndPadding);
         }
 
         // A replaced element without an authored height is as tall as its (scaled) image.
@@ -932,7 +966,7 @@ public sealed partial class HtmlRenderer
 
         if (string.Equals(display, "list-item", StringComparison.OrdinalIgnoreCase))
         {
-            currentTextStyle = PaintListItemMarker(displayList, element, styleMap, currentTextStyle, context, borderBoxX, contentX, contentY);
+            currentTextStyle = PaintListItemMarker(currentTextStyle.IsHidden ? new DisplayList() : displayList, element, styleMap, currentTextStyle, context, borderBoxX, contentX, contentY);
         }
 
         if (formControlKind != FormControlKind.None)
@@ -947,10 +981,11 @@ public sealed partial class HtmlRenderer
             var formControlContentHeight = float.IsNaN(formControlSpecifiedHeight)
                 ? currentTextStyle.FontSize * currentTextStyle.LineHeightMultiplier
                 : formControlSpecifiedHeight;
-            PaintFormControl(displayList, element, formControlKind, currentTextStyle, context, contentX, contentY, contentWidth, formControlContentHeight);
+            PaintFormControl(currentTextStyle.IsHidden ? new DisplayList() : displayList, element, formControlKind, currentTextStyle, context, contentX, contentY, contentWidth, formControlContentHeight);
         }
 
-        var childCursorY = contentY;
+        // A table cell's content is shifted within the cell by its `vertical-align`.
+        var childCursorY = contentY + contentOffsetY;
         var childPreviousBlockMarginBottom = 0f;
         var childSuppressNextBlockTopMargin = collapseWithFirstChild && !float.Equals(effectiveMarginTop, marginTop);
         var childFloats = establishesContext ? new FloatArea() : floats;
@@ -1043,7 +1078,34 @@ public sealed partial class HtmlRenderer
             return;
         }
 
-        if (TryResolveColumnLayout(styleMap, contentWidth, currentTextStyle.FontSize, out var columnLayout))
+        var isOrthogonalFlow = IsVerticalMode(currentTextStyle.WritingMode) != IsVerticalMode(inheritedTextStyle.FlowMode) &&
+                               formControlKind == FormControlKind.None &&
+                               !(element is not IPseudoElement && IsReplacedElementTag(tagName));
+
+        if (isOrthogonalFlow)
+        {
+            // An orthogonal flow (a vertical box in horizontal content or the reverse): its content
+            // runs along this box's height and is placed by a transform; an auto width is the
+            // content's block size.
+            var flowStyle = currentTextStyle with { FlowMode = currentTextStyle.WritingMode };
+            var inlineSize = ResolveOrthogonalInlineSize(node, styleMap, flowStyle, resolvedContentHeight, heightReference, verticalBorderAndPadding, context);
+            var flowStart = displayList.Commands.Count;
+            var blockSize = LayoutOrthogonalFlowContent(orderedChildren, flowStyle, inlineSize, context, displayList);
+
+            if (float.IsNaN(specifiedContentWidth) && float.IsNaN(forcedBorderBoxWidth))
+            {
+                contentWidth = ClampToMinMaxWidth(styleMap, blockSize, flowContainingWidth, horizontalBorderAndPadding);
+            }
+
+            displayList.InsertRange(flowStart, [new PushTransformCommand(ResolveOrthogonalFlowTransform(currentTextStyle.WritingMode, inheritedTextStyle.FlowMode, contentX, contentY + contentOffsetY, contentWidth, inlineSize))]);
+            displayList.PopTransform();
+            resolvedContentHeight = inlineSize;
+            childCursorY = contentY + inlineSize;
+
+            // Sticky boxes in there were registered in the flow's own coordinates.
+            context.StickyScopes.Peek().Clear();
+        }
+        else if (TryResolveColumnLayout(styleMap, contentWidth, currentTextStyle.FontSize, out var columnLayout))
         {
             var columnHeight = LayoutMultiColumnChildren(
                 orderedChildren,
@@ -1067,7 +1129,7 @@ public sealed partial class HtmlRenderer
             LayoutFlowChildren(
                 orderedChildren,
                 contentX,
-                contentY,
+                contentY + contentOffsetY,
                 contentWidth,
                 ref childCursorY,
                 ref childPreviousBlockMarginBottom,
@@ -1098,7 +1160,7 @@ public sealed partial class HtmlRenderer
         var minimumContentHeight = ResolveAuthoredDimension(styleMap, "min-height", heightReference, 0f, verticalBorderAndPadding);
         var maximumContentHeight = ResolveAuthoredDimension(styleMap, "max-height", heightReference, float.NaN, verticalBorderAndPadding);
         contentHeight = Math.Max(contentHeight, minimumContentHeight);
-        if (!float.IsNaN(maximumContentHeight))
+        if (!float.IsNaN(maximumContentHeight) && float.IsNaN(forcedBorderBoxHeight))
         {
             contentHeight = Math.Min(contentHeight, maximumContentHeight);
         }
@@ -1133,24 +1195,17 @@ public sealed partial class HtmlRenderer
             paddingBottom);
 
         var clipsOverflow = ShouldClipOverflow(styleMap);
-        var transform = ParseCssTransform(styleMap, borderBoxX, borderBoxY, borderBoxWidth, borderBoxHeight, currentTextStyle.FontSize);
-        var hasTransform = !transform.IsIdentity;
-        var filterFunctions = ParseCssFilter(styleMap);
-        var hasFilter = filterFunctions.Count > 0;
-        var opacity = ParseCssOpacity(styleMap);
-        var hasOpacity = opacity < 1f;
-        var clipPathShape = ParseClipPath(styleMap, borderBoxWidth, borderBoxHeight);
-        var hasClipPath = clipPathShape is not null;
-        var blendMode = ParseBlendMode(styleMap, "mix-blend-mode");
-        var isIsolated = styleMap.TryGetValue("isolation", out var isolationValue) &&
-                         string.Equals(isolationValue.Trim(), "isolate", StringComparison.OrdinalIgnoreCase);
-        var hasBlendScope = blendMode != RenderBlendMode.Normal || isIsolated;
-        var createsStackingContext = HasExplicitZIndex(styleMap) || hasOpacity || hasTransform || hasFilter || hasClipPath || hasBlendScope;
 
         // Percentage radii refer to the border box, which is only known now.
         box = box with { BorderRadius = ResolveBorderRadii(styleMap, borderBoxWidth, borderBoxHeight) };
         var boxPaintBuffer = new DisplayList();
-        var maskLayers = ResolveMaskLayers(
+
+        // A `visibility: hidden` box keeps its place and its scopes (which visible descendants
+        // still paint in) but paints none of its own decorations.
+        var decorationBuffer = currentTextStyle.IsHidden ? new DisplayList() : boxPaintBuffer;
+        var effects = OpenElementEffectScopes(
+            boxPaintBuffer,
+            decorationBuffer,
             styleMap,
             element,
             borderBoxX,
@@ -1159,79 +1214,14 @@ public sealed partial class HtmlRenderer
             borderBoxHeight,
             new EdgeSizes(borderTop, borderRight, borderBottom, borderLeft),
             new EdgeSizes(paddingTop, paddingRight, paddingBottom, paddingLeft),
-            box.BorderRadius);
-        var hasMask = maskLayers.Count > 0;
-        var backdropFunctions = ParseCssFilter(styleMap, "backdrop-filter");
-        createsStackingContext = createsStackingContext || hasMask || backdropFunctions.Count > 0;
+            box.BorderRadius,
+            currentTextStyle.FontSize);
+        var createsStackingContext = HasExplicitZIndex(styleMap) || effects.CreatesStackingContext;
 
-        // A transform applies to the whole element - background, border, outline, and every
-        // descendant all paint under it - so its push has to be the very first thing in this
-        // element's own paint scope, wrapping even the background (unlike the overflow clip below,
-        // which per spec explicitly excludes the border/outline it is nested inside).
-        if (hasTransform)
-        {
-            boxPaintBuffer.PushTransform(transform);
-        }
-
-        // `backdrop-filter` filters what is already painted behind the box, before the box's own
-        // groups open (inside them there would be nothing to filter yet).
-        if (backdropFunctions.Count > 0)
-        {
-            boxPaintBuffer.DrawBackdropFilter(
-                new RenderRect(borderBoxX, borderBoxY, borderBoxWidth, borderBoxHeight),
-                box.BorderRadius.ClampToBox(borderBoxWidth, borderBoxHeight),
-                backdropFunctions);
-        }
-
-        // `opacity` nests inside `transform` (compositing does not care about coordinate space,
-        // only about *where* transform already placed the content) but outside `filter` (matching
-        // how a browser processes filter effects on the element's own content first, then
-        // composites the already-filtered result onto the backdrop at the element's opacity).
-        // `mix-blend-mode` blends the element's finished group (already faded by its opacity)
-        // onto the backdrop, so it wraps the opacity scope. `isolation: isolate` alone opens a
-        // normal group that bounds the backdrop blend modes inside it can see.
-        if (hasBlendScope)
-        {
-            boxPaintBuffer.PushBlendMode(blendMode);
-        }
-
-        if (hasOpacity)
-        {
-            boxPaintBuffer.PushOpacity(opacity);
-        }
-
-        // `filter` wraps the whole element too, exactly like `transform` above - it is nested
-        // inside the transform scope (not outside it) so the filter's own raster operates in the
-        // element's already-transformed local space, matching how a scaled element's blur radius
-        // should scale along with it rather than staying a fixed screen-space size.
-        if (hasFilter)
-        {
-            boxPaintBuffer.PushFilter(filterFunctions);
-        }
-
-        // `clip-path` wraps the whole element too - background, border, outline, and every
-        // descendant are all clipped to the shape (unlike the overflow clip below, which excludes
-        // the border/outline it is nested inside) - nested innermost of the four whole-element
-        // scopes above, since its shape is expressed in the element's own already-transformed
-        // local space and should clip the filtered/opacity-composited result, not the other way
-        // around.
-        if (hasClipPath)
-        {
-            boxPaintBuffer.PushClipShape(clipPathShape!);
-        }
-
-        // A mask is the innermost whole-element scope: the masked group is everything the
-        // element paints.
-        if (hasMask)
-        {
-            boxPaintBuffer.PushMask(maskLayers);
-        }
-
-
-        PaintBoxBackground(boxPaintBuffer, styleMap, box, borderBoxX, borderBoxY, borderBoxWidth, borderBoxHeight, new EdgeSizes(borderTop, borderRight, borderBottom, borderLeft), new EdgeSizes(paddingTop, paddingRight, paddingBottom, paddingLeft));
-        PaintBoxShadows(boxPaintBuffer, box.BoxShadows, borderBoxX, borderBoxY, borderBoxWidth, borderBoxHeight, box.BorderRadius);
-        PaintBoxBorder(boxPaintBuffer, styleMap, node.Ref, box, borderBoxX, borderBoxY, borderBoxWidth, borderBoxHeight);
-        PaintOutline(boxPaintBuffer, styleMap, borderBoxX, borderBoxY, borderBoxWidth, borderBoxHeight);
+        PaintBoxBackground(decorationBuffer, styleMap, box, borderBoxX, borderBoxY, borderBoxWidth, borderBoxHeight, new EdgeSizes(borderTop, borderRight, borderBottom, borderLeft), new EdgeSizes(paddingTop, paddingRight, paddingBottom, paddingLeft));
+        PaintBoxShadows(decorationBuffer, box.BoxShadows, borderBoxX, borderBoxY, borderBoxWidth, borderBoxHeight, box.BorderRadius);
+        PaintBoxBorder(decorationBuffer, styleMap, node.Ref, box, borderBoxX, borderBoxY, borderBoxWidth, borderBoxHeight);
+        PaintOutline(decorationBuffer, styleMap, borderBoxX, borderBoxY, borderBoxWidth, borderBoxHeight);
 
         if (clipsOverflow)
         {
@@ -1255,6 +1245,7 @@ public sealed partial class HtmlRenderer
         }
 
         displayList.InsertRange(paintInsertionIndex, boxPaintBuffer.Commands);
+        ResolveStickyBoxes(displayList, context.StickyScopes.Peek(), new RenderRect(contentX, contentY, contentWidth, contentHeight), context);
 
         if (TryResolveReplacedElementImage(node, styleMap, flowContainingWidth, borderBoxX + borderLeft + paddingLeft, borderBoxY + borderTop + paddingTop, out var image, out var imageRect, out var objectFitClipRect))
         {
@@ -1263,7 +1254,7 @@ public sealed partial class HtmlRenderer
                 displayList.PushClip(objectFitClip, RenderCornerRadii.Zero);
             }
 
-            displayList.DrawImage(imageRect, image!);
+            (currentTextStyle.IsHidden ? new DisplayList() : displayList).DrawImage(imageRect, image!);
 
             if (objectFitClipRect is not null)
             {
@@ -1276,45 +1267,7 @@ public sealed partial class HtmlRenderer
             displayList.PopClip();
         }
 
-        if (hasMask)
-        {
-            displayList.PopMask();
-        }
-
-        // Closes the clip-path scope opened above, once children (and, for a replaced element,
-        // its image) have all been emitted - nested inside filter/opacity/transform, so it closes
-        // before they do.
-        if (hasClipPath)
-        {
-            displayList.PopClip();
-        }
-
-        // Closes the filter scope opened above, once children (and, for a replaced element, its
-        // image) have all been emitted - nested inside the opacity scope, so it has to close
-        // before that one does.
-        if (hasFilter)
-        {
-            displayList.PopFilter();
-        }
-
-        // Closes the opacity scope opened above - nested inside the transform scope, so it closes
-        // before that one does too.
-        if (hasOpacity)
-        {
-            displayList.PopOpacity();
-        }
-
-        if (hasBlendScope)
-        {
-            displayList.PopBlendMode();
-        }
-
-        // Closes the transform scope opened above, once children (and, for a replaced element, its
-        // image) have all been emitted - the outermost scope, since it was also the first pushed.
-        if (hasTransform)
-        {
-            displayList.PopTransform();
-        }
+        CloseElementEffectScopes(displayList, effects);
 
         if (isFloat)
         {
@@ -1340,6 +1293,140 @@ public sealed partial class HtmlRenderer
         previousBlockMarginBottom = effectiveMarginBottom + context.ParagraphSpacing;
     }
 
+    /// <summary>
+    /// The whole-element effect scopes a box opened, outermost first: transform, blend mode,
+    /// opacity, filter, clip-path, mask.
+    /// </summary>
+    private readonly record struct ElementEffectScopes(bool Transform, bool BlendMode, bool Opacity, bool Filter, bool ClipPath, bool Mask, bool BackdropFilter)
+    {
+        public bool CreatesStackingContext => Transform || BlendMode || Opacity || Filter || ClipPath || Mask || BackdropFilter;
+    }
+
+    /// <summary>
+    /// Opens the scopes that apply to an element as a whole (background, border, outline and
+    /// every descendant) into <paramref name="buffer"/>, which is spliced in before the box's own
+    /// decorations, and paints its <c>backdrop-filter</c>. Every block-level container (blocks,
+    /// flex, grid, tables) goes through here so they all honor the same effects;
+    /// <see cref="CloseElementEffectScopes"/> closes them once the children are emitted.
+    /// </summary>
+    private static ElementEffectScopes OpenElementEffectScopes(
+        DisplayList buffer,
+        DisplayList decorationBuffer,
+        Dictionary<string, string> styleMap,
+        IElement element,
+        float borderBoxX,
+        float borderBoxY,
+        float borderBoxWidth,
+        float borderBoxHeight,
+        EdgeSizes border,
+        EdgeSizes padding,
+        RenderCornerRadii radii,
+        float fontSize)
+    {
+        var transform = ParseCssTransform(styleMap, borderBoxX, borderBoxY, borderBoxWidth, borderBoxHeight, fontSize);
+        var filterFunctions = ParseCssFilter(styleMap);
+        var opacity = ParseCssOpacity(styleMap);
+        var clipPathShape = ParseClipPath(styleMap, borderBoxWidth, borderBoxHeight);
+        var blendMode = ParseBlendMode(styleMap, "mix-blend-mode");
+        var isIsolated = styleMap.TryGetValue("isolation", out var isolationValue) &&
+                         string.Equals(isolationValue.Trim(), "isolate", StringComparison.OrdinalIgnoreCase);
+        var maskLayers = ResolveMaskLayers(styleMap, element, borderBoxX, borderBoxY, borderBoxWidth, borderBoxHeight, border, padding, radii);
+        var backdropFunctions = ParseCssFilter(styleMap, "backdrop-filter");
+        var scopes = new ElementEffectScopes(
+            Transform: !transform.IsIdentity,
+            BlendMode: blendMode != RenderBlendMode.Normal || isIsolated,
+            Opacity: opacity < 1f,
+            Filter: filterFunctions.Count > 0,
+            ClipPath: clipPathShape is not null,
+            Mask: maskLayers.Count > 0,
+            BackdropFilter: backdropFunctions.Count > 0);
+
+        // A transform applies to the whole element - background, border, outline, and every
+        // descendant all paint under it - so it is the outermost scope, wrapping even the
+        // background (unlike the overflow clip, which excludes the border/outline).
+        if (scopes.Transform)
+        {
+            buffer.PushTransform(transform);
+        }
+
+        // `backdrop-filter` filters what is already painted behind the box, before the box's own
+        // groups open (inside them there would be nothing to filter yet).
+        if (scopes.BackdropFilter)
+        {
+            decorationBuffer.DrawBackdropFilter(
+                new RenderRect(borderBoxX, borderBoxY, borderBoxWidth, borderBoxHeight),
+                radii.ClampToBox(borderBoxWidth, borderBoxHeight),
+                backdropFunctions);
+        }
+
+        // `mix-blend-mode` blends the element's finished group (already faded by its opacity)
+        // onto the backdrop, so it wraps the opacity scope; `isolation: isolate` alone opens a
+        // normal group that bounds the blend modes inside it. `opacity` composites the already
+        // filtered content, so it wraps `filter`, which works in the element's transformed space.
+        if (scopes.BlendMode)
+        {
+            buffer.PushBlendMode(blendMode);
+        }
+
+        if (scopes.Opacity)
+        {
+            buffer.PushOpacity(opacity);
+        }
+
+        if (scopes.Filter)
+        {
+            buffer.PushFilter(filterFunctions);
+        }
+
+        // `clip-path` clips the filtered/composited result in the element's own transformed
+        // space, and a mask is the innermost scope: the masked group is everything the element
+        // paints.
+        if (scopes.ClipPath)
+        {
+            buffer.PushClipShape(clipPathShape!);
+        }
+
+        if (scopes.Mask)
+        {
+            buffer.PushMask(maskLayers);
+        }
+
+        return scopes;
+    }
+
+    private static void CloseElementEffectScopes(DisplayList displayList, ElementEffectScopes scopes)
+    {
+        if (scopes.Mask)
+        {
+            displayList.PopMask();
+        }
+
+        if (scopes.ClipPath)
+        {
+            displayList.PopClip();
+        }
+
+        if (scopes.Filter)
+        {
+            displayList.PopFilter();
+        }
+
+        if (scopes.Opacity)
+        {
+            displayList.PopOpacity();
+        }
+
+        if (scopes.BlendMode)
+        {
+            displayList.PopBlendMode();
+        }
+
+        if (scopes.Transform)
+        {
+            displayList.PopTransform();
+        }
+    }
+
     private readonly record struct FlexItemLayoutInfo(
         IRenderNode Node,
         Dictionary<string, string> Style,
@@ -1348,7 +1435,14 @@ public sealed partial class HtmlRenderer
         float FlexShrink,
         float BaseMainSize,
         float CrossSize,
-        string AlignSelf);
+        string AlignSelf,
+        float MinMainSize = 0f,
+        float MaxMainSize = float.PositiveInfinity,
+        float MainBorderAndPadding = 0f)
+    {
+        /// <summary>The flex base size clamped by the item's min and max main size.</summary>
+        public float HypotheticalMainSize => Math.Max(MinMainSize, Math.Min(MaxMainSize, BaseMainSize));
+    }
 
     private readonly record struct GridPlacement(int LineIndex, int Span);
 
@@ -1449,12 +1543,10 @@ public sealed partial class HtmlRenderer
             .OrderBy(item => item.Order)
             .ToList();
 
-        var mainGap = ParseGridGap(styleMap, isRowDirection ? "column-gap" : "row-gap", containingWidth, 0)
-            ?? ParseGridGap(styleMap, "gap", containingWidth, 0)
-            ?? 0f;
-        var crossGap = ParseGridGap(styleMap, isRowDirection ? "row-gap" : "column-gap", containingWidth, 0)
-            ?? ParseGridGap(styleMap, "gap", containingWidth, 0)
-            ?? 0f;
+        var columnGapValue = ResolveColumnGap(styleMap, containingWidth) ?? 0f;
+        var rowGapValue = ResolveRowGap(styleMap, ResolveGapHeightReference(styleMap, containingWidth, paddingTop + paddingBottom + borderTop + borderBottom)) ?? 0f;
+        var mainGap = isRowDirection ? columnGapValue : rowGapValue;
+        var crossGap = isRowDirection ? rowGapValue : columnGapValue;
         if (flexItems.Count == 0)
         {
             cursorY = flowBorderBoxY + borderTop + paddingTop + borderBottom + paddingBottom;
@@ -1472,7 +1564,7 @@ public sealed partial class HtmlRenderer
 
         if (float.IsNaN(containerMainSize))
         {
-            containerMainSize = flexItems.Sum(item => item.BaseMainSize) + Math.Max(0, flexItems.Count - 1) * mainGap;
+            containerMainSize = flexItems.Sum(item => item.HypotheticalMainSize) + Math.Max(0, flexItems.Count - 1) * mainGap;
         }
         else if (containerMainSize <= 0f)
         {
@@ -1499,7 +1591,7 @@ public sealed partial class HtmlRenderer
 
         foreach (var item in flexItems)
         {
-            if (string.Equals(flexWrap, "wrap", StringComparison.OrdinalIgnoreCase) && currentLine.Count > 0 && currentLineMainSize + mainGap + item.BaseMainSize > containerMainSize && containerMainSize > 0f)
+            if (string.Equals(flexWrap, "wrap", StringComparison.OrdinalIgnoreCase) && currentLine.Count > 0 && currentLineMainSize + mainGap + item.HypotheticalMainSize > containerMainSize && containerMainSize > 0f)
             {
                 lines.Add(currentLine);
                 currentLine = new List<FlexItemLayoutInfo>();
@@ -1507,7 +1599,7 @@ public sealed partial class HtmlRenderer
             }
 
             currentLine.Add(item);
-            currentLineMainSize += item.BaseMainSize;
+            currentLineMainSize += item.HypotheticalMainSize;
         }
 
         if (currentLine.Count > 0)
@@ -1533,7 +1625,7 @@ public sealed partial class HtmlRenderer
         var lineCrossSizes = lines.Select(line => line.Count > 0
             ? line.Max(item => item.Style.ContainsKey("height")
                 ? item.CrossSize
-                : Math.Max(item.CrossSize, EstimateFlexItemCrossSize(item.Node, item.BaseMainSize, isRowDirection, inheritedTextStyle, context)))
+                : Math.Max(item.CrossSize, EstimateFlexItemCrossSize(item.Node, item.HypotheticalMainSize, isRowDirection, inheritedTextStyle, context)))
             : 0f).ToList();
         var totalCrossSize = lineCrossSizes.Sum() + Math.Max(0, lines.Count - 1) * crossGap;
         var remainingCrossSize = Math.Max(0f, containerCrossSize - totalCrossSize);
@@ -1575,29 +1667,15 @@ public sealed partial class HtmlRenderer
         for (var lineIndex = 0; lineIndex < lines.Count; lineIndex++)
         {
             var line = lines[lineIndex];
-            var lineBaseSize = line.Sum(item => item.BaseMainSize);
             var lineGap = Math.Max(0, line.Count - 1) * mainGap;
-            var lineGrowSum = line.Sum(item => item.FlexGrow);
-            var lineShrinkSum = line.Sum(item => item.FlexShrink);
             var lineItems = new List<(FlexItemLayoutInfo Item, float FinalMainSize)>(line.Count);
-            var availableMainSize = containerMainSize - lineBaseSize - lineGap;
+            var finalMainSizes = ResolveFlexibleLengths(line, containerMainSize - lineGap);
             var lineMainSize = lineGap;
 
-            foreach (var item in line)
+            for (var itemIndex = 0; itemIndex < line.Count; itemIndex++)
             {
-                var finalMainSize = item.BaseMainSize;
-
-                if (availableMainSize > 0f && lineGrowSum > 0f)
-                {
-                    finalMainSize = item.BaseMainSize + (availableMainSize * item.FlexGrow / lineGrowSum);
-                }
-                else if (availableMainSize < 0f && lineShrinkSum > 0f)
-                {
-                    finalMainSize = Math.Max(0f, item.BaseMainSize + (availableMainSize * item.FlexShrink / lineShrinkSum));
-                }
-
-                lineItems.Add((item, finalMainSize));
-                lineMainSize += finalMainSize;
+                lineItems.Add((line[itemIndex], finalMainSizes[itemIndex]));
+                lineMainSize += finalMainSizes[itemIndex];
             }
 
             var spacerCount = Math.Max(0, lineItems.Count - 1);
@@ -1783,17 +1861,31 @@ public sealed partial class HtmlRenderer
         // Percentage radii refer to the border box, which is only known now.
         box = box with { BorderRadius = ResolveBorderRadii(styleMap, borderBoxWidth, borderBoxHeight) };
         var boxPaintBuffer = new DisplayList();
+        var decorationBuffer = inheritedTextStyle.IsHidden ? new DisplayList() : boxPaintBuffer;
+        var effects = OpenElementEffectScopes(
+            boxPaintBuffer,
+            decorationBuffer,
+            styleMap,
+            node.Ref,
+            borderBoxX,
+            borderBoxY,
+            borderBoxWidth,
+            borderBoxHeight,
+            new EdgeSizes(borderTop, borderRight, borderBottom, borderLeft),
+            new EdgeSizes(paddingTop, paddingRight, paddingBottom, paddingLeft),
+            box.BorderRadius,
+            inheritedTextStyle.FontSize);
 
         if (box.BackgroundPaint is RenderColorPaint colorPaint && colorPaint.Color.A == 0)
         {
-            boxPaintBuffer.FillRect(new RenderRect(borderBoxX, borderBoxY, borderBoxWidth, borderBoxHeight), RenderColor.Transparent);
+            decorationBuffer.FillRect(new RenderRect(borderBoxX, borderBoxY, borderBoxWidth, borderBoxHeight), RenderColor.Transparent);
         }
         else
         {
-            PaintBoxBackground(boxPaintBuffer, styleMap, box, borderBoxX, borderBoxY, borderBoxWidth, borderBoxHeight, new EdgeSizes(borderTop, borderRight, borderBottom, borderLeft), new EdgeSizes(paddingTop, paddingRight, paddingBottom, paddingLeft));
+            PaintBoxBackground(decorationBuffer, styleMap, box, borderBoxX, borderBoxY, borderBoxWidth, borderBoxHeight, new EdgeSizes(borderTop, borderRight, borderBottom, borderLeft), new EdgeSizes(paddingTop, paddingRight, paddingBottom, paddingLeft));
         }
 
-        PaintBoxShadows(boxPaintBuffer, box.BoxShadows, borderBoxX, borderBoxY, borderBoxWidth, borderBoxHeight, box.BorderRadius);
+        PaintBoxShadows(decorationBuffer, box.BoxShadows, borderBoxX, borderBoxY, borderBoxWidth, borderBoxHeight, box.BorderRadius);
 
         RecordLayoutMetrics(
             node.Ref,
@@ -1810,8 +1902,8 @@ public sealed partial class HtmlRenderer
             paddingTop,
             paddingBottom);
 
-        PaintBoxBorder(boxPaintBuffer, styleMap, node.Ref, box, borderBoxX, borderBoxY, borderBoxWidth, borderBoxHeight);
-        PaintOutline(boxPaintBuffer, styleMap, borderBoxX, borderBoxY, borderBoxWidth, borderBoxHeight);
+        PaintBoxBorder(decorationBuffer, styleMap, node.Ref, box, borderBoxX, borderBoxY, borderBoxWidth, borderBoxHeight);
+        PaintOutline(decorationBuffer, styleMap, borderBoxX, borderBoxY, borderBoxWidth, borderBoxHeight);
 
         var clipsOverflow = ShouldClipOverflow(styleMap);
 
@@ -1826,6 +1918,15 @@ public sealed partial class HtmlRenderer
         }
 
         displayList.InsertRange(boxPaintInsertIndex, boxPaintBuffer.Commands);
+        ResolveStickyBoxes(
+            displayList,
+            context.StickyScopes.Peek(),
+            new RenderRect(
+                borderBoxX + borderLeft + paddingLeft,
+                borderBoxY + borderTop + paddingTop,
+                Math.Max(0f, borderBoxWidth - borderLeft - borderRight - paddingLeft - paddingRight),
+                Math.Max(0f, borderBoxHeight - borderTop - borderBottom - paddingTop - paddingBottom)),
+            context);
 
         if (TryResolveReplacedElementImage(node, styleMap, containingWidth, borderBoxX + borderLeft + paddingLeft, borderBoxY + borderTop + paddingTop, out var image, out var imageRect, out var objectFitClipRect))
         {
@@ -1834,7 +1935,7 @@ public sealed partial class HtmlRenderer
                 displayList.PushClip(objectFitClip, RenderCornerRadii.Zero);
             }
 
-            displayList.DrawImage(imageRect, image!);
+            (inheritedTextStyle.IsHidden ? new DisplayList() : displayList).DrawImage(imageRect, image!);
 
             if (objectFitClipRect is not null)
             {
@@ -1847,6 +1948,7 @@ public sealed partial class HtmlRenderer
             displayList.PopClip();
         }
 
+        CloseElementEffectScopes(displayList, effects);
         cursorY = flowBorderBoxY + borderBoxHeight;
         previousBlockMarginBottom = effectiveMarginBottom + context.ParagraphSpacing;
         suppressNextBlockTopMargin = false;
@@ -1886,415 +1988,6 @@ public sealed partial class HtmlRenderer
             : (flexMainSize.HasValue ? flexMainSize.Value : ResolveAuthoredDimension(styleMap, propertyName, relativeTo, defaultValue, borderAndPaddingSum));
     }
 
-    /// <summary>
-    /// The rows of a table: children with <c>display: table-row</c>, directly or inside row
-    /// groups (<c>table-header-group</c>/<c>table-row-group</c>/<c>table-footer-group</c>). The
-    /// table structure comes from the computed <c>display</c> (the default stylesheet maps
-    /// <c>tr</c>, <c>tbody</c>, ... onto it), not from tag names, and a nested table's rows are
-    /// never mistaken for this table's own.
-    /// </summary>
-    private static IEnumerable<ElementRenderNode> CollectTableRows(ElementRenderNode tableNode)
-    {
-        foreach (var child in tableNode.Children)
-        {
-            if (child is not ElementRenderNode childElement)
-            {
-                continue;
-            }
-
-            if (HasDisplay(childElement, "table-row"))
-            {
-                yield return childElement;
-            }
-            else if (HasDisplay(childElement, "table-header-group") || HasDisplay(childElement, "table-row-group") || HasDisplay(childElement, "table-footer-group"))
-            {
-                foreach (var row in CollectTableRows(childElement))
-                {
-                    yield return row;
-                }
-            }
-        }
-    }
-
-    private static bool HasDisplay(ElementRenderNode node, string display) =>
-        string.Equals(node.ComputedStyle.GetDisplay()?.Trim(), display, StringComparison.OrdinalIgnoreCase);
-
-    private static void LayoutTable(
-        ElementRenderNode tableNode,
-        float containingX,
-        float containingY,
-        float containingWidth,
-        ref float cursorY,
-        ref float previousBlockMarginBottom,
-        ref bool suppressNextBlockTopMargin,
-        FloatArea floats,
-        ref bool textIndentConsumed,
-        RenderTextStyle inheritedTextStyle,
-        LayoutContext context,
-        DisplayList displayList,
-        float maxY)
-    {
-        var tableStyle = GetOrCreateStyleMap(context, tableNode.Ref, tableNode.ComputedStyle);
-        var specifiedWidth = ParseLength(tableStyle, "width", containingWidth, float.NaN, allowAuto: true);
-        var availableWidth = float.IsNaN(specifiedWidth) ? containingWidth : specifiedWidth;
-        var borderCollapse = string.Equals(tableStyle.TryGetValue("border-collapse", out var borderCollapseValue) ? borderCollapseValue : null, "collapse", StringComparison.OrdinalIgnoreCase);
-
-        var rows = CollectTableRows(tableNode).ToList();
-        var colgroup = tableNode.Children
-            .Where(child => child is ElementRenderNode columnGroup && HasDisplay(columnGroup, "table-column-group"))
-            .Cast<ElementRenderNode>()
-            .FirstOrDefault();
-        var columnSpecs = new List<(int ColumnIndex, float Width)>();
-
-        if (colgroup is not null)
-        {
-            var columnNodes = colgroup.Children
-                .Where(child => child is ElementRenderNode column && HasDisplay(column, "table-column"))
-                .Cast<ElementRenderNode>()
-                .ToList();
-
-            for (var index = 0; index < columnNodes.Count; index++)
-            {
-                var columnStyle = GetOrCreateStyleMap(context, columnNodes[index].Ref, columnNodes[index].ComputedStyle);
-                var specifiedColumnWidth = ParseLength(columnStyle, "width", availableWidth, float.NaN, allowAuto: true);
-                if (!float.IsNaN(specifiedColumnWidth))
-                {
-                    columnSpecs.Add((index, specifiedColumnWidth));
-                }
-            }
-        }
-
-        if (rows.Count == 0)
-        {
-            cursorY += inheritedTextStyle.FontSize * inheritedTextStyle.LineHeightMultiplier;
-            return;
-        }
-
-        var rowCellLists = rows
-            .Select(row => row.Children
-                .Where(child => child is ElementRenderNode cellNode && HasDisplay(cellNode, "table-cell"))
-                .Cast<ElementRenderNode>()
-                .ToList())
-            .ToList();
-
-        var tableCells = new List<TableCellPlacement>();
-        var rowSpanOccupancy = new List<int>();
-        var columnCount = 0;
-
-        for (var rowIndex = 0; rowIndex < rowCellLists.Count; rowIndex++)
-        {
-            var cells = rowCellLists[rowIndex];
-            var currentRowOccupied = new List<int>();
-            var nextRowSpanOccupancy = new List<int>();
-            var currentColumnIndex = 0;
-
-            foreach (var cellNode in cells)
-            {
-                while (true)
-                {
-                    while (currentColumnIndex >= currentRowOccupied.Count)
-                    {
-                        currentRowOccupied.Add(0);
-                    }
-
-                    while (currentColumnIndex >= rowSpanOccupancy.Count)
-                    {
-                        rowSpanOccupancy.Add(0);
-                    }
-
-                    if (rowSpanOccupancy[currentColumnIndex] == 0 && currentRowOccupied[currentColumnIndex] == 0)
-                    {
-                        break;
-                    }
-
-                    currentColumnIndex++;
-                }
-
-                var cellStyle = GetOrCreateStyleMap(context, cellNode.Ref, cellNode.ComputedStyle);
-                var cellTextStyle = ResolveTextStyle(cellStyle, inheritedTextStyle);
-                var text = NormalizeWhitespace(cellNode.Ref.TextContent ?? string.Empty);
-                var colspan = 1;
-                var rowspan = 1;
-
-                if (int.TryParse(cellNode.Ref.GetAttribute("colspan"), NumberStyles.Integer, CultureInfo.InvariantCulture, out var parsedColspan) && parsedColspan > 0)
-                {
-                    colspan = parsedColspan;
-                }
-
-                if (int.TryParse(cellNode.Ref.GetAttribute("rowspan"), NumberStyles.Integer, CultureInfo.InvariantCulture, out var parsedRowspan) && parsedRowspan > 0)
-                {
-                    rowspan = parsedRowspan;
-                }
-
-                for (var spanOffset = 0; spanOffset < colspan; spanOffset++)
-                {
-                    while (currentColumnIndex + spanOffset >= currentRowOccupied.Count)
-                    {
-                        currentRowOccupied.Add(0);
-                    }
-
-                    currentRowOccupied[currentColumnIndex + spanOffset] = 1;
-                }
-
-                for (var spanOffset = 0; spanOffset < colspan; spanOffset++)
-                {
-                    while (currentColumnIndex + spanOffset >= nextRowSpanOccupancy.Count)
-                    {
-                        nextRowSpanOccupancy.Add(0);
-                    }
-
-                    nextRowSpanOccupancy[currentColumnIndex + spanOffset] = Math.Max(nextRowSpanOccupancy[currentColumnIndex + spanOffset], Math.Max(0, rowspan - 1));
-                }
-
-                tableCells.Add(new TableCellPlacement(rowIndex, currentColumnIndex, colspan, rowspan, cellNode, cellStyle, cellTextStyle, text,
-                    ParseLength(cellStyle, "padding-left", containingWidth, 4f, allowAuto: false),
-                    ParseLength(cellStyle, "padding-right", containingWidth, 4f, allowAuto: false),
-                    ParseLength(cellStyle, "padding-top", containingWidth, 4f, allowAuto: false),
-                    ParseLength(cellStyle, "padding-bottom", containingWidth, 4f, allowAuto: false),
-                    ParseLength(cellStyle, "border-left-width", containingWidth, 1f, allowAuto: false),
-                    ParseLength(cellStyle, "border-right-width", containingWidth, 1f, allowAuto: false),
-                    ParseLength(cellStyle, "border-top-width", containingWidth, 1f, allowAuto: false),
-                    ParseLength(cellStyle, "border-bottom-width", containingWidth, 1f, allowAuto: false),
-                    ParseColor(cellStyle.TryGetValue("background-color", out var backgroundColor) ? backgroundColor : null, RenderColor.Transparent),
-                    ParseCellVerticalAlign(cellStyle)));
-
-                columnCount = Math.Max(columnCount, currentColumnIndex + colspan);
-                currentColumnIndex += colspan;
-            }
-
-            foreach (var index in Enumerable.Range(0, rowSpanOccupancy.Count))
-            {
-                if (rowSpanOccupancy[index] > 0)
-                {
-                    // A row with fewer cells than the span reaches over leaves the new list short.
-                    while (index >= nextRowSpanOccupancy.Count)
-                    {
-                        nextRowSpanOccupancy.Add(0);
-                    }
-
-                    nextRowSpanOccupancy[index] = Math.Max(nextRowSpanOccupancy[index], rowSpanOccupancy[index] - 1);
-                }
-            }
-
-            rowSpanOccupancy = nextRowSpanOccupancy;
-        }
-
-        if (columnCount <= 0)
-        {
-            cursorY += inheritedTextStyle.FontSize * inheritedTextStyle.LineHeightMultiplier;
-            return;
-        }
-
-        var columnMinWidths = new float[columnCount];
-        foreach (var placement in tableCells)
-        {
-            var specifiedCellWidth = ParseLength(placement.CellStyle, "width", availableWidth, float.NaN, allowAuto: true);
-            var paddingLeft = placement.PaddingLeft;
-            var paddingRight = placement.PaddingRight;
-            var borderLeftWidth = placement.BorderLeftWidth;
-            var borderRightWidth = placement.BorderRightWidth;
-            var textWidth = placement.Text.Length > 0 ? MeasureTextWidth(context, placement.Text, placement.CellTextStyle) : 0f;
-            var minCellWidth = textWidth + paddingLeft + paddingRight + borderLeftWidth + borderRightWidth + 8f;
-            var widthPerColumn = float.IsNaN(specifiedCellWidth) ? minCellWidth / Math.Max(1, placement.ColumnSpan) : specifiedCellWidth / Math.Max(1, placement.ColumnSpan);
-
-            for (var spanOffset = 0; spanOffset < placement.ColumnSpan; spanOffset++)
-            {
-                var columnIndex = placement.ColumnIndex + spanOffset;
-                columnMinWidths[columnIndex] = Math.Max(columnMinWidths[columnIndex], widthPerColumn);
-            }
-        }
-
-        foreach (var (columnIndex, columnWidth) in columnSpecs)
-        {
-            if (columnIndex < columnMinWidths.Length)
-            {
-                columnMinWidths[columnIndex] = Math.Max(columnMinWidths[columnIndex], columnWidth);
-            }
-        }
-
-        var totalMinWidth = columnMinWidths.Sum();
-        var tableWidth = Math.Max(availableWidth, totalMinWidth);
-        var columnWidths = new float[columnCount];
-
-        if (availableWidth > totalMinWidth)
-        {
-            var extraWidth = availableWidth - totalMinWidth;
-            var extraPerColumn = extraWidth / Math.Max(1, columnCount);
-            for (var columnIndex = 0; columnIndex < columnCount; columnIndex++)
-            {
-                columnWidths[columnIndex] = columnMinWidths[columnIndex] + extraPerColumn;
-            }
-        }
-        else if (availableWidth > 0f && totalMinWidth > availableWidth)
-        {
-            var scale = availableWidth / totalMinWidth;
-            for (var columnIndex = 0; columnIndex < columnCount; columnIndex++)
-            {
-                columnWidths[columnIndex] = columnMinWidths[columnIndex] * scale;
-            }
-        }
-        else
-        {
-            columnWidths = columnMinWidths.ToArray();
-        }
-
-        var tableX = containingX;
-        var tableY = cursorY;
-        var rowTopOffsets = new float[rowCellLists.Count];
-        var rowHeights = new float[rowCellLists.Count];
-
-        // Cells confined to a single row establish the row heights on their own.
-        foreach (var placement in tableCells.Where(placement => placement.RowSpan <= 1))
-        {
-            rowHeights[placement.RowIndex] = Math.Max(rowHeights[placement.RowIndex], MeasureCellHeight(context, placement, columnWidths));
-        }
-
-        for (var rowIndex = 0; rowIndex < rowHeights.Length; rowIndex++)
-        {
-            rowHeights[rowIndex] = Math.Max(rowHeights[rowIndex], 20f);
-        }
-
-        // A spanning cell only has to fit across the rows it covers taken together, so it grows
-        // them by whatever is still missing rather than imposing its full height on each one.
-        foreach (var placement in tableCells.Where(placement => placement.RowSpan > 1))
-        {
-            var spannedRows = Enumerable.Range(placement.RowIndex, placement.RowSpan).ToArray();
-            var available = spannedRows.Sum(rowIndex => rowHeights[rowIndex]);
-            var required = MeasureCellHeight(context, placement, columnWidths);
-
-            if (required > available)
-            {
-                var deficitPerRow = (required - available) / placement.RowSpan;
-
-                foreach (var rowIndex in spannedRows)
-                {
-                    rowHeights[rowIndex] += deficitPerRow;
-                }
-            }
-        }
-
-        var currentRowTop = 0f;
-        for (var rowIndex = 0; rowIndex < rowCellLists.Count; rowIndex++)
-        {
-            rowTopOffsets[rowIndex] = currentRowTop;
-            currentRowTop += rowHeights[rowIndex];
-        }
-
-        var columnLefts = new float[columnCount];
-        var currentColumnLeft = 0f;
-        for (var columnIndex = 0; columnIndex < columnCount; columnIndex++)
-        {
-            columnLefts[columnIndex] = currentColumnLeft;
-            currentColumnLeft += columnWidths[columnIndex];
-        }
-
-        var tableHeight = currentRowTop;
-        foreach (var placement in tableCells)
-        {
-            var contentWidth = Math.Max(0f, columnWidths.Skip(placement.ColumnIndex).Take(placement.ColumnSpan).Sum() - placement.PaddingLeft - placement.PaddingRight - placement.BorderLeftWidth - placement.BorderRightWidth);
-            var cellX = tableX + columnLefts[placement.ColumnIndex];
-            var cellY = tableY + rowTopOffsets[placement.RowIndex];
-            var cellWidth = columnWidths.Skip(placement.ColumnIndex).Take(placement.ColumnSpan).Sum();
-            var cellHeight = 0f;
-            for (var rowIndex = placement.RowIndex; rowIndex < placement.RowIndex + placement.RowSpan; rowIndex++)
-            {
-                cellHeight += rowHeights[rowIndex];
-            }
-
-            RecordLayoutMetrics(
-                placement.CellNode.Ref,
-                cellX,
-                cellY,
-                cellWidth,
-                cellHeight,
-                placement.BorderLeftWidth,
-                placement.BorderRightWidth,
-                placement.BorderTopWidth,
-                placement.BorderBottomWidth,
-                placement.PaddingLeft,
-                placement.PaddingRight,
-                placement.PaddingTop,
-                placement.PaddingBottom);
-
-            displayList.FillRect(new RenderRect(cellX, cellY, cellWidth, cellHeight), placement.BackgroundColor);
-
-            if (borderCollapse)
-            {
-                // Collapsed borders are shared, so each cell contributes only its top and left
-                // edge and the table frame closes the far sides. Drawing full outlines instead
-                // would lay two lines over every shared edge, and a grid spanning the whole table
-                // would cut straight through the cells that span rows or columns.
-                displayList.FillRect(new RenderRect(cellX, cellY, cellWidth, CollapsedBorderWidth), RenderColor.Black);
-                displayList.FillRect(new RenderRect(cellX, cellY, CollapsedBorderWidth, cellHeight), RenderColor.Black);
-            }
-            else
-            {
-                displayList.FillRect(new RenderRect(cellX, cellY, cellWidth, placement.BorderTopWidth), RenderColor.Black);
-                displayList.FillRect(new RenderRect(cellX + cellWidth - placement.BorderRightWidth, cellY, placement.BorderRightWidth, cellHeight), RenderColor.Black);
-                displayList.FillRect(new RenderRect(cellX, cellY + cellHeight - placement.BorderBottomWidth, cellWidth, placement.BorderBottomWidth), RenderColor.Black);
-                displayList.FillRect(new RenderRect(cellX, cellY, placement.BorderLeftWidth, cellHeight), RenderColor.Black);
-            }
-
-            if (contentWidth > 0f && placement.Text.Length > 0)
-            {
-                var wrappedLines = WrapText(context, placement.Text, contentWidth, placement.CellTextStyle);
-                var lineHeight = placement.CellTextStyle.FontSize * placement.CellTextStyle.LineHeightMultiplier;
-                var lineX = cellX + placement.PaddingLeft + placement.BorderLeftWidth;
-
-                // The content box can be taller than the text, most visibly in a cell that spans
-                // rows, so the block of lines is placed according to the cell's vertical-align.
-                var contentBoxHeight = cellHeight - placement.PaddingTop - placement.PaddingBottom
-                    - placement.BorderTopWidth - placement.BorderBottomWidth;
-                var slack = Math.Max(0f, contentBoxHeight - (wrappedLines.Count * lineHeight));
-                var verticalOffset = placement.VerticalAlign switch
-                {
-                    CellVerticalAlign.Middle => slack / 2f,
-                    CellVerticalAlign.Bottom => slack,
-                    _ => 0f,
-                };
-
-                var lineY = cellY + placement.PaddingTop + placement.BorderTopWidth + verticalOffset + lineHeight;
-
-                for (var lineIndex = 0; lineIndex < wrappedLines.Count; lineIndex++)
-                {
-                    var line = wrappedLines[lineIndex];
-                    var cellLineY = lineY + (lineIndex * lineHeight);
-                    DrawStyledText(context, displayList, line, lineX, cellLineY, placement.CellTextStyle);
-                }
-            }
-        }
-
-        if (borderCollapse)
-        {
-            // The interior lines come from the cell outlines above; only the frame is left, which
-            // also closes the edge of rows that hold fewer cells than the table has columns.
-            displayList.FillRect(new RenderRect(tableX, tableY, tableWidth, CollapsedBorderWidth), RenderColor.Black);
-            displayList.FillRect(new RenderRect(tableX, tableY + tableHeight - CollapsedBorderWidth, tableWidth, CollapsedBorderWidth), RenderColor.Black);
-            displayList.FillRect(new RenderRect(tableX, tableY, CollapsedBorderWidth, tableHeight), RenderColor.Black);
-            displayList.FillRect(new RenderRect(tableX + tableWidth - CollapsedBorderWidth, tableY, CollapsedBorderWidth, tableHeight), RenderColor.Black);
-        }
-
-        RecordLayoutMetrics(
-            tableNode.Ref,
-            tableX,
-            tableY,
-            tableWidth,
-            tableHeight,
-            borderLeft: 0f,
-            borderRight: 0f,
-            borderTop: 0f,
-            borderBottom: 0f,
-            paddingLeft: 0f,
-            paddingRight: 0f,
-            paddingTop: 0f,
-            paddingBottom: 0f);
-
-        displayList.FillRect(new RenderRect(tableX, tableY, tableWidth, tableHeight), RenderColor.Transparent);
-        cursorY = tableY + tableHeight + 4f;
-        previousBlockMarginBottom = 0f;
-        suppressNextBlockTopMargin = false;
-    }
-
     private static void LayoutGridContainer(
         ElementRenderNode node,
         float containingX,
@@ -2329,10 +2022,8 @@ public sealed partial class HtmlRenderer
         // (and appended), so their paint commands are spliced in before this index instead.
         var boxPaintInsertIndex = displayList.Commands.Count;
 
-        var columnGap = ParseGridGap(styleMap, "column-gap", containingWidth, 0)
-            ?? ParseGridGap(styleMap, "gap", containingWidth, 0);
-        var rowGap = ParseGridGap(styleMap, "row-gap", containingWidth, 0)
-            ?? ParseGridGap(styleMap, "gap", containingWidth, 0);
+        var columnGap = ResolveColumnGap(styleMap, containingWidth);
+        var rowGap = ResolveRowGap(styleMap, ResolveGapHeightReference(styleMap, containingWidth, paddingTop + paddingBottom + borderTop + borderBottom));
         var resolvedColumnGap = columnGap ?? 0f;
         var resolvedRowGap = rowGap ?? 0f;
         var gridItems = node.Children
@@ -2340,7 +2031,9 @@ public sealed partial class HtmlRenderer
             .ToList();
 
         var explicitGridTemplateColumns = ResolveExplicitPropertyValue(node.Ref, node.ComputedStyle, "grid-template-columns");
-        var columns = ParseGridTrackListStructured(explicitGridTemplateColumns, containingWidth, resolvedColumnGap, gridItems.Count);
+        var columnLineNames = new Dictionary<string, List<int>>(StringComparer.Ordinal);
+        var rowLineNames = new Dictionary<string, List<int>>(StringComparer.Ordinal);
+        var columns = ParseGridTrackListStructured(explicitGridTemplateColumns, containingWidth, resolvedColumnGap, gridItems.Count, columnLineNames);
 
         if (columns.Count == 0)
         {
@@ -2348,10 +2041,11 @@ public sealed partial class HtmlRenderer
         }
 
         var gridVerticalBorderAndPadding = borderTop + borderBottom + paddingTop + paddingBottom;
-        var containerHeight = ResolveAuthoredDimension(styleMap, "height", containingWidth, float.NaN, gridVerticalBorderAndPadding);
+        var containerHeight = ResolveDefiniteContentHeight(styleMap, containingWidth, gridVerticalBorderAndPadding);
         var explicitGridTemplateRows = ResolveExplicitPropertyValue(node.Ref, node.ComputedStyle, "grid-template-rows");
-        var rows = ParseGridTrackListStructured(explicitGridTemplateRows, containerHeight);
+        var rows = ParseGridTrackListStructured(explicitGridTemplateRows, containerHeight, lineNames: rowLineNames);
         var hasExplicitRowTracks = rows.Count > 0;
+        var explicitRowCount = rows.Count;
         var autoRowDefinitions = styleMap.TryGetValue("grid-auto-rows", out var autoRowsValue)
             ? ParseGridTrackListStructured(autoRowsValue, containerHeight)
             : [];
@@ -2379,6 +2073,32 @@ public sealed partial class HtmlRenderer
         // GridTrackSize model instead of a flat pixel list.
         var itemPlacements = new List<(ElementRenderNode Element, GridPlacement Column, GridPlacement Row)>();
         var namedAreas = ParseGridTemplateAreas(styleMap.TryGetValue("grid-template-areas", out var areasValue) ? areasValue : null);
+
+        // Every area also names the lines around it: `name-start` and `name-end`.
+        foreach (var (areaName, namedArea) in namedAreas)
+        {
+            AddImplicitGridLine(columnLineNames, areaName + "-start", namedArea.Column);
+            AddImplicitGridLine(columnLineNames, areaName + "-end", namedArea.Column + namedArea.ColumnSpan);
+            AddImplicitGridLine(rowLineNames, areaName + "-start", namedArea.Row);
+            AddImplicitGridLine(rowLineNames, areaName + "-end", namedArea.Row + namedArea.RowSpan);
+        }
+
+        var columnLines = new GridLines(columnLineNames, columns.Count + 1);
+        var rowLines = new GridLines(rowLineNames, hasExplicitRowTracks ? explicitRowCount + 1 : 1);
+
+        static void AddImplicitGridLine(Dictionary<string, List<int>> names, string name, int line)
+        {
+            if (!names.TryGetValue(name, out var indices))
+            {
+                names[name] = indices = [];
+            }
+
+            if (!indices.Contains(line))
+            {
+                indices.Add(line);
+                indices.Sort();
+            }
+        }
         var occupiedCells = new HashSet<(int Column, int Row)>();
         var currentColumn = 0;
         var currentRow = 0;
@@ -2403,14 +2123,11 @@ public sealed partial class HtmlRenderer
         foreach (var rowItem in placementItems.OfType<ElementRenderNode>())
         {
             var rowStyle = GetOrCreateStyleMap(context, rowItem.Ref, rowItem.ComputedStyle);
-            var rowRaw = rowStyle.GetValueOrDefault("grid-row") ?? string.Empty;
-            var columnRaw = rowStyle.GetValueOrDefault("grid-column") ?? string.Empty;
-            var rowTokens = rowRaw.Split(new[] { ' ', '/', '\t', '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
-            var hasRowPlacement = rowTokens.Length > 0 && int.TryParse(rowTokens[0], NumberStyles.Integer, CultureInfo.InvariantCulture, out _);
-            var hasColumnPlacement = columnRaw.Split(new[] { ' ', '/', '\t', '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries).Any(token => int.TryParse(token, NumberStyles.Integer, CultureInfo.InvariantCulture, out _));
+            var hasRowPlacement = HasGridPlacement(rowStyle, "grid-row", rowLines);
+            var hasColumnPlacement = HasGridPlacement(rowStyle, "grid-column", columnLines);
             if (hasRowPlacement && !hasColumnPlacement)
             {
-                var rowPlacement = ResolveGridPlacementFromMap(rowStyle, "grid-row", 0);
+                var rowPlacement = ResolveGridPlacementFromMap(rowStyle, "grid-row", 0, rowLines);
                 var column = 0;
                 while (!CanPlace(column, rowPlacement.LineIndex, 1, rowPlacement.Span))
                 {
@@ -2450,10 +2167,10 @@ public sealed partial class HtmlRenderer
                 currentRow = 0;
                 continue;
             }
-            var placementColumn = ResolveGridPlacementFromMap(childStyleMap, "grid-column", currentColumn);
-            var placementRow = ResolveGridPlacementFromMap(childStyleMap, "grid-row", currentRow);
-            var hasExplicitColumn = HasGridPlacement(childStyleMap, "grid-column");
-            var hasExplicitRow = HasGridPlacement(childStyleMap, "grid-row");
+            var placementColumn = ResolveGridPlacementFromMap(childStyleMap, "grid-column", currentColumn, columnLines);
+            var placementRow = ResolveGridPlacementFromMap(childStyleMap, "grid-row", currentRow, rowLines);
+            var hasExplicitColumn = HasGridPlacement(childStyleMap, "grid-column", columnLines);
+            var hasExplicitRow = HasGridPlacement(childStyleMap, "grid-row", rowLines);
             var effectivePlacementColumn = new GridPlacement(Math.Max(0, hasExplicitColumn ? placementColumn.LineIndex : currentColumn), placementColumn.Span);
             var effectivePlacementRow = new GridPlacement(Math.Max(0, hasExplicitRow ? placementRow.LineIndex : currentRow), placementRow.Span);
 
@@ -2494,15 +2211,13 @@ public sealed partial class HtmlRenderer
                 foreach (var rowOnlyItem in placementItems.OfType<ElementRenderNode>())
                 {
                     var rowOnlyStyle = GetOrCreateStyleMap(context, rowOnlyItem.Ref, rowOnlyItem.ComputedStyle);
-                    var rowRaw = rowOnlyStyle.GetValueOrDefault("grid-row") ?? string.Empty;
                     var columnRaw = rowOnlyStyle.GetValueOrDefault("grid-column") ?? string.Empty;
-                    var rowTokens = rowRaw.Split(new[] { ' ', '/', '\t', '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
-                    if (rowTokens.Length == 0 || !rowTokens.Any(token => int.TryParse(token, NumberStyles.Integer, CultureInfo.InvariantCulture, out _)) || !string.IsNullOrWhiteSpace(columnRaw) || HasGridPlacement(rowOnlyStyle, "grid-area"))
+                    if (!HasGridPlacement(rowOnlyStyle, "grid-row", rowLines) || !string.IsNullOrWhiteSpace(columnRaw) || HasGridPlacement(rowOnlyStyle, "grid-area"))
                     {
                         continue;
                     }
 
-                    var rowOnlyPlacement = ResolveGridPlacementFromMap(rowOnlyStyle, "grid-row", 0);
+                    var rowOnlyPlacement = ResolveGridPlacementFromMap(rowOnlyStyle, "grid-row", 0, rowLines);
                     var columnsOverlap = effectivePlacementColumn.LineIndex < 1 + effectivePlacementColumn.Span &&
                         0 < effectivePlacementColumn.LineIndex + effectivePlacementColumn.Span;
                     if (columnsOverlap)
@@ -2564,16 +2279,24 @@ public sealed partial class HtmlRenderer
         ResolveGridFractionTracks(columns, resolvedColumnGap, containingWidth);
 
         var resolvedColumnSizes = columns.Select(track => track.Pixels).ToList();
+        var fractionRowContent = new Dictionary<int, float>();
+
         foreach (var (element, placementColumn, placementRow) in itemPlacements)
         {
-            if (placementRow.LineIndex >= rows.Count || rows[placementRow.LineIndex].Kind != GridTrackSizeKind.Auto)
+            if (placementRow.LineIndex >= rows.Count || rows[placementRow.LineIndex].Kind == GridTrackSizeKind.Fixed)
             {
                 continue;
             }
 
+            var isFractionRow = rows[placementRow.LineIndex].Kind == GridTrackSizeKind.Fraction;
+
+            if (isFractionRow && (placementRow.Span != 1 || !float.IsNaN(containerHeight)))
+            {
+                continue;
+            }
 
             var itemStyle = GetOrCreateStyleMap(context, element.Ref, element.ComputedStyle);
-            if (!float.IsNaN(ParseLength(itemStyle, "height", containingWidth, float.NaN, allowAuto: true)))
+            if (!isFractionRow && !float.IsNaN(ParseLength(itemStyle, "height", containingWidth, float.NaN, allowAuto: true)))
             {
                 continue;
             }
@@ -2585,12 +2308,24 @@ public sealed partial class HtmlRenderer
                 resolvedColumnGap,
                 containingWidth);
             var measuredHeight = MeasureGridItemHeight(element, cellWidth, inheritedTextStyle, context, maxY);
-            GrowGridTrackSize(rows, placementRow.LineIndex, measuredHeight);
+
+            if (isFractionRow)
+            {
+                fractionRowContent[placementRow.LineIndex] = Math.Max(fractionRowContent.GetValueOrDefault(placementRow.LineIndex), measuredHeight);
+            }
+            else
+            {
+                GrowGridTrackSize(rows, placementRow.LineIndex, measuredHeight);
+            }
         }
 
-        if (hasExplicitRowTracks && !float.IsNaN(containerHeight))
+        if (!float.IsNaN(containerHeight))
         {
             ResolveGridFractionTracks(rows, resolvedRowGap, containerHeight);
+        }
+        else
+        {
+            ResolveIndefiniteGridFractionTracks(rows, fractionRowContent);
         }
 
         var columnSizes = columns.Select(t => t.Pixels).ToList();
@@ -2628,16 +2363,36 @@ public sealed partial class HtmlRenderer
             var cellContentHeight = Math.Max(0f, cellHeight - childVerticalExtras);
             var resolvedChildContentWidth = float.IsNaN(childContentWidth) ? cellContentWidth : childContentWidth;
             var resolvedChildContentHeight = float.IsNaN(childContentHeight) ? cellContentHeight : childContentHeight;
+            var justifySelf = ResolveGridSelfAlignment(childStyleMap, "justify-self", styleMap, "justify-items");
+            var alignSelf = ResolveGridSelfAlignment(childStyleMap, "align-self", styleMap, "align-items");
+
+            // An item that is not stretched is as wide as its content (shrink-to-fit) and as tall.
+            if (float.IsNaN(childContentWidth) && justifySelf != GridSelfAlignment.Stretch)
+            {
+                var fitWidth = Math.Min(cellWidth, ResolveShrinkToFitBorderBoxWidth(elementChild, cellWidth, inheritedTextStyle, context, out _, out _));
+                childContentWidth = Math.Max(0f, fitWidth - childHorizontalExtras);
+                resolvedChildContentWidth = childContentWidth;
+            }
+
             var childBorderBoxWidth = float.IsNaN(childContentWidth) ? cellWidth : childContentWidth + childHorizontalExtras;
+
+            if (float.IsNaN(childContentHeight) && alignSelf != GridSelfAlignment.Stretch)
+            {
+                var measured = TrialLayout(elementChild, childBorderBoxWidth, inheritedTextStyle, context, childBorderBoxWidth, isAtomicInline: false).Metrics?.BorderBoxHeight ?? 0f;
+                childContentHeight = Math.Max(0f, measured - childVerticalExtras);
+                resolvedChildContentHeight = childContentHeight;
+            }
+
             var childBorderBoxHeight = float.IsNaN(childContentHeight) ? cellHeight : childContentHeight + childVerticalExtras;
-            var justifyItems = styleMap.TryGetValue("justify-items", out var justifyItemsValue) ? justifyItemsValue : "stretch";
-            var alignItemsValue = styleMap.TryGetValue("align-items", out var alignItemsValueRaw) ? alignItemsValueRaw : "stretch";
-            var alignedCellX = string.Equals(justifyItems, "center", StringComparison.OrdinalIgnoreCase) && childBorderBoxWidth < cellWidth
-                ? cellX + (cellWidth - childBorderBoxWidth) / 2f
-                : cellX;
-            var alignedCellY = string.Equals(alignItemsValue, "center", StringComparison.OrdinalIgnoreCase) && childBorderBoxHeight < cellHeight
-                ? cellY + (cellHeight - childBorderBoxHeight) / 2f
-                : cellY;
+            var alignedCellX = cellX + AlignInGridCell(justifySelf, cellWidth, childBorderBoxWidth);
+            var alignedCellY = cellY + AlignInGridCell(alignSelf, cellHeight, childBorderBoxHeight);
+
+            static float AlignInGridCell(GridSelfAlignment alignment, float cellSize, float itemSize) => alignment switch
+            {
+                GridSelfAlignment.Center => (cellSize - itemSize) / 2f,
+                GridSelfAlignment.End => cellSize - itemSize,
+                _ => 0f,
+            };
 
             var childCursor = alignedCellY;
             var childPreviousBlockMarginBottom = 0f;
@@ -2666,10 +2421,18 @@ public sealed partial class HtmlRenderer
         }
 
         var gridContentWidth = GetGridContentSize(columnSizes, resolvedColumnGap, containingWidth);
-        var specifiedHeight = ResolveAuthoredDimension(styleMap, "height", containingWidth, float.NaN, gridVerticalBorderAndPadding);
         var gridContentHeight = GetGridContentSize(rowSizes, resolvedRowGap, 0f);
         var borderBoxWidth = borderLeft + paddingLeft + Math.Max(containingWidth, gridContentWidth) + paddingRight + borderRight;
-        var resolvedGridContentHeight = float.IsNaN(specifiedHeight) ? gridContentHeight : Math.Max(specifiedHeight, gridContentHeight);
+
+        // An authored height is the height; taller content overflows, as in a block.
+        var resolvedGridContentHeight = float.IsNaN(containerHeight) ? gridContentHeight : containerHeight;
+        resolvedGridContentHeight = Math.Max(resolvedGridContentHeight, ResolveAuthoredDimension(styleMap, "min-height", containingWidth, 0f, gridVerticalBorderAndPadding));
+        var maximumGridContentHeight = ResolveAuthoredDimension(styleMap, "max-height", containingWidth, float.NaN, gridVerticalBorderAndPadding);
+
+        if (!float.IsNaN(maximumGridContentHeight))
+        {
+            resolvedGridContentHeight = Math.Min(resolvedGridContentHeight, maximumGridContentHeight);
+        }
         var borderBoxHeight = borderTop + paddingTop + resolvedGridContentHeight + paddingBottom + borderBottom;
         var canCollapseWithLastChild = borderBottom <= 0f && paddingBottom <= 0f;
         var effectiveMarginBottom = ParseLength(styleMap, "margin-bottom", containingWidth, box.Margin.Bottom, allowAuto: false);
@@ -2682,17 +2445,31 @@ public sealed partial class HtmlRenderer
         // Percentage radii refer to the border box, which is only known now.
         box = box with { BorderRadius = ResolveBorderRadii(styleMap, borderBoxWidth, borderBoxHeight) };
         var boxPaintBuffer = new DisplayList();
+        var decorationBuffer = inheritedTextStyle.IsHidden ? new DisplayList() : boxPaintBuffer;
+        var effects = OpenElementEffectScopes(
+            boxPaintBuffer,
+            decorationBuffer,
+            styleMap,
+            node.Ref,
+            borderBoxX,
+            borderBoxY,
+            borderBoxWidth,
+            borderBoxHeight,
+            new EdgeSizes(borderTop, borderRight, borderBottom, borderLeft),
+            new EdgeSizes(paddingTop, paddingRight, paddingBottom, paddingLeft),
+            box.BorderRadius,
+            inheritedTextStyle.FontSize);
 
         if (box.BackgroundPaint is RenderColorPaint colorPaint && colorPaint.Color.A == 0)
         {
-            boxPaintBuffer.FillRect(new RenderRect(borderBoxX, borderBoxY, borderBoxWidth, borderBoxHeight), RenderColor.Transparent);
+            decorationBuffer.FillRect(new RenderRect(borderBoxX, borderBoxY, borderBoxWidth, borderBoxHeight), RenderColor.Transparent);
         }
         else
         {
-            PaintBoxBackground(boxPaintBuffer, styleMap, box, borderBoxX, borderBoxY, borderBoxWidth, borderBoxHeight, new EdgeSizes(borderTop, borderRight, borderBottom, borderLeft), new EdgeSizes(paddingTop, paddingRight, paddingBottom, paddingLeft));
+            PaintBoxBackground(decorationBuffer, styleMap, box, borderBoxX, borderBoxY, borderBoxWidth, borderBoxHeight, new EdgeSizes(borderTop, borderRight, borderBottom, borderLeft), new EdgeSizes(paddingTop, paddingRight, paddingBottom, paddingLeft));
         }
 
-        PaintBoxShadows(boxPaintBuffer, box.BoxShadows, borderBoxX, borderBoxY, borderBoxWidth, borderBoxHeight, box.BorderRadius);
+        PaintBoxShadows(decorationBuffer, box.BoxShadows, borderBoxX, borderBoxY, borderBoxWidth, borderBoxHeight, box.BorderRadius);
 
         RecordLayoutMetrics(
             node.Ref,
@@ -2709,8 +2486,8 @@ public sealed partial class HtmlRenderer
             paddingTop,
             paddingBottom);
 
-        PaintBoxBorder(boxPaintBuffer, styleMap, node.Ref, box, borderBoxX, borderBoxY, borderBoxWidth, borderBoxHeight);
-        PaintOutline(boxPaintBuffer, styleMap, borderBoxX, borderBoxY, borderBoxWidth, borderBoxHeight);
+        PaintBoxBorder(decorationBuffer, styleMap, node.Ref, box, borderBoxX, borderBoxY, borderBoxWidth, borderBoxHeight);
+        PaintOutline(decorationBuffer, styleMap, borderBoxX, borderBoxY, borderBoxWidth, borderBoxHeight);
 
         var clipsOverflow = ShouldClipOverflow(styleMap);
 
@@ -2725,12 +2502,22 @@ public sealed partial class HtmlRenderer
         }
 
         displayList.InsertRange(boxPaintInsertIndex, boxPaintBuffer.Commands);
+        ResolveStickyBoxes(
+            displayList,
+            context.StickyScopes.Peek(),
+            new RenderRect(
+                borderBoxX + borderLeft + paddingLeft,
+                borderBoxY + borderTop + paddingTop,
+                Math.Max(0f, borderBoxWidth - borderLeft - borderRight - paddingLeft - paddingRight),
+                Math.Max(0f, borderBoxHeight - borderTop - borderBottom - paddingTop - paddingBottom)),
+            context);
 
         if (clipsOverflow)
         {
             displayList.PopClip();
         }
 
+        CloseElementEffectScopes(displayList, effects);
         cursorY = flowBorderBoxY + borderBoxHeight;
         previousBlockMarginBottom = effectiveMarginBottom + context.ParagraphSpacing;
         suppressNextBlockTopMargin = false;
@@ -2782,7 +2569,7 @@ public sealed partial class HtmlRenderer
     /// value - the caller falls back to a single implicit track, the same default a real browser
     /// gives an unstyled grid container.
     /// </summary>
-    private static List<GridTrackSize> ParseGridTrackListStructured(string rawValue, float relativeTo, float gap = 0f, int itemCount = 0)
+    private static List<GridTrackSize> ParseGridTrackListStructured(string rawValue, float relativeTo, float gap = 0f, int itemCount = 0, Dictionary<string, List<int>>? lineNames = null)
     {
         var tracks = new List<GridTrackSize>();
         var trimmed = rawValue?.Trim() ?? string.Empty;
@@ -2797,7 +2584,7 @@ public sealed partial class HtmlRenderer
 
         if (parsed is not null)
         {
-            AppendGridTracks(parsed, relativeTo, tracks, gap, itemCount);
+            AppendGridTracks(parsed, relativeTo, tracks, gap, itemCount, lineNames);
             return tracks;
         }
 
@@ -2809,7 +2596,7 @@ public sealed partial class HtmlRenderer
         // track list). TryParseAutoRepeatTrackList hand-parses just that one shape; anything else
         // that also failed to parse (a genuinely malformed value) still falls through to the empty
         // list the caller already treats as "no explicit tracks".
-        if (TryParseAutoRepeatTrackList(trimmed, relativeTo, gap, itemCount, tracks))
+        if (TryParseAutoRepeatTrackList(trimmed, relativeTo, gap, itemCount, tracks, lineNames))
         {
             return tracks;
         }
@@ -2825,7 +2612,7 @@ public sealed partial class HtmlRenderer
     /// own structural parsing back to AngleSharp.Css's `GridParser` exactly as the normal path does -
     /// only the outer auto-fill/auto-fit keyword recognition itself is hand-rolled.
     /// </summary>
-    private static bool TryParseAutoRepeatTrackList(string trimmed, float relativeTo, float gap, int itemCount, List<GridTrackSize> tracks)
+    private static bool TryParseAutoRepeatTrackList(string trimmed, float relativeTo, float gap, int itemCount, List<GridTrackSize> tracks, Dictionary<string, List<int>>? lineNames)
     {
         if (!trimmed.StartsWith("repeat(", StringComparison.OrdinalIgnoreCase) || !trimmed.EndsWith(")", StringComparison.Ordinal))
         {
@@ -2884,7 +2671,7 @@ public sealed partial class HtmlRenderer
 
         if (groupMinSize <= 0f || float.IsNaN(relativeTo) || relativeTo <= 0f)
         {
-            AppendGridTracks(trackDefinition, relativeTo, tracks, gap, itemCount);
+            AppendGridTracks(trackDefinition, relativeTo, tracks, gap, itemCount, lineNames);
             return true;
         }
 
@@ -2897,20 +2684,31 @@ public sealed partial class HtmlRenderer
 
         for (var i = 0; i < fillCount; i++)
         {
-            AppendGridTracks(trackDefinition, relativeTo, tracks, gap, itemCount);
+            AppendGridTracks(trackDefinition, relativeTo, tracks, gap, itemCount, lineNames);
         }
 
         return true;
     }
 
-    private static void AppendGridTracks(ICssValue value, float relativeTo, List<GridTrackSize> tracks, float gap, int itemCount)
+    private static void AppendGridTracks(ICssValue value, float relativeTo, List<GridTrackSize> tracks, float gap, int itemCount, Dictionary<string, List<int>>? lineNames = null)
     {
         switch (value)
         {
-            case CssLineNamesValue:
-                // Named grid lines (`[name]`) are not represented in this renderer's line-index
-                // placement model (see ResolveGridPlacement, which only understands numeric lines
-                // and spans) - a deliberate, documented scope cut, not a crash or a dropped track.
+            // `[name]` names the line before the next track (0-based line index = tracks so far).
+            case CssLineNamesValue names:
+                if (lineNames is not null)
+                {
+                    foreach (var name in names.Names)
+                    {
+                        if (!lineNames.TryGetValue(name, out var indices))
+                        {
+                            lineNames[name] = indices = [];
+                        }
+
+                        indices.Add(tracks.Count);
+                    }
+                }
+
                 break;
 
             // CssRepeatValue/CssFitContentValue are both `internal` in AngleSharp.Css (unlike
@@ -2921,7 +2719,7 @@ public sealed partial class HtmlRenderer
 
                 for (var i = 0; i < count; i++)
                 {
-                    AppendGridTracks(repeatFunc.Arguments[1], relativeTo, tracks, gap, itemCount);
+                    AppendGridTracks(repeatFunc.Arguments[1], relativeTo, tracks, gap, itemCount, lineNames);
                 }
 
                 break;
@@ -2931,7 +2729,7 @@ public sealed partial class HtmlRenderer
                 {
                     if (item is not null)
                     {
-                        AppendGridTracks(item, relativeTo, tracks, gap, itemCount);
+                        AppendGridTracks(item, relativeTo, tracks, gap, itemCount, lineNames);
                     }
                 }
 
@@ -3095,52 +2893,245 @@ public sealed partial class HtmlRenderer
         }
 
         var token = tokenIndex >= 0 && tokenIndex < tokens.Length ? tokens[tokenIndex] : tokens[^1];
+
+        if (token.EndsWith('%') &&
+            float.TryParse(token[..^1], NumberStyles.Float, CultureInfo.InvariantCulture, out var percentage))
+        {
+            return percentage / 100f * relativeTo;
+        }
+
         var parsed = ParseLengthValue(token, float.NaN, allowAuto: false);
         return float.IsNaN(parsed) ? null : parsed;
     }
 
-    private static GridPlacement ResolveGridPlacementFromMap(Dictionary<string, string> childStyleMap, string propertyName, int fallbackIndex)
+    /// <summary>
+    /// <c>column-gap</c>, else the second (or only) value of the <c>gap</c> shorthand. Percentages
+    /// refer to the container's content-box width.
+    /// </summary>
+    private static float? ResolveColumnGap(Dictionary<string, string> styleMap, float contentWidth) =>
+        ParseGridGap(styleMap, "column-gap", contentWidth, 0) ?? ParseGridGap(styleMap, "gap", contentWidth, 1);
+
+    /// <summary>
+    /// <c>row-gap</c>, else the first value of the <c>gap</c> shorthand. Percentages refer to the
+    /// container's content-box height, and to zero while that height is indefinite.
+    /// </summary>
+    private static float? ResolveRowGap(Dictionary<string, string> styleMap, float definiteContentHeight) =>
+        ParseGridGap(styleMap, "row-gap", definiteContentHeight, 0) ?? ParseGridGap(styleMap, "gap", definiteContentHeight, 0);
+
+    private static float ResolveGapHeightReference(Dictionary<string, string> styleMap, float containingWidth, float verticalBorderAndPadding)
     {
-        if (!childStyleMap.TryGetValue(propertyName, out var rawValue) || string.IsNullOrWhiteSpace(rawValue))
-        {
-            return new GridPlacement(fallbackIndex, 1);
-        }
-
-        var tokens = rawValue.Split(new[] { ' ', '/', '\t', '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
-        if (tokens.Length >= 2 && string.Equals(tokens[0], "span", StringComparison.OrdinalIgnoreCase) && int.TryParse(tokens[1], out var leadingSpan))
-        {
-            return new GridPlacement(Math.Max(0, fallbackIndex), Math.Max(1, leadingSpan));
-        }
-
-        var startToken = tokens.FirstOrDefault(token => int.TryParse(token, out _));
-
-        if (startToken is not null && int.TryParse(startToken, out var explicitIndex))
-        {
-            var spanIndex = Array.FindIndex(tokens, token => string.Equals(token, "span", StringComparison.OrdinalIgnoreCase));
-            var span = spanIndex >= 0 && spanIndex + 1 < tokens.Length && int.TryParse(tokens[spanIndex + 1], out var parsedSpan)
-                ? parsedSpan
-                : tokens.Length > 1 && int.TryParse(tokens[1], out var endLine) ? Math.Max(1, endLine - explicitIndex) : 1;
-            return new GridPlacement(Math.Max(0, explicitIndex - 1), Math.Max(1, span));
-        }
-
-        if (tokens.Length >= 3 && string.Equals(tokens[1], "span", StringComparison.OrdinalIgnoreCase) && int.TryParse(tokens[2], out var spanCount))
-        {
-            return new GridPlacement(Math.Max(0, fallbackIndex), Math.Max(1, spanCount));
-        }
-
-        return new GridPlacement(Math.Max(0, fallbackIndex), 1);
+        var height = ResolveDefiniteContentHeight(styleMap, containingWidth, verticalBorderAndPadding);
+        return float.IsNaN(height) ? 0f : height;
     }
 
-    private static bool HasGridPlacement(Dictionary<string, string> styleMap, string propertyName)
+    /// <summary>
+    /// The named lines of one grid axis (from <c>[name]</c> in the track list and the implicit
+    /// <c>area-start</c>/<c>area-end</c> lines of <c>grid-template-areas</c>) and its explicit
+    /// line count, which negative line numbers count back from.
+    /// </summary>
+    private sealed record GridLines(Dictionary<string, List<int>> Names, int ExplicitLineCount)
     {
-        if (!styleMap.TryGetValue(propertyName, out var value) || string.IsNullOrWhiteSpace(value))
+        public static readonly GridLines None = new(new Dictionary<string, List<int>>(StringComparer.Ordinal), 0);
+    }
+
+    private static GridPlacement ResolveGridPlacementFromMap(Dictionary<string, string> childStyleMap, string propertyName, int fallbackIndex, GridLines? lines = null)
+    {
+        var (start, span) = ParseGridLinePlacement(childStyleMap.GetValueOrDefault(propertyName), lines ?? GridLines.None);
+        return new GridPlacement(start ?? Math.Max(0, fallbackIndex), Math.Max(1, span));
+    }
+
+    private static bool HasGridPlacement(Dictionary<string, string> styleMap, string propertyName, GridLines? lines = null) =>
+        ParseGridLinePlacement(styleMap.GetValueOrDefault(propertyName), lines ?? GridLines.None).Start is not null;
+
+    /// <summary>
+    /// Parses a <c>grid-column</c>/<c>grid-row</c> value (<c>start / end</c>, either side a line
+    /// number, a negative line number, a line name optionally with an index, <c>span n</c> or
+    /// <c>auto</c>) into a 0-based start line (null when auto-placed) and a span.
+    /// </summary>
+    private static (int? Start, int Span) ParseGridLinePlacement(string? rawValue, GridLines lines)
+    {
+        if (string.IsNullOrWhiteSpace(rawValue))
         {
-            return false;
+            return (null, 1);
         }
 
-        var tokens = value.Split(new[] { ' ', '/', '\t', '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
-        return tokens.Length > 0 && int.TryParse(tokens[0], NumberStyles.Integer, CultureInfo.InvariantCulture, out _);
+        var parts = rawValue.Split('/', 2);
+        var startTokens = SplitGridLineTokens(parts[0]);
+        var endTokens = parts.Length > 1 ? SplitGridLineTokens(parts[1]) : null;
+
+        // A lone name stands for both edges, so `grid-column: a` fills the area `a`.
+        if (endTokens is null && startTokens.Length == 1 && !int.TryParse(startTokens[0], NumberStyles.Integer, CultureInfo.InvariantCulture, out _) &&
+            !string.Equals(startTokens[0], "auto", StringComparison.OrdinalIgnoreCase))
+        {
+            endTokens = startTokens;
+        }
+
+        var start = ResolveGridLine(startTokens, lines, "-start");
+        var end = endTokens is null ? null : ResolveGridLine(endTokens, lines, "-end");
+        var startSpan = ResolveGridSpan(startTokens);
+        var endSpan = endTokens is null ? null : ResolveGridSpan(endTokens);
+
+        if (start is { } bothStart && end is { } bothEnd)
+        {
+            return bothStart == bothEnd ? (bothStart, 1) : (Math.Min(bothStart, bothEnd), Math.Abs(bothEnd - bothStart));
+        }
+
+        if (start is { } onlyStart)
+        {
+            return (onlyStart, endSpan ?? 1);
+        }
+
+        if (end is { } onlyEnd)
+        {
+            var span = startSpan ?? 1;
+            return (Math.Max(0, onlyEnd - span), span);
+        }
+
+        return (null, startSpan ?? endSpan ?? 1);
     }
+
+    private static string[] SplitGridLineTokens(string part) =>
+        part.Split(new[] { ' ', '\t', '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+
+    private static int? ResolveGridLine(string[] tokens, GridLines lines, string nameSuffix)
+    {
+        if (tokens.Any(token => string.Equals(token, "span", StringComparison.OrdinalIgnoreCase)))
+        {
+            return null;
+        }
+
+        int? number = null;
+        string? name = null;
+
+        foreach (var token in tokens)
+        {
+            if (int.TryParse(token, NumberStyles.Integer, CultureInfo.InvariantCulture, out var parsed))
+            {
+                number = parsed;
+            }
+            else if (!string.Equals(token, "auto", StringComparison.OrdinalIgnoreCase))
+            {
+                name = token;
+            }
+        }
+
+        if (name is null)
+        {
+            return number switch
+            {
+                > 0 => number.Value - 1,
+                < 0 => Math.Max(0, lines.ExplicitLineCount + number.Value),
+                _ => null,
+            };
+        }
+
+        // `name-start`/`name-end` (the implicit lines of an area) win over a plain `name`.
+        if (!lines.Names.TryGetValue(name + nameSuffix, out var indices) && !lines.Names.TryGetValue(name, out indices))
+        {
+            return null;
+        }
+
+        var nth = number ?? 1;
+        return nth switch
+        {
+            > 0 when nth <= indices.Count => indices[nth - 1],
+            < 0 when -nth <= indices.Count => indices[indices.Count + nth],
+            _ => null,
+        };
+    }
+
+    private static int? ResolveGridSpan(string[] tokens)
+    {
+        var spanIndex = Array.FindIndex(tokens, token => string.Equals(token, "span", StringComparison.OrdinalIgnoreCase));
+
+        if (spanIndex < 0)
+        {
+            return null;
+        }
+
+        return tokens.Skip(spanIndex + 1).Select(token => int.TryParse(token, NumberStyles.Integer, CultureInfo.InvariantCulture, out var count) ? count : (int?)null)
+            .FirstOrDefault(count => count is > 0) ?? 1;
+    }
+
+    /// <summary>
+    /// <c>justify-self</c>/<c>align-self</c>, where <c>auto</c> defers to the container's
+    /// <c>justify-items</c>/<c>align-items</c>; <c>normal</c> stretches.
+    /// </summary>
+    private static GridSelfAlignment ResolveGridSelfAlignment(Dictionary<string, string> itemStyle, string selfProperty, Dictionary<string, string> containerStyle, string itemsProperty)
+    {
+        var value = itemStyle.GetValueOrDefault(selfProperty)?.Trim().ToLowerInvariant();
+
+        if (string.IsNullOrEmpty(value) || value == "auto")
+        {
+            value = containerStyle.GetValueOrDefault(itemsProperty)?.Trim().ToLowerInvariant() ?? string.Empty;
+        }
+
+        var keyword = value.Split(' ', StringSplitOptions.RemoveEmptyEntries).LastOrDefault() ?? string.Empty;
+
+        return keyword switch
+        {
+            "start" or "flex-start" or "self-start" or "left" or "baseline" => GridSelfAlignment.Start,
+            "end" or "flex-end" or "self-end" or "right" => GridSelfAlignment.End,
+            "center" => GridSelfAlignment.Center,
+            _ => GridSelfAlignment.Stretch,
+        };
+    }
+
+    private enum GridSelfAlignment
+    {
+        Stretch,
+        Start,
+        Center,
+        End,
+    }
+
+    /// <summary>
+    /// <c>fr</c> rows of a grid without a definite height: every <c>fr</c> unit gets the largest
+    /// size any of those rows needs per unit for its content (the spec's flex fraction for
+    /// indefinite free space), so the rows keep their ratios and still fit their items.
+    /// </summary>
+    private static void ResolveIndefiniteGridFractionTracks(List<GridTrackSize> tracks, Dictionary<int, float> contentSizes)
+    {
+        var flexFraction = 0f;
+
+        for (var index = 0; index < tracks.Count; index++)
+        {
+            var track = tracks[index];
+
+            if (track.Kind != GridTrackSizeKind.Fraction)
+            {
+                continue;
+            }
+
+            var needed = Math.Max(track.MinPixels ?? 0f, contentSizes.GetValueOrDefault(index));
+
+            if (track.FractionValue >= 1f)
+            {
+                flexFraction = Math.Max(flexFraction, needed / track.FractionValue);
+            }
+            else
+            {
+                flexFraction = Math.Max(flexFraction, needed);
+            }
+        }
+
+        foreach (var track in tracks)
+        {
+            if (track.Kind == GridTrackSizeKind.Fraction)
+            {
+                track.Pixels = Math.Max(track.MinPixels ?? 0f, flexFraction * track.FractionValue);
+            }
+        }
+    }
+
+    /// <summary>
+    /// An authored height that is definite for layout purposes: percentages have no definite
+    /// base here and count as auto.
+    /// </summary>
+    private static float ResolveDefiniteContentHeight(Dictionary<string, string> styleMap, float containingWidth, float verticalBorderAndPadding) =>
+        styleMap.TryGetValue("height", out var rawHeight) && rawHeight.TrimEnd().EndsWith('%')
+            ? float.NaN
+            : ResolveAuthoredDimension(styleMap, "height", containingWidth, float.NaN, verticalBorderAndPadding);
 
     private static float ResolveGridItemEstimatedSize(ElementRenderNode elementChild, Dictionary<string, string> styleMap, float fallbackSize, string propertyName)
     {
@@ -3368,7 +3359,7 @@ public sealed partial class HtmlRenderer
         suppressNextBlockTopMargin = false;
 
         var (bandLeft, bandRight) = floats.GetBand(cursorY, textStyle.FontSize * textStyle.LineHeightMultiplier, containingX, containingX + containingWidth);
-        LayoutWrappedText(text, bandLeft, bandRight - bandLeft, ref cursorY, textStyle, context, displayList, maxY, textIndentConsumed ? 0f : textStyle.TextIndent);
+        LayoutWrappedText(text, bandLeft, bandRight - bandLeft, ref cursorY, textStyle, context, displayList, maxY, textIndentConsumed ? 0f : textStyle.TextIndent + textStyle.MarkerIndent);
         textIndentConsumed = true;
     }
 
@@ -3632,53 +3623,17 @@ public sealed partial class HtmlRenderer
             : "stretch";
     }
 
-    private static float GetFlexGrow(Dictionary<string, string> styleMap)
-    {
-        return styleMap.ContainsKey("flex") && TryParseFlexShorthand(styleMap, out var shorthandGrow, out _, out _) ? shorthandGrow
-            : styleMap.TryGetValue("flex-grow", out var value) && !string.IsNullOrWhiteSpace(value)
-            ? ParseLengthValue(value.Trim(), 0f, allowAuto: false)
-            : TryParseFlexShorthand(styleMap, out var grow, out _, out _) ? grow
+    // Only the longhands are read: AngleSharp.Css serializes the `flex` shorthand lossily (a lone
+    // `flex-basis: 40px` reads back as `flex: 40px`, which would mean `1 1 40px`).
+    private static float GetFlexGrow(Dictionary<string, string> styleMap) =>
+        styleMap.TryGetValue("flex-grow", out var value) && !string.IsNullOrWhiteSpace(value)
+            ? Math.Max(0f, ParseLengthValue(value.Trim(), 0f, allowAuto: false))
             : 0f;
-    }
 
-    private static float GetFlexShrink(Dictionary<string, string> styleMap)
-    {
-        return styleMap.ContainsKey("flex") && TryParseFlexShorthand(styleMap, out _, out var shorthandShrink, out _) ? shorthandShrink
-            : styleMap.TryGetValue("flex-shrink", out var value) && !string.IsNullOrWhiteSpace(value)
-            ? ParseLengthValue(value.Trim(), 1f, allowAuto: false)
-            : TryParseFlexShorthand(styleMap, out _, out var shrink, out _) ? shrink
+    private static float GetFlexShrink(Dictionary<string, string> styleMap) =>
+        styleMap.TryGetValue("flex-shrink", out var value) && !string.IsNullOrWhiteSpace(value)
+            ? Math.Max(0f, ParseLengthValue(value.Trim(), 1f, allowAuto: false))
             : 1f;
-    }
-
-    private static bool TryParseFlexShorthand(Dictionary<string, string> styleMap, out float grow, out float shrink, out string basis)
-    {
-        grow = 0f;
-        shrink = 1f;
-        basis = "auto";
-
-        if (!styleMap.TryGetValue("flex", out var value) || string.IsNullOrWhiteSpace(value))
-        {
-            return false;
-        }
-
-        var tokens = value.Split(' ', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
-        if (tokens.Length == 0 || !float.TryParse(tokens[0], NumberStyles.Float, CultureInfo.InvariantCulture, out grow))
-        {
-            return false;
-        }
-
-        if (tokens.Length > 1 && float.TryParse(tokens[1], NumberStyles.Float, CultureInfo.InvariantCulture, out var parsedShrink))
-        {
-            shrink = parsedShrink;
-        }
-
-        if (tokens.Length > 2)
-        {
-            basis = tokens[2];
-        }
-
-        return true;
-    }
 
     private static float GetFlexOrder(Dictionary<string, string> styleMap)
     {
@@ -3716,27 +3671,64 @@ public sealed partial class HtmlRenderer
         var childBox = ResolveBoxStyle(childStyle, elementChild.Ref);
         var horizontalBorderAndPadding = childBox.BorderWidth.Left + childBox.BorderWidth.Right + childBox.Padding.Left + childBox.Padding.Right;
         var verticalBorderAndPadding = childBox.BorderWidth.Top + childBox.BorderWidth.Bottom + childBox.Padding.Top + childBox.Padding.Bottom;
-        var baseMainSize = ResolveFlexBaseSize(childStyle, isRowDirection, relativeTo, isRowDirection ? horizontalBorderAndPadding : verticalBorderAndPadding);
-        var crossSize = ResolveFlexCrossSize(childStyle, isRowDirection, relativeTo, isRowDirection ? verticalBorderAndPadding : horizontalBorderAndPadding);
-        if (isRowDirection && float.IsNaN(ParseLength(childStyle, "width", relativeTo, float.NaN, allowAuto: true)))
-        {
-            // A content-sized item starts from its max-content width (its contents laid out on
-            // one line, or its image's width), capped by its own max-width.
-            var childTextStyle = ResolveTextStyle(childStyle, inheritedTextStyle);
-            var contentWidth = TryResolveReplacedContentWidth(elementChild, childStyle, relativeTo, out var replacedWidth)
-                ? replacedWidth
-                : ComputeContentIntrinsicWidths(elementChild, childTextStyle, relativeTo, context).Max;
-            contentWidth = ClampToMinMaxWidth(childStyle, contentWidth, relativeTo, horizontalBorderAndPadding);
-            baseMainSize = Math.Max(baseMainSize, contentWidth);
-        }
-
-        if (!isRowDirection && float.IsNaN(ParseLength(childStyle, "height", relativeTo, float.NaN, allowAuto: true)))
-        {
-            baseMainSize = Math.Max(baseMainSize, EstimateFlexItemMainSize(child, crossSize, context));
-            baseMainSize = Math.Max(baseMainSize, ResolveAuthoredDimension(childStyle, "min-height", relativeTo, 0f, verticalBorderAndPadding));
-        }
         var mainBorderAndPadding = isRowDirection ? horizontalBorderAndPadding : verticalBorderAndPadding;
         var crossBorderAndPadding = isRowDirection ? verticalBorderAndPadding : horizontalBorderAndPadding;
+        var crossSize = ResolveFlexCrossSize(childStyle, isRowDirection, relativeTo, crossBorderAndPadding);
+        var mainProperty = isRowDirection ? "width" : "height";
+        var specifiedMainSize = ResolveAuthoredDimension(childStyle, mainProperty, relativeTo, float.NaN, mainBorderAndPadding);
+
+        // The content size along the main axis: max-content (or the image's width) for rows, the
+        // laid-out height for columns; the min-content width feeds the automatic minimum.
+        var childTextStyle = ResolveTextStyle(childStyle, inheritedTextStyle);
+        float contentMainSize;
+        float contentMinimum;
+
+        if (isRowDirection)
+        {
+            var intrinsic = TryResolveReplacedContentWidth(elementChild, childStyle, relativeTo, out var replacedWidth)
+                ? new IntrinsicWidths(replacedWidth, replacedWidth)
+                : ComputeContentIntrinsicWidths(elementChild, childTextStyle, relativeTo, context);
+            contentMainSize = intrinsic.Max;
+            contentMinimum = intrinsic.Min;
+        }
+        else
+        {
+            var measureWidth = crossSize > 0f ? crossSize + crossBorderAndPadding : relativeTo;
+            contentMainSize = Math.Max(0f, MeasureBorderBoxHeight(elementChild, measureWidth, inheritedTextStyle, context) - mainBorderAndPadding);
+            contentMinimum = contentMainSize;
+        }
+
+        // `flex-basis` when definite, else the main size property, else the content size.
+        var baseMainSize = ResolveFlexBaseSize(childStyle, relativeTo, mainBorderAndPadding);
+
+        if (float.IsNaN(baseMainSize))
+        {
+            baseMainSize = float.IsNaN(specifiedMainSize) ? contentMainSize : specifiedMainSize;
+        }
+
+        var minProperty = isRowDirection ? "min-width" : "min-height";
+        var maxMainSize = ResolveAuthoredDimension(childStyle, isRowDirection ? "max-width" : "max-height", relativeTo, float.NaN, mainBorderAndPadding);
+        var minRaw = childStyle.GetValueOrDefault(minProperty)?.Trim();
+        float minMainSize;
+
+        if (string.IsNullOrEmpty(minRaw) || string.Equals(minRaw, "auto", StringComparison.OrdinalIgnoreCase))
+        {
+            // `min-width: auto`: a flex item does not shrink below its content (or below its
+            // specified size, when that is smaller); scroll containers have no such minimum.
+            minMainSize = ShouldClipOverflow(childStyle)
+                ? 0f
+                : float.IsNaN(specifiedMainSize) ? contentMinimum : Math.Min(contentMinimum, specifiedMainSize);
+
+            if (!float.IsNaN(maxMainSize))
+            {
+                minMainSize = Math.Min(minMainSize, maxMainSize);
+            }
+        }
+        else
+        {
+            minMainSize = ResolveAuthoredDimension(childStyle, minProperty, relativeTo, 0f, mainBorderAndPadding);
+        }
+
         return new FlexItemLayoutInfo(
             child,
             childStyle,
@@ -3745,27 +3737,110 @@ public sealed partial class HtmlRenderer
             GetFlexShrink(childStyle),
             baseMainSize + mainBorderAndPadding,
             crossSize + crossBorderAndPadding,
-            GetAlignSelf(childStyle, "auto"));
+            GetAlignSelf(childStyle, "auto"),
+            minMainSize + mainBorderAndPadding,
+            float.IsNaN(maxMainSize) ? float.PositiveInfinity : maxMainSize + mainBorderAndPadding,
+            mainBorderAndPadding);
     }
 
-    private static float ResolveFlexBaseSize(Dictionary<string, string> styleMap, bool isRowDirection, float relativeTo, float mainAxisBorderAndPadding)
+    /// <summary>
+    /// The definite flex basis (content-box), or NaN for <c>auto</c>/<c>content</c>.
+    /// </summary>
+    private static float ResolveFlexBaseSize(Dictionary<string, string> styleMap, float relativeTo, float mainAxisBorderAndPadding)
     {
-        var flexBasisValue = styleMap.ContainsKey("flex-basis") ? styleMap["flex-basis"] : TryParseFlexShorthand(styleMap, out _, out _, out var shorthandBasis) ? shorthandBasis : "auto";
+        var flexBasisValue = styleMap.TryGetValue("flex-basis", out var longhand) && !string.IsNullOrWhiteSpace(longhand)
+            ? longhand
+            : "auto";
+
+        if (flexBasisValue.Trim().ToLowerInvariant() is "auto" or "content")
+        {
+            return float.NaN;
+        }
+
         var flexBasisMap = new Dictionary<string, string>(styleMap, StringComparer.OrdinalIgnoreCase)
         {
             ["flex-basis"] = flexBasisValue,
         };
-        var flexBasis = ResolveAuthoredDimension(flexBasisMap, "flex-basis", relativeTo, float.NaN, mainAxisBorderAndPadding);
-        if (!float.IsNaN(flexBasis))
+        return ResolveAuthoredDimension(flexBasisMap, "flex-basis", relativeTo, float.NaN, mainAxisBorderAndPadding);
+    }
+
+    /// <summary>
+    /// The CSS "resolve flexible lengths" algorithm for one flex line: the free space is shared by
+    /// <c>flex-grow</c>, or taken by <c>flex-shrink</c> weighted with each item's base size, and
+    /// items that hit their min or max size are frozen there while the rest is shared again.
+    /// Sizes are border-box sizes.
+    /// </summary>
+    private static float[] ResolveFlexibleLengths(IReadOnlyList<FlexItemLayoutInfo> line, float availableSpace)
+    {
+        var count = line.Count;
+        var targets = new float[count];
+        var frozen = new bool[count];
+        var growing = line.Sum(item => item.HypotheticalMainSize) < availableSpace;
+
+        for (var index = 0; index < count; index++)
         {
-            return flexBasis;
+            var item = line[index];
+            var factor = growing ? item.FlexGrow : item.FlexShrink;
+
+            if (factor <= 0f || (growing && item.BaseMainSize > item.HypotheticalMainSize) || (!growing && item.BaseMainSize < item.HypotheticalMainSize))
+            {
+                frozen[index] = true;
+                targets[index] = item.HypotheticalMainSize;
+            }
         }
 
-        var mainSize = isRowDirection
-            ? ResolveAuthoredDimension(styleMap, "width", relativeTo, float.NaN, mainAxisBorderAndPadding)
-            : ResolveAuthoredDimension(styleMap, "height", relativeTo, float.NaN, mainAxisBorderAndPadding);
+        var initialFreeSpace = availableSpace - Enumerable.Range(0, count).Sum(index => frozen[index] ? targets[index] : line[index].BaseMainSize);
 
-        return float.IsNaN(mainSize) ? 0f : mainSize;
+        for (var iteration = 0; iteration <= count && frozen.Contains(false); iteration++)
+        {
+            var freeSpace = availableSpace - Enumerable.Range(0, count).Sum(index => frozen[index] ? targets[index] : line[index].BaseMainSize);
+            var factorSum = Enumerable.Range(0, count).Where(index => !frozen[index]).Sum(index => growing ? line[index].FlexGrow : line[index].FlexShrink);
+
+            if (factorSum < 1f && Math.Abs(initialFreeSpace * factorSum) < Math.Abs(freeSpace))
+            {
+                freeSpace = initialFreeSpace * factorSum;
+            }
+
+            var scaledShrinkSum = Enumerable.Range(0, count).Where(index => !frozen[index])
+                .Sum(index => line[index].FlexShrink * Math.Max(0f, line[index].BaseMainSize - line[index].MainBorderAndPadding));
+            var totalViolation = 0f;
+            var violations = new float[count];
+
+            for (var index = 0; index < count; index++)
+            {
+                if (frozen[index])
+                {
+                    continue;
+                }
+
+                var item = line[index];
+                var target = item.BaseMainSize;
+
+                if (growing && factorSum > 0f)
+                {
+                    target += freeSpace * item.FlexGrow / factorSum;
+                }
+                else if (!growing && scaledShrinkSum > 0f)
+                {
+                    target -= Math.Abs(freeSpace) * item.FlexShrink * Math.Max(0f, item.BaseMainSize - item.MainBorderAndPadding) / scaledShrinkSum;
+                }
+
+                var clamped = Math.Max(item.MinMainSize, Math.Min(item.MaxMainSize, Math.Max(item.MainBorderAndPadding, target)));
+                violations[index] = clamped - target;
+                totalViolation += violations[index];
+                targets[index] = clamped;
+            }
+
+            for (var index = 0; index < count; index++)
+            {
+                if (!frozen[index] && (Math.Abs(totalViolation) < 0.001f || (totalViolation > 0f && violations[index] > 0f) || (totalViolation < 0f && violations[index] < 0f)))
+                {
+                    frozen[index] = true;
+                }
+            }
+        }
+
+        return targets;
     }
 
     private static float ResolveFlexCrossSize(Dictionary<string, string> styleMap, bool isRowDirection, float relativeTo, float crossAxisBorderAndPadding)
@@ -3777,73 +3852,26 @@ public sealed partial class HtmlRenderer
         return float.IsNaN(crossSize) ? 0f : crossSize;
     }
 
-    private static float EstimateFlexItemCrossSize(IRenderNode node, float mainSize, bool isRowDirection, RenderTextStyle inheritedTextStyle, LayoutContext context)
+    private static float EstimateFlexItemCrossSize(IRenderNode node, float mainSize, bool isRowDirection, RenderTextStyle inheritedTextStyle, LayoutContext context) =>
+        isRowDirection && node is ElementRenderNode element
+            ? MeasureBorderBoxHeight(element, mainSize, inheritedTextStyle, context)
+            : 0f;
+
+    /// <summary>
+    /// The border-box height of an element laid out at the given border-box width, by a trial
+    /// layout, cached for the render (nested flex containers would otherwise multiply them).
+    /// </summary>
+    private static float MeasureBorderBoxHeight(ElementRenderNode element, float borderBoxWidth, RenderTextStyle inheritedTextStyle, LayoutContext context)
     {
-        if (!isRowDirection || node is not ElementRenderNode element)
+        var key = (element.Ref, borderBoxWidth);
+
+        if (!context.MeasuredHeights.TryGetValue(key, out var height))
         {
-            return 0f;
+            height = TrialLayout(element, borderBoxWidth, inheritedTextStyle, context, borderBoxWidth, isAtomicInline: false).Metrics?.BorderBoxHeight ?? 0f;
+            context.MeasuredHeights[key] = height;
         }
 
-        var styleMap = GetOrCreateStyleMap(context, element.Ref, element.ComputedStyle);
-        var box = ResolveBoxStyle(styleMap, element.Ref);
-        var horizontalExtras = box.BorderWidth.Left + box.BorderWidth.Right + box.Padding.Left + box.Padding.Right;
-        var verticalExtras = box.BorderWidth.Top + box.BorderWidth.Bottom + box.Padding.Top + box.Padding.Bottom;
-        var contentWidth = Math.Max(1f, mainSize - horizontalExtras);
-        var textStyle = ResolveTextStyle(styleMap, inheritedTextStyle);
-        var contentHeight = 0f;
-
-        foreach (var child in element.Children)
-        {
-            if (child is TextRenderNode textNode)
-            {
-                var text = NormalizeWhitespace(textNode.Ref.Data, textStyle.WhiteSpace);
-                if (text.Length > 0)
-                {
-                    contentHeight += WrapTextRespectingWhiteSpace(context, text, contentWidth, textStyle).Count * textStyle.FontSize * textStyle.LineHeightMultiplier;
-                }
-            }
-            else if (child is ElementRenderNode childElement)
-            {
-                var childStyle = GetOrCreateStyleMap(context, childElement.Ref, childElement.ComputedStyle);
-                if (IsReplacedElementTag(childElement.Ref.LocalName))
-                {
-                    var childBox = ResolveBoxStyle(childStyle, childElement.Ref);
-                    var childVerticalExtras = childBox.BorderWidth.Top + childBox.BorderWidth.Bottom + childBox.Padding.Top + childBox.Padding.Bottom;
-                    var childHeight = ResolveAuthoredDimension(childStyle, "height", contentWidth, float.NaN, childVerticalExtras);
-
-                    if (!float.IsNaN(childHeight))
-                    {
-                        contentHeight += childHeight + childVerticalExtras + childBox.Margin.Top + childBox.Margin.Bottom;
-                        continue;
-                    }
-                }
-
-                var childTextStyle = ResolveTextStyle(childStyle, textStyle);
-                var childText = NormalizeWhitespace(childElement.Ref.TextContent ?? string.Empty, childTextStyle.WhiteSpace);
-                if (childText.Length > 0)
-                {
-                    contentHeight += WrapTextRespectingWhiteSpace(context, childText, contentWidth, childTextStyle).Count * childTextStyle.FontSize * childTextStyle.LineHeightMultiplier;
-                }
-            }
-        }
-
-        return contentHeight + verticalExtras;
-    }
-
-    private static float EstimateFlexItemMainSize(IRenderNode node, float crossSize, LayoutContext context)
-    {
-        if (node is not ElementRenderNode element)
-        {
-            return 0f;
-        }
-
-        var styleMap = GetOrCreateStyleMap(context, element.Ref, element.ComputedStyle);
-        var box = ResolveBoxStyle(styleMap, element.Ref);
-        var contentWidth = Math.Max(1f, crossSize - box.BorderWidth.Left - box.BorderWidth.Right - box.Padding.Left - box.Padding.Right);
-        var textStyle = ResolveTextStyle(styleMap, new RenderTextStyle(16f, RenderColor.Black, "sans-serif", 1.2f, 400f, false, false, false, RenderColor.Black, global::AngleSharp.Renderer.Rendering.RenderTextDecorationStyle.Solid, TextAlign.Left, 0f, 0f, 0f, [], WhiteSpaceMode.Normal, WordBreakMode.Normal, OverflowWrapMode.Normal, TextOverflowMode.Clip, 0, TextDirection.Ltr));
-        var text = NormalizeWhitespace(element.Ref.TextContent ?? string.Empty, textStyle.WhiteSpace);
-        var lineCount = text.Length == 0 ? 0 : WrapTextRespectingWhiteSpace(context, text, contentWidth, textStyle).Count;
-        return lineCount * textStyle.FontSize * textStyle.LineHeightMultiplier;
+        return height;
     }
 
     /// <summary>
@@ -3874,6 +3902,26 @@ public sealed partial class HtmlRenderer
         return string.Equals(display?.Trim(), "inline-block", StringComparison.OrdinalIgnoreCase);
     }
 
+    /// <summary>
+    /// <c>visibility</c> (inherited): <c>hidden</c>, and <c>collapse</c> outside tables, keep the
+    /// box in layout but paint nothing of it; a descendant may become visible again.
+    /// </summary>
+    private static bool ResolveIsHidden(Dictionary<string, string> styleMap, bool inherited) =>
+        styleMap.TryGetValue("visibility", out var visibility) && !string.IsNullOrWhiteSpace(visibility)
+            ? visibility.Trim().ToLowerInvariant() is "hidden" or "collapse"
+            : inherited;
+
+    /// <summary>
+    /// Whether a node takes part in layout at all. AngleSharp.Css's <c>IsVisible</c> also rejects
+    /// <c>visibility: hidden</c>, but a hidden box still occupies its space; it is only not
+    /// painted (<see cref="RenderTextStyle.IsHidden"/>). The <c>hidden</c> attribute is the user
+    /// agent stylesheet's <c>display: none</c>.
+    /// </summary>
+    private static bool GeneratesBoxes(IRenderNode node) =>
+        node.Ref.Owner is not null &&
+        (node is not ElementRenderNode element ||
+         !string.Equals(element.ComputedStyle.GetDisplay()?.Trim(), "none", StringComparison.OrdinalIgnoreCase));
+
     private static RenderTextStyle ResolveTextStyle(Dictionary<string, string> styleMap, RenderTextStyle inherited)
     {
         var fontSize = ParseLength(styleMap, "font-size", inherited.FontSize, inherited.FontSize, allowAuto: false);
@@ -3891,7 +3939,7 @@ public sealed partial class HtmlRenderer
         var direction = ParseTextDirection(styleMap, inherited.Direction);
         var textAlign = ParseTextAlign(styleMap, inherited.TextAlign, direction);
         var letterSpacing = ParseLength(styleMap, "letter-spacing", inherited.FontSize, inherited.LetterSpacing, allowAuto: false);
-        var textIndent = ParseLength(styleMap, "text-indent", inherited.FontSize, 0f, allowAuto: false);
+        var textIndent = ParseLength(styleMap, "text-indent", inherited.FontSize, inherited.TextIndent, allowAuto: false);
         var verticalAlignOffset = ParseVerticalAlign(styleMap, fontSize);
         var textShadows = ParseTextShadows(styleMap.TryGetValue("text-shadow", out var textShadowValue) ? textShadowValue : null, inherited.TextShadows);
         var whiteSpace = ParseWhiteSpace(styleMap, inherited.WhiteSpace);
@@ -3907,7 +3955,12 @@ public sealed partial class HtmlRenderer
         var variantCaps = ParseFontVariantCaps(styleMap, inherited.VariantCaps);
         var fontStretch = ParseFontStretch(styleMap, inherited.FontStretch);
 
-        return new RenderTextStyle(fontSize, color, fontFamily, lineHeight, fontWeight, isItalic, underline, strikeThrough, decorationColor, decorationStyle, textAlign, letterSpacing, textIndent, verticalAlignOffset, textShadows, whiteSpace, wordBreak, overflowWrap, textOverflow, lineClamp, direction, textTransform, wordSpacing, textAlignLast, hyphens, tabSize, tabSizeIsLength, variantCaps, fontStretch);
+        return new RenderTextStyle(fontSize, color, fontFamily, lineHeight, fontWeight, isItalic, underline, strikeThrough, decorationColor, decorationStyle, textAlign, letterSpacing, textIndent, verticalAlignOffset, textShadows, whiteSpace, wordBreak, overflowWrap, textOverflow, lineClamp, direction, textTransform, wordSpacing, textAlignLast, hyphens, tabSize, tabSizeIsLength, variantCaps, fontStretch,
+            IsHidden: ResolveIsHidden(styleMap, inherited.IsHidden),
+            WritingMode: ParseWritingMode(styleMap.GetValueOrDefault("writing-mode"), inherited.WritingMode),
+            TextOrientation: ParseTextOrientation(styleMap.GetValueOrDefault("text-orientation"), inherited.TextOrientation),
+            // The system text is laid out in only changes at an orthogonal flow (LayoutElement).
+            FlowMode: inherited.FlowMode);
     }
 
     /// <summary>
@@ -3969,8 +4022,7 @@ public sealed partial class HtmlRenderer
     /// <c>text-overflow</c>, unlike every other property resolved in <see cref="ResolveTextStyle"/>,
     /// is deliberately never inherited - every element re-derives it fresh from its own style map,
     /// defaulting to <see cref="TextOverflowMode.Clip"/> even when an ancestor set
-    /// `text-overflow: ellipsis`, mirroring the same non-inheritance <see cref="RenderTextStyle.TextIndent"/>
-    /// already establishes for itself. It also has no effect unless this element's own `overflow`
+    /// `text-overflow: ellipsis`. It also has no effect unless this element's own `overflow`
     /// clips (per spec, and matching <see cref="ShouldClipOverflow"/>'s existing "either axis"
     /// simplification) - `ellipsis` on a box that does not clip is simply ignored, same as a real
     /// browser.
@@ -4038,27 +4090,6 @@ public sealed partial class HtmlRenderer
             "pre-line" => WhiteSpaceMode.PreLine,
             "break-spaces" => WhiteSpaceMode.BreakSpaces,
             _ => WhiteSpaceMode.Normal,
-        };
-    }
-
-    /// <summary>
-    /// Reads the box-level meaning of <c>vertical-align</c>, which is what the property means on a
-    /// table cell. On inline content the same property shifts the text instead, which is what
-    /// <see cref="ParseVerticalAlign"/> handles.
-    /// </summary>
-    private static CellVerticalAlign ParseCellVerticalAlign(Dictionary<string, string> styleMap)
-    {
-        if (!styleMap.TryGetValue("vertical-align", out var value) || string.IsNullOrWhiteSpace(value))
-        {
-            return CellVerticalAlign.Middle;
-        }
-
-        return value.Trim().ToLowerInvariant() switch
-        {
-            "top" or "text-top" => CellVerticalAlign.Top,
-            "bottom" or "text-bottom" => CellVerticalAlign.Bottom,
-            "middle" => CellVerticalAlign.Middle,
-            _ => CellVerticalAlign.Top,
         };
     }
 
@@ -4451,6 +4482,12 @@ public sealed partial class HtmlRenderer
         }
 
         var map = CreateStyleMap(style, element, context);
+
+        if (context.BoxSystems.TryGetValue(element, out var boxSystem))
+        {
+            RemapStyleMapToLogical(map, boxSystem);
+        }
+
         context.StyleMapCache[element] = map;
         return map;
     }
@@ -4582,6 +4619,8 @@ public sealed partial class HtmlRenderer
 
         AddIfPresent(map, "display", displayValue);
         AddIfPresent(map, "visibility", style.GetVisibility());
+        AddIfPresent(map, "writing-mode", style.GetPropertyValue("writing-mode"));
+        AddIfPresent(map, "text-orientation", style.GetPropertyValue("text-orientation"));
         AddLengthProperty(map, style, "width", explicitDeclarations);
         AddLengthProperty(map, style, "height", explicitDeclarations);
         AddLengthProperty(map, style, "min-width", explicitDeclarations);
@@ -4620,6 +4659,10 @@ public sealed partial class HtmlRenderer
         AddLengthProperty(map, style, "border-bottom-width");
         AddLengthProperty(map, style, "border-left-width");
         AddIfPresent(map, "border-collapse", style.GetPropertyValue("border-collapse"));
+        AddIfPresent(map, "border-spacing", style.GetPropertyValue("border-spacing"));
+        AddIfPresent(map, "table-layout", style.GetPropertyValue("table-layout"));
+        AddIfPresent(map, "caption-side", style.GetPropertyValue("caption-side"));
+        AddIfPresent(map, "empty-cells", style.GetPropertyValue("empty-cells"));
 
         AddIfPresent(map, "border-top-style", style.GetBorderTopStyle());
         AddIfPresent(map, "border-right-style", style.GetBorderRightStyle());
@@ -4707,10 +4750,10 @@ public sealed partial class HtmlRenderer
         }
 
         AddIfPresent(map, "align-self", string.IsNullOrWhiteSpace(style.GetPropertyValue("align-self")) ? ParseStyleAttributeValue(inlineStyle, "align-self") : style.GetPropertyValue("align-self"));
+        AddIfPresent(map, "justify-self", string.IsNullOrWhiteSpace(style.GetPropertyValue("justify-self")) ? ParseStyleAttributeValue(inlineStyle, "justify-self") : style.GetPropertyValue("justify-self"));
         AddIfPresent(map, "flex-grow", string.IsNullOrWhiteSpace(style.GetPropertyValue("flex-grow")) ? ParseStyleAttributeValue(inlineStyle, "flex-grow") : style.GetPropertyValue("flex-grow"));
         AddIfPresent(map, "flex-shrink", string.IsNullOrWhiteSpace(style.GetPropertyValue("flex-shrink")) ? ParseStyleAttributeValue(inlineStyle, "flex-shrink") : style.GetPropertyValue("flex-shrink"));
         AddIfPresent(map, "flex-basis", string.IsNullOrWhiteSpace(style.GetPropertyValue("flex-basis")) ? ParseStyleAttributeValue(inlineStyle, "flex-basis") : style.GetPropertyValue("flex-basis"));
-        AddIfPresent(map, "flex", string.IsNullOrWhiteSpace(style.GetPropertyValue("flex")) ? ParseStyleAttributeValue(inlineStyle, "flex") : style.GetPropertyValue("flex"));
         AddIfPresent(map, "order", string.IsNullOrWhiteSpace(style.GetPropertyValue("order")) ? ParseStyleAttributeValue(inlineStyle, "order") : style.GetPropertyValue("order"));
 
         var resolvedBackgroundImage = explicitDeclarations is not null ? ReadExplicitOrComputed(explicitDeclarations, style, "background-image") : ResolveExplicitBackgroundImage(element, style);
@@ -5001,7 +5044,7 @@ public sealed partial class HtmlRenderer
                 continue;
             }
 
-            if (!childElement.IsVisible())
+            if (!GeneratesBoxes(childElement))
             {
                 continue;
             }
@@ -6579,10 +6622,9 @@ public sealed partial class HtmlRenderer
     /// <summary>
     /// Paints a `display: list-item` element's marker (bullet or number) and, for
     /// `list-style-position: inside`, returns a copy of <paramref name="textStyle"/> whose
-    /// <see cref="RenderTextStyle.TextIndent"/> is widened to make room for it on the first line.
-    /// Safe to widen locally: <see cref="ResolveTextStyle"/> never falls back to an inherited
-    /// <c>TextIndent</c> (each element re-derives its own from its own style map, defaulting to
-    /// 0), so this local adjustment cannot leak into nested descendants' own indent.
+    /// <see cref="RenderTextStyle.MarkerIndent"/> makes room for it on the first line. That is a
+    /// separate field from the inherited <c>TextIndent</c>: <see cref="ResolveTextStyle"/> builds
+    /// every descendant's style afresh, so the marker space never leaks into nested blocks.
     /// </summary>
     private static RenderTextStyle PaintListItemMarker(
         DisplayList displayList,
@@ -6638,7 +6680,7 @@ public sealed partial class HtmlRenderer
                     break;
             }
 
-            return isInside ? textStyle with { TextIndent = textStyle.TextIndent + markerSize + MarkerGap } : textStyle;
+            return isInside ? textStyle with { MarkerIndent = markerSize + MarkerGap } : textStyle;
         }
 
         var markerText = FormatListMarkerText(ResolveListItemOrdinal(element), listStyleType);
@@ -6647,7 +6689,7 @@ public sealed partial class HtmlRenderer
 
         DrawStyledText(context, displayList, markerText, markerX, markerBaselineY, textStyle, decorate: false);
 
-        return isInside ? textStyle with { TextIndent = textStyle.TextIndent + markerWidth + MarkerGap } : textStyle;
+        return isInside ? textStyle with { MarkerIndent = markerWidth + MarkerGap } : textStyle;
     }
 
     /// <summary>
@@ -9636,27 +9678,6 @@ public sealed partial class HtmlRenderer
     }
 
     /// <summary>
-    /// The height a cell needs for its own content, independent of the rows it spans.
-    /// </summary>
-    private static float MeasureCellHeight(
-        LayoutContext context,
-        TableCellPlacement placement,
-        float[] columnWidths)
-    {
-        var contentWidth = Math.Max(0f, columnWidths.Skip(placement.ColumnIndex).Take(placement.ColumnSpan).Sum()
-            - placement.PaddingLeft - placement.PaddingRight - placement.BorderLeftWidth - placement.BorderRightWidth);
-        var contentHeight = 0f;
-
-        if (contentWidth > 0f && placement.Text.Length > 0)
-        {
-            var wrappedLines = WrapText(context, placement.Text, contentWidth, placement.CellTextStyle);
-            contentHeight = wrappedLines.Count * placement.CellTextStyle.FontSize * placement.CellTextStyle.LineHeightMultiplier;
-        }
-
-        return Math.Max(20f, contentHeight + placement.PaddingTop + placement.PaddingBottom + placement.BorderTopWidth + placement.BorderBottomWidth);
-    }
-
-    /// <summary>
     /// Greedy word-wrapping, extended with `word-break: break-all`/`overflow-wrap: break-word`
     /// support - both read straight off <paramref name="textStyle"/> rather than as separate
     /// parameters, since every caller already carries a fully-resolved <see cref="RenderTextStyle"/>.
@@ -9988,6 +10009,11 @@ public sealed partial class HtmlRenderer
     {
         text = StripSoftHyphens(text);
 
+        if (TryMeasureOrientedText(context, text, textStyle, out var orientedWidth))
+        {
+            return orientedWidth;
+        }
+
         if (textStyle.VariantCaps == FontVariantCapsMode.Normal)
         {
             return context.TextMeasurer.MeasureWidth(text, ToRenderFont(textStyle, context.Fonts));
@@ -10092,40 +10118,6 @@ public sealed partial class HtmlRenderer
         return preserveNewlines ? sb.ToString() : sb.ToString().Trim();
     }
 
-    /// <summary>
-    /// Where a cell's content sits within the box the cell occupies.
-    /// </summary>
-    /// <remarks>
-    /// <c>baseline</c> is treated as <c>top</c>: aligning the first line boxes of every cell in a
-    /// row against a shared baseline is not implemented.
-    /// </remarks>
-    private enum CellVerticalAlign
-    {
-        Top,
-        Middle,
-        Bottom,
-    }
-
-    private readonly record struct TableCellPlacement(
-        int RowIndex,
-        int ColumnIndex,
-        int ColumnSpan,
-        int RowSpan,
-        ElementRenderNode CellNode,
-        Dictionary<string, string> CellStyle,
-        RenderTextStyle CellTextStyle,
-        string Text,
-        float PaddingLeft,
-        float PaddingRight,
-        float PaddingTop,
-        float PaddingBottom,
-        float BorderLeftWidth,
-        float BorderRightWidth,
-        float BorderTopWidth,
-        float BorderBottomWidth,
-        RenderColor BackgroundColor,
-        CellVerticalAlign VerticalAlign);
-
     private readonly record struct RenderTextStyle(
         float FontSize,
         RenderColor Color,
@@ -10155,7 +10147,12 @@ public sealed partial class HtmlRenderer
         float TabSize = 8f,
         bool TabSizeIsLength = false,
         FontVariantCapsMode VariantCaps = FontVariantCapsMode.Normal,
-        float FontStretch = 100f);
+        float FontStretch = 100f,
+        float MarkerIndent = 0f,
+        bool IsHidden = false,
+        WritingModeKind WritingMode = WritingModeKind.HorizontalTb,
+        TextOrientationKind TextOrientation = TextOrientationKind.Mixed,
+        WritingModeKind FlowMode = WritingModeKind.HorizontalTb);
 
     private enum TextAlign
     {
@@ -10215,10 +10212,8 @@ public sealed partial class HtmlRenderer
 
     /// <summary>
     /// <c>text-overflow</c>. Unlike <see cref="WhiteSpaceMode"/>/<see cref="WordBreakMode"/>/
-    /// <see cref="OverflowWrapMode"/>, this is deliberately never inherited - see
-    /// <see cref="ParseTextOverflow"/>, which mirrors <see cref="RenderTextStyle.TextIndent"/>'s own
-    /// existing non-inheritance for the same reason (it targets this element's own line box, not a
-    /// descendant's).
+    /// <see cref="OverflowWrapMode"/>, this is deliberately never inherited (it targets this
+    /// element's own line box, not a descendant's) - see <see cref="ParseTextOverflow"/>.
     /// </summary>
     private enum TextOverflowMode
     {

@@ -195,7 +195,7 @@ public sealed partial class HtmlRenderer
             displayList.PopClip();
         }
 
-        PaintColumnRules(styleMap, segments.Count, columns, contentX, contentY, columnHeight, displayList);
+        PaintColumnRules(styleMap, segments.Count, columns, contentX, contentY, columnHeight, textStyle.IsHidden ? new DisplayList() : displayList);
         return columnHeight;
     }
 
