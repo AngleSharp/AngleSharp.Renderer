@@ -15,10 +15,10 @@ using AngleSharp.Renderer.Rendering;
 /// </summary>
 internal static class FontFaceLoader
 {
-    // Skia reads raw TrueType/OpenType only. The compressed web wrappers would need a decoder
-    // this library does not carry, so those sources are skipped and the next one is tried.
+    // Skia reads TrueType/OpenType; WOFF and WOFF2 are unwrapped by WebFontDecoder. SVG fonts and
+    // EOT are not supported, so those sources are skipped and the next one is tried.
     private static readonly HashSet<string> UnsupportedFormats =
-        new(StringComparer.OrdinalIgnoreCase) { "woff", "woff2", "svg", "embedded-opentype" };
+        new(StringComparer.OrdinalIgnoreCase) { "svg", "embedded-opentype" };
 
     public static FontFaceSet Load(IDocument document)
     {
@@ -90,8 +90,7 @@ internal static class FontFaceLoader
 
         if (TryDecodeDataUri(url, out var inlineData))
         {
-            data = inlineData;
-            return IsSupportedFontData(data);
+            return WebFontDecoder.TryDecode(inlineData, out data);
         }
 
         // Matching how images are handled, nothing is fetched unless the browsing context was
@@ -117,30 +116,12 @@ internal static class FontFaceLoader
             using var content = response.Content;
             using var buffer = new MemoryStream();
             content.CopyTo(buffer);
-            data = buffer.ToArray();
-
-            return IsSupportedFontData(data);
+            return WebFontDecoder.TryDecode(buffer.ToArray(), out data);
         }
         catch
         {
             return false;
         }
-    }
-
-    /// <summary>
-    /// Rejects the compressed wrappers up front, so a face that could never be rasterized does not
-    /// shadow the next source or the next family in the fallback list.
-    /// </summary>
-    private static bool IsSupportedFontData(byte[] data)
-    {
-        if (data.Length < 4)
-        {
-            return false;
-        }
-
-        var tag = Encoding.ASCII.GetString(data, 0, 4);
-
-        return tag is not ("wOFF" or "wOF2");
     }
 
     private static IEnumerable<string> SplitSources(string source)

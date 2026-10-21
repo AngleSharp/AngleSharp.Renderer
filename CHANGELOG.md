@@ -1,3 +1,61 @@
+# 0.8.0
+
+Released on Wednesday, October 21 2026.
+
+- Improved inline-blocks, floats and absolutely positioned boxes with an auto width, which now shrink to fit their content
+- Improved inline backgrounds and borders, which are painted per line fragment
+- Improved images, which are now inline boxes sized from their natural size, with the background color painted under background images
+- Updated the required AngleSharp.Css version to 1.2.0
+- Updated styling to come only from the computed style: removed the tag-name fallbacks for inline display, heading weight, hidden `<script>`/`<style>`/`input[type=hidden]`, `<textarea>` white-space and the form-control look (the missing default-stylesheet rules are reported to AngleSharp.Css)
+- Updated `FillRectCommand` to carry an optional `PaintArea` (the box a gradient or image paint is sized in), with a matching `DisplayList.FillRect` overload
+- Updated table layout to detect rows and cells by their `display` value instead of tag names
+- Updated `RenderGradientPaint` and `RenderImagePaint` to carry optional tiling and repeat modes
+- Removed a hard-coded `justify-content` for elements with the `nested` class
+- Fixed inline layout: inline content now forms real line boxes, so inline siblings directly in `<body>` share a line, adjacent inline elements are no longer separated by a spurious space, mixed sizes share one baseline, nested inline styles are kept, and `white-space` preservation, `word-break`, `overflow-wrap` and `text-align` apply to mixed inline content
+- Fixed `font-weight: bolder`/`lighter` being ignored (so `<b>`, `<strong>` and headings render bold via the default stylesheet)
+- Fixed percentage `border-radius` values, which now resolve against the border box
+- Fixed `vertical-align` on a box shifting the text inside it
+- Fixed `min-width`/`max-width` being ignored for block widths
+- Added the border styles `dotted`, `groove`, `ridge`, `inset` and `outset`
+- Added correct rounded borders with differing widths, colors or styles (new `FillRingCommand`)
+- Added multiple background layers, `background-repeat: space | round`, and sized/positioned/repeated gradient backgrounds
+- Added `border-image` (new `DrawBorderImageCommand`)
+- Added CSS masks via `mask-image` and its companion properties (new `PushMaskCommand`/`PopMaskCommand`)
+- Added `backdrop-filter` (new `DrawBackdropFilterCommand`)
+- Added the individual transform properties `translate`, `rotate` and `scale`
+- Added `float: right` and `clear`, with floats shared across a block formatting context: text in following blocks wraps around them line by line, and `overflow`/`flow-root` containers enclose their floats
+- Added `text-transform` and `word-spacing`
+- Added `outline-offset`, `background-clip` and `background-origin` (images and gradients now start inside the border by default, as `background-origin: padding-box` specifies)
+- Added `mix-blend-mode`, `isolation` and `background-blend-mode`
+- Added intrinsic grid column sizing: `auto`, `min-content`, `max-content`, `fit-content()` and `minmax()` columns are sized from their items' min/max-content widths instead of a character-count estimate, and `auto` columns stretch into leftover space unless `justify-content` packs them
+- Added quote generation in `content` (`open-quote`, `close-quote`, `no-open-quote`, `no-close-quote`) with the `quotes` property and language-dependent defaults, and images in `content: url()`, also mixed with text
+- Added transitions and animations of `transform`, `translate`, `rotate`, `scale`, `filter` and `backdrop-filter`
+- Added `input[type=image]`, the date/time input family (`date`, `time`, `datetime-local`, `month`, `week`) with formatted values and picker icons, and `accent-color`
+- Added page CSS for inline SVG (including inheritance from the surrounding HTML) and the remaining SVG filter primitives (`feTurbulence`, `feDiffuseLighting`, `feSpecularLighting`, `feDisplacementMap`, `feConvolveMatrix`, `feTile`, `feImage`, `feBlend`, all `feComponentTransfer` functions, `SourceAlpha`), with filter regions, primitive subregions and `color-interpolation-filters` (linearRGB by default)
+- Fixed `feFlood` to fill its whole region instead of recoloring the input
+- Added multi-column layout (`column-count`, `column-width`, `column-gap`, `column-rule`)
+- Added the Unicode Bidirectional Algorithm (UAX #9) with `unicode-bidi`, replacing the word-order reversal for `direction: rtl`
+- Added WOFF and WOFF2 web fonts in `@font-face`
+- Added `text-align: justify` and `text-align-last`
+- Added soft-hyphen line breaking and `hyphens` (`auto` behaves like `manual`)
+- Added `tab-size`
+- Added synthesized small capitals for `font-variant: small-caps`/`all-small-caps`
+- Added `font-stretch` for installed and `@font-face` fonts (new optional `FontStretch` on `RenderFont`, `DrawTextCommand` and `DrawTextShadowCommand`)
+- Added `text-overflow: ellipsis` and `-webkit-line-clamp` for mixed inline content
+- Fixed `text-indent` not being inherited by nested blocks
+- Updated table layout: the table box (margins, `auto` centering, `clear`, border, padding, background), `border-spacing`, shrink-to-fit auto widths from per-column min/max-content widths, `table-layout: fixed`, cells laid out as real flow content with their own computed borders, padding and backgrounds (no more hard-coded black borders and 4px padding), `vertical-align: baseline` for cells, row/row-group/column backgrounds, captions with `caption-side`, header and footer groups, `empty-cells`, `visibility: collapse` for rows and columns, percentage row and cell heights, a collapsing border model in which the widest border wins each grid line, and tables inside shrink-to-fit boxes
+- Fixed percentage `column-gap`/`row-gap`/`gap` in grid and flex containers being ignored
+- Added `writing-mode` (`vertical-rl`, `vertical-lr`, `sideways-rl`, `sideways-lr`) with orthogonal flows in either direction, physical box properties mapped onto the logical ones, and `text-orientation` (CJK upright by default under `mixed`)
+- Added `position: sticky` with `bottom`, `left` and `right`, confined to the containing block, and painted over later siblings at any nesting depth
+- Added named grid lines (including the implicit lines of `grid-template-areas`), negative line numbers, `justify-self`, start/center/end alignment for grid items, and `fr` rows in grids without a definite height
+- Added `transform`, `opacity`, `filter`, `mix-blend-mode`, `clip-path`, masks and `backdrop-filter` on flex, grid and table containers
+- Improved flex sizing to follow the spec's flexible length resolution: definite `flex-basis` values are no longer widened to the content, items do not shrink below their content (`min-width: auto`), shrinking is weighted by base size, items frozen at `min`/`max` sizes leave the space to the others, and item heights come from a real layout
+- Fixed grid containers growing past their authored height
+- Fixed percentage widths of children inflating the intrinsic width of shrink-to-fit boxes and flex items
+- Fixed the `gap` shorthand being left out of the intrinsic width of flex containers
+- Fixed `visibility: hidden` removing elements from layout: hidden boxes now keep their space and only skip painting, and descendants with `visibility: visible` are painted
+- Fixed boxes with a decided width of zero (empty table cells, atomic inlines) losing their height
+
 # 0.7.0
 
 Released on Monday, October 19 2026.

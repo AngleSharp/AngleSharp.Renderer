@@ -13,7 +13,46 @@ public sealed record RenderColorPaint(RenderColor Color) : RenderPaint;
 /// <summary>
 /// Represents a gradient paint.
 /// </summary>
-public sealed record RenderGradientPaint(RenderGradient Gradient) : RenderPaint;
+/// <param name="Gradient">The gradient.</param>
+/// <param name="Tile">
+/// How the gradient is sized, positioned and repeated as a background/mask image, or
+/// <see langword="null"/> when it simply fills its whole paint area (the default `auto` size).
+/// </param>
+public sealed record RenderGradientPaint(RenderGradient Gradient, RenderBackgroundTile? Tile = null) : RenderPaint;
+
+/// <summary>
+/// How one axis of a background or mask image repeats (`background-repeat`/`mask-repeat`).
+/// </summary>
+public enum RenderBackgroundRepeat
+{
+    /// <summary>Tiles the image, clipping the last tile.</summary>
+    Repeat,
+
+    /// <summary>Paints the image once.</summary>
+    NoRepeat,
+
+    /// <summary>Tiles as many whole images as fit, spreading the leftover space between them.</summary>
+    Space,
+
+    /// <summary>Scales the image so a whole number of tiles fills the area.</summary>
+    Round,
+}
+
+/// <summary>
+/// The size, position and repetition of an image that has no intrinsic size (a gradient) when it
+/// is used as a background or mask layer.
+/// </summary>
+/// <param name="Size">The `background-size`; `auto` sizes the tile to the whole paint area.</param>
+/// <param name="PositionX">The horizontal `background-position`.</param>
+/// <param name="PositionY">The vertical `background-position`.</param>
+/// <param name="RepeatX">The horizontal repetition.</param>
+/// <param name="RepeatY">The vertical repetition.</param>
+public sealed record RenderBackgroundTile(
+    RenderBackgroundSize Size,
+    RenderBackgroundPositionComponent PositionX,
+    RenderBackgroundPositionComponent PositionY,
+    RenderBackgroundRepeat RepeatX,
+    RenderBackgroundRepeat RepeatY);
 
 /// <summary>
 /// Represents a `background-image: url(...)` paint. The image itself is already fully loaded and
@@ -31,13 +70,27 @@ public sealed record RenderGradientPaint(RenderGradient Gradient) : RenderPaint;
 /// <param name="PositionX">The horizontal `background-position` component.</param>
 /// <param name="PositionY">The vertical `background-position` component.</param>
 /// <param name="Size">The `background-size` specification.</param>
+/// <param name="RepeatModeX">
+/// The horizontal repetition when it is `space` or `round`; <see langword="null"/> means
+/// <paramref name="RepeatX"/> decides between `repeat` and `no-repeat`.
+/// </param>
+/// <param name="RepeatModeY">The vertical counterpart of <paramref name="RepeatModeX"/>.</param>
 public sealed record RenderImagePaint(
     RenderedImage Image,
     bool RepeatX,
     bool RepeatY,
     RenderBackgroundPositionComponent PositionX,
     RenderBackgroundPositionComponent PositionY,
-    RenderBackgroundSize Size) : RenderPaint;
+    RenderBackgroundSize Size,
+    RenderBackgroundRepeat? RepeatModeX = null,
+    RenderBackgroundRepeat? RepeatModeY = null) : RenderPaint
+{
+    /// <summary>The effective horizontal repetition.</summary>
+    public RenderBackgroundRepeat EffectiveRepeatX => RepeatModeX ?? (RepeatX ? RenderBackgroundRepeat.Repeat : RenderBackgroundRepeat.NoRepeat);
+
+    /// <summary>The effective vertical repetition.</summary>
+    public RenderBackgroundRepeat EffectiveRepeatY => RepeatModeY ?? (RepeatY ? RenderBackgroundRepeat.Repeat : RenderBackgroundRepeat.NoRepeat);
+}
 
 /// <summary>
 /// One axis of a `background-position` value, resolved as

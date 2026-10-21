@@ -55,10 +55,11 @@ This implementation is intentionally lightweight and bitmap-backed, but it suppo
 
 ## Text And Fonts
 
-The renderer supports basic text styling such as font size, weight, italic, alignment, spacing, and decoration.
-Generic font families like `serif`, `sans-serif`, and `monospace` are mapped to installed local fonts so they render as visibly different faces.
+The renderer supports text styling such as font size, weight, italic, alignment, letter and word spacing, `text-transform`, decorations, shadows, `white-space`, `word-break`, `overflow-wrap`, and `text-overflow`.
+Inline content is laid out in line boxes, so nested inline elements keep their own styles, share a baseline with the surrounding text, and wrap together with it.
 
-If you want predictable output in visual tests, specify an explicit font family and keep the host environment consistent.
+Generic font families like `serif`, `sans-serif`, and `monospace` always map to fonts bundled with the renderer, so they render the same on every machine.
+Named families resolve only when installed on the host (or declared via `@font-face`), so prefer generic families when you need predictable output in visual tests.
 
 ## Visual Testing
 

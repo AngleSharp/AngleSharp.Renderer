@@ -56,8 +56,9 @@ internal enum SvgPaintKind
 
 /// <summary>
 /// The inherited paint and font state while walking an SVG element tree. Presentation attributes
-/// inherit down the tree by default; an SVG-internal &lt;style&gt; rule overrides them, and an
-/// inline `style=""` declaration on the element overrides both, matching the CSS cascade.
+/// inherit down the tree by default; SVG-internal &lt;style&gt; rules and (for an inline SVG) the
+/// host page's style sheets override them, and an inline `style=""` declaration on the element
+/// overrides all of them, matching the CSS cascade.
 /// </summary>
 internal readonly record struct SvgPaintState(
     SvgPaintValue Fill,
@@ -94,10 +95,15 @@ internal readonly record struct SvgPaintState(
     /// layering in, from weakest to strongest: presentation attributes, matched
     /// SVG-internal &lt;style&gt; rules, then an inline `style` attribute.
     /// </summary>
-    public SvgPaintState Resolve(IElement element, SvgRenderContext context, SvgViewport viewport)
-    {
-        var declarations = ReadDeclarations(element, context);
+    public SvgPaintState Resolve(IElement element, SvgRenderContext context, SvgViewport viewport) =>
+        ResolveDeclarations(ReadDeclarations(element, context), viewport);
 
+    /// <summary>
+    /// Layers <paramref name="declarations"/> (property name to value) over this inherited state -
+    /// also how the root picks up the inherited style of the HTML around an inline SVG.
+    /// </summary>
+    public SvgPaintState ResolveDeclarations(IReadOnlyDictionary<string, string> declarations, SvgViewport viewport)
+    {
         // `color` is resolved first so `currentColor` on this same element's fill/stroke picks up
         // its own computed value, not the inherited one, matching the CSS `currentColor` keyword.
         var currentColor = CurrentColor;
@@ -288,7 +294,7 @@ internal readonly record struct SvgPaintState(
         };
     }
 
-    private static bool TryGetDeclaration(Dictionary<string, string> declarations, string name, out string value)
+    private static bool TryGetDeclaration(IReadOnlyDictionary<string, string> declarations, string name, out string value)
     {
         if (declarations.TryGetValue(name, out var found) && !string.IsNullOrWhiteSpace(found))
         {
@@ -320,7 +326,8 @@ internal readonly record struct SvgPaintState(
         return false;
     }
 
-    private static readonly string[] PresentationProperties =
+    /// <summary>The properties this renderer reads, from presentation attributes and CSS alike.</summary>
+    public static readonly string[] PresentationProperties =
     [
         "fill", "stroke", "fill-opacity", "stroke-opacity", "stroke-width", "opacity", "fill-rule",
         "font-family", "font-size", "font-weight", "font-style", "text-anchor", "color",
@@ -349,7 +356,17 @@ internal readonly record struct SvgPaintState(
             }
         }
 
-        // 3. Inline style overrides everything else, matching the CSS-over-attribute cascade.
+        // 3. The host page's own style sheets, for an inline SVG (author rules; approximated as
+        // applying after the SVG-internal ones instead of interleaving by specificity).
+        if (context.PageDeclarations.TryGetValue(element, out var pageDeclarations))
+        {
+            foreach (var (property, value) in pageDeclarations)
+            {
+                declarations[property] = value;
+            }
+        }
+
+        // 4. Inline style overrides everything else, matching the CSS-over-attribute cascade.
         var style = element.GetAttribute("style");
 
         if (!string.IsNullOrWhiteSpace(style))
