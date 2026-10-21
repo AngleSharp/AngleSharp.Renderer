@@ -4,8 +4,8 @@ Released on Wednesday, October 21 2026.
 
 - Improved inline-blocks, floats and absolutely positioned boxes with an auto width, which now shrink to fit their content
 - Improved inline backgrounds and borders, which are painted per line fragment
-- Updated the required AngleSharp.Css version to 1.2.0-beta.349 (pre-release)
 - Improved images, which are now inline boxes sized from their natural size, with the background color painted under background images
+- Updated the required AngleSharp.Css version to 1.2.0
 - Updated styling to come only from the computed style: removed the tag-name fallbacks for inline display, heading weight, hidden `<script>`/`<style>`/`input[type=hidden]`, `<textarea>` white-space and the form-control look (the missing default-stylesheet rules are reported to AngleSharp.Css)
 - Updated `FillRectCommand` to carry an optional `PaintArea` (the box a gradient or image paint is sized in), with a matching `DisplayList.FillRect` overload
 - Updated table layout to detect rows and cells by their `display` value instead of tag names

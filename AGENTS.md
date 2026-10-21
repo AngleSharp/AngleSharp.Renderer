@@ -41,11 +41,11 @@ Never resolve named families with `SKTypeface.FromFamilyName`: it substitutes th
 
 ## Upstream Policy (important)
 
-**Never work around AngleSharp / AngleSharp.Css bugs locally.** Reproduce them with a failing test in the upstream project's own suite, fix them there, verify locally via a temporary `ProjectReference` to the sibling checkout, then revert to `PackageReference` once released. Wrong output in the meantime is acceptable. Current minimums: `AngleSharp` 1.8.1+, `AngleSharp.Css` 1.2.0-beta.349+ (a pre-release, until 1.2.0 ships), set via `AngleSharpVersion`/`AngleSharpCssVersion` in the `.csproj` and the `ANGLESHARP_VERSION`/`ANGLESHARP_CSS_VERSION` env of `ci.yml` and `update-snapshots.yml` (which override the `.csproj`, so change all three together). Prefer delegating CSS grammar to AngleSharp.Css's public parsers (`TransformParser`, `FilterParser`, `GradientParser`, `GridParser`, `TimingFunctionParser`) and keeping only the conversion to backend-agnostic `Render*` types here. Hand-roll only what upstream genuinely lacks (e.g. `clip-path` basic shapes).
+**Never work around AngleSharp / AngleSharp.Css bugs locally.** Reproduce them with a failing test in the upstream project's own suite, fix them there, verify locally via a temporary `ProjectReference` to the sibling checkout, then revert to `PackageReference` once released. Wrong output in the meantime is acceptable. Current minimums: `AngleSharp` 1.8.1+, `AngleSharp.Css` 1.2.0+, set via `AngleSharpVersion`/`AngleSharpCssVersion` in the `.csproj` and the `ANGLESHARP_VERSION`/`ANGLESHARP_CSS_VERSION` env of `ci.yml` and `update-snapshots.yml` (which override the `.csproj`, so change all three together). Prefer delegating CSS grammar to AngleSharp.Css's public parsers (`TransformParser`, `FilterParser`, `GradientParser`, `GridParser`, `TimingFunctionParser`) and keeping only the conversion to backend-agnostic `Render*` types here. Hand-roll only what upstream genuinely lacks (e.g. `clip-path` basic shapes).
 
 **Styling comes only from the computed style** (the render tree, cascaded with the UA stylesheet), never from tag names: no "`<b>` is bold", "`h1` is 700", "`<span>` is inline", "`<script>` is hidden". An unset `display` is its initial value, `inline`. Tag names are only legitimate for element semantics that CSS does not express (replaced-element content, form-control values, `<select>` options, `ol`/`li` ordinals). When the UA sheet lacks a rule, file it upstream as a failing test.
 
-Upstream status: everything filed so far is fixed as of 1.2.0-beta.349; no failing upstream tests are open.
+Upstream status: everything filed so far is fixed as of 1.2.0; no failing upstream tests are open.
 
 ## Core Layout Invariants
 
