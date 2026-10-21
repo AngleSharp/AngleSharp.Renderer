@@ -87,7 +87,7 @@ internal sealed class CssTransitionTracker
                     continue;
                 }
 
-                var naturalValue = CssValueInterpolation.ReadNaturalValue(style, property, kind);
+                var naturalValue = CssValueInterpolation.ReadNaturalValue(style, property, kind, element);
 
                 if (naturalValue is not null)
                 {
@@ -120,7 +120,7 @@ internal sealed class CssTransitionTracker
                     continue;
                 }
 
-                var naturalValue = CssValueInterpolation.ReadNaturalValue(style, property, kind);
+                var naturalValue = CssValueInterpolation.ReadNaturalValue(style, property, kind, element);
 
                 if (naturalValue is null)
                 {

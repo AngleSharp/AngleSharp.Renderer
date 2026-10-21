@@ -4,7 +4,7 @@ Released on Wednesday, October 21 2026.
 
 - Improved inline-blocks, floats and absolutely positioned boxes with an auto width, which now shrink to fit their content
 - Improved inline backgrounds and borders, which are painted per line fragment
-- Updated the required AngleSharp.Css version to 1.2.0-beta.347 (pre-release)
+- Updated the required AngleSharp.Css version to 1.2.0-beta.349 (pre-release)
 - Improved images, which are now inline boxes sized from their natural size, with the background color painted under background images
 - Updated styling to come only from the computed style: removed the tag-name fallbacks for inline display, heading weight, hidden `<script>`/`<style>`/`input[type=hidden]`, `<textarea>` white-space and the form-control look (the missing default-stylesheet rules are reported to AngleSharp.Css)
 - Updated `FillRectCommand` to carry an optional `PaintArea` (the box a gradient or image paint is sized in), with a matching `DisplayList.FillRect` overload
@@ -27,6 +27,12 @@ Released on Wednesday, October 21 2026.
 - Added `text-transform` and `word-spacing`
 - Added `outline-offset`, `background-clip` and `background-origin` (images and gradients now start inside the border by default, as `background-origin: padding-box` specifies)
 - Added `mix-blend-mode`, `isolation` and `background-blend-mode`
+- Added intrinsic grid column sizing: `auto`, `min-content`, `max-content`, `fit-content()` and `minmax()` columns are sized from their items' min/max-content widths instead of a character-count estimate, and `auto` columns stretch into leftover space unless `justify-content` packs them
+- Added quote generation in `content` (`open-quote`, `close-quote`, `no-open-quote`, `no-close-quote`) with the `quotes` property and language-dependent defaults, and images in `content: url()`, also mixed with text
+- Added transitions and animations of `transform`, `translate`, `rotate`, `scale`, `filter` and `backdrop-filter`
+- Added `input[type=image]`, the date/time input family (`date`, `time`, `datetime-local`, `month`, `week`) with formatted values and picker icons, and `accent-color`
+- Added page CSS for inline SVG (including inheritance from the surrounding HTML) and the remaining SVG filter primitives (`feTurbulence`, `feDiffuseLighting`, `feSpecularLighting`, `feDisplacementMap`, `feConvolveMatrix`, `feTile`, `feImage`, `feBlend`, all `feComponentTransfer` functions, `SourceAlpha`), with filter regions, primitive subregions and `color-interpolation-filters` (linearRGB by default)
+- Fixed `feFlood` to fill its whole region instead of recoloring the input
 - Added multi-column layout (`column-count`, `column-width`, `column-gap`, `column-rule`)
 - Added the Unicode Bidirectional Algorithm (UAX #9) with `unicode-bidi`, replacing the word-order reversal for `direction: rtl`
 - Added WOFF and WOFF2 web fonts in `@font-face`

@@ -70,10 +70,12 @@ public sealed class TableSpanTests
         var spanned = await TallestCellAsync($"""
             <table>
               <tr><td rowspan="2">{Long}</td><td>a</td></tr>
-              <tr><td>b</td></tr>
+              <tr><td>a</td></tr>
             </table>
             """);
 
+        // Both tables keep "a" in the second column, so the first column is equally wide in both and
+        // the long text wraps identically.
         Assert.True(spanned > 40f, "The sample text was expected to wrap to several lines.");
         Assert.True(spanned <= reference + 0.5f,
             $"The spanning cell grew to {spanned:F1}px against a required {reference:F1}px, " +

@@ -17,6 +17,7 @@ using AngleSharp.Dom;
 using AngleSharp.Io;
 using AngleSharp.Renderer.Rendering;
 using AngleSharp.Renderer.Skia;
+using AngleSharp.Renderer.Skia.Svg;
 using AngleSharp.Text;
 
 using SkiaSharp;
@@ -29,7 +30,20 @@ public sealed partial class HtmlRenderer
     // Per-document cache keeps image payloads stable across repeated renders of the same DOM instance.
     private static readonly ConditionalWeakTable<IDocument, DocumentImageCache> s_imageCacheByDocument = new();
     // Inline <svg> markup has no URL to key a per-document cache on, so it is cached per element instead.
-    private static readonly ConditionalWeakTable<IElement, CachedImageResource> s_inlineSvgCacheByElement = new();
+    private static readonly ConditionalWeakTable<IElement, InlineSvgCacheEntry> s_inlineSvgCacheByElement = new();
+
+    /// <summary>
+    /// A rasterized inline SVG with the fingerprint of everything it was drawn from (its markup and
+    /// the page styles reaching it), so a changed attribute, class or page rule re-rasterizes it.
+    /// </summary>
+    private sealed record InlineSvgCacheEntry(string Fingerprint, CachedImageResource Resource);
+
+    /// <summary>
+    /// `::before`/`::after` pseudo-elements whose `content` is a single `url()` image, which makes
+    /// them replaced elements (CSS Generated Content). Filled per render by <see cref="ProcessCounters"/>;
+    /// pseudo-elements are rebuilt with every render tree, so stale entries die with them.
+    /// </summary>
+    private static readonly ConditionalWeakTable<IElement, string> s_generatedContentImages = new();
     private static readonly AsyncLocal<LayoutCapture?> s_layoutCapture = new();
     private static readonly ITextMeasurer s_defaultTextMeasurer = new SkiaTextMeasurer();
 
@@ -593,12 +607,10 @@ public sealed partial class HtmlRenderer
             return;
         }
 
-        // IsReplacedElementTag reads the host's own tagName, which a ::before/::after pseudo-element
-        // shares (PseudoElement.LocalName/TagName proxy through) - a real browser gives a generated-
-        // content pseudo its own independent display computation (defaulting to inline, per spec),
-        // entirely unrelated to whatever the host's tag would otherwise force, so this renderer must
-        // not either.
-        var renderAsBlock = ShouldRenderAsBlock(computedStyle) || (element is not IPseudoElement && IsReplacedElementTag(tagName));
+        // A ::before/::after pseudo-element shares its host's tagName (PseudoElement.LocalName/TagName
+        // proxy through), so IsReplacedElement never judges a pseudo by tag - only an image in its
+        // own `content` makes it replaced.
+        var renderAsBlock = ShouldRenderAsBlock(computedStyle) || IsReplacedElement(element);
         var isInlineBlock = IsInlineBlock(computedStyle);
         var currentTextStyle = ResolveTextStyle(styleMap, inheritedTextStyle);
 
@@ -778,7 +790,7 @@ public sealed partial class HtmlRenderer
         }
         else if (float.IsNaN(specifiedContentWidth) && !isFlexItem)
         {
-            if (element is not IPseudoElement && IsReplacedElementTag(tagName) &&
+            if (IsReplacedElement(element) &&
                 TryResolveReplacedContentWidth(node, styleMap, flowContainingWidth, out var replacedWidth))
             {
                 // A replaced element is as wide as its image, not as wide as its container.
@@ -922,7 +934,7 @@ public sealed partial class HtmlRenderer
         }
 
         // A replaced element without an authored height is as tall as its (scaled) image.
-        if (float.IsNaN(resolvedContentHeight) && element is not IPseudoElement && IsReplacedElementTag(tagName) &&
+        if (float.IsNaN(resolvedContentHeight) && IsReplacedElement(element) &&
             TryResolveReplacedElementImage(node, styleMap, flowContainingWidth, 0f, 0f, out _, out var replacedRect, out var replacedClip))
         {
             resolvedContentHeight = replacedClip?.Height ?? replacedRect.Height;
@@ -981,7 +993,7 @@ public sealed partial class HtmlRenderer
             var formControlContentHeight = float.IsNaN(formControlSpecifiedHeight)
                 ? currentTextStyle.FontSize * currentTextStyle.LineHeightMultiplier
                 : formControlSpecifiedHeight;
-            PaintFormControl(currentTextStyle.IsHidden ? new DisplayList() : displayList, element, formControlKind, currentTextStyle, context, contentX, contentY, contentWidth, formControlContentHeight);
+            PaintFormControl(currentTextStyle.IsHidden ? new DisplayList() : displayList, element, formControlKind, currentTextStyle, ResolveAccentColor(styleMap), context, contentX, contentY, contentWidth, formControlContentHeight);
         }
 
         // A table cell's content is shifted within the cell by its `vertical-align`.
@@ -1003,7 +1015,7 @@ public sealed partial class HtmlRenderer
         // content does, and needed no special-casing at all once the box itself got its default
         // border/padding/background chrome.
         // A ::before/::after pseudo-element's own tagName proxies through to its host (see the
-        // IsReplacedElementTag/ResolveFormControlKind guards above) - an <svg>'s own generated-content
+        // IsReplacedElement/ResolveFormControlKind guards above) - an <svg>'s own generated-content
         // pseudo is not itself the foreign-namespaced SVG subtree, and must still get to paint its own
         // single synthetic text child below rather than being emptied out like the real <svg> root is.
         var orderedChildren = element is not IPseudoElement &&
@@ -1080,7 +1092,7 @@ public sealed partial class HtmlRenderer
 
         var isOrthogonalFlow = IsVerticalMode(currentTextStyle.WritingMode) != IsVerticalMode(inheritedTextStyle.FlowMode) &&
                                formControlKind == FormControlKind.None &&
-                               !(element is not IPseudoElement && IsReplacedElementTag(tagName));
+                               !IsReplacedElement(element);
 
         if (isOrthogonalFlow)
         {
@@ -1449,9 +1461,8 @@ public sealed partial class HtmlRenderer
     /// <summary>
     /// A CSS Grid track's own sizing function, kept unresolved (unlike a plain pixel size) until
     /// <see cref="LayoutGridContainer"/>'s own two-pass sizing algorithm can run: <see cref="Auto"/>
-    /// tracks are grown by the estimated size of the items placed in them (this renderer's existing
-    /// approximation for content-based sizing - see <see cref="ResolveGridItemEstimatedSize"/>), and
-    /// only once every <see cref="Auto"/>/<see cref="Fixed"/> track is settled can the free space
+    /// columns are sized from their items' intrinsic widths (<see cref="ResolveIntrinsicGridColumns"/>)
+    /// and <see cref="Auto"/> rows from their items' measured heights, and only once every <see cref="Auto"/>/<see cref="Fixed"/> track is settled can the free space
     /// left over be distributed across <see cref="Fraction"/> (`fr`) tracks.
     /// </summary>
     private sealed class GridTrackSize
@@ -1475,9 +1486,22 @@ public sealed partial class HtmlRenderer
         /// always itself (its `fr` share), matching spec.</summary>
         public float? MaxPixels;
 
+        /// <summary>How an <see cref="GridTrackSizeKind.Auto"/> track's growth limit is sized.</summary>
+        public GridTrackMaxSizing MaxSizing;
+
+        /// <summary>A `max-content` minimum: the base size follows max-content instead of min-content
+        /// contributions (only consulted without a <see cref="MinPixels"/> floor).</summary>
+        public bool MinIsMaxContent;
+
         public static GridTrackSize Fixed(float pixels) => new() { Kind = GridTrackSizeKind.Fixed, Pixels = Math.Max(0f, pixels) };
 
-        public static GridTrackSize Auto(float? min = null, float? max = null) => new() { Kind = GridTrackSizeKind.Auto, MinPixels = min, MaxPixels = max };
+        public static GridTrackSize Auto(float? min = null, float? max = null) => new()
+        {
+            Kind = GridTrackSizeKind.Auto,
+            MinPixels = min,
+            MaxPixels = max,
+            MaxSizing = max is null ? GridTrackMaxSizing.Auto : GridTrackMaxSizing.Fixed,
+        };
 
         public static GridTrackSize Fraction(float fr, float? min = null) => new() { Kind = GridTrackSizeKind.Fraction, FractionValue = Math.Max(0f, fr), MinPixels = min };
     }
@@ -1487,6 +1511,20 @@ public sealed partial class HtmlRenderer
         Fixed,
         Auto,
         Fraction,
+    }
+
+    /// <summary>
+    /// The maximum of a content-sized track: `auto` (max-content, and the track stretches into
+    /// leftover space), `min-content`, `max-content`, `fit-content(limit)` (max-content capped at
+    /// <see cref="GridTrackSize.MaxPixels"/>) or a fixed length.
+    /// </summary>
+    private enum GridTrackMaxSizing
+    {
+        Auto,
+        MinContent,
+        MaxContent,
+        FitContent,
+        Fixed,
     }
 
     private static void LayoutFlexContainer(
@@ -2067,11 +2105,10 @@ public sealed partial class HtmlRenderer
 
         // Pass 1: resolve every item's placement once (reused unchanged in pass 2 below, so a
         // wrapping auto-placement cursor can never land an item in a different cell the second
-        // time around) and grow every Auto column/row to fit its own items' estimated size -
-        // mirroring this renderer's existing, pre-structured-parsing item-estimate approximation
-        // for content sizing (ResolveGridItemEstimatedSize), just now applied through the new
-        // GridTrackSize model instead of a flat pixel list.
+        // time around), collect the intrinsic width contributions of items in Auto columns and
+        // grow Auto rows to their items' authored heights (content heights are measured below).
         var itemPlacements = new List<(ElementRenderNode Element, GridPlacement Column, GridPlacement Row)>();
+        var columnContributions = new List<(GridPlacement Column, IntrinsicWidths Widths)>();
         var namedAreas = ParseGridTemplateAreas(styleMap.TryGetValue("grid-template-areas", out var areasValue) ? areasValue : null);
 
         // Every area also names the lines around it: `name-start` and `name-end`.
@@ -2241,12 +2278,7 @@ public sealed partial class HtmlRenderer
                 }
             }
 
-            // The item's *own* width/height (childStyleMap), not the container's - a real,
-            // confirmed bug in the pre-existing estimate (it read the container's styleMap here,
-            // so every item's estimate was really just re-reading the container's own width/height
-            // regardless of what any individual item was actually styled with).
-            var estimatedItemWidth = ResolveGridItemEstimatedSize(elementChild, childStyleMap, containingWidth, "width");
-            var estimatedItemHeight = ResolveGridItemEstimatedSize(elementChild, childStyleMap, containingWidth, "height");
+            var authoredItemHeight = ResolveGridItemAuthoredHeight(childStyleMap, containingWidth);
             var effectiveColumnCount = Math.Max(columns.Count, effectivePlacementColumn.LineIndex + effectivePlacementColumn.Span);
             var effectiveRowCount = Math.Max(rows.Count, effectivePlacementRow.LineIndex + effectivePlacementRow.Span);
 
@@ -2260,8 +2292,12 @@ public sealed partial class HtmlRenderer
                 rows.Add(autoRowDefinitions.Count > 0 ? CloneGridTrackSize(autoRowDefinitions[rows.Count % autoRowDefinitions.Count]) : GridTrackSize.Auto());
             }
 
-            GrowGridTrackSize(columns, effectivePlacementColumn.LineIndex, estimatedItemWidth);
-            GrowGridTrackSize(rows, effectivePlacementRow.LineIndex, estimatedItemHeight);
+            if (Enumerable.Range(effectivePlacementColumn.LineIndex, effectivePlacementColumn.Span).Any(i => i >= 0 && columns[i].Kind == GridTrackSizeKind.Auto))
+            {
+                columnContributions.Add((effectivePlacementColumn, ComputeOuterIntrinsicWidths(elementChild, inheritedTextStyle, containingWidth, context)));
+            }
+
+            GrowGridTrackSize(rows, effectivePlacementRow.LineIndex, authoredItemHeight);
 
             currentColumn++;
             if (currentColumn >= columns.Count)
@@ -2276,6 +2312,8 @@ public sealed partial class HtmlRenderer
         // rows have no real meaning against an otherwise auto-sized container (there is no "free
         // space" to speak of), a deliberate, documented scope cut rather than an attempt at the
         // spec's own intrinsic-sizing fallback for that case.
+        var justifyContent = styleMap.GetValueOrDefault("justify-content")?.Trim().ToLowerInvariant();
+        ResolveIntrinsicGridColumns(columns, columnContributions, resolvedColumnGap, containingWidth, stretchAutoTracks: justifyContent is null or "" or "normal" or "stretch");
         ResolveGridFractionTracks(columns, resolvedColumnGap, containingWidth);
 
         var resolvedColumnSizes = columns.Select(track => track.Pixels).ToList();
@@ -2822,18 +2860,28 @@ public sealed partial class HtmlRenderer
                 return ConvertGridMinMax(minMax, relativeTo);
 
             case ICssFunctionValue fitContentFunc when string.Equals(fitContentFunc.Name, "fit-content", StringComparison.OrdinalIgnoreCase) && fitContentFunc.Arguments.Length == 1:
-                return GridTrackSize.Auto(max: ResolveGridTrackLength(fitContentFunc.Arguments[0], relativeTo));
+                var fitContent = GridTrackSize.Auto(max: ResolveGridTrackLength(fitContentFunc.Arguments[0], relativeTo));
+                fitContent.MaxSizing = GridTrackMaxSizing.FitContent;
+                return fitContent;
 
             case CssLengthValue:
                 return GridTrackSize.Fixed(ResolveGridTrackLength(value, relativeTo));
 
             default:
-                // "auto"/"min-content"/"max-content" and anything else unrecognized - all treated
-                // as content-sized, the same approximation this renderer already used for every
-                // plain "auto" track before structured parsing.
-                return GridTrackSize.Auto();
+                // "auto"/"min-content"/"max-content"; anything unrecognized is content-sized like "auto".
+                var track = GridTrackSize.Auto();
+                track.MaxSizing = ResolveGridContentKeyword(value);
+                track.MinIsMaxContent = track.MaxSizing == GridTrackMaxSizing.MaxContent;
+                return track;
         }
     }
+
+    private static GridTrackMaxSizing ResolveGridContentKeyword(ICssValue? value) => value?.CssText.Trim().ToLowerInvariant() switch
+    {
+        "min-content" => GridTrackMaxSizing.MinContent,
+        "max-content" => GridTrackMaxSizing.MaxContent,
+        _ => GridTrackMaxSizing.Auto,
+    };
 
     /// <summary>
     /// `minmax(min, max)` where `max` is a `&lt;flex&gt;` (`fr`) is the common, important case
@@ -2854,7 +2902,15 @@ public sealed partial class HtmlRenderer
 
         var min = minMax.Minimum is CssLengthValue ? ResolveGridTrackLength(minMax.Minimum, relativeTo) : (float?)null;
         var max = minMax.Maximum is CssLengthValue ? ResolveGridTrackLength(minMax.Maximum, relativeTo) : (float?)null;
-        return GridTrackSize.Auto(min, max);
+        var track = GridTrackSize.Auto(min, max);
+
+        if (max is null)
+        {
+            track.MaxSizing = ResolveGridContentKeyword(minMax.Maximum);
+        }
+
+        track.MinIsMaxContent = min is null && ResolveGridContentKeyword(minMax.Minimum) == GridTrackMaxSizing.MaxContent;
+        return track;
     }
 
     /// <summary>
@@ -3133,41 +3189,18 @@ public sealed partial class HtmlRenderer
             ? float.NaN
             : ResolveAuthoredDimension(styleMap, "height", containingWidth, float.NaN, verticalBorderAndPadding);
 
-    private static float ResolveGridItemEstimatedSize(ElementRenderNode elementChild, Dictionary<string, string> styleMap, float fallbackSize, string propertyName)
+    /// <summary>
+    /// The item's authored <c>height</c> (at least its <c>min-height</c>), which sizes its Auto row
+    /// up front; items without one are measured once the column widths are known.
+    /// </summary>
+    private static float ResolveGridItemAuthoredHeight(Dictionary<string, string> styleMap, float fallbackSize)
     {
-        var rawValue = styleMap.TryGetValue(propertyName, out var value) && !string.IsNullOrWhiteSpace(value)
-            ? value
-            : null;
+        var height = styleMap.TryGetValue("height", out var value) && !string.IsNullOrWhiteSpace(value)
+            ? ParseLengthValue(value, fallbackSize, allowAuto: false)
+            : float.NaN;
+        var authored = float.IsNaN(height) ? 0f : Math.Max(0f, height);
 
-        float estimate;
-
-        if (string.IsNullOrWhiteSpace(rawValue))
-        {
-            var text = NormalizeWhitespace(elementChild.Ref.TextContent ?? string.Empty, WhiteSpaceMode.Normal);
-            var fontSize = ParseLength(styleMap, "font-size", 16f, 16f, allowAuto: false);
-            var box = ResolveBoxStyle(styleMap, elementChild.Ref);
-            var verticalExtras = box.BorderWidth.Top + box.BorderWidth.Bottom + box.Padding.Top + box.Padding.Bottom;
-            var intrinsicTextWidth = text.Split(' ', StringSplitOptions.RemoveEmptyEntries)
-                .Select(word => word.Length)
-                .DefaultIfEmpty(0)
-                .Max() * fontSize * 0.6f;
-
-            estimate = string.Equals(propertyName, "width", StringComparison.OrdinalIgnoreCase)
-                ? intrinsicTextWidth
-                : text.Length == 0 ? 0f : fontSize * 1.35f + verticalExtras;
-        }
-        else
-        {
-            var parsed = ParseLengthValue(rawValue, fallbackSize, allowAuto: false);
-            estimate = float.IsNaN(parsed) ? fallbackSize : Math.Max(0f, parsed);
-        }
-
-        if (string.Equals(propertyName, "height", StringComparison.OrdinalIgnoreCase))
-        {
-            estimate = Math.Max(estimate, ParseLength(styleMap, "min-height", fallbackSize, 0f, allowAuto: false));
-        }
-
-        return estimate;
+        return Math.Max(authored, ParseLength(styleMap, "min-height", fallbackSize, 0f, allowAuto: false));
     }
 
     private static float MeasureGridItemHeight(ElementRenderNode element, float containingWidth, RenderTextStyle inheritedTextStyle, LayoutContext context, float maxY)
@@ -3204,6 +3237,108 @@ public sealed partial class HtmlRenderer
     /// specifically (a `Fixed` track already has its final size; a `Fraction` track's only comes
     /// from <see cref="ResolveGridFractionTracks"/>, once every `Auto`/`Fixed` track is settled).
     /// </summary>
+    /// <summary>
+    /// Sizes a grid's content-sized columns from their items' min-content/max-content
+    /// contributions (CSS Grid §12.5, simplified): each track gets a base size (min-content, or its
+    /// `minmax()` floor) and a growth limit (max-content, or its fixed / `fit-content()` maximum).
+    /// Items are taken by increasing span; one spanning several tracks spreads what those tracks
+    /// still lack equally over the content-sized ones, and one spanning an `fr` track is ignored.
+    /// Free space then grows tracks up to their growth limits ("maximize tracks"); what is left
+    /// stretches `auto`-maximum tracks equally when no `fr` track takes it and `justify-content`
+    /// does not pack the tracks.
+    /// </summary>
+    private static void ResolveIntrinsicGridColumns(List<GridTrackSize> columns, List<(GridPlacement Column, IntrinsicWidths Widths)> contributions, float gap, float availableWidth, bool stretchAutoTracks)
+    {
+        var baseSizes = new float[columns.Count];
+        var limits = new float[columns.Count];
+
+        foreach (var (placement, widths) in contributions.OrderBy(c => c.Column.Span))
+        {
+            var first = Math.Max(0, placement.LineIndex);
+            var last = Math.Min(columns.Count, placement.LineIndex + placement.Span);
+            var autoTracks = Enumerable.Range(first, last - first).Where(i => columns[i].Kind == GridTrackSizeKind.Auto).ToList();
+
+            if (autoTracks.Count == 0 || Enumerable.Range(first, last - first).Any(i => columns[i].Kind == GridTrackSizeKind.Fraction))
+            {
+                continue;
+            }
+
+            var spacing = Math.Max(0, last - first - 1) * gap + Enumerable.Range(first, last - first).Where(i => columns[i].Kind == GridTrackSizeKind.Fixed).Sum(i => columns[i].Pixels);
+            var track = columns[autoTracks[0]];
+            var single = last - first == 1;
+            var minContribution = single && track.MinIsMaxContent ? widths.Max : widths.Min;
+            var maxContribution = single && track.MaxSizing == GridTrackMaxSizing.MinContent ? widths.Min : widths.Max;
+
+            SpreadExcess(baseSizes, minContribution);
+            SpreadExcess(limits, maxContribution);
+
+            void SpreadExcess(float[] sizes, float contribution)
+            {
+                var excess = contribution - spacing - autoTracks.Sum(i => sizes[i]);
+
+                if (excess > 0f)
+                {
+                    foreach (var i in autoTracks)
+                    {
+                        sizes[i] += excess / autoTracks.Count;
+                    }
+                }
+            }
+        }
+
+        for (var i = 0; i < columns.Count; i++)
+        {
+            var track = columns[i];
+
+            if (track.Kind != GridTrackSizeKind.Auto)
+            {
+                continue;
+            }
+
+            var baseSize = track.MinPixels ?? baseSizes[i];
+            var limit = track.MaxSizing switch
+            {
+                GridTrackMaxSizing.Fixed => track.MaxPixels ?? limits[i],
+                GridTrackMaxSizing.FitContent => Math.Min(limits[i], track.MaxPixels ?? limits[i]),
+                _ => limits[i],
+            };
+
+            track.Pixels = baseSize;
+            limits[i] = Math.Max(baseSize, limit);
+        }
+
+        var freeSpace = availableWidth - Math.Max(0, columns.Count - 1) * gap - columns.Sum(t => t.Kind == GridTrackSizeKind.Fraction ? t.MinPixels ?? 0f : t.Pixels);
+
+        while (freeSpace > 0.01f)
+        {
+            var growable = Enumerable.Range(0, columns.Count).Where(i => columns[i].Kind == GridTrackSizeKind.Auto && columns[i].Pixels < limits[i] - 0.01f).ToList();
+
+            if (growable.Count == 0)
+            {
+                break;
+            }
+
+            var share = freeSpace / growable.Count;
+
+            foreach (var i in growable)
+            {
+                var growth = Math.Min(share, limits[i] - columns[i].Pixels);
+                columns[i].Pixels += growth;
+                freeSpace -= growth;
+            }
+        }
+
+        if (stretchAutoTracks && freeSpace > 0.01f && columns.All(t => t.Kind != GridTrackSizeKind.Fraction))
+        {
+            var stretchable = columns.Where(t => t.Kind == GridTrackSizeKind.Auto && t.MaxSizing == GridTrackMaxSizing.Auto).ToList();
+
+            foreach (var track in stretchable)
+            {
+                track.Pixels += freeSpace / stretchable.Count;
+            }
+        }
+    }
+
     private static void GrowGridTrackSize(List<GridTrackSize> tracks, int index, float itemEstimate)
     {
         while (tracks.Count <= index)
@@ -3267,7 +3402,14 @@ public sealed partial class HtmlRenderer
     {
         GridTrackSizeKind.Fixed => GridTrackSize.Fixed(track.Pixels),
         GridTrackSizeKind.Fraction => GridTrackSize.Fraction(track.FractionValue, track.MinPixels),
-        _ => GridTrackSize.Auto(track.MinPixels, track.MaxPixels),
+        _ => new GridTrackSize
+        {
+            Kind = GridTrackSizeKind.Auto,
+            MinPixels = track.MinPixels,
+            MaxPixels = track.MaxPixels,
+            MaxSizing = track.MaxSizing,
+            MinIsMaxContent = track.MinIsMaxContent,
+        },
     };
 
     private static Dictionary<string, (int Row, int Column, int RowSpan, int ColumnSpan)> ParseGridTemplateAreas(string? value)
@@ -4719,6 +4861,7 @@ public sealed partial class HtmlRenderer
             AddIfPresent(map, "grid-auto-flow", string.IsNullOrWhiteSpace(explicitGridAutoFlow) ? ParseStyleAttributeValue(inlineStyle, "grid-auto-flow") : explicitGridAutoFlow);
             var explicitJustifyItems = explicitDeclarations is not null ? ReadExplicitOrComputed(explicitDeclarations, style, "justify-items") : ResolveExplicitPropertyValue(element, style, "justify-items");
             AddIfPresent(map, "justify-items", string.IsNullOrWhiteSpace(explicitJustifyItems) ? ParseStyleAttributeValue(inlineStyle, "justify-items") : explicitJustifyItems);
+            AddIfPresent(map, "justify-content", explicitDeclarations is not null ? ReadExplicitOrComputed(explicitDeclarations, style, "justify-content") : ResolveExplicitPropertyValue(element, style, "justify-content"));
             var explicitAlignItems = explicitDeclarations is not null ? ReadExplicitOrComputed(explicitDeclarations, style, "align-items") : ResolveExplicitPropertyValue(element, style, "align-items");
             AddIfPresent(map, "align-items", string.IsNullOrWhiteSpace(explicitAlignItems) ? ParseStyleAttributeValue(inlineStyle, "align-items") : explicitAlignItems);
         }
@@ -4860,6 +5003,7 @@ public sealed partial class HtmlRenderer
         AddIfPresent(map, "text-transform", style.GetPropertyValue("text-transform"));
         AddIfPresent(map, "line-height", style.GetLineHeight());
         AddIfPresent(map, "color", style.GetColor());
+        AddIfPresent(map, "accent-color", style.GetPropertyValue("accent-color"));
         AddIfPresent(map, "white-space", style.GetPropertyValue("white-space"));
         AddIfPresent(map, "text-overflow", style.GetPropertyValue("text-overflow"));
         // Not a property AngleSharp.Css's own declaration factory necessarily recognizes (a
@@ -5577,9 +5721,24 @@ public sealed partial class HtmlRenderer
             new EdgeSizes(outlineWidth, outlineWidth, outlineWidth, outlineWidth));
     }
 
-    private static bool IsReplacedElementTag(string tagName) =>
-        string.Equals(tagName, "img", StringComparison.OrdinalIgnoreCase) ||
-        string.Equals(tagName, "svg", StringComparison.OrdinalIgnoreCase);
+    /// <summary>
+    /// Whether the element's content is an image: `&lt;img&gt;`, `&lt;svg&gt;`, `input[type=image]`, or a
+    /// pseudo-element whose `content` is a single `url()`. A pseudo-element proxies its host's tag
+    /// name and attributes, so it is only ever judged by its generated content.
+    /// </summary>
+    private static bool IsReplacedElement(IElement element) => element is IPseudoElement
+        ? s_generatedContentImages.TryGetValue(element, out _)
+        : string.Equals(element.LocalName, "img", StringComparison.OrdinalIgnoreCase) ||
+          string.Equals(element.LocalName, "svg", StringComparison.OrdinalIgnoreCase) ||
+          (IsImageInput(element) && HasLoadableImageSource(element));
+
+    private static bool HasLoadableImageSource(IElement element) =>
+        TryGetOrLoadImageResource(element, element.GetAttribute("src"), out var imageResource) && imageResource is not null;
+
+    private static bool IsImageInput(IElement element) =>
+        element is not IPseudoElement &&
+        string.Equals(element.LocalName, "input", StringComparison.OrdinalIgnoreCase) &&
+        string.Equals(element.GetAttribute("type")?.Trim(), "image", StringComparison.OrdinalIgnoreCase);
 
     private static bool TryResolveReplacedElementImage(ElementRenderNode node, Dictionary<string, string> styleMap, float containingWidth, float x, float y, out RenderedImage? image, out RenderRect rect, out RenderRect? clipRect) =>
         TryResolveImage(node, styleMap, containingWidth, x, y, out image, out rect, out clipRect) ||
@@ -5592,16 +5751,23 @@ public sealed partial class HtmlRenderer
         clipRect = null;
 
         // node.Ref.LocalName/GetAttribute("src") proxy through to the host for a ::before/::after
-        // pseudo-element (PseudoElement.cs, AngleSharp.Css) - without this guard, an <img>'s own
-        // generated-content pseudo would be mistaken for the <img> itself and paint the same image
-        // a second time as if the pseudo were a replaced element in its own right.
-        if (node.Ref is IPseudoElement || !string.Equals(node.Ref.LocalName, "img", StringComparison.OrdinalIgnoreCase))
+        // pseudo-element (PseudoElement.cs, AngleSharp.Css), so a pseudo is only ever an image
+        // through its own `content: url()`, never through its host's `src`.
+        CachedImageResource? imageResource;
+
+        if (node.Ref is IPseudoElement)
+        {
+            if (!s_generatedContentImages.TryGetValue(node.Ref, out var contentUrl) ||
+                !TryGetOrLoadBackgroundImageResource(node.Ref, contentUrl, out imageResource) || imageResource is null)
+            {
+                return false;
+            }
+        }
+        else if (!string.Equals(node.Ref.LocalName, "img", StringComparison.OrdinalIgnoreCase) && !IsImageInput(node.Ref))
         {
             return false;
         }
-
-        var source = node.Ref.GetAttribute("src");
-        if (!TryGetOrLoadImageResource(node.Ref, source, out var imageResource) || imageResource is null)
+        else if (!TryGetOrLoadImageResource(node.Ref, node.Ref.GetAttribute("src"), out imageResource) || imageResource is null)
         {
             return false;
         }
@@ -5778,35 +5944,116 @@ public sealed partial class HtmlRenderer
 
     private static bool TryGetOrLoadInlineSvgResource(IElement element, out CachedImageResource? imageResource)
     {
-        if (s_inlineSvgCacheByElement.TryGetValue(element, out var cached))
+        var pageStyle = ResolveSvgPageStyle(element);
+        var fingerprint = BuildInlineSvgFingerprint(element, pageStyle);
+
+        if (s_inlineSvgCacheByElement.TryGetValue(element, out var cached) && cached.Fingerprint == fingerprint)
         {
-            imageResource = cached;
+            imageResource = cached.Resource;
             return true;
         }
 
-        if (!TryRasterizeInlineSvgElement(element, out imageResource) || imageResource is null)
-        {
-            return false;
-        }
-
-        s_inlineSvgCacheByElement.AddOrUpdate(element, imageResource);
-        return true;
-    }
-
-    private static bool TryRasterizeInlineSvgElement(IElement element, out CachedImageResource? imageResource)
-    {
+        // The already-parsed element is walked directly - AngleSharp parsed this SVG once, as
+        // part of the host document, and it is never serialized back to text and re-parsed.
         imageResource = null;
 
-        // The already-parsed element is walked directly - AngleSharp parsed this SVG once, as
-        // part of the host document, and it is never serialized back to text and re-parsed. Only
-        // the SVG's own presentation attributes/style apply - page CSS never cascades into it.
-        if (!SvgRasterizer.TryRasterizeElement(element, out var pngBytes, out var naturalWidth, out var naturalHeight))
+        if (!SvgRasterizer.TryRasterizeElement(element, out var pngBytes, out var naturalWidth, out var naturalHeight, pageStyle))
         {
             return false;
         }
 
         imageResource = new CachedImageResource(pngBytes, "image/png", naturalWidth, naturalHeight);
+        s_inlineSvgCacheByElement.AddOrUpdate(element, new InlineSvgCacheEntry(fingerprint, imageResource));
         return true;
+    }
+
+    /// <summary>
+    /// How the host page styles an inline SVG: the root's computed values of the inherited SVG
+    /// properties (everything but `opacity`), and each element's cascaded page declarations of the
+    /// properties the SVG renderer reads.
+    /// </summary>
+    private static SvgPageStyle? ResolveSvgPageStyle(IElement svgRoot)
+    {
+        var window = svgRoot.Owner?.DefaultView;
+
+        if (window is null)
+        {
+            return null;
+        }
+
+        var device = window.Document.Context.GetService<IRenderDevice>() ?? new DefaultRenderDevice();
+        var styleCollection = window.GetStyleCollection(device);
+        var rootStyle = svgRoot.ComputeCurrentStyle();
+        var inherited = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+
+        foreach (var property in SvgPaintState.PresentationProperties)
+        {
+            var value = property == "color" ? rootStyle.GetColor() : rootStyle.GetPropertyValue(property);
+
+            if (property != "opacity" && !string.IsNullOrWhiteSpace(value))
+            {
+                inherited[property] = value;
+            }
+        }
+
+        var declarations = new Dictionary<IElement, IReadOnlyDictionary<string, string>>(ReferenceEqualityComparer.Instance);
+
+        foreach (var element in svgRoot.DescendantsAndSelf<IElement>())
+        {
+            // Only what the page declares on the element itself: inherited values must not beat
+            // the element's own presentation attributes (GetDeclarations merges in the ancestors).
+            var cascaded = styleCollection.ComputeExplicitStyle(element);
+            Dictionary<string, string>? values = null;
+
+            foreach (var property in SvgPaintState.PresentationProperties)
+            {
+                var value = cascaded.GetPropertyValue(property);
+
+                if (!string.IsNullOrWhiteSpace(value))
+                {
+                    (values ??= new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase))[property] = value;
+                }
+            }
+
+            if (values is not null)
+            {
+                declarations[element] = values;
+            }
+        }
+
+        return new SvgPageStyle(inherited, declarations);
+    }
+
+    private static string BuildInlineSvgFingerprint(IElement svgRoot, SvgPageStyle? pageStyle)
+    {
+        var builder = new StringBuilder(svgRoot.OuterHtml);
+
+        if (pageStyle is not null)
+        {
+            foreach (var (property, value) in pageStyle.Inherited.OrderBy(entry => entry.Key, StringComparer.Ordinal))
+            {
+                builder.Append('\n').Append(property).Append(':').Append(value);
+            }
+
+            var index = 0;
+
+            foreach (var element in svgRoot.DescendantsAndSelf<IElement>())
+            {
+                if (pageStyle.Declarations.TryGetValue(element, out var values))
+                {
+                    builder.Append('\n').Append(index);
+
+                    foreach (var (property, value) in values.OrderBy(entry => entry.Key, StringComparer.Ordinal))
+                    {
+                        builder.Append(';').Append(property).Append(':').Append(value);
+                    }
+                }
+
+                index++;
+            }
+        }
+
+        return builder.ToString();
     }
 
     private static bool TryGetOrLoadImageResource(IElement element, string? source, out CachedImageResource? imageResource)
@@ -6093,6 +6340,13 @@ public sealed partial class HtmlRenderer
         /// <summary>`input[type=file]` - a button-like box showing a fixed "Choose File" label.</summary>
         File,
 
+        /// <summary>
+        /// The date/time family - `date`, `time`, `datetime-local`, `month`, `week` - showing its
+        /// value (or the segmented placeholder) formatted the way an en-US browser does, next to a
+        /// calendar or clock picker icon.
+        /// </summary>
+        DateTime,
+
         /// <summary>`&lt;textarea&gt;` - gets the same box chrome as a text input, but keeps its real
         /// child text node flowing through the ordinary block child-layout path for its content.</summary>
         TextArea,
@@ -6102,11 +6356,17 @@ public sealed partial class HtmlRenderer
     }
 
     /// <summary>
-    /// A common browser checkbox/radio accent color (Chrome/Edge's default `accent-color`),
-    /// approximated as a fixed constant - this renderer does not parse the CSS `accent-color`
-    /// property itself, a deliberate scope cut for a rarely-overridden value.
+    /// The accent color `accent-color: auto` stands for (Chrome/Edge's default), used for checked
+    /// checkboxes and radios and the range thumb.
     /// </summary>
     private static readonly RenderColor FormControlAccentColor = new(26, 115, 232, 255);
+
+    /// <summary>The element's `accent-color` (inherited), or the default for `auto`/unset.</summary>
+    private static RenderColor ResolveAccentColor(Dictionary<string, string> styleMap) =>
+        styleMap.TryGetValue("accent-color", out var value) && !string.IsNullOrWhiteSpace(value) &&
+        !value.Trim().Equals("auto", StringComparison.OrdinalIgnoreCase)
+            ? ParseColor(value, FormControlAccentColor)
+            : FormControlAccentColor;
 
     /// <summary>
     /// The bundled sans-serif font's own ascent, as a fraction of font-size, measured empirically
@@ -6213,9 +6473,13 @@ public sealed partial class HtmlRenderer
             "radio" => FormControlKind.Radio,
             "color" => FormControlKind.Color,
             "range" => FormControlKind.Range,
+            "date" or "time" or "datetime-local" or "month" or "week" => FormControlKind.DateTime,
             "file" => FormControlKind.File,
             "button" or "submit" or "reset" => FormControlKind.Button,
             "hidden" => FormControlKind.Hidden,
+            // An image button is a replaced element; without a loadable image it falls back to a
+            // button showing its `alt` text, as browsers do.
+            "image" => HasLoadableImageSource(element) ? FormControlKind.None : FormControlKind.Button,
             _ => FormControlKind.TextLike,
         };
     }
@@ -6280,6 +6544,19 @@ public sealed partial class HtmlRenderer
                 SetDefault("height", FormatPixelValue(Math.Max(16f, lineHeight * 0.6f)));
                 break;
 
+            case FormControlKind.DateTime:
+            {
+                // Wide enough for the placeholder (or the value, if longer) plus the picker icon.
+                var type = element.GetAttribute("type")?.Trim().ToLowerInvariant() ?? "date";
+                var textWidth = Math.Max(
+                    MeasureTextWidth(context, FormatDateTimeInputValue(type, null), textStyle),
+                    MeasureTextWidth(context, ResolveFormControlLabel(kind, element), textStyle));
+                var iconWidth = textStyle.FontSize * FormControlPickerIconScale;
+                SetDefault("width", FormatPixelValue(textWidth + (textStyle.FontSize * 0.5f) + iconWidth));
+                SetDefault("height", FormatPixelValue(lineHeight));
+                break;
+            }
+
             case FormControlKind.File:
             case FormControlKind.Button:
             {
@@ -6299,6 +6576,88 @@ public sealed partial class HtmlRenderer
                 break;
             }
         }
+    }
+
+    /// <summary>The picker icon of a date/time input, as a fraction of the font size.</summary>
+    private const float FormControlPickerIconScale = 0.9f;
+
+    /// <summary>
+    /// A date/time input's displayed text: its value in en-US form (`05/03/2024`, `01:05 PM`,
+    /// `May 2024`, `Week 18, 2024`), or the segmented placeholder when the value is missing or
+    /// invalid, as browsers do.
+    /// </summary>
+    private static string FormatDateTimeInputValue(string type, string? value)
+    {
+        const string DatePlaceholder = "mm/dd/yyyy";
+        const string TimePlaceholder = "--:-- --";
+        var trimmed = value?.Trim() ?? string.Empty;
+        var culture = CultureInfo.InvariantCulture;
+
+        string? FormatDate(string text) =>
+            DateTime.TryParseExact(text, "yyyy-MM-dd", culture, DateTimeStyles.None, out var date) ? date.ToString("MM/dd/yyyy", culture) : null;
+
+        string? FormatTime(string text) =>
+            DateTime.TryParseExact(text, ["HH:mm", "HH:mm:ss", "HH:mm:ss.FFF"], culture, DateTimeStyles.None, out var time)
+                ? time.ToString(time.Second != 0 || time.Millisecond != 0 ? "hh:mm:ss tt" : "hh:mm tt", culture)
+                : null;
+
+        switch (type)
+        {
+            case "time":
+                return FormatTime(trimmed) ?? TimePlaceholder;
+
+            case "datetime-local":
+            {
+                var separator = trimmed.IndexOfAny(['T', ' ']);
+                var date = separator > 0 ? FormatDate(trimmed[..separator]) : null;
+                var time = separator > 0 ? FormatTime(trimmed[(separator + 1)..]) : null;
+                return date is not null && time is not null ? $"{date}, {time}" : $"{DatePlaceholder}, {TimePlaceholder}";
+            }
+
+            case "month":
+                return DateTime.TryParseExact(trimmed, "yyyy-MM", culture, DateTimeStyles.None, out var month)
+                    ? month.ToString("MMMM yyyy", culture)
+                    : "--------- ----";
+
+            case "week":
+            {
+                var weekIndex = trimmed.IndexOf("-W", StringComparison.OrdinalIgnoreCase);
+                return weekIndex == 4 &&
+                       int.TryParse(trimmed[..4], NumberStyles.None, culture, out var year) &&
+                       int.TryParse(trimmed[(weekIndex + 2)..], NumberStyles.None, culture, out var week) &&
+                       trimmed.Length == 8 && week is >= 1 and <= 53 && year > 0
+                    ? string.Create(culture, $"Week {week:00}, {year:0000}")
+                    : "Week --, ----";
+            }
+
+            default:
+                return FormatDate(trimmed) ?? DatePlaceholder;
+        }
+    }
+
+    /// <summary>
+    /// A date/time input's picker icon in the text color: a calendar (an outlined page with a
+    /// filled header) or, for `time`, a clock (a circle with two hands).
+    /// </summary>
+    private static void PaintPickerIcon(DisplayList displayList, RenderRect rect, RenderColor color, bool isClock)
+    {
+        var stroke = Math.Max(1f, rect.Width / 10f);
+        var none = new RenderCornerRadii(0f, 0f, 0f, 0f, 0f, 0f, 0f, 0f);
+
+        if (isClock)
+        {
+            var radius = rect.Width / 2f;
+            displayList.StrokeRoundedRect(rect, color, stroke, new RenderCornerRadii(radius, radius, radius, radius, radius, radius, radius, radius));
+            var centerX = rect.X + radius;
+            var centerY = rect.Y + radius;
+            displayList.FillRect(new RenderRect(centerX - (stroke / 2f), rect.Y + (rect.Height * 0.25f), stroke, radius * 0.5f + (stroke / 2f)), color);
+            displayList.FillRect(new RenderRect(centerX - (stroke / 2f), centerY - (stroke / 2f), rect.Width * 0.25f + (stroke / 2f), stroke), color);
+            return;
+        }
+
+        var page = new RenderRect(rect.X, rect.Y + (rect.Height * 0.1f), rect.Width, rect.Height * 0.9f);
+        displayList.StrokeRoundedRect(page, color, stroke, none);
+        displayList.FillRect(new RenderRect(page.X, page.Y, page.Width, page.Height * 0.3f), color);
     }
 
     private static string FormatPixelValue(float pixels) =>
@@ -6332,6 +6691,7 @@ public sealed partial class HtmlRenderer
 
                 return element.GetAttribute("type")?.Trim().ToLowerInvariant() switch
                 {
+                    "image" => element.GetAttribute("alt") is { Length: > 0 } alt ? alt : "Submit",
                     "submit" => "Submit",
                     "reset" => "Reset",
                     _ => "Button",
@@ -6360,6 +6720,9 @@ public sealed partial class HtmlRenderer
                 return selected is not null ? NormalizeWhitespace(selected.TextContent ?? string.Empty) : string.Empty;
             }
 
+            case FormControlKind.DateTime:
+                return FormatDateTimeInputValue(element.GetAttribute("type")?.Trim().ToLowerInvariant() ?? "date", element.GetAttribute("value"));
+
             case FormControlKind.File:
                 // No filename-tracking model (this renderer does not simulate a real file picker
                 // dialog or an `IElement.Files` selection) - always the fixed label a real browser
@@ -6384,6 +6747,7 @@ public sealed partial class HtmlRenderer
         IElement element,
         FormControlKind kind,
         RenderTextStyle textStyle,
+        RenderColor accentColor,
         LayoutContext context,
         float contentX,
         float contentY,
@@ -6396,6 +6760,7 @@ public sealed partial class HtmlRenderer
             case FormControlKind.Select:
             case FormControlKind.Button:
             case FormControlKind.File:
+            case FormControlKind.DateTime:
             {
                 var label = ResolveFormControlLabel(kind, element);
 
@@ -6444,6 +6809,14 @@ public sealed partial class HtmlRenderer
                     PaintFormControlCaret(displayList, element, textStyle, contentX + labelWidth, baselineY);
                 }
 
+                if (kind == FormControlKind.DateTime)
+                {
+                    var iconSize = Math.Min(contentHeight, textStyle.FontSize * FormControlPickerIconScale);
+                    var iconRect = new RenderRect(contentX + contentWidth - iconSize, contentY + ((contentHeight - iconSize) / 2f), iconSize, iconSize);
+                    var isClock = string.Equals(element.GetAttribute("type")?.Trim(), "time", StringComparison.OrdinalIgnoreCase);
+                    PaintPickerIcon(displayList, iconRect, textStyle.Color, isClock);
+                }
+
                 break;
             }
 
@@ -6459,7 +6832,7 @@ public sealed partial class HtmlRenderer
                     var size = Math.Max(0f, Math.Min(contentWidth, contentHeight) * 0.6f);
                     var insetX = (contentWidth - size) / 2f;
                     var insetY = (contentHeight - size) / 2f;
-                    displayList.FillRect(new RenderRect(contentX + insetX, contentY + insetY, size, size), FormControlAccentColor);
+                    displayList.FillRect(new RenderRect(contentX + insetX, contentY + insetY, size, size), accentColor);
                 }
 
                 break;
@@ -6475,7 +6848,7 @@ public sealed partial class HtmlRenderer
                     var radii = new RenderCornerRadii(
                         size / 2f, size / 2f, size / 2f, size / 2f,
                         size / 2f, size / 2f, size / 2f, size / 2f);
-                    displayList.FillRect(new RenderRect(contentX + insetX, contentY + insetY, size, size), FormControlAccentColor, radii);
+                    displayList.FillRect(new RenderRect(contentX + insetX, contentY + insetY, size, size), accentColor, radii);
                 }
 
                 break;
@@ -6524,7 +6897,7 @@ public sealed partial class HtmlRenderer
                 var thumbY = contentY + ((contentHeight - thumbSize) / 2f);
                 displayList.FillRect(
                     new RenderRect(thumbX, thumbY, thumbSize, thumbSize),
-                    FormControlAccentColor,
+                    accentColor,
                     new RenderCornerRadii(thumbSize / 2f, thumbSize / 2f, thumbSize / 2f, thumbSize / 2f, thumbSize / 2f, thumbSize / 2f, thumbSize / 2f, thumbSize / 2f));
                 break;
             }
@@ -6832,12 +7205,14 @@ public sealed partial class HtmlRenderer
     /// onto <paramref name="context"/>'s counter stacks is always popped again right before this
     /// call itself returns, regardless of how the recursive `foreach` over children unwinds.
     /// </summary>
-    private static void ProcessCounters(IRenderNode node, LayoutContext context)
+    private static void ProcessCounters(IRenderNode node, LayoutContext context, GeneratedContentState? state = null, IElement? host = null)
     {
         if (node is not ElementRenderNode elementNode)
         {
             return;
         }
+
+        state ??= new GeneratedContentState();
 
         var styleMap = GetOrCreateStyleMap(context, elementNode.Ref, elementNode.ComputedStyle);
 
@@ -6853,20 +7228,28 @@ public sealed partial class HtmlRenderer
             ? []
             : ApplyCounterDeclarations(styleMap, context.Counters);
 
-        if (elementNode.Ref is IPseudoElement &&
-            TryEvaluateCounterContent(elementNode.ComputedStyle.GetPropertyValue("content"), context.Counters, out var evaluatedContent))
+        if (elementNode.Ref is IPseudoElement)
         {
-            var textChild = elementNode.Children.OfType<TextRenderNode>().FirstOrDefault();
+            var rawContent = elementNode.ComputedStyle.GetPropertyValue("content");
 
-            if (textChild is not null)
+            if (TryResolveContentImageUrl(rawContent) is { } imageUrl)
             {
-                textChild.Ref.Data = evaluatedContent;
+                s_generatedContentImages.AddOrUpdate(elementNode.Ref, imageUrl);
+            }
+            else
+            {
+                s_generatedContentImages.Remove(elementNode.Ref);
+
+                if (TryEvaluateGeneratedContent(rawContent, host ?? elementNode.Ref, elementNode.ComputedStyle, context.Counters, state, out var segments))
+                {
+                    ApplyGeneratedContent(elementNode, segments);
+                }
             }
         }
 
         foreach (var child in elementNode.Children)
         {
-            ProcessCounters(child, context);
+            ProcessCounters(child, context, state, elementNode.Ref);
         }
 
         // Pop in reverse order of introduction - matters only for the rare case of the same
@@ -7001,29 +7384,193 @@ public sealed partial class HtmlRenderer
     }
 
     /// <summary>
-    /// Re-derives a `::before`/`::after` pseudo-element's generated text from its own *raw*
-    /// `content` declaration text, for the one case AngleSharp.Css's own generated-content
-    /// resolution cannot handle: `counter()`/`counters()`. Scoped to a `content` value composed
-    /// entirely of quoted string literals and `counter()`/`counters()` calls (the overwhelmingly
-    /// common way either is actually used - `content: counter(item) ". "` style) - a value mixing
-    /// in anything else this parser does not recognize (`attr()`, nested quotes/functions, ...)
-    /// returns <see langword="false"/> so the caller leaves AngleSharp.Css's own synthesized text
-    /// (which drops just the counter segment, not the whole value) untouched rather than replacing
-    /// it with something wrong. Only the `decimal` counter style is supported - a `list-style-type`-
-    /// style second argument to `counter()`/`counters()` (`upper-roman`, `disc`, ...) is read only
-    /// far enough to be skipped over, not interpreted.
+    /// Puts evaluated generated content into a pseudo-element's render node: the text of its one
+    /// synthesized text child, or - when images are mixed in - a sequence of text nodes and
+    /// anonymous replaced `img` nodes (a detached element styled with initial values, which is
+    /// what an anonymous image box is). AngleSharp.Css builds a pseudo's children as a mutable
+    /// list; should that ever change, the images are dropped and only the text remains.
     /// </summary>
-    private static bool TryEvaluateCounterContent(string? rawContent, Dictionary<string, Stack<int>> counters, out string result)
+    private static void ApplyGeneratedContent(ElementRenderNode pseudoNode, List<GeneratedContentSegment> segments)
     {
-        result = string.Empty;
+        var text = string.Concat(segments.Select(segment => segment.Text));
+
+        if (segments.Any(segment => segment.ImageUrl is not null) &&
+            pseudoNode.Children is List<IRenderNode> children &&
+            pseudoNode.Ref.Owner is { } document)
+        {
+            children.Clear();
+
+            foreach (var segment in segments)
+            {
+                if (segment.ImageUrl is { } url)
+                {
+                    var image = document.CreateElement("img");
+                    image.SetAttribute("src", url);
+                    var style = image.ComputeCurrentStyle();
+                    children.Add(new ElementRenderNode(image, pseudoNode, new List<IRenderNode>(), style, style));
+                }
+                else
+                {
+                    children.Add(new TextRenderNode(document.CreateTextNode(segment.Text!), pseudoNode));
+                }
+            }
+
+            return;
+        }
+
+        if (pseudoNode.Children.OfType<TextRenderNode>().FirstOrDefault() is { } textChild)
+        {
+            textChild.Ref.Data = text;
+        }
+    }
+
+    /// <summary>
+    /// Document-order state of generated content: the current quote nesting depth, which every
+    /// `open-quote`/`no-open-quote` raises and every `close-quote`/`no-close-quote` lowers.
+    /// </summary>
+    private sealed class GeneratedContentState
+    {
+        public int QuoteDepth;
+    }
+
+    /// <summary>
+    /// The image URL of a `content` value that is exactly one `url()` - the case that turns a
+    /// pseudo-element into a replaced element. Anything else (no image, or an image mixed with
+    /// text) returns <see langword="null"/>.
+    /// </summary>
+    private static string? TryResolveContentImageUrl(string? rawContent)
+    {
+        var trimmed = rawContent?.Trim();
+
+        if (trimmed is null || !trimmed.StartsWith("url(", StringComparison.OrdinalIgnoreCase) || !trimmed.EndsWith(')'))
+        {
+            return null;
+        }
+
+        var url = StripQuotes(trimmed[4..^1]);
+        return url.Length == 0 || url.Contains('"') || url.Contains('\'') ? null : url;
+    }
+
+    /// <summary>
+    /// Re-derives a `::before`/`::after` pseudo-element's generated content from its own *raw*
+    /// `content` declaration, as text and image segments, for the parts AngleSharp.Css's own
+    /// generated-content resolution cannot handle, because they need document state:
+    /// `counter()`/`counters()`, the quote keywords (`open-quote`, `close-quote`, `no-open-quote`,
+    /// `no-close-quote`, nested through <paramref name="state"/> and picked from `quotes`) and
+    /// `url()` images among text. Strings and `attr()` may be mixed in. A value without any of
+    /// these, or one this parser does not recognize, returns <see langword="false"/> so the caller keeps AngleSharp.Css's own
+    /// text (a rejected value is rejected whole, before it can change the quote depth). Only the
+    /// `decimal` counter style is supported - a second `counter()` argument is skipped.
+    /// </summary>
+    private static bool TryEvaluateGeneratedContent(string? rawContent, IElement host, ICssStyleDeclaration style, Dictionary<string, Stack<int>> counters, GeneratedContentState state, out List<GeneratedContentSegment> result)
+    {
+        result = [];
 
         if (string.IsNullOrWhiteSpace(rawContent) ||
-            !(rawContent.Contains("counter(", StringComparison.OrdinalIgnoreCase) || rawContent.Contains("counters(", StringComparison.OrdinalIgnoreCase)))
+            !(rawContent.Contains("counter", StringComparison.OrdinalIgnoreCase) ||
+              rawContent.Contains("quote", StringComparison.OrdinalIgnoreCase) ||
+              rawContent.Contains("url(", StringComparison.OrdinalIgnoreCase)) ||
+            !TryTokenizeContent(rawContent, out var tokens))
         {
             return false;
         }
 
+        var segments = result;
         var builder = new StringBuilder();
+
+        void Flush()
+        {
+            if (builder.Length > 0)
+            {
+                segments.Add(new GeneratedContentSegment(builder.ToString(), null));
+                builder.Clear();
+            }
+        }
+        IReadOnlyList<(string Open, string Close)>? quotes = null;
+
+        foreach (var (kind, value, arguments) in tokens)
+        {
+            switch (kind)
+            {
+                case ContentTokenKind.String:
+                    builder.Append(value);
+                    break;
+
+                case ContentTokenKind.Function when value == "counter" && arguments.Length > 0:
+                    builder.Append((counters.TryGetValue(arguments[0], out var stack) && stack.Count > 0 ? stack.Peek() : 0).ToString(CultureInfo.InvariantCulture));
+                    break;
+
+                case ContentTokenKind.Function when value == "counters" && arguments.Length > 0:
+                    builder.Append(counters.TryGetValue(arguments[0], out var nested) && nested.Count > 0
+                        ? string.Join(arguments.Length > 1 ? arguments[1] : string.Empty, nested.Reverse())
+                        : "0");
+                    break;
+
+                case ContentTokenKind.Function when value == "attr" && arguments.Length > 0:
+                    builder.Append(host.GetAttribute(arguments[0]) ?? string.Empty);
+                    break;
+
+                case ContentTokenKind.Function when value == "url" && arguments.Length > 0:
+                    Flush();
+                    segments.Add(new GeneratedContentSegment(null, arguments[0]));
+                    break;
+
+                case ContentTokenKind.Keyword when value == "open-quote":
+                    quotes ??= ResolveQuotes(style.GetPropertyValue("quotes"), host);
+
+                    if (quotes.Count > 0)
+                    {
+                        builder.Append(quotes[Math.Min(state.QuoteDepth, quotes.Count - 1)].Open);
+                    }
+
+                    state.QuoteDepth++;
+                    break;
+
+                case ContentTokenKind.Keyword when value == "close-quote":
+                    if (state.QuoteDepth > 0)
+                    {
+                        state.QuoteDepth--;
+                        quotes ??= ResolveQuotes(style.GetPropertyValue("quotes"), host);
+
+                        if (quotes.Count > 0)
+                        {
+                            builder.Append(quotes[Math.Min(state.QuoteDepth, quotes.Count - 1)].Close);
+                        }
+                    }
+
+                    break;
+
+                case ContentTokenKind.Keyword when value == "no-open-quote":
+                    state.QuoteDepth++;
+                    break;
+
+                case ContentTokenKind.Keyword when value == "no-close-quote":
+                    state.QuoteDepth = Math.Max(0, state.QuoteDepth - 1);
+                    break;
+            }
+        }
+
+        Flush();
+        return true;
+    }
+
+    /// <summary>A run of generated text, or (with <see cref="ImageUrl"/>) one generated image.</summary>
+    private readonly record struct GeneratedContentSegment(string? Text, string? ImageUrl);
+
+    private enum ContentTokenKind
+    {
+        String,
+        Function,
+        Keyword,
+    }
+
+    /// <summary>
+    /// Splits a serialized `content` value into strings, functions (`counter()`, `counters()`,
+    /// `attr()`, `url()`) and quote keywords; any other token fails the whole value.
+    /// </summary>
+    private static bool TryTokenizeContent(string rawContent, out List<(ContentTokenKind Kind, string Value, string[] Arguments)> tokens)
+    {
+        tokens = [];
         var i = 0;
 
         while (i < rawContent.Length)
@@ -7036,30 +7583,58 @@ public sealed partial class HtmlRenderer
 
             if (rawContent[i] is '"' or '\'')
             {
-                var quote = rawContent[i];
-                var closingQuoteIndex = rawContent.IndexOf(quote, i + 1);
+                var closingQuoteIndex = rawContent.IndexOf(rawContent[i], i + 1);
 
                 if (closingQuoteIndex < 0)
                 {
                     return false;
                 }
 
-                builder.Append(rawContent[(i + 1)..closingQuoteIndex]);
+                tokens.Add((ContentTokenKind.String, rawContent[(i + 1)..closingQuoteIndex], []));
                 i = closingQuoteIndex + 1;
                 continue;
             }
 
-            var openParenIndex = rawContent.IndexOf('(', i);
+            var start = i;
 
-            if (openParenIndex < 0)
+            while (i < rawContent.Length && (char.IsLetterOrDigit(rawContent[i]) || rawContent[i] == '-'))
+            {
+                i++;
+            }
+
+            var name = rawContent[start..i].ToLowerInvariant();
+
+            if (name.Length == 0)
             {
                 return false;
             }
 
-            var functionName = rawContent[i..openParenIndex].Trim().ToLowerInvariant();
-            var closeParenIndex = rawContent.IndexOf(')', openParenIndex);
+            if (i >= rawContent.Length || rawContent[i] != '(')
+            {
+                if (name is not ("open-quote" or "close-quote" or "no-open-quote" or "no-close-quote"))
+                {
+                    return false;
+                }
 
-            if (closeParenIndex < 0)
+                tokens.Add((ContentTokenKind.Keyword, name, []));
+                continue;
+            }
+
+            // A quoted argument (a `url("...")`, a `counters()` separator) may itself contain `)`.
+            var closeParenIndex = i + 1;
+
+            while (closeParenIndex < rawContent.Length && rawContent[closeParenIndex] != ')')
+            {
+                if (rawContent[closeParenIndex] is '"' or '\'')
+                {
+                    var end = rawContent.IndexOf(rawContent[closeParenIndex], closeParenIndex + 1);
+                    closeParenIndex = end < 0 ? rawContent.Length : end;
+                }
+
+                closeParenIndex++;
+            }
+
+            if (closeParenIndex >= rawContent.Length || name is not ("counter" or "counters" or "attr" or "url"))
             {
                 return false;
             }
@@ -7068,37 +7643,63 @@ public sealed partial class HtmlRenderer
             // preserve the author's original comma - `counters(item, ".")` round-trips through
             // `GetPropertyValue` as `counters(item .)`, space-separated with no comma at all
             // (confirmed empirically, not assumed) - so arguments have to be tokenized respecting
-            // quoted strings and treating both `,` and whitespace as equally valid separators,
-            // rather than a naive `Split(',')`.
-            var arguments = TokenizeFunctionArguments(rawContent[(openParenIndex + 1)..closeParenIndex])
+            // quoted strings and treating both `,` and whitespace as equally valid separators.
+            var arguments = TokenizeFunctionArguments(rawContent[(i + 1)..closeParenIndex])
                 .Select(StripQuotes)
                 .ToArray();
 
-            if (functionName == "counter" && arguments.Length > 0)
-            {
-                var value = counters.TryGetValue(arguments[0], out var stack) && stack.Count > 0 ? stack.Peek() : 0;
-                builder.Append(value.ToString(CultureInfo.InvariantCulture));
-            }
-            else if (functionName == "counters" && arguments.Length > 0)
-            {
-                var separator = arguments.Length > 1 ? arguments[1] : string.Empty;
-                var value = counters.TryGetValue(arguments[0], out var stack) && stack.Count > 0
-                    ? string.Join(separator, stack.Reverse())
-                    : "0";
-                builder.Append(value);
-            }
-            else
-            {
-                // An unrecognized function (attr(), url(), ...) mixed into the same value - bail
-                // out entirely rather than guessing, per this method's own scope-cut remarks.
-                return false;
-            }
+            tokens.Add((ContentTokenKind.Function, name, arguments));
 
             i = closeParenIndex + 1;
         }
 
-        result = builder.ToString();
         return true;
+    }
+
+    /// <summary>
+    /// The quote pairs of a `quotes` value, outermost first: the listed strings, none for `none`,
+    /// or (`auto`, which AngleSharp.Css reports for an unset value as an empty string) the
+    /// conventional pairs of the host's content language, English by default.
+    /// </summary>
+    private static IReadOnlyList<(string Open, string Close)> ResolveQuotes(string? quotesValue, IElement host)
+    {
+        var trimmed = quotesValue?.Trim() ?? string.Empty;
+
+        if (trimmed.Equals("none", StringComparison.OrdinalIgnoreCase))
+        {
+            return [];
+        }
+
+        if (trimmed.Length > 0 && !trimmed.Equals("auto", StringComparison.OrdinalIgnoreCase))
+        {
+            var strings = TokenizeFunctionArguments(trimmed).Select(StripQuotes).ToList();
+            var pairs = new List<(string Open, string Close)>();
+
+            for (var i = 0; i + 1 < strings.Count; i += 2)
+            {
+                pairs.Add((strings[i], strings[i + 1]));
+            }
+
+            if (pairs.Count > 0)
+            {
+                return pairs;
+            }
+        }
+
+        var language = host.Closest("[lang]")?.GetAttribute("lang")?.Trim().ToLowerInvariant() ?? string.Empty;
+        var primary = language.Split('-', '_')[0];
+
+        return primary switch
+        {
+            "de" or "cs" or "sk" or "sl" or "lt" or "is" => [("\u201E", "\u201C"), ("\u201A", "\u2018")],
+            "fr" or "es" or "it" or "pt" or "ca" or "el" => [("\u00AB", "\u00BB"), ("\u201C", "\u201D")],
+            "ru" or "uk" or "be" => [("\u00AB", "\u00BB"), ("\u201E", "\u201C")],
+            "pl" or "hu" or "ro" or "hr" or "bg" => [("\u201E", "\u201D"), ("\u00AB", "\u00BB")],
+            "sv" or "fi" => [("\u201D", "\u201D"), ("\u2019", "\u2019")],
+            "da" => [("\u00BB", "\u00AB"), ("\u203A", "\u2039")],
+            "ja" => [("\u300C", "\u300D"), ("\u300E", "\u300F")],
+            _ => [("\u201C", "\u201D"), ("\u2018", "\u2019")],
+        };
     }
 
     private static string StripQuotes(string token)
@@ -8608,6 +9209,60 @@ public sealed partial class HtmlRenderer
         var toOrigin = RenderTransform2D.Translate(originX, originY);
         var fromOrigin = RenderTransform2D.Translate(-originX, -originY);
         return RenderTransform2D.Multiply(toOrigin, RenderTransform2D.Multiply(functionsMatrix, fromOrigin));
+    }
+
+    /// <summary>
+    /// An element's current authored `transform`, read the way <see cref="CreateStyleMap"/> reads
+    /// it (the extracted inline declaration, else the cascaded one) - never the computed value.
+    /// </summary>
+    internal static string? ReadAuthoredTransform(IElement element)
+    {
+        var inline = element.GetAttribute("data-render-transform");
+
+        if (!string.IsNullOrWhiteSpace(inline))
+        {
+            return inline;
+        }
+
+        var window = element.Owner?.DefaultView;
+
+        if (window is null)
+        {
+            return null;
+        }
+
+        var device = window.Document.Context.GetService<IRenderDevice>() ?? new DefaultRenderDevice();
+        return window.GetStyleCollection(device).GetDeclarations(element).GetPropertyValue("transform");
+    }
+
+    /// <summary>
+    /// The 2D matrix of a transform list that needs no box to resolve (no percentages), for
+    /// interpolating mismatched lists; <see langword="null"/> otherwise.
+    /// </summary>
+    internal static RenderTransform2D? TryComputeTransformMatrix(string value)
+    {
+        if (value.Contains('%'))
+        {
+            return null;
+        }
+
+        if (value.Trim().Equals("none", StringComparison.OrdinalIgnoreCase))
+        {
+            return RenderTransform2D.Identity;
+        }
+
+        var dimensions = new CssTransformRenderDimensions(0d, 0d, 16d);
+        var source = new StringSource(value);
+        var matrix = RenderTransform2D.Identity;
+        var any = false;
+
+        while (TransformParser.ParseTransform(source) is { } functionValue)
+        {
+            matrix = RenderTransform2D.Multiply(matrix, ConvertToRenderTransform(functionValue, dimensions));
+            any = true;
+        }
+
+        return any ? matrix : null;
     }
 
     private static string[] GetIndividualTransformParts(Dictionary<string, string> styleMap, string propertyName) =>

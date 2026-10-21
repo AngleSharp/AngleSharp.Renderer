@@ -30,6 +30,13 @@ internal static class SvgElementRenderer
         }
     }
 
+    /// <summary>
+    /// Renders one element in user space with initial paint state, the way a filter's `feImage`
+    /// draws an `#id` reference.
+    /// </summary>
+    public static void RenderReferencedElement(SKCanvas canvas, IElement element, SvgRenderContext context, SvgViewport viewport) =>
+        RenderElement(canvas, element, SvgPaintState.Initial, context, viewport);
+
     private static void RenderElement(SKCanvas canvas, IElement element, SvgPaintState inheritedState, SvgRenderContext context, SvgViewport viewport)
     {
         var tagName = element.LocalName;
@@ -66,9 +73,11 @@ internal static class SvgElementRenderer
 
         var filterLayerCount = -1;
 
-        if (filterElement is not null && SvgFilterBuilder.Build(filterElement) is { } imageFilter)
+        if (filterElement is not null && SvgFilterBuilder.Build(filterElement, element, context, viewport) is { } filter)
         {
-            using var filterPaint = new SKPaint { ImageFilter = imageFilter };
+            // The filter region clips both what the filter sees and what it produces.
+            canvas.ClipRect(filter.Region);
+            using var filterPaint = new SKPaint { ImageFilter = filter.ImageFilter };
             filterLayerCount = canvas.SaveLayer(filterPaint);
         }
 

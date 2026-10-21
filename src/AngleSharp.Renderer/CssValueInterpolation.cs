@@ -1,6 +1,7 @@
 using AngleSharp.Css.Dom;
 using AngleSharp.Css.Parser;
 using AngleSharp.Css.Values;
+using AngleSharp.Dom;
 using AngleSharp.Renderer.Rendering;
 using AngleSharp.Text;
 using System.Globalization;
@@ -16,6 +17,12 @@ internal enum CssInterpolationValueKind
     Color,
     LengthPixels,
     Number,
+
+    /// <summary>
+    /// A list of functions or components (`transform`, `filter`, `translate`, ...), interpolated by
+    /// structure (<see cref="CssFunctionListInterpolation"/>).
+    /// </summary>
+    FunctionList,
 }
 
 /// <summary>
@@ -78,7 +85,7 @@ internal readonly record struct CssTimingFunction(bool IsSteps, double X1, doubl
             u = (lo + hi) / 2d;
             var currentX = BezierComponent(u, x1, x2);
 
-            if (Math.Abs(currentX - x) < 0.0001d)
+            if (Math.Abs(currentX - x) < 1e-7d)
             {
                 break;
             }
@@ -108,13 +115,11 @@ internal readonly record struct CssTimingFunction(bool IsSteps, double X1, doubl
 
 /// <summary>
 /// Shared value-interpolation machinery for CSS `transition` (<see cref="CssTransitionTracker"/>)
-/// and `animation` (<see cref="CssAnimationTracker"/>) - both only ever animate a fixed, explicit
-/// whitelist of properties (colors, channel-wise; numeric lengths/`opacity`, plain numeric lerp),
-/// covering the overwhelming majority of real-world usage without a general CSS-value
-/// interpolation engine that would need to understand every property's own grammar, including ones
-/// this renderer does not otherwise resolve component-wise (`transform`/`filter`) - a deliberate,
-/// documented scope cut, not an oversight. `transition-property: all` (and an `animation` keyframe
-/// declaring any other property) is limited to this same whitelist for the same reason.
+/// and `animation` (<see cref="CssAnimationTracker"/>) - both animate an explicit whitelist of
+/// properties: colors (channel-wise), numeric lengths and `opacity` (plain numeric lerp), and the
+/// function lists `transform`/`translate`/`rotate`/`scale`/`filter`/`backdrop-filter` (by structure,
+/// <see cref="CssFunctionListInterpolation"/>). `transition-property: all` (and an `animation`
+/// keyframe declaring any other property) is limited to this same whitelist.
 /// </summary>
 internal static class CssValueInterpolation
 {
@@ -146,20 +151,35 @@ internal static class CssValueInterpolation
         ["left"] = CssInterpolationValueKind.LengthPixels,
         ["right"] = CssInterpolationValueKind.LengthPixels,
         ["bottom"] = CssInterpolationValueKind.LengthPixels,
+        ["transform"] = CssInterpolationValueKind.FunctionList,
+        ["translate"] = CssInterpolationValueKind.FunctionList,
+        ["rotate"] = CssInterpolationValueKind.FunctionList,
+        ["scale"] = CssInterpolationValueKind.FunctionList,
+        ["filter"] = CssInterpolationValueKind.FunctionList,
+        ["backdrop-filter"] = CssInterpolationValueKind.FunctionList,
     };
 
     public static CssInterpolationValueKind KindOf(string property) =>
         InterpolatableProperties.TryGetValue(property, out var kind) ? kind : CssInterpolationValueKind.Number;
 
-    public static string? ReadNaturalValue(ICssStyleDeclaration style, string property, CssInterpolationValueKind kind)
+    /// <summary>
+    /// The value of <paramref name="property"/> in <paramref name="style"/> in a form
+    /// <see cref="Interpolate"/> understands, or <see langword="null"/> when it has none. With an
+    /// <paramref name="element"/> (an element's own current value, as opposed to a keyframe's
+    /// declaration), an unset function list counts as its initial `none`, so it can transition
+    /// from and to nothing.
+    /// </summary>
+    public static string? ReadNaturalValue(ICssStyleDeclaration style, string property, CssInterpolationValueKind kind, IElement? element = null)
     {
         var raw = property.Equals("opacity", StringComparison.OrdinalIgnoreCase)
             ? style.GetOpacity()
-            : style.GetPropertyValue(property);
+            : property.Equals("transform", StringComparison.OrdinalIgnoreCase) && element is not null
+                ? HtmlRenderer.ReadAuthoredTransform(element)
+                : style.GetPropertyValue(property);
 
         if (string.IsNullOrWhiteSpace(raw))
         {
-            return null;
+            return kind == CssInterpolationValueKind.FunctionList && element is not null ? "none" : null;
         }
 
         return kind switch
@@ -167,6 +187,7 @@ internal static class CssValueInterpolation
             CssInterpolationValueKind.Color => raw,
             CssInterpolationValueKind.Number => float.TryParse(raw.Trim(), NumberStyles.Float, CultureInfo.InvariantCulture, out _) ? raw.Trim() : null,
             CssInterpolationValueKind.LengthPixels => float.IsNaN(HtmlRenderer.ParseLengthValue(raw, float.NaN, allowAuto: false)) ? null : raw,
+            CssInterpolationValueKind.FunctionList => raw.Trim(),
             _ => null,
         };
     }
@@ -183,6 +204,7 @@ internal static class CssValueInterpolation
             CssInterpolationValueKind.Color => HtmlRenderer.ParseColor(a, RenderColor.Transparent) == HtmlRenderer.ParseColor(b, RenderColor.Transparent),
             CssInterpolationValueKind.Number or CssInterpolationValueKind.LengthPixels =>
                 Math.Abs(HtmlRenderer.ParseLengthValue(a, 0f, allowAuto: false) - HtmlRenderer.ParseLengthValue(b, 0f, allowAuto: false)) < 0.01f,
+            CssInterpolationValueKind.FunctionList => CssFunctionListInterpolation.AreEquivalent(a, b),
             _ => false,
         };
     }
@@ -193,13 +215,12 @@ internal static class CssValueInterpolation
 
         if (kind == CssInterpolationValueKind.Color)
         {
-            var fromColor = HtmlRenderer.ParseColor(from, RenderColor.Transparent);
-            var toColor = HtmlRenderer.ParseColor(to, RenderColor.Transparent);
-            var r = Lerp(fromColor.R, toColor.R, t);
-            var g = Lerp(fromColor.G, toColor.G, t);
-            var b = Lerp(fromColor.B, toColor.B, t);
-            var a = Lerp(fromColor.A, toColor.A, t) / 255d;
-            return string.Create(CultureInfo.InvariantCulture, $"rgba({r}, {g}, {b}, {a.ToString("0.###", CultureInfo.InvariantCulture)})");
+            return InterpolateColor(HtmlRenderer.ParseColor(from, RenderColor.Transparent), HtmlRenderer.ParseColor(to, RenderColor.Transparent), t);
+        }
+
+        if (kind == CssInterpolationValueKind.FunctionList)
+        {
+            return CssFunctionListInterpolation.Interpolate(property, from, to, t);
         }
 
         var fromNumber = HtmlRenderer.ParseLengthValue(from, 0f, allowAuto: false);
@@ -209,6 +230,15 @@ internal static class CssValueInterpolation
         return kind == CssInterpolationValueKind.Number
             ? interpolated.ToString("0.####", CultureInfo.InvariantCulture)
             : string.Create(CultureInfo.InvariantCulture, $"{interpolated.ToString("0.####", CultureInfo.InvariantCulture)}px");
+    }
+
+    public static string InterpolateColor(RenderColor from, RenderColor to, double t)
+    {
+        var r = Lerp(from.R, to.R, t);
+        var g = Lerp(from.G, to.G, t);
+        var b = Lerp(from.B, to.B, t);
+        var a = Lerp(from.A, to.A, t) / 255d;
+        return string.Create(CultureInfo.InvariantCulture, $"rgba({r}, {g}, {b}, {a.ToString("0.###", CultureInfo.InvariantCulture)})");
     }
 
     private static byte Lerp(byte from, byte to, double t) =>

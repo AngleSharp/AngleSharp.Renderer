@@ -37,6 +37,32 @@ public sealed class TableLayoutTests
         Assert.Equal(new RenderRect(47f, 12f, 30f, 10f), green.Rect);
     }
 
+    [Theory]
+    [InlineData("", 200f)]
+    [InlineData("box-sizing:content-box;", 220f)]
+    public async Task TableWidth_IsABorderBoxWidthByDefault(string boxSizing, float expectedWidth)
+    {
+        var displayList = await LayoutAsync($$"""
+            <table style="{{boxSizing}} width:200px; border:10px solid #0000ff; border-spacing:0; background-color:#ffff00">
+              <tr><td style="padding:0; height:10px"></td></tr>
+            </table>
+            """);
+
+        Assert.Equal(expectedWidth, SingleFill(displayList, Yellow).Rect.Width, precision: 2);
+    }
+
+    [Fact]
+    public async Task Table_DoesNotInheritTextIndent()
+    {
+        var displayList = await LayoutAsync("""
+            <div style="text-indent:40px">
+              <table style="border-spacing:0"><tr><td style="padding:0; background-color:#ff0000">x</td></tr></table>
+            </div>
+            """);
+
+        Assert.Equal(SingleFill(displayList, Red).Rect.X, SingleText(displayList, "x").X, precision: 2);
+    }
+
     [Fact]
     public async Task AutoWidthTable_ShrinksToFitAndCentersWithAutoMargins()
     {

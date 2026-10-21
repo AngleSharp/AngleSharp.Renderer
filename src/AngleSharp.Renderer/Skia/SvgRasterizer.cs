@@ -91,7 +91,7 @@ internal static class SvgRasterizer
     /// Rasterizes an SVG element that was already parsed as part of a larger document (an inline
     /// &lt;svg&gt; in the host HTML) - the DOM is walked directly, nothing is re-parsed.
     /// </summary>
-    public static bool TryRasterizeElement(IElement svgRoot, out byte[] pngBytes, out int naturalWidth, out int naturalHeight)
+    public static bool TryRasterizeElement(IElement svgRoot, out byte[] pngBytes, out int naturalWidth, out int naturalHeight, SvgPageStyle? pageStyle = null)
     {
         pngBytes = [];
         naturalWidth = 0;
@@ -123,13 +123,16 @@ internal static class SvgRasterizer
             using var bitmap = new SKBitmap(pixelWidth, pixelHeight, SKColorType.Rgba8888, SKAlphaType.Premul);
             bitmap.Erase(SKColors.Transparent);
 
-            var renderContext = SvgRenderContext.Build(svgRoot);
+            var renderContext = SvgRenderContext.Build(svgRoot, pageStyle);
+            var initialState = pageStyle is null
+                ? SvgPaintState.Initial
+                : SvgPaintState.Initial.ResolveDeclarations(pageStyle.Inherited, contentViewport);
 
             using (var canvas = new SKCanvas(bitmap))
             {
                 canvas.Scale(scale, scale);
                 canvas.Concat(ref viewBoxMatrix);
-                SvgElementRenderer.Render(canvas, svgRoot, SvgPaintState.Initial, renderContext, contentViewport);
+                SvgElementRenderer.Render(canvas, svgRoot, initialState, renderContext, contentViewport);
                 canvas.Flush();
             }
 

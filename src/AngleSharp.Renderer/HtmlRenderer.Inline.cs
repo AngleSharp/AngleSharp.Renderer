@@ -226,7 +226,7 @@ public sealed partial class HtmlRenderer
             return true;
         }
 
-        if (element.Ref is not IPseudoElement && IsReplacedElementTag(element.Ref.LocalName))
+        if (IsReplacedElement(element.Ref))
         {
             var display = GetDisplay(styleMap)?.Trim().ToLowerInvariant();
             return string.IsNullOrEmpty(display) || display is "inline" or "inline-block";
@@ -251,7 +251,7 @@ public sealed partial class HtmlRenderer
     private static bool IsAtomicInlineElement(ElementRenderNode element, Dictionary<string, string> styleMap) =>
         IsAtomicInlineDisplay(element.ComputedStyle) ||
         ResolveFormControlKind(element.Ref) != FormControlKind.None ||
-        (element.Ref is not IPseudoElement && IsReplacedElementTag(element.Ref.LocalName) && IsInlineLevelElement(element, styleMap));
+        (IsReplacedElement(element.Ref) && IsInlineLevelElement(element, styleMap));
 
     private enum InlinePieceKind
     {
@@ -2018,7 +2018,7 @@ public sealed partial class HtmlRenderer
     {
         width = 0f;
 
-        if (element.Ref is IPseudoElement || !IsReplacedElementTag(element.Ref.LocalName) ||
+        if (!IsReplacedElement(element.Ref) ||
             !TryResolveReplacedElementImage(element, styleMap, containingWidth, 0f, 0f, out _, out var imageRect, out var objectFitClip))
         {
             return false;
@@ -2143,7 +2143,7 @@ public sealed partial class HtmlRenderer
 
         // An orthogonal flow is as wide as its content's block size.
         if (IsVerticalMode(textStyle.WritingMode) != IsVerticalMode(textStyle.FlowMode) && formControlKind == FormControlKind.None &&
-            !(element.Ref is not IPseudoElement && IsReplacedElementTag(element.Ref.LocalName)))
+            !IsReplacedElement(element.Ref))
         {
             var blockSize = MeasureOrthogonalBlockSize(element, styleMap, textStyle, percentageBase, context);
             return new IntrinsicWidths(blockSize, blockSize);

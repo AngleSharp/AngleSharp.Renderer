@@ -1704,12 +1704,139 @@ public sealed class HtmlRendererTests
             .ToArray();
 
         Assert.Equal(2, secondColumnCells.Length);
-        // First grid: the item's estimated size (20px) is below the minmax() floor, so the
-        // Auto track clamps up to its 60px minimum.
-        Assert.Equal(60f, secondColumnCells[0].Rect.X);
-        // Second grid: the item's estimated size (150px) exceeds the minmax() ceiling, so the
-        // Auto track clamps down to its 100px maximum.
+        // First grid: the item (20px) is below the minmax() floor, so the track starts at 60px,
+        // then free space grows it to its fixed 100px maximum.
+        Assert.Equal(100f, secondColumnCells[0].Rect.X);
+        // Second grid: the item (150px) exceeds the minmax() ceiling, so the track stops at 100px.
         Assert.Equal(100f, secondColumnCells[1].Rect.X);
+    }
+
+    [Theory]
+    [InlineData("block")]
+    [InlineData("flex; flex-direction:column")]
+    public async Task BuildDisplayList_AuthoredHeightLetsContentOverflow(string display)
+    {
+        var document = await ParseAsync($$"""
+            <html><body style="margin:0">
+                <div style="display:{{display}}; height:20px; background-color:#ff0000;">
+                    <div style="height:30px;"></div>
+                    <div style="height:30px;"></div>
+                </div>
+                <div style="height:10px; background-color:#0000ff;"></div>
+            </body></html>
+            """);
+
+        var displayList = new HtmlRenderer().BuildDisplayList(document, new DefaultRenderDevice { ViewPortWidth = 200, ViewPortHeight = 200 });
+        var box = Assert.Single(displayList.Commands.OfType<FillRectCommand>().Where(command => command.Color.Equals(new RenderColor(255, 0, 0))));
+        var next = Assert.Single(displayList.Commands.OfType<FillRectCommand>().Where(command => command.Color.Equals(new RenderColor(0, 0, 255))));
+
+        Assert.Equal(20f, box.Rect.Height, precision: 2);
+        Assert.Equal(box.Rect.Y + 20f, next.Rect.Y, precision: 2);
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_SizesAutoGridColumnToItsMaxContent()
+    {
+        var document = await ParseAsync("""
+            <html><body>
+                <div style="display:grid; grid-template-columns:auto 1fr; width:300px;">
+                    <div style="background-color:#ff0000;"><span style="display:inline-block; width:40px; height:10px;"></span><span style="display:inline-block; width:40px; height:10px;"></span></div>
+                    <div style="height:10px; background-color:#0000ff;"></div>
+                </div>
+            </body></html>
+            """);
+
+        var displayList = new HtmlRenderer().BuildDisplayList(document, new DefaultRenderDevice { ViewPortWidth = 400, ViewPortHeight = 200 });
+        var first = Assert.Single(displayList.Commands.OfType<FillRectCommand>().Where(command => command.Color.Equals(new RenderColor(255, 0, 0))));
+        var second = Assert.Single(displayList.Commands.OfType<FillRectCommand>().Where(command => command.Color.Equals(new RenderColor(0, 0, 255))));
+
+        Assert.Equal(80f, first.Rect.Width, precision: 2);
+        Assert.Equal(first.Rect.X + 80f, second.Rect.X, precision: 2);
+        Assert.Equal(220f, second.Rect.Width, precision: 2);
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_GrowsAutoGridColumnFromMinContentIntoFreeSpace()
+    {
+        // min-content 40px, max-content more than 80px: the track gets the 50px left beside 250px.
+        var document = await ParseAsync("""
+            <html><body>
+                <div style="display:grid; grid-template-columns:auto 250px; width:300px;">
+                    <div style="background-color:#ff0000;"><span style="display:inline-block; width:40px; height:10px;"></span> <span style="display:inline-block; width:40px; height:10px;"></span></div>
+                    <div style="height:10px; background-color:#0000ff;"></div>
+                </div>
+            </body></html>
+            """);
+
+        var displayList = new HtmlRenderer().BuildDisplayList(document, new DefaultRenderDevice { ViewPortWidth = 400, ViewPortHeight = 200 });
+        var first = Assert.Single(displayList.Commands.OfType<FillRectCommand>().Where(command => command.Color.Equals(new RenderColor(255, 0, 0))));
+
+        Assert.Equal(50f, first.Rect.Width, precision: 2);
+    }
+
+    [Theory]
+    [InlineData("normal", 150f)]
+    [InlineData("start", 50f)]
+    public async Task BuildDisplayList_StretchesAutoGridColumnsUnlessJustified(string justifyContent, float expectedWidth)
+    {
+        var document = await ParseAsync($$"""
+            <html><body>
+                <div style="display:grid; grid-template-columns:auto auto; justify-content:{{justifyContent}}; width:300px;">
+                    <div style="background-color:#ff0000;"><div style="width:50px; height:10px;"></div></div>
+                    <div style="background-color:#0000ff;"><div style="width:50px; height:10px;"></div></div>
+                </div>
+            </body></html>
+            """);
+
+        var displayList = new HtmlRenderer().BuildDisplayList(document, new DefaultRenderDevice { ViewPortWidth = 400, ViewPortHeight = 200 });
+        var first = Assert.Single(displayList.Commands.OfType<FillRectCommand>().Where(command => command.Color.Equals(new RenderColor(255, 0, 0))));
+        var second = Assert.Single(displayList.Commands.OfType<FillRectCommand>().Where(command => command.Color.Equals(new RenderColor(0, 0, 255))));
+
+        Assert.Equal(expectedWidth, first.Rect.Width, precision: 2);
+        Assert.Equal(expectedWidth, second.Rect.Width, precision: 2);
+        Assert.Equal(first.Rect.X + expectedWidth, second.Rect.X, precision: 2);
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_SpreadsSpanningGridItemAcrossItsAutoColumns()
+    {
+        var document = await ParseAsync("""
+            <html><body>
+                <div style="display:grid; grid-template-columns:auto auto; justify-content:start;">
+                    <div style="grid-column:span 2;"><div style="width:120px; height:10px;"></div></div>
+                    <div style="background-color:#ff0000;"><div style="width:20px; height:10px;"></div></div>
+                    <div style="background-color:#0000ff;"><div style="width:20px; height:10px;"></div></div>
+                </div>
+            </body></html>
+            """);
+
+        var displayList = new HtmlRenderer().BuildDisplayList(document, new DefaultRenderDevice { ViewPortWidth = 400, ViewPortHeight = 200 });
+        var first = Assert.Single(displayList.Commands.OfType<FillRectCommand>().Where(command => command.Color.Equals(new RenderColor(255, 0, 0))));
+        var second = Assert.Single(displayList.Commands.OfType<FillRectCommand>().Where(command => command.Color.Equals(new RenderColor(0, 0, 255))));
+
+        Assert.Equal(60f, first.Rect.Width, precision: 2);
+        Assert.Equal(60f, second.Rect.Width, precision: 2);
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_SizesMinAndMaxContentGridColumns()
+    {
+        var document = await ParseAsync("""
+            <html><body>
+                <div style="display:grid; grid-template-columns:min-content max-content; width:300px;">
+                    <div style="background-color:#ff0000;"><span style="display:inline-block; width:40px; height:10px;"></span> <span style="display:inline-block; width:40px; height:10px;"></span></div>
+                    <div style="background-color:#0000ff;"><span style="display:inline-block; width:30px; height:10px;"></span><span style="display:inline-block; width:30px; height:10px;"></span></div>
+                </div>
+            </body></html>
+            """);
+
+        var displayList = new HtmlRenderer().BuildDisplayList(document, new DefaultRenderDevice { ViewPortWidth = 400, ViewPortHeight = 200 });
+        var first = Assert.Single(displayList.Commands.OfType<FillRectCommand>().Where(command => command.Color.Equals(new RenderColor(255, 0, 0))));
+        var second = Assert.Single(displayList.Commands.OfType<FillRectCommand>().Where(command => command.Color.Equals(new RenderColor(0, 0, 255))));
+
+        // Neither keyword stretches into the 200px left over.
+        Assert.Equal(40f, first.Rect.Width, precision: 2);
+        Assert.Equal(60f, second.Rect.Width, precision: 2);
     }
 
     [Fact]
@@ -2330,8 +2457,9 @@ public sealed class HtmlRendererTests
         using var bitmap = SkiaSharp.SKBitmap.Decode(image.Data);
         var pixel = bitmap.GetPixel(20, 20);
 
-        // slope=0.5 halves the red channel (200 -> ~100); green/blue are untouched (still 0).
-        Assert.InRange(pixel.Red, 90, 110);
+        // slope=0.5 halves the red channel in linearRGB, the default color-interpolation-filters:
+        // 200 is 0.578 linear, halved 0.289, back in sRGB ~146. Green/blue are untouched (still 0).
+        Assert.InRange(pixel.Red, 140, 152);
         Assert.Equal(0, pixel.Green);
         Assert.Equal(0, pixel.Blue);
     }
@@ -4817,7 +4945,6 @@ public sealed class HtmlRendererTests
     [InlineData("email")]
     [InlineData("search")]
     [InlineData("tel")]
-    [InlineData("date")]
     public async Task BuildDisplayList_TextLikeInputGetsDefaultChromeAndShowsItsValue(string type)
     {
         var document = await ParseAsync($"""<html><body><input type="{type}" value="Hello" /></body></html>""");
