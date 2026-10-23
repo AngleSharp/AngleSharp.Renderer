@@ -27,7 +27,7 @@ public sealed class SkiaTextMeasurer : ITextMeasurer
             return 0f;
         }
 
-        return SkiaTextShaping.MeasureTextWidth(GetPaint(font), text, font.LetterSpacing);
+        return SkiaTextShaping.MeasureTextWidth(GetPaint(font), text, font.LetterSpacing, font);
     }
 
     private static SKPaint GetPaint(RenderFont font)

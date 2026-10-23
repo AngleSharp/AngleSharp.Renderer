@@ -1,6 +1,8 @@
 namespace AngleSharp;
 
 using AngleSharp.Media.Dom;
+using AngleSharp.Renderer.Rendering;
+using System.Linq;
 
 /// <summary>
 /// Configuration extensions for registering canvas rendering services.
@@ -17,12 +19,17 @@ public static class RenderingConfigurationExtensions
     }
 
     /// <summary>
-    /// Registers a custom rendering service with the configuration.
+    /// Registers a custom rendering service with the configuration, plus the image service that
+    /// keeps loaded <c>&lt;img&gt;</c> data available for painting.
     /// </summary>
     public static IConfiguration WithRendering(this IConfiguration configuration, Func<IBrowsingContext, IRenderingService> factory)
     {
         ArgumentNullException.ThrowIfNull(configuration);
         ArgumentNullException.ThrowIfNull(factory);
-        return configuration.WithOnly(factory);
+        configuration = configuration.WithOnly(factory);
+
+        return configuration.Services.OfType<ImageResourceService>().Any()
+            ? configuration
+            : configuration.With(ImageResourceService.Instance);
     }
 }
