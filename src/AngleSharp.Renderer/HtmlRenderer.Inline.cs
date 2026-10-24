@@ -199,11 +199,6 @@ public sealed partial class HtmlRenderer
             return FlowChildKind.OutOfFlow;
         }
 
-        if (IsFloated(styleMap))
-        {
-            return FlowChildKind.Block;
-        }
-
         return IsInlineLevelElement(element, styleMap) ? FlowChildKind.Inline : FlowChildKind.Block;
     }
 
@@ -464,7 +459,7 @@ public sealed partial class HtmlRenderer
                 return;
             }
 
-            if (IsFloated(styleMap) || !IsInlineLevelElement(element, styleMap))
+            if (!IsInlineLevelElement(element, styleMap))
             {
                 Pieces.Add(new InlinePiece { Kind = InlinePieceKind.BlockInInline, Style = parentStyle, Box = parentBox, Element = element });
                 _previousWasCollapsibleSpace = true;
@@ -2241,7 +2236,7 @@ public sealed partial class HtmlRenderer
                         break;
                     }
 
-                    var isInline = IsInlineLevelElement(child, childStyleMap) && !IsFloated(childStyleMap);
+                    var isInline = IsInlineLevelElement(child, childStyleMap);
 
                     if (isInline && !IsAtomicInlineElement(child, childStyleMap))
                     {

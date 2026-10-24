@@ -110,6 +110,11 @@ public sealed partial class HtmlRenderer
     private static WritingModeKind GetContentSystem(IElement element, LayoutContext context) =>
         context.ContentSystems.TryGetValue(element, out var system) ? system : WritingModeKind.HorizontalTb;
 
+    /// <summary>Whether an element's content runs orthogonally to the system its box sits in.</summary>
+    private static bool IsOrthogonalFlow(IElement element, LayoutContext context) =>
+        IsVerticalMode(GetContentSystem(element, context)) !=
+        IsVerticalMode(context.BoxSystems.TryGetValue(element, out var boxSystem) ? boxSystem : WritingModeKind.HorizontalTb);
+
     /// <summary>
     /// The inline size of an orthogonal flow: the box's (logical) height when it has one, else
     /// shrink-to-fit against the viewport's extent along the flow's inline axis.

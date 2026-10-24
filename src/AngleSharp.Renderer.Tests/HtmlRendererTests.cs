@@ -8939,7 +8939,7 @@ public sealed class HtmlRendererTests
     {
         var context = BrowsingContext.New(configuration ?? Configuration.Default.WithCss());
 
-        return await context.OpenAsync(request =>
+        var document = await context.OpenAsync(request =>
         {
             if (!string.IsNullOrWhiteSpace(address))
             {
@@ -8948,6 +8948,14 @@ public sealed class HtmlRendererTests
 
             request.Content(html);
         });
+
+        // The expectations here are in page coordinates without the UA sheet's `body { margin:
+        // 8px }`. As the first sheet, any body margin a test sets itself still wins.
+        var resetStyle = document.CreateElement("style");
+        resetStyle.TextContent = "body { margin: 0 }";
+        document.Head?.Prepend(resetStyle);
+
+        return document;
     }
 
     private sealed class SingleResponseImageRequester : BaseRequester

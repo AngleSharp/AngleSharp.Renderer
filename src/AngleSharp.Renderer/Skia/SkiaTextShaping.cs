@@ -3,6 +3,7 @@ namespace AngleSharp.Renderer.Skia;
 using System.Collections.Concurrent;
 using System.Linq;
 using System.Runtime.CompilerServices;
+using System.Text;
 using System.Threading;
 
 using AngleSharp.Renderer.Rendering;
@@ -56,6 +57,9 @@ internal static class SkiaTextShaping
         new(CreateSystemFontFamilyIndex, LazyThreadSafetyMode.ExecutionAndPublication);
 
     private static readonly ConcurrentDictionary<SystemTypefaceKey, SKTypeface?> ResolvedSystemTypefaces = new();
+
+    // What the host offers for a character no declared or bundled font has, per style.
+    private static readonly ConcurrentDictionary<(int Codepoint, int Weight, int Width, SKFontStyleSlant Slant), SKTypeface?> CharacterFallbacks = new();
 
     // Decoding a font file is expensive and a face outlives a single render, so the typeface is
     // kept alongside the face itself rather than rebuilt per paint.
@@ -132,36 +136,196 @@ internal static class SkiaTextShaping
 
         foreach (var family in families)
         {
-            var normalized = family.Trim('\'', '"', ' ');
-
-            if (string.IsNullOrWhiteSpace(normalized))
-            {
-                continue;
-            }
-
-            // Generic names are keywords, so they always mean the bundled fonts and cannot be
-            // taken over by an @font-face declaration.
-            if (GenericFontMappings.TryGetValue(normalized, out var bundledFamilyKey) &&
-                BundledFonts.Value.TryGetValue(bundledFamilyKey, out var bundledFamily))
-            {
-                return isBold ? bundledFamily.Bold : bundledFamily.Regular;
-            }
-
-            // A declared face takes precedence over an installed font of the same name.
-            if (!faces.IsEmpty &&
-                faces.TryMatch(normalized, requestedWeight, isItalic, out var face) &&
-                TryResolveFaceTypeface(face, fontStyle, out var faceTypeface))
-            {
-                return faceTypeface;
-            }
-
-            if (TryResolveSystemTypeface(normalized, fontStyle, out var typeface))
+            if (TryResolveFamily(family, fontStyle, faces, requestedWeight, out var typeface))
             {
                 return typeface;
             }
         }
 
         return GetDefaultTypeface(isBold);
+    }
+
+    /// <summary>
+    /// Resolves one entry of a <c>font-family</c> list, or reports that it is unavailable.
+    /// </summary>
+    private static bool TryResolveFamily(string family, SKFontStyle fontStyle, FontFaceSet faces, float requestedWeight, out SKTypeface typeface)
+    {
+        var normalized = family.Trim('\'', '"', ' ');
+        var isBold = fontStyle.Weight >= (int)SKFontStyleWeight.Bold;
+        var isItalic = fontStyle.Slant != SKFontStyleSlant.Upright;
+
+        if (string.IsNullOrWhiteSpace(normalized))
+        {
+            typeface = null!;
+            return false;
+        }
+
+        // Generic names are keywords, so they always mean the bundled fonts and cannot be
+        // taken over by an @font-face declaration.
+        if (GenericFontMappings.TryGetValue(normalized, out var bundledFamilyKey) &&
+            BundledFonts.Value.TryGetValue(bundledFamilyKey, out var bundledFamily))
+        {
+            typeface = isBold ? bundledFamily.Bold : bundledFamily.Regular;
+            return true;
+        }
+
+        // A declared face takes precedence over an installed font of the same name.
+        if (!faces.IsEmpty &&
+            faces.TryMatch(normalized, requestedWeight, isItalic, out var face) &&
+            TryResolveFaceTypeface(face, fontStyle, out typeface))
+        {
+            return true;
+        }
+
+        return TryResolveSystemTypeface(normalized, fontStyle, out typeface);
+    }
+
+    /// <summary>
+    /// The typeface that draws a character the font's own typeface has no glyph for (CSS Fonts 4
+    /// §5.1): the next entry of the <c>font-family</c> list that has it, then the bundled fonts,
+    /// then whatever the host offers for it. Only the last step depends on the installed fonts,
+    /// and only for characters none of the bundled fonts cover.
+    /// </summary>
+    private static SKTypeface ResolveFallbackTypeface(RenderFont font, SKTypeface primary, int codepoint)
+    {
+        var fontStyle = CreateFontStyle(font.FontWeight, font.IsItalic, font.FontStretch);
+        var faces = font.Faces ?? FontFaceSet.Empty;
+
+        foreach (var family in font.FontFamily.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+        {
+            if (TryResolveFamily(family, fontStyle, faces, font.FontWeight, out var typeface) && HasGlyph(typeface, codepoint))
+            {
+                return typeface;
+            }
+        }
+
+        var isBold = fontStyle.Weight >= (int)SKFontStyleWeight.Bold;
+
+        foreach (var bundledFamily in BundledFonts.Value.Values)
+        {
+            var typeface = isBold ? bundledFamily.Bold : bundledFamily.Regular;
+
+            if (HasGlyph(typeface, codepoint))
+            {
+                return typeface;
+            }
+        }
+
+        var hostFallback = CharacterFallbacks.GetOrAdd((codepoint, fontStyle.Weight, fontStyle.Width, fontStyle.Slant), static key =>
+        {
+            var match = SKFontManager.Default.MatchCharacter(null, new SKFontStyle(key.Weight, key.Width, key.Slant), null, key.Codepoint);
+            return match is not null && HasGlyph(match, key.Codepoint) ? match : null;
+        });
+
+        return hostFallback ?? primary;
+    }
+
+    private static bool HasGlyph(SKTypeface typeface, int codepoint) => typeface.GetGlyph(codepoint) != 0;
+
+    /// <summary>
+    /// Splits text into runs that each draw with one typeface: the paint's own where it has the
+    /// glyphs, a fallback (<see cref="ResolveFallbackTypeface"/>) where it does not. Returns
+    /// <see langword="null"/> when the paint's typeface covers the whole text, the common case.
+    /// </summary>
+    private static List<(string Text, SKTypeface Typeface)>? SplitFallbackRuns(SKPaint paint, string text, RenderFont? font)
+    {
+        var primary = paint.Typeface;
+
+        if (font is null || primary is null || primary.ContainsGlyphs(text))
+        {
+            return null;
+        }
+
+        var runs = new List<(string Text, SKTypeface Typeface)>();
+        var builder = new StringBuilder();
+        SKTypeface? current = null;
+
+        foreach (var rune in text.EnumerateRunes())
+        {
+            // Spaces and controls stay with the run they are in rather than splitting it.
+            var typeface = current is not null && (Rune.IsWhiteSpace(rune) || Rune.IsControl(rune)) ? current :
+                HasGlyph(primary, rune.Value) || Rune.IsWhiteSpace(rune) || Rune.IsControl(rune) ? primary :
+                ResolveFallbackTypeface(font.Value, primary, rune.Value);
+
+            if (current is not null && !ReferenceEquals(typeface, current))
+            {
+                runs.Add((builder.ToString(), current));
+                builder.Clear();
+            }
+
+            current = typeface;
+            builder.Append(rune.ToString());
+        }
+
+        if (current is not null)
+        {
+            runs.Add((builder.ToString(), current));
+        }
+
+        return runs;
+    }
+
+    /// <summary>
+    /// A copy of <paramref name="paint"/> drawing with another typeface, slanted synthetically
+    /// when the font asks for italics the typeface does not have.
+    /// </summary>
+    private static SKPaint CreateFallbackPaint(SKPaint paint, SKTypeface typeface, RenderFont font)
+    {
+        var fallbackPaint = paint.Clone();
+        fallbackPaint.Typeface = typeface;
+        fallbackPaint.TextSkewX = font.IsItalic && typeface.FontSlant == SKFontStyleSlant.Upright ? -0.25f : 0f;
+        return fallbackPaint;
+    }
+
+    /// <summary>
+    /// Draws text the way <see cref="MeasureTextWidth"/> measures it: per fallback run, and
+    /// character by character when letter spacing is in play.
+    /// </summary>
+    public static void DrawText(SKCanvas canvas, SKPaint paint, string text, float x, float y, float letterSpacing, RenderFont? font = null)
+    {
+        if (SplitFallbackRuns(paint, text, font) is not { } runs)
+        {
+            DrawSingleTypefaceText(canvas, paint, text, x, y, letterSpacing);
+            return;
+        }
+
+        var cursorX = x;
+
+        foreach (var (runText, typeface) in runs)
+        {
+            var runPaint = ReferenceEquals(typeface, paint.Typeface) ? paint : CreateFallbackPaint(paint, typeface, font!.Value);
+
+            try
+            {
+                DrawSingleTypefaceText(canvas, runPaint, runText, cursorX, y, letterSpacing);
+                cursorX += MeasureSingleTypefaceText(runPaint, runText, letterSpacing) + (letterSpacing > 0f ? letterSpacing : 0f);
+            }
+            finally
+            {
+                if (!ReferenceEquals(runPaint, paint))
+                {
+                    runPaint.Dispose();
+                }
+            }
+        }
+    }
+
+    private static void DrawSingleTypefaceText(SKCanvas canvas, SKPaint paint, string text, float x, float y, float letterSpacing)
+    {
+        if (letterSpacing <= 0f)
+        {
+            canvas.DrawText(text, x, y, paint);
+            return;
+        }
+
+        var cursorX = x;
+
+        foreach (var character in text)
+        {
+            var glyph = character.ToString();
+            canvas.DrawText(glyph, cursorX, y, paint);
+            cursorX += paint.MeasureText(glyph) + letterSpacing;
+        }
     }
 
     /// <summary>
@@ -269,7 +433,34 @@ internal static class SkiaTextShaping
     /// Measures the advance width, mirroring how the backend lays glyphs out when letter
     /// spacing is in play.
     /// </summary>
-    public static float MeasureTextWidth(SKPaint paint, string text, float letterSpacing)
+    public static float MeasureTextWidth(SKPaint paint, string text, float letterSpacing, RenderFont? font = null)
+    {
+        if (SplitFallbackRuns(paint, text, font) is not { } runs)
+        {
+            return MeasureSingleTypefaceText(paint, text, letterSpacing);
+        }
+
+        var width = 0f;
+
+        foreach (var (runText, typeface) in runs)
+        {
+            if (ReferenceEquals(typeface, paint.Typeface))
+            {
+                width += MeasureSingleTypefaceText(paint, runText, letterSpacing);
+            }
+            else
+            {
+                using var runPaint = CreateFallbackPaint(paint, typeface, font!.Value);
+                width += MeasureSingleTypefaceText(runPaint, runText, letterSpacing);
+            }
+
+            width += letterSpacing > 0f ? letterSpacing : 0f;
+        }
+
+        return letterSpacing > 0f ? width - letterSpacing : width;
+    }
+
+    private static float MeasureSingleTypefaceText(SKPaint paint, string text, float letterSpacing)
     {
         if (letterSpacing <= 0f)
         {

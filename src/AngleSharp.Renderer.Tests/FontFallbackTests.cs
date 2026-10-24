@@ -117,6 +117,36 @@ public sealed class FontFallbackTests
         return null;
     }
 
+    // ♔ is in DejaVu Sans and DejaVu Sans Mono, but not in DejaVu Serif.
+    private const string SerifLacks = "\u2654";
+
+    [Fact]
+    public void MissingGlyph_FallsBackToABundledFontThatHasIt()
+    {
+        var serif = Width(SerifLacks, "serif");
+
+        Assert.Equal(Width(SerifLacks, "sans-serif"), serif, tolerance: 0.01f);
+    }
+
+    [Fact]
+    public void MissingGlyph_FallsBackAlongTheFamilyListFirst()
+    {
+        Assert.Equal(Width(SerifLacks, "monospace"), Width(SerifLacks, "serif, monospace"), tolerance: 0.01f);
+        Assert.True(Math.Abs(Width(SerifLacks, "monospace") - Width(SerifLacks, "sans-serif")) > 0.01f,
+            "Expected the monospace glyph to differ from the sans-serif one.");
+    }
+
+    [Fact]
+    public void MissingGlyph_FallbackOnlyAffectsThatCharacter()
+    {
+        var mixed = Width("ab" + SerifLacks + "cd", "serif");
+
+        Assert.Equal(Width("ab", "serif") + Width(SerifLacks, "sans-serif") + Width("cd", "serif"), mixed, tolerance: 0.05f);
+    }
+
+    private static float Width(string text, string fontFamily) =>
+        Measurer.MeasureWidth(text, new RenderFont(fontFamily, 20f, 400f, false, 0f));
+
     private static float Width(string fontFamily) =>
         Measurer.MeasureWidth(Sample, new RenderFont(fontFamily, 20f, 400f, false, 0f));
 

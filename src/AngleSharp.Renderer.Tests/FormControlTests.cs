@@ -125,6 +125,29 @@ public sealed class FormControlTests
         Assert.Contains(displayList.Commands.OfType<FillRectCommand>(), command => command.Color.Equals(DefaultAccent));
     }
 
+    [Theory]
+    [InlineData("<input placeholder=\"Name\">")]
+    [InlineData("<textarea placeholder=\"Name\"></textarea>")]
+    public async Task Placeholder_TakesTheDefaultPlaceholderStyle(string control)
+    {
+        var displayList = await LayoutAsync($"<div style=\"color:#00ff00\">{control}</div>");
+
+        var text = Assert.Single(displayList.Commands.OfType<DrawTextCommand>(), command => command.Text == "Name");
+        Assert.Equal(new RenderColor(169, 169, 169), text.Color);
+    }
+
+    [Theory]
+    [InlineData("<input placeholder=\"Name\">")]
+    [InlineData("<textarea placeholder=\"Name\"></textarea>")]
+    public async Task Placeholder_TakesAuthoredPlaceholderRules(string control)
+    {
+        var displayList = await LayoutAsync($"<style>::placeholder {{ color: rgb(1, 2, 3); font-size: 20px }}</style>{control}");
+
+        var text = Assert.Single(displayList.Commands.OfType<DrawTextCommand>(), command => command.Text == "Name");
+        Assert.Equal(new RenderColor(1, 2, 3), text.Color);
+        Assert.Equal(20f, text.FontSize, precision: 2);
+    }
+
     private static async Task<DisplayList> LayoutAsync(string body)
     {
         var context = BrowsingContext.New(Configuration.Default.WithCss());

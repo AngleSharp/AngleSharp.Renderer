@@ -915,7 +915,7 @@ public sealed partial class SkiaRenderBackend : IRenderBackend, ITextMeasurer
         using var paint = SkiaTextShaping.CreateTextPaint(font);
         paint.Color = ToSkColor(command.Color);
 
-        DrawTextWithLetterSpacing(canvas, paint, command.Text, command.X, command.Y, command.LetterSpacing);
+        SkiaTextShaping.DrawText(canvas, paint, command.Text, command.X, command.Y, command.LetterSpacing, font);
 
         if (command.Underline || command.StrikeThrough)
         {
@@ -927,7 +927,7 @@ public sealed partial class SkiaRenderBackend : IRenderBackend, ITextMeasurer
                 StrokeWidth = Math.Max(1f, command.FontSize / 14f),
             };
 
-            var textWidth = SkiaTextShaping.MeasureTextWidth(paint, command.Text, command.LetterSpacing);
+            var textWidth = SkiaTextShaping.MeasureTextWidth(paint, command.Text, command.LetterSpacing, font);
 
             if (command.Underline)
             {
@@ -963,7 +963,7 @@ public sealed partial class SkiaRenderBackend : IRenderBackend, ITextMeasurer
             paint.MaskFilter = SKMaskFilter.CreateBlur(SKBlurStyle.Normal, command.BlurRadius / 2f);
         }
 
-        DrawTextWithLetterSpacing(canvas, paint, command.Text, command.X, command.Y, command.LetterSpacing);
+        SkiaTextShaping.DrawText(canvas, paint, command.Text, command.X, command.Y, command.LetterSpacing, font);
     }
 
     private static void DrawDecorationLine(SKCanvas canvas, SKPaint paint, float x, float y, float width, RenderTextDecorationStyle style)
@@ -1014,24 +1014,6 @@ public sealed partial class SkiaRenderBackend : IRenderBackend, ITextMeasurer
             var segmentEnd = Math.Min(cursor + dashLength, end);
             canvas.DrawLine(cursor, y, segmentEnd, y, paint);
             cursor = segmentEnd + gapLength;
-        }
-    }
-
-    private static void DrawTextWithLetterSpacing(SKCanvas canvas, SKPaint paint, string text, float x, float y, float letterSpacing)
-    {
-        if (letterSpacing <= 0f)
-        {
-            canvas.DrawText(text, x, y, paint);
-            return;
-        }
-
-        var cursorX = x;
-
-        foreach (var character in text)
-        {
-            var glyph = character.ToString();
-            canvas.DrawText(glyph, cursorX, y, paint);
-            cursorX += paint.MeasureText(glyph) + letterSpacing;
         }
     }
 
