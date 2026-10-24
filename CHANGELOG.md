@@ -3,6 +3,7 @@
 Released on Friday, October 23 2026.
 
 - Updated `WithRendering()` to also register an image resource service, which keeps loaded `<img>` data for painting (and gives images their natural size)
+- Updated the required AngleSharp version to 1.8.5 and AngleSharp.Css version to 1.2.1
 - Updated the page layout: `<html>` and `<body>` are laid out as ordinary boxes, so `<body>`'s margin (8px from the default stylesheet), padding, border, width and `max-width` apply; the root's background (or `<body>`'s, when the root has none) paints the canvas, and their `overflow` applies to the viewport
 - Fixed a stack overflow when laying out a floated or absolutely positioned inline-level box (`<span style="float: left">`), which is now blockified
 - Fixed painting failing with `ObjectDisposedException` for documents with loaded `<img>` elements
@@ -10,7 +11,7 @@ Released on Friday, October 23 2026.
 - Fixed form controls showing their attributes instead of their live state (`value`, `checked`, `selected`, and a `<textarea>`'s value)
 - Fixed `width`, `height`, `min-*` and `max-*` in units other than `px` and `%` (`em`, `rem`, `vw`, ...) being ignored
 - Fixed top margins collapsing through only one level of first children, and inline-blocks collapsing their margin with their parent's
-- Added `placeholder` text for text inputs and `<textarea>`
+- Added `placeholder` text for text inputs and `<textarea>`, styled by `::placeholder` (`color: darkgray` from the default stylesheet)
 - Added per-character font fallback: characters the resolved font lacks come from the next `font-family` entry that has them, then the bundled fonts, then the installed fonts
 
 # 0.8.0

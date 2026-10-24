@@ -683,11 +683,10 @@ public sealed partial class HtmlRenderer
         }
 
         // Atomic inlines and flex items lay out their own contents as a block, whatever their
-        // inline display value. Flex items, floats and absolutely positioned boxes are blockified
-        // (CSS Display 3 §2.7); the flow already places floats as blocks, so treating one as inline
-        // here would hand it back to an inline formatting context that lays it out again, forever.
-        if (!renderAsBlock && (isInlineBlock || isAtomicInline || isFlexItem || IsAtomicInlineDisplay(computedStyle) ||
-                               IsFloated(styleMap) || IsOutOfFlowPositioned(styleMap)))
+        // inline display value. Floats and absolutely positioned boxes arrive blockified in the
+        // computed `display` (CSS Display 3 §2.7); flex items are not, as AngleSharp.Css does not
+        // know about the formatting context they participate in.
+        if (!renderAsBlock && (isInlineBlock || isAtomicInline || isFlexItem || IsAtomicInlineDisplay(computedStyle)))
         {
             renderAsBlock = true;
         }
@@ -6932,7 +6931,7 @@ public sealed partial class HtmlRenderer
 
                 else if (kind == FormControlKind.TextLike && ResolvePlaceholder(element) is { } placeholder)
                 {
-                    DrawStyledText(context, displayList, placeholder, contentX, baselineY, ResolvePlaceholderTextStyle(textStyle), decorate: false);
+                    DrawStyledText(context, displayList, placeholder, contentX, baselineY, ResolvePlaceholderTextStyle(element, textStyle, context), decorate: false);
                 }
 
                 if (kind == FormControlKind.TextLike)
@@ -7059,7 +7058,7 @@ public sealed partial class HtmlRenderer
 
                 if (normalizedText.Length == 0 && ResolvePlaceholder(element) is { } placeholder)
                 {
-                    var placeholderStyle = ResolvePlaceholderTextStyle(textStyle);
+                    var placeholderStyle = ResolvePlaceholderTextStyle(element, textStyle, context);
                     var placeholderLines = WrapTextRespectingWhiteSpace(context, NormalizeWhitespace(placeholder, textStyle.WhiteSpace), contentWidth, textStyle);
                     displayList.PushClip(new RenderRect(contentX, contentY, contentWidth, contentHeight), RenderCornerRadii.Zero);
 
@@ -7125,14 +7124,14 @@ public sealed partial class HtmlRenderer
     }
 
     /// <summary>
-    /// The style placeholder text paints with. AngleSharp.Css does not compute `::placeholder`
-    /// yet, so this is the default look browsers give it (Firefox's UA rule `opacity: 0.54`):
-    /// the control's own text color, faded.
+    /// The style placeholder text paints with: the computed `::placeholder` style (inheriting from
+    /// the control; its default look, `color: darkgray`, comes from the UA sheet). Without a style
+    /// collection (no window) it is the control's own text style.
     /// </summary>
-    private static RenderTextStyle ResolvePlaceholderTextStyle(RenderTextStyle textStyle) =>
-        textStyle with { Color = textStyle.Color with { A = (byte)Math.Round(textStyle.Color.A * PlaceholderOpacity) } };
-
-    private const float PlaceholderOpacity = 0.54f;
+    private static RenderTextStyle ResolvePlaceholderTextStyle(IElement element, RenderTextStyle textStyle, LayoutContext context) =>
+        context.StyleCollection is { } styleCollection
+            ? ResolveTextStyle(CreateStyleMap(styleCollection.ComputeDeclarations(element, "::placeholder")), textStyle)
+            : textStyle;
 
     private static bool IsInputChecked(IElement element) =>
         element is IHtmlInputElement input ? input.IsChecked : element.HasAttribute("checked");
