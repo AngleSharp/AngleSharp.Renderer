@@ -1,4 +1,5 @@
 using AngleSharp.Css;
+using AngleSharp.Css.Dom;
 using AngleSharp.Dom;
 using AngleSharp.Renderer.Rendering;
 using System.Linq;
@@ -235,6 +236,12 @@ internal sealed class InteractiveHtmlRendererState : IDomHarness
 
         return _animationTracker.GetAnimatedValue(element, property, _clockMs);
     }
+
+    /// <summary>
+    /// Gets the animated value of a property, given the element's computed style.
+    /// </summary>
+    internal string? GetAnimatedValue(IElement element, string property, ICssStyleDeclaration computedStyle) =>
+        _animationTracker.GetAnimatedValue(element, property, _clockMs, computedStyle);
 
     public RenderedImage PaintToPng()
     {

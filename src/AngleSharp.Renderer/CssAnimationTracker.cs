@@ -96,9 +96,9 @@ internal sealed class CssAnimationTracker
     /// `animation-fill-mode` does not include `forwards`) - a signal to the caller to use whatever
     /// value it would otherwise have used.
     /// </summary>
-    public string? GetAnimatedValue(IElement element, string property, double clockMs)
+    public string? GetAnimatedValue(IElement element, string property, double clockMs, ICssStyleDeclaration? computedStyle = null)
     {
-        var specs = GetAnimationSpecs(element);
+        var specs = GetAnimationSpecs(element, computedStyle);
 
         if (specs.Count == 0)
         {
@@ -123,16 +123,17 @@ internal sealed class CssAnimationTracker
         return result;
     }
 
-    private List<CssAnimationSpec> GetAnimationSpecs(IElement element)
+    // the computed style, when the caller has it, saves running the element's cascade again
+    private List<CssAnimationSpec> GetAnimationSpecs(IElement element, ICssStyleDeclaration? computedStyle)
     {
         if (_frameSpecs is null)
         {
-            return ParseAnimationSpecs(element.ComputeCurrentStyle());
+            return ParseAnimationSpecs(computedStyle ?? element.ComputeCurrentStyle());
         }
 
         if (!_frameSpecs.TryGetValue(element, out var specs))
         {
-            specs = ParseAnimationSpecs(element.ComputeCurrentStyle());
+            specs = ParseAnimationSpecs(computedStyle ?? element.ComputeCurrentStyle());
             _frameSpecs[element] = specs;
         }
 

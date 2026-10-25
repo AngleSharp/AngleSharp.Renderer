@@ -118,14 +118,18 @@ public sealed partial class HtmlRenderer
         ITextMeasurer TextMeasurer,
         FontFaceSet Fonts,
         Dictionary<IElement, Dictionary<string, string>> StyleMapCache,
-        IStyleCollection? StyleCollection,
+        Lazy<IStyleCollection?> LazyStyleCollection,
         Dictionary<string, Stack<int>> Counters,
         Dictionary<IElement, TableStructure> TableStructures,
         Stack<List<StickyBox>> StickyScopes,
         Dictionary<(IElement Element, float Width), float> MeasuredHeights,
         Dictionary<IElement, WritingModeKind> BoxSystems,
         Dictionary<IElement, WritingModeKind> ContentSystems,
-        Dictionary<IElement, ICssStyleDeclaration> SpecifiedStyles);
+        Dictionary<IElement, ICssStyleDeclaration> SpecifiedStyles)
+    {
+        // only needed for what the render tree does not hold (e.g. ::placeholder), so it is built on demand
+        public IStyleCollection? StyleCollection => LazyStyleCollection.Value;
+    }
 
     private sealed class LayoutCapture
     {
@@ -315,9 +319,9 @@ public sealed partial class HtmlRenderer
         // ?? new DefaultRenderDevice()) so this produces the identical collection that logic would
         // have built on its own, just once instead of thousands of times.
         var explicitStyleWindow = document.DefaultView;
-        var styleCollection = explicitStyleWindow is not null
+        var styleCollection = new Lazy<IStyleCollection?>(() => explicitStyleWindow is not null
             ? explicitStyleWindow.GetStyleCollection(explicitStyleWindow.Document.Context.GetService<IRenderDevice>() ?? new DefaultRenderDevice())
-            : null;
+            : null);
 
         return new LayoutContext(
             Width: width,
@@ -337,7 +341,7 @@ public sealed partial class HtmlRenderer
             // must never be answered from a stale map computed on a previous call. See
             // GetOrCreateStyleMap's own remarks for why caching within a single call is safe.
             StyleMapCache: new Dictionary<IElement, Dictionary<string, string>>(ReferenceEqualityComparer.Instance),
-            StyleCollection: styleCollection,
+            LazyStyleCollection: styleCollection,
             // CSS counters (`counter-reset`/`counter-increment`/`counter-set`, read by `counter()`/
             // `counters()` in `content`) are scoped to a single render exactly like StyleMapCache
             // above - a fresh, empty stack set every call, never persisted across renders, so a
@@ -5665,7 +5669,9 @@ public sealed partial class HtmlRenderer
 
         foreach (var property in CssValueInterpolation.InterpolatableProperties.Keys)
         {
-            var animatedValue = isAnimated ? harness.GetAnimatedValue(element, property) : null;
+            var animatedValue = !isAnimated ? null
+                : harness is InteractiveHtmlRendererState state ? state.GetAnimatedValue(element, property, style)
+                : harness.GetAnimatedValue(element, property);
 
             if (animatedValue is not null)
             {

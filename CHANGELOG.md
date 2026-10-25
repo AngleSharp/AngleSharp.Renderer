@@ -2,6 +2,7 @@
 
 Released on Sunday, October 25 2026.
 
+- Improved painting animated elements and every layout: the animations are read from the computed style the renderer already has instead of running the cascade again, and the style collection (only needed for e.g. `::placeholder`) is only built when used
 - Improved the layout of pages with many inline SVGs: how the page styles an inline SVG is resolved once per layout pass instead of every time the SVG is measured or laid out
 - Improved the layout of deep pages: the cascaded declarations of an element are taken from the render tree instead of running the cascade for the element and all of its ancestors
 - Improved the layout of pages with large `style` elements: the rules declaring `-webkit-line-clamp` and `overflow-wrap` are collected once per layout pass instead of once per element
