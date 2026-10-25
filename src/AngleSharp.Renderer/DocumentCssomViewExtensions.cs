@@ -20,7 +20,7 @@ public static class DocumentCssomViewExtensions
 
         var harness = document.Context.GetDomHarness();
         var metricsMap = HtmlRenderer.CaptureLayoutMetrics(document, harness.RenderDevice);
-        var targetElement = FindTopMostElementAt(metricsMap, x, y);
+        var targetElement = HitTesting.FindTopMostElementAt(metricsMap, x, y);
 
         if (targetElement is null)
         {
@@ -81,39 +81,6 @@ public static class DocumentCssomViewExtensions
         return null;
     }
 
-    private static IElement? FindTopMostElementAt(IReadOnlyDictionary<IElement, HtmlRenderer.ElementLayoutMetrics> metrics, double x, double y)
-    {
-        return metrics
-            .Where(pair => Contains(pair.Value, x, y))
-            .OrderByDescending(pair => GetDepth(pair.Key))
-            .ThenBy(pair => Math.Max(0f, pair.Value.BorderBoxWidth) * Math.Max(0f, pair.Value.BorderBoxHeight))
-            .Select(pair => pair.Key)
-            .FirstOrDefault();
-    }
-
-    private static bool Contains(HtmlRenderer.ElementLayoutMetrics metrics, double x, double y)
-    {
-        var left = metrics.BorderBoxX;
-        var top = metrics.BorderBoxY;
-        var right = metrics.BorderBoxX + metrics.BorderBoxWidth;
-        var bottom = metrics.BorderBoxY + metrics.BorderBoxHeight;
-
-        return x >= left && x <= right && y >= top && y <= bottom;
-    }
-
-    private static int GetDepth(IElement element)
-    {
-        var depth = 0;
-        var current = element.ParentElement;
-
-        while (current is not null)
-        {
-            depth++;
-            current = current.ParentElement;
-        }
-
-        return depth;
-    }
 
     private static float ParseLengthOrDefault(string? value, float fallback)
     {

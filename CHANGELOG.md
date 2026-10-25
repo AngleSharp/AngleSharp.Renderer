@@ -7,6 +7,10 @@ Released on Sunday, October 25 2026.
 - Improved the layout of pages with large `style` elements: the rules declaring `-webkit-line-clamp` and `overflow-wrap` are collected once per layout pass instead of once per element
 - Improved painting pages with running CSS animations: the animations of an element and their keyframes are looked up once per frame instead of once per animatable property (each running the element's cascade and searching all style sheets)
 - Improved the layout of grids and flex containers: the grid templates are taken from the style map instead of running the cascade again, and the cross size of a flex item is estimated once
+- Fixed an empty `<button>` (or `<input type=button>` without a value) showing the placeholder label "Button" instead of nothing (e.g. an icon button styled by its background)
+- Fixed background images and web fonts being requested with the `Accept` header of a document, which some servers refuse (e.g. IIS answers 406 Not Acceptable), and error responses being decoded as the resource
+- Fixed overlong words breaking after a slash or hyphen followed by a digit (e.g. the date `8/21/2026`), which UAX #14 does not allow
+- Fixed hit testing (hover, clicks, caret positions) taking the most deeply nested element at a point instead of the one painted on top: it now follows the painting order (z-index, positioned boxes above the normal flow, document order), skips content clipped by an ancestor's `overflow`, and ignores `visibility: hidden` and `pointer-events: none` (e.g. an empty panel overflowing onto a navigation took its clicks)
 - Fixed percentage heights resolving against the containing block's width: they now refer to its height when it is definite (the viewport for the root element), and are `auto` otherwise
 - Fixed a row flex container laid out as an item of a column flex container taking its width as its height
 - Fixed a column flex container being at least as tall as it is wide, and using the height it gets from its own flex container

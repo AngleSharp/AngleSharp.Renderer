@@ -44,6 +44,18 @@ public sealed class FormControlTests
     }
 
     [Theory]
+    [InlineData("<button></button>")]
+    [InlineData("<button style=\"width:32px; height:32px\"> </button>")]
+    [InlineData("<input type=button>")]
+    public async Task EmptyButtons_ShowNoLabel(string markup)
+    {
+        // found on www.florian-rappl.de: its search button is an icon (a background image)
+        var displayList = await LayoutAsync(markup);
+
+        Assert.Empty(displayList.Commands.OfType<DrawTextCommand>());
+    }
+
+    [Theory]
     [InlineData("date", "", "mm/dd/yyyy")]
     [InlineData("date", "2024-05-03", "05/03/2024")]
     [InlineData("time", "", "--:-- --")]

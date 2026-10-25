@@ -93,7 +93,18 @@ public sealed partial class HtmlRenderer
         float PaddingLeft,
         float PaddingRight,
         float PaddingTop,
-        float PaddingBottom);
+        float PaddingBottom,
+        HitTestLayer Layer = default);
+
+    /// <summary>
+    /// What hit testing needs to know about an element beyond its box: where it paints relative
+    /// to the others (CSS 2.1 Appendix E), if it clips its content, and if it can be hit at all.
+    /// </summary>
+    /// <param name="IsLayerRoot">If it paints as a layer of its own (positioned, z-indexed or a stacking context).</param>
+    /// <param name="ZIndex">Its z-index, 0 for auto.</param>
+    /// <param name="ClipsOverflow">If its content is clipped to its padding box.</param>
+    /// <param name="IsHidden">If it is not hit itself (visibility: hidden, pointer-events: none).</param>
+    internal readonly record struct HitTestLayer(bool IsLayerRoot, int ZIndex, bool ClipsOverflow, bool IsHidden);
 
     private readonly record struct LayoutContext(
         int Width,
@@ -151,12 +162,52 @@ public sealed partial class HtmlRenderer
         try
         {
             _ = BuildDisplayList(document, viewport, context, renderDevice, measureFullExtent: true);
-            return capture.Snapshot();
+            return AddHitTestLayers(capture.Snapshot(), context);
         }
         finally
         {
             s_layoutCapture.Value = previous;
         }
+    }
+
+    private static IReadOnlyDictionary<IElement, ElementLayoutMetrics> AddHitTestLayers(IReadOnlyDictionary<IElement, ElementLayoutMetrics> metrics, LayoutContext context)
+    {
+        var result = new Dictionary<IElement, ElementLayoutMetrics>(metrics.Count, ReferenceEqualityComparer.Instance);
+
+        foreach (var (element, elementMetrics) in metrics)
+        {
+            result[element] = context.StyleMapCache.TryGetValue(element, out var styleMap)
+                ? elementMetrics with { Layer = ResolveHitTestLayer(element, styleMap, context) }
+                : elementMetrics;
+        }
+
+        return result;
+    }
+
+    private static HitTestLayer ResolveHitTestLayer(IElement element, Dictionary<string, string> styleMap, LayoutContext context)
+    {
+        var position = styleMap.GetValueOrDefault("position")?.Trim().ToLowerInvariant();
+        var isPositioned = position is not (null or "" or "static");
+        var zIndexText = styleMap.GetValueOrDefault("z-index");
+        var hasZIndex = int.TryParse(zIndexText?.Trim(), NumberStyles.Integer, CultureInfo.InvariantCulture, out var zIndex);
+        // z-index applies to flex and grid items without a position, too
+        var parentDisplay = element.ParentElement is { } parent && context.StyleMapCache.TryGetValue(parent, out var parentMap)
+            ? parentMap.GetValueOrDefault("display") ?? string.Empty
+            : string.Empty;
+        var isItem = parentDisplay.Contains("flex", StringComparison.OrdinalIgnoreCase) || parentDisplay.Contains("grid", StringComparison.OrdinalIgnoreCase);
+        var isStackingContext = (hasZIndex && (isPositioned || isItem)) ||
+            (float.TryParse(styleMap.GetValueOrDefault("opacity"), NumberStyles.Float, CultureInfo.InvariantCulture, out var opacity) && opacity < 1f) ||
+            styleMap.GetValueOrDefault("transform")?.Trim() is { Length: > 0 } transform && !transform.Equals("none", StringComparison.OrdinalIgnoreCase);
+        var visibility = styleMap.GetValueOrDefault("visibility")?.Trim();
+        var pointerEvents = styleMap.GetValueOrDefault("pointer-events")?.Trim();
+
+        return new HitTestLayer(
+            isPositioned || isStackingContext,
+            hasZIndex && (isPositioned || isItem) ? zIndex : 0,
+            ShouldClipOverflow(styleMap),
+            string.Equals(visibility, "hidden", StringComparison.OrdinalIgnoreCase) ||
+            string.Equals(visibility, "collapse", StringComparison.OrdinalIgnoreCase) ||
+            string.Equals(pointerEvents, "none", StringComparison.OrdinalIgnoreCase));
     }
 
     private static void RecordLayoutMetrics(
@@ -5254,6 +5305,7 @@ public sealed partial class HtmlRenderer
 
         AddIfPresent(map, "display", displayValue);
         AddIfPresent(map, "visibility", style.GetVisibility());
+        AddIfPresent(map, "pointer-events", style.GetPropertyValue("pointer-events"));
         AddIfPresent(map, "writing-mode", style.GetPropertyValue("writing-mode"));
         AddIfPresent(map, "text-orientation", style.GetPropertyValue("text-orientation"));
         AddLengthProperty(map, style, "width", explicitDeclarations);
@@ -6911,11 +6963,12 @@ public sealed partial class HtmlRenderer
         try
         {
             var target = new Url(document.BaseUrl, url);
-            var download = loader.FetchAsync(DocumentRequest.Get(target, source: document, referer: document.BaseUri));
+            var download = loader.FetchAsync(CreateResourceRequest(target, document, ImageAcceptHeader));
             var response = download.Task.GetAwaiter().GetResult();
 
-            if (response?.Content is null)
+            if (response?.Content is null || !IsSuccessStatus(response))
             {
+                response?.Dispose();
                 return false;
             }
 
@@ -6940,6 +6993,22 @@ public sealed partial class HtmlRenderer
             return false;
         }
     }
+
+    // what browsers ask for when loading an image; some servers refuse the document types a
+    // DocumentRequest asks for by default (e.g. IIS answers 406 Not Acceptable)
+    internal const string ImageAcceptHeader = "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8";
+
+    /// <summary>
+    /// A request for a subresource of the document (an image, a font), asking for the given types.
+    /// </summary>
+    internal static DocumentRequest CreateResourceRequest(Url target, IDocument document, string accept)
+    {
+        var request = DocumentRequest.Get(target, source: document, referer: document.BaseUri);
+        request.Headers[HeaderNames.Accept] = accept;
+        return request;
+    }
+
+    internal static bool IsSuccessStatus(IResponse response) => (int)response.StatusCode is >= 200 and < 300;
 
     private static bool TryDecodeImageBytes(byte[] bytes, string? mimeType, out CachedImageResource? imageResource)
     {
@@ -7407,8 +7476,7 @@ public sealed partial class HtmlRenderer
             {
                 if (string.Equals(element.LocalName, "button", StringComparison.OrdinalIgnoreCase))
                 {
-                    var text = NormalizeWhitespace(element.TextContent ?? string.Empty);
-                    return text.Length > 0 ? text : "Button";
+                    return NormalizeWhitespace(element.TextContent ?? string.Empty);
                 }
 
                 var value = ResolveInputValue(element);
@@ -7423,7 +7491,7 @@ public sealed partial class HtmlRenderer
                     "image" => element.GetAttribute("alt") is { Length: > 0 } alt ? alt : "Submit",
                     "submit" => "Submit",
                     "reset" => "Reset",
-                    _ => "Button",
+                    _ => string.Empty,
                 };
             }
 
@@ -11425,7 +11493,8 @@ public sealed partial class HtmlRenderer
 
         for (var index = 0; index < word.Length; index++)
         {
-            if (word[index] is '-' or '/')
+            // no break before a digit (UAX #14 HY/SY × NU), e.g. in a date like 8/21/2026
+            if (word[index] is '-' or '/' && (index + 1 >= word.Length || !char.IsDigit(word[index + 1])))
             {
                 chunks.Add(word[start..(index + 1)]);
                 start = index + 1;

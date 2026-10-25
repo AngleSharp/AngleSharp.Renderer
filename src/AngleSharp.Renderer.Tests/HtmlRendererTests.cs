@@ -293,6 +293,25 @@ public sealed class HtmlRendererTests
     }
 
     [Fact]
+    public async Task BuildDisplayList_BackgroundImageIsRequestedAsAnImage()
+    {
+        // found on www.florian-rappl.de: its server refuses images asked for as documents (406)
+        var configuration = Configuration.Default
+            .WithCss()
+            .With(new ImageOnlyRequester(Convert.FromBase64String("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAACklEQVR4nGMAAQABAA4A4cQTmwAAAABJRU5ErkJggg==")))
+            .WithDefaultLoader(new LoaderOptions { IsResourceLoadingEnabled = true });
+        var document = await ParseAsync("""
+            <html><body>
+                <div style="width:80px; height:60px; background-image: url(http://assets.test/tile.png);"></div>
+            </body></html>
+            """, configuration, "http://example.test/");
+
+        var displayList = new HtmlRenderer().BuildDisplayList(document, new DefaultRenderDevice { ViewPortWidth = 240, ViewPortHeight = 160 });
+
+        Assert.Single(displayList.Commands.OfType<FillRectCommand>().Where(fill => fill.Paint is RenderImagePaint));
+    }
+
+    [Fact]
     public async Task BuildDisplayList_FetchesAndCachesHttpBackgroundImagePerDocument()
     {
         var requester = new SingleResponseImageRequester(Convert.FromBase64String("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAACklEQVR4nGMAAQABAA4A4cQTmwAAAABJRU5ErkJggg=="));
@@ -6925,6 +6944,22 @@ public sealed class HtmlRendererTests
         Assert.DoesNotContain(lines, line => line.StartsWith("ABCDEFGHIJKLMNOPQRSTUVWXYZ", StringComparison.Ordinal));
     }
 
+    [Theory]
+    [InlineData("8/21/2026", "8/21/2026")]
+    [InlineData("2024-2026", "2024-2026")]
+    [InlineData("client/server", "client/|server")]
+    public async Task BuildDisplayList_OverlongWordsBreakAfterSlashesAndHyphensButNotBeforeDigits(string word, string expected)
+    {
+        // found on www.florian-rappl.de: a date badge a hair too narrow showed "8/ 21/ 2026"
+        var document = await ParseAsync($"""
+            <html><body style="margin:0"><div style="width:20px">{word}</div><div style="width:20px">{word}</div></body></html>
+            """);
+
+        var lines = BuildDisplayList(document).Commands.OfType<DrawTextCommand>().Select(command => command.Text).ToArray();
+
+        Assert.Equal(expected + "|" + expected, string.Join("|", lines));
+    }
+
     [Fact]
     public async Task BuildDisplayList_OverflowWrapNormalLeavesAnOverlongWordOnOneOverflowingLine()
     {
@@ -9623,6 +9658,29 @@ public sealed class HtmlRendererTests
         document.Head?.Prepend(resetStyle);
 
         return document;
+    }
+
+    private sealed class ImageOnlyRequester(byte[] imageData) : BaseRequester
+    {
+        public override bool SupportsProtocol(string protocol) =>
+            string.Equals(protocol, "http", StringComparison.OrdinalIgnoreCase);
+
+        protected override Task<IResponse?> PerformRequestAsync(Request request, CancellationToken cancel)
+        {
+            var acceptsImages = request.Headers.TryGetValue("Accept", out var accept) && accept.Contains("image/", StringComparison.Ordinal);
+            var response = new DefaultResponse
+            {
+                Address = request.Address,
+                StatusCode = acceptsImages ? HttpStatusCode.OK : HttpStatusCode.NotAcceptable,
+                Headers = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+                {
+                    ["Content-Type"] = acceptsImages ? "image/png" : "text/html",
+                },
+                Content = new MemoryStream(acceptsImages ? imageData : "<h1>Not acceptable</h1>"u8.ToArray()),
+            };
+
+            return Task.FromResult<IResponse?>(response);
+        }
     }
 
     private sealed class SingleResponseImageRequester : BaseRequester
