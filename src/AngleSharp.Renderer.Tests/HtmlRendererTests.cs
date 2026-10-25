@@ -8872,6 +8872,42 @@ public sealed class HtmlRendererTests
         Assert.Equal(10f, red.Y, precision: 2);
     }
 
+    [Theory]
+    [InlineData("left:0; top:0; right:0; bottom:0", 0f, 200f, 0f, 100f)]
+    [InlineData("left:10px; top:10px; bottom:20px; width:50px", 10f, 50f, 10f, 70f)]
+    [InlineData("inset:5px", 5f, 190f, 5f, 90f)]
+    [InlineData("top:10%; bottom:10%; left:0; width:10px", 0f, 10f, 10f, 80f)]
+    [InlineData("top:0; bottom:0; left:0; width:10px; padding:5px; margin:10px", 10f, 20f, 10f, 80f)]
+    public async Task BuildDisplayList_AbsolutelyPositionedBoxStretchesBetweenTopAndBottom(string offsets, float x, float width, float y, float height)
+    {
+        var document = await ParseAsync($"""
+            <html><body style="margin:0">
+                <div style="position:relative; width:200px; height:100px"><div style="position:absolute; {offsets}; background-color:#ff0000"></div></div>
+            </body></html>
+            """);
+
+        var red = SingleFill(BuildDisplayList(document), Red).Rect;
+
+        Assert.Equal(x, red.X, precision: 1);
+        Assert.Equal(width, red.Width, precision: 1);
+        Assert.Equal(y, red.Y, precision: 1);
+        Assert.Equal(height, red.Height, precision: 1);
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_FixedBoxStretchesBetweenTopAndBottomOfTheViewport()
+    {
+        var document = await ParseAsync("""
+            <html><body style="margin:0">
+                <div style="position:fixed; top:10px; bottom:30px; left:0; width:20px; background-color:#ff0000"></div>
+            </body></html>
+            """);
+
+        var displayList = new HtmlRenderer().BuildDisplayList(document, new DefaultRenderDevice { ViewPortWidth = 200, ViewPortHeight = 300 });
+
+        Assert.Equal(260f, SingleFill(displayList, Red).Rect.Height, precision: 1);
+    }
+
     [Fact]
     public async Task BuildDisplayList_AbsolutelyPositionedBoxWithAutoOffsetsStaysInPlace()
     {

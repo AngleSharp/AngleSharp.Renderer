@@ -8,6 +8,7 @@ Released on Sunday, October 25 2026.
 - Improved the layout of pages with large `style` elements: the rules declaring `-webkit-line-clamp` and `overflow-wrap` are collected once per layout pass instead of once per element
 - Improved painting pages with running CSS animations: the animations of an element and their keyframes are looked up once per frame instead of once per animatable property (each running the element's cascade and searching all style sheets)
 - Improved the layout of grids and flex containers: the grid templates are taken from the style map instead of running the cascade again, and the cross size of a flex item is estimated once
+- Fixed absolutely positioned boxes with `top` and `bottom` (e.g. `inset: 0`) and an auto height having no height instead of filling the space between them, the margins of positioned boxes not offsetting them, and percentages of `top` referring to the width of the containing block
 - Fixed an empty `<button>` (or `<input type=button>` without a value) showing the placeholder label "Button" instead of nothing (e.g. an icon button styled by its background)
 - Fixed background images and web fonts being requested with the `Accept` header of a document, which some servers refuse (e.g. IIS answers 406 Not Acceptable), and error responses being decoded as the resource
 - Fixed overlong words breaking after a slash or hyphen followed by a digit (e.g. the date `8/21/2026`), which UAX #14 does not allow

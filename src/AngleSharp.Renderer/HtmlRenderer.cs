@@ -174,6 +174,8 @@ public sealed partial class HtmlRenderer
         }
     }
 
+    private static float ZeroIfNaN(float value) => float.IsNaN(value) ? 0f : value;
+
     private static IReadOnlyDictionary<IElement, ElementLayoutMetrics> AddHitTestLayers(IReadOnlyDictionary<IElement, ElementLayoutMetrics> metrics, LayoutContext context)
     {
         var result = new Dictionary<IElement, ElementLayoutMetrics>(metrics.Count, ReferenceEqualityComparer.Instance);
@@ -885,6 +887,9 @@ public sealed partial class HtmlRenderer
         var isFixed = string.Equals(position, "fixed", StringComparison.OrdinalIgnoreCase);
         var isRelative = string.Equals(position, "relative", StringComparison.OrdinalIgnoreCase);
 
+        // the margins of a positioned box only offset it within its containing block (auto ones count as zero)
+        var positionedMargins = new EdgeSizes(ZeroIfNaN(marginTop), ZeroIfNaN(marginRight), ZeroIfNaN(marginBottom), ZeroIfNaN(marginLeft));
+
         if (isAbsolute || isFixed)
         {
             marginTop = 0f;
@@ -1062,8 +1067,12 @@ public sealed partial class HtmlRenderer
             flowBorderBoxY = floatY + marginTop;
         }
 
+        // percentages of top and bottom refer to the height of the containing block
+        var offsetHeightReference = isFixed ? context.Height
+            : isAbsolute && !float.IsNaN(positionedContainingHeight) ? positionedContainingHeight
+            : flowContainingWidth;
         var leftOffset = ParseLength(styleMap, "left", flowContainingWidth, 0f, allowAuto: true);
-        var topOffset = ParseLength(styleMap, "top", flowContainingWidth, 0f, allowAuto: true);
+        var topOffset = ParseLength(styleMap, "top", offsetHeightReference, 0f, allowAuto: true);
         var rightOffset = ParseLength(styleMap, "right", flowContainingWidth, float.NaN, allowAuto: true);
         var bottomOffset = ParseLength(styleMap, "bottom", float.IsNaN(positionedContainingHeight) ? flowContainingWidth : positionedContainingHeight, float.NaN, allowAuto: true);
 
@@ -1084,17 +1093,18 @@ public sealed partial class HtmlRenderer
         // with both offsets of an axis auto, an absolutely positioned box stays where it would be in flow
         var hasStaticX = isAbsolute && float.IsNaN(rightOffset) && float.IsNaN(ParseLength(styleMap, "left", flowContainingWidth, float.NaN, allowAuto: true));
         var hasStaticY = isAbsolute && float.IsNaN(bottomOffset) && float.IsNaN(ParseLength(styleMap, "top", flowContainingWidth, float.NaN, allowAuto: true));
+        // an offset places the margin box of an absolutely positioned box
         var borderBoxX = isFixed
-            ? context.Padding + leftOffset
+            ? context.Padding + leftOffset + positionedMargins.Left
             : isAbsolute
-                ? hasStaticX ? flowBorderBoxX : absoluteContainingX + leftOffset
+                ? hasStaticX ? flowBorderBoxX : absoluteContainingX + leftOffset + positionedMargins.Left
                 : flowBorderBoxX + (isRelative ? leftOffset : 0f);
         // `position: sticky` is laid out at its natural position; its container shifts it once
         // its own box is known (see ResolveStickyBoxes).
         var borderBoxY = isFixed
-            ? context.Padding + topOffset
+            ? context.Padding + topOffset + positionedMargins.Top
             : isAbsolute
-                ? hasStaticY ? flowBorderBoxY : absoluteContainingY + topOffset
+                ? hasStaticY ? flowBorderBoxY : absoluteContainingY + topOffset + positionedMargins.Top
                 : flowBorderBoxY + (isRelative ? topOffset : 0f);
         var contentX = borderBoxX + borderLeft + paddingLeft;
         var contentY = borderBoxY + borderTop + paddingTop;
@@ -1126,6 +1136,21 @@ public sealed partial class HtmlRenderer
             resolvedContentHeight = Math.Max(0f, forcedBorderBoxHeight - verticalBorderAndPadding);
         }
 
+        // An absolutely positioned box of auto height with both top and bottom fills the space
+        // between them in its containing block (CSS 2.1 §10.6.4); a replaced one keeps its own height.
+        var stretchContainingHeight = isFixed ? context.Height : isAbsolute ? positionedContainingHeight : float.NaN;
+
+        if (float.IsNaN(resolvedContentHeight) && !float.IsNaN(stretchContainingHeight) && !IsReplacedElement(element))
+        {
+            var stretchTop = ParseLength(styleMap, "top", stretchContainingHeight, float.NaN, allowAuto: true);
+            var stretchBottom = ParseLength(styleMap, "bottom", stretchContainingHeight, float.NaN, allowAuto: true);
+
+            if (!float.IsNaN(stretchTop) && !float.IsNaN(stretchBottom))
+            {
+                resolvedContentHeight = Math.Max(0f, stretchContainingHeight - stretchTop - stretchBottom - positionedMargins.Top - positionedMargins.Bottom - verticalBorderAndPadding);
+            }
+        }
+
         // A replaced element without an authored height is as tall as its (scaled) image.
         if (float.IsNaN(resolvedContentHeight) && IsReplacedElement(element) &&
             TryResolveReplacedElementImage(node, styleMap, flowContainingWidth, 0f, 0f, out _, out var replacedRect, out var replacedClip))
@@ -1145,12 +1170,12 @@ public sealed partial class HtmlRenderer
 
         if (isAbsolute && !styleMap.ContainsKey("left") && !float.IsNaN(rightOffset))
         {
-            borderBoxX = absoluteContainingX + absoluteContainingWidth - rightOffset - positionedBorderBoxWidth;
+            borderBoxX = absoluteContainingX + absoluteContainingWidth - rightOffset - positionedMargins.Right - positionedBorderBoxWidth;
         }
 
         if (isAbsolute && !styleMap.ContainsKey("top") && !float.IsNaN(bottomOffset) && !float.IsNaN(positionedContainingHeight) && !float.IsNaN(positionedBorderBoxHeight))
         {
-            borderBoxY = absoluteContainingY + positionedContainingHeight - bottomOffset - positionedBorderBoxHeight;
+            borderBoxY = absoluteContainingY + positionedContainingHeight - bottomOffset - positionedMargins.Bottom - positionedBorderBoxHeight;
         }
 
         contentX = borderBoxX + borderLeft + paddingLeft;
