@@ -114,8 +114,19 @@ internal static class SkiaTextShaping
             // Only slant synthetically when the resolved face is upright. A real italic face is
             // already slanted, and skewing it again doubles the angle.
             TextSkewX = font.IsItalic && typeface.FontSlant == SKFontStyleSlant.Upright ? -0.25f : 0f,
+            FakeBoldText = NeedsSyntheticBold(font, typeface),
         };
     }
+
+    /// <summary>
+    /// Bold is synthesized when the resolved face is lighter than asked for (CSS Fonts 4 §5.2,
+    /// font-synthesis: weight), e.g. a variable web font whose weight axis cannot be set here, or
+    /// a family that only comes in one weight.
+    /// </summary>
+    private static bool NeedsSyntheticBold(RenderFont font, SKTypeface typeface) =>
+        font.FontWeight >= SyntheticBoldThreshold && typeface.FontWeight < SyntheticBoldThreshold;
+
+    private const float SyntheticBoldThreshold = 600f;
 
     /// <summary>
     /// Resolves a CSS font-family list to a typeface, honouring the declared fallback order.
@@ -274,6 +285,7 @@ internal static class SkiaTextShaping
         var fallbackPaint = paint.Clone();
         fallbackPaint.Typeface = typeface;
         fallbackPaint.TextSkewX = font.IsItalic && typeface.FontSlant == SKFontStyleSlant.Upright ? -0.25f : 0f;
+        fallbackPaint.FakeBoldText = NeedsSyntheticBold(font, typeface);
         return fallbackPaint;
     }
 

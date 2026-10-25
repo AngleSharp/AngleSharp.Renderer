@@ -28,6 +28,18 @@ public sealed class SvgStyleAndFilterTests
     }
 
     [Fact]
+    public async Task PageCss_WithCustomPropertiesStylesSvgElements()
+    {
+        // found on MDN: the logo's paths are filled with var(--color-text-primary)
+        var pixel = await SampleAsync("""
+            <style>:root { --brand: rgb(0, 128, 0) } .icon rect { fill: var(--brand) }</style>
+            <svg class="icon" width="20" height="20"><rect width="20" height="20" fill="red"/></svg>
+            """, 10, 10);
+
+        AssertColor(Green, pixel);
+    }
+
+    [Fact]
     public async Task PageCss_BeatsPresentationAttributes()
     {
         var pixel = await SampleAsync("""
@@ -91,6 +103,38 @@ public sealed class SvgStyleAndFilterTests
         AssertColor(Green, Sample(document, 10, 10));
         document.GetElementById("icon")!.ClassList.Add("on");
         AssertColor(Blue, Sample(document, 10, 10));
+    }
+
+    [Fact]
+    public async Task PageCss_StylesSvgsLaidOutRepeatedly()
+    {
+        // flex items are measured before they are laid out, which resolves an SVG more than once per pass
+        var document = await OpenAsync("""
+            <style>.icon rect { fill: rgb(0, 128, 0) } .on .icon rect { fill: rgb(0, 0, 255) }</style>
+            <div id="bar" style="display: flex"><span><svg class="icon" width="20" height="20"><rect width="20" height="20"/></svg></span></div>
+            """);
+
+        AssertColor(Green, Sample(document, 10, 10));
+        document.GetElementById("bar")!.ClassList.Add("on");
+        AssertColor(Blue, Sample(document, 10, 10));
+    }
+
+    [Fact]
+    public async Task PageCss_StylesEachOfSeveralIdenticalSvgs()
+    {
+        var document = await OpenAsync("""
+            <style>.a rect { fill: rgb(0, 128, 0) } .b rect { fill: rgb(0, 0, 255) }</style>
+            <div style="display: flex">
+            <span class="a"><svg width="20" height="20"><rect width="20" height="20"/></svg></span>
+            <span class="b"><svg width="20" height="20"><rect width="20" height="20"/></svg></span>
+            </div>
+            """);
+        var displayList = new HtmlRenderer().BuildDisplayList(document, new DefaultRenderDevice { ViewPortWidth = 300, ViewPortHeight = 200 });
+        var images = displayList.Commands.OfType<DrawImageCommand>().OrderBy(command => command.Rect.X).ToArray();
+
+        Assert.Equal(2, images.Length);
+        AssertColor(Green, Center(images[0]));
+        AssertColor(Blue, Center(images[1]));
     }
 
     [Fact]
@@ -358,6 +402,12 @@ public sealed class SvgStyleAndFilterTests
         var scaleX = bitmap.Width / image.Rect.Width;
         var scaleY = bitmap.Height / image.Rect.Height;
         return bitmap.GetPixel((int)((x + 0.5f) * scaleX), (int)((y + 0.5f) * scaleY));
+    }
+
+    private static SKColor Center(DrawImageCommand image)
+    {
+        using var bitmap = SKBitmap.Decode(image.Image.Data);
+        return bitmap.GetPixel(bitmap.Width / 2, bitmap.Height / 2);
     }
 
     private static async Task<IDocument> OpenAsync(string body)

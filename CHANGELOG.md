@@ -1,3 +1,39 @@
+# 0.8.2
+
+Released on Sunday, October 25 2026.
+
+- Improved the layout of pages with many inline SVGs: how the page styles an inline SVG is resolved once per layout pass instead of every time the SVG is measured or laid out
+- Improved the layout of deep pages: the cascaded declarations of an element are taken from the render tree instead of running the cascade for the element and all of its ancestors
+- Improved the layout of pages with large `style` elements: the rules declaring `-webkit-line-clamp` and `overflow-wrap` are collected once per layout pass instead of once per element
+- Fixed percentage heights resolving against the containing block's width: they now refer to its height when it is definite (the viewport for the root element), and are `auto` otherwise
+- Fixed a row flex container laid out as an item of a column flex container taking its width as its height
+- Fixed a column flex container being at least as tall as it is wide, and using the height it gets from its own flex container
+- Fixed flex items with an authored `height: auto` (or `fit-content`) being treated as having a definite height
+- Fixed children of `display: contents` elements not becoming flex and grid items
+- Fixed `<button>` elements with element content (e.g. icons) showing a placeholder label instead of their content, and flex or grid buttons drawing their label twice
+- Fixed grid items spanning several rows growing only the first one, and items spanning a flexible (`fr`) row growing the other rows
+- Fixed grid items placed by `grid-area` not sizing content-sized tracks
+- Fixed cascaded values using `var()` (e.g. `grid-template-columns: var(--columns)`) being used without substitution
+- Fixed inline SVGs styled by the page with `var()` (e.g. `fill: var(--text)`) losing those styles
+- Fixed `transform` with `var()` being ignored
+- Fixed `display: none` children taking a flex item or grid cell
+- Fixed `auto` grid rows not stretching to a definite grid height (`align-content: normal`), and `align-content` being ignored for grids
+- Fixed flex item margins being taken from their main size instead of being added to it, and `auto` margins of flex items not taking the free space (e.g. `margin-right: auto` pushing the following items to the end)
+- Fixed the alignment keywords of CSS Box Alignment (`start`, `end`, `left`, `right`, `safe`/`unsafe`, `normal`) being ignored for flex containers
+- Fixed text directly inside a flex container having no size as a flex item, which let the following items overlap it and collapsed a flex container holding only text
+- Fixed `<button>` elements with generated content (`::before`/`::after`, e.g. icons) not showing it
+- Fixed `currentcolor` in computed values (e.g. `background-color: currentcolor`) being ignored instead of using the element's color
+- Fixed `letter-spacing` around spaces missing from the content width of text, which made shrink-to-fit boxes (e.g. flex items) too narrow for their text
+- Fixed absolutely positioned children of flex containers being laid out as flex items, and a flex container without items not painting its box or keeping its height
+- Fixed absolutely positioned boxes with `auto` offsets (e.g. no `top`) being moved to the corner of their containing block instead of staying at their static position
+- Fixed SVG filters (e.g. a drop shadow in an SVG icon) making the whole SVG disappear when running with SkiaSharp 3 (e.g. in an Avalonia app), which no longer has `SKImageFilter.CropRect`
+- Fixed the content width of a grid with several columns being the one of its widest item instead of the sum of its columns, which let the items of a shrink-to-fit grid overlap (e.g. the label and icons of GitHub's buttons)
+- Fixed block-level `<button>` elements (e.g. `display: flex`) filling their container instead of being as wide as their content
+- Fixed positioned or z-indexed boxes being laid out after their siblings (in painting order): e.g. a `position: relative; z-index: 1` box moved below the boxes following it, flex items with a `z-index` changed their order, and absolutely positioned boxes lost their static position; they are now laid out in document order and only painted above the in-flow content
+- Fixed `backdrop-filter` inside an element with `isolation: isolate` filtering the page behind that element instead of its content (e.g. GitHub's header buttons showed white): isolation only opens a group when something inside blends
+- Fixed items of a column flex container that are not stretched (e.g. `align-items: center`) having no width instead of being as wide as their content, which hid GitHub's repository tabs
+- Added synthetic bold for faces lighter than the requested weight (`font-synthesis: weight`), e.g. variable web fonts
+
 # 0.8.1
 
 Released on Friday, October 23 2026.

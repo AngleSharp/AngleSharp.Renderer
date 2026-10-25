@@ -68,7 +68,7 @@ internal static class SvgFilterBuilder
             var inputFilter = ConvertSpace(input, linear);
             SKImageFilter? SecondInput() => ConvertSpace(Input(primitive.GetAttribute("in2")), linear);
             var subregion = ResolveSubregion(primitive, region, bounds, viewport, primitiveUnitsAreBoundingBox);
-            var crop = new SKImageFilter.CropRect(subregion);
+            var crop = subregion;
 
             var result = tag switch
             {
@@ -223,16 +223,16 @@ internal static class SvgFilterBuilder
         return SKRect.Intersect(SKRect.Create(x, y, width, height), region);
     }
 
-    private static SKImageFilter BuildGaussianBlur(IElement primitive, SKImageFilter? input, SKImageFilter.CropRect crop)
+    private static SKImageFilter BuildGaussianBlur(IElement primitive, SKImageFilter? input, SKRect crop)
     {
         var (sigmaX, sigmaY) = ParsePair(primitive.GetAttribute("stdDeviation"), 0f);
         return SKImageFilter.CreateBlur(sigmaX, sigmaY, input, crop);
     }
 
-    private static SKImageFilter BuildOffset(IElement primitive, SKImageFilter? input, SKImageFilter.CropRect crop) =>
+    private static SKImageFilter BuildOffset(IElement primitive, SKImageFilter? input, SKRect crop) =>
         SKImageFilter.CreateOffset(ParseFloat(primitive.GetAttribute("dx"), 0f), ParseFloat(primitive.GetAttribute("dy"), 0f), input, crop);
 
-    private static SKImageFilter BuildMerge(IElement primitive, Func<string?, SKImageFilter?> input, SKImageFilter.CropRect crop)
+    private static SKImageFilter BuildMerge(IElement primitive, Func<string?, SKImageFilter?> input, SKRect crop)
     {
         var nodes = primitive.Children
             .Where(child => string.Equals(child.LocalName, "feMergeNode", StringComparison.OrdinalIgnoreCase))
@@ -242,7 +242,7 @@ internal static class SvgFilterBuilder
         return nodes.Length > 0 ? SKImageFilter.CreateMerge(nodes, crop) : Transparent(crop);
     }
 
-    private static SKImageFilter BuildColorMatrix(IElement primitive, SKImageFilter? input, SKImageFilter.CropRect crop)
+    private static SKImageFilter BuildColorMatrix(IElement primitive, SKImageFilter? input, SKRect crop)
     {
         var type = primitive.GetAttribute("type")?.Trim().ToLowerInvariant();
         var values = primitive.GetAttribute("values");
@@ -260,7 +260,7 @@ internal static class SvgFilterBuilder
         return SKImageFilter.CreateColorFilter(colorFilter, input, crop);
     }
 
-    private static SKImageFilter BuildDropShadow(IElement primitive, SKImageFilter? input, SKImageFilter.CropRect crop, bool linear)
+    private static SKImageFilter BuildDropShadow(IElement primitive, SKImageFilter? input, SKRect crop, bool linear)
     {
         var dx = ParseFloat(primitive.GetAttribute("dx"), 2f);
         var dy = ParseFloat(primitive.GetAttribute("dy"), 2f);
@@ -269,13 +269,13 @@ internal static class SvgFilterBuilder
     }
 
     /// <summary>`feFlood` fills its whole subregion with `flood-color`/`flood-opacity`.</summary>
-    private static SKImageFilter BuildFlood(IElement primitive, SKImageFilter.CropRect crop, bool linear)
+    private static SKImageFilter BuildFlood(IElement primitive, SKRect crop, bool linear)
     {
         using var paint = new SKPaint { Color = ToSpace(ParseFloodColor(primitive), linear) };
         return SKImageFilter.CreatePaint(paint, crop);
     }
 
-    private static SKImageFilter Transparent(SKImageFilter.CropRect crop)
+    private static SKImageFilter Transparent(SKRect crop)
     {
         using var paint = new SKPaint { Color = SKColors.Transparent };
         return SKImageFilter.CreatePaint(paint, crop);
@@ -298,7 +298,7 @@ internal static class SvgFilterBuilder
     /// `feComposite`: `in` over/in/out/atop/xor `in2`, or `arithmetic`'s
     /// `k1*i1*i2 + k2*i1 + k3*i2 + k4` (i1 = `in`, the foreground; i2 = `in2`, the background).
     /// </summary>
-    private static SKImageFilter BuildComposite(IElement primitive, SKImageFilter? input, SKImageFilter? input2, SKImageFilter.CropRect crop)
+    private static SKImageFilter BuildComposite(IElement primitive, SKImageFilter? input, SKImageFilter? input2, SKRect crop)
     {
         var op = primitive.GetAttribute("operator")?.Trim().ToLowerInvariant();
 
@@ -329,7 +329,7 @@ internal static class SvgFilterBuilder
     }
 
     /// <summary>`feBlend`: `in` blended onto `in2` with any CSS blend mode.</summary>
-    private static SKImageFilter BuildBlend(IElement primitive, SKImageFilter? input, SKImageFilter? input2, SKImageFilter.CropRect crop)
+    private static SKImageFilter BuildBlend(IElement primitive, SKImageFilter? input, SKImageFilter? input2, SKRect crop)
     {
         var mode = primitive.GetAttribute("mode")?.Trim().ToLowerInvariant() switch
         {
@@ -358,7 +358,7 @@ internal static class SvgFilterBuilder
     /// `feMorphology` grows (`dilate`, the default) or shrinks (`erode`) the input's own opaque
     /// region by `radius`.
     /// </summary>
-    private static SKImageFilter BuildMorphology(IElement primitive, SKImageFilter? input, SKImageFilter.CropRect crop)
+    private static SKImageFilter BuildMorphology(IElement primitive, SKImageFilter? input, SKRect crop)
     {
         var (radiusX, radiusY) = ParsePair(primitive.GetAttribute("radius"), 0f);
         var isErode = string.Equals(primitive.GetAttribute("operator")?.Trim(), "erode", StringComparison.OrdinalIgnoreCase);
@@ -373,7 +373,7 @@ internal static class SvgFilterBuilder
     /// `identity`, `table`, `discrete`, `linear` or `gamma` - as a 256-entry lookup table on
     /// unpremultiplied values.
     /// </summary>
-    private static SKImageFilter BuildComponentTransfer(IElement primitive, SKImageFilter? input, SKImageFilter.CropRect crop)
+    private static SKImageFilter BuildComponentTransfer(IElement primitive, SKImageFilter? input, SKRect crop)
     {
         var tables = new byte[4][];
 
@@ -445,7 +445,7 @@ internal static class SvgFilterBuilder
     /// is reversed (and the target mirrored); `divisor` (default: the kernel sum, or 1) becomes
     /// the gain.
     /// </summary>
-    private static SKImageFilter? BuildConvolveMatrix(IElement primitive, SKImageFilter? input, SKImageFilter.CropRect crop)
+    private static SKImageFilter? BuildConvolveMatrix(IElement primitive, SKImageFilter? input, SKRect crop)
     {
         var (orderX, orderY) = ParsePair(primitive.GetAttribute("order"), 3f);
         var width = Math.Max(1, (int)orderX);
@@ -485,7 +485,7 @@ internal static class SvgFilterBuilder
     /// `feDiffuseLighting`/`feSpecularLighting` with the first `feDistantLight`, `fePointLight` or
     /// `feSpotLight` child; the input's alpha is the bump map.
     /// </summary>
-    private static SKImageFilter BuildLighting(IElement primitive, SKImageFilter? input, SKImageFilter.CropRect crop, bool specular, bool linear)
+    private static SKImageFilter BuildLighting(IElement primitive, SKImageFilter? input, SKRect crop, bool specular, bool linear)
     {
         var light = primitive.Children.FirstOrDefault(child => child.LocalName.ToLowerInvariant() is "fedistantlight" or "fepointlight" or "fespotlight");
 
@@ -534,7 +534,7 @@ internal static class SvgFilterBuilder
     }
 
     /// <summary>`feDisplacementMap`: `in` shifted by `scale` times the selected channels of `in2`.</summary>
-    private static SKImageFilter BuildDisplacementMap(IElement primitive, SKImageFilter? input, SKImageFilter? displacement, SKImageFilter.CropRect crop)
+    private static SKImageFilter BuildDisplacementMap(IElement primitive, SKImageFilter? input, SKImageFilter? displacement, SKRect crop)
     {
         static SKColorChannel Channel(string? value) => value?.Trim().ToUpperInvariant() switch
         {
@@ -554,7 +554,7 @@ internal static class SvgFilterBuilder
     }
 
     /// <summary>`feTurbulence`: Perlin `turbulence` (the default) or `fractalNoise` over the subregion.</summary>
-    private static SKImageFilter BuildTurbulence(IElement primitive, SKImageFilter.CropRect crop)
+    private static SKImageFilter BuildTurbulence(IElement primitive, SKRect crop)
     {
         var (frequencyX, frequencyY) = ParsePair(primitive.GetAttribute("baseFrequency"), 0f);
         var octaves = Math.Max(1, (int)ParseFloat(primitive.GetAttribute("numOctaves"), 1f));
@@ -574,7 +574,7 @@ internal static class SvgFilterBuilder
     /// </summary>
     private static SKImageFilter BuildImage(IElement primitive, SKRect subregion, SvgRenderContext context, SvgViewport viewport)
     {
-        var crop = new SKImageFilter.CropRect(subregion);
+        var crop = subregion;
         var href = (primitive.GetAttribute("href") ?? primitive.GetAttribute("xlink:href"))?.Trim();
 
         if (href is { Length: > 1 } && href[0] == '#' && context.ElementsById.TryGetValue(href[1..], out var referenced))
