@@ -1502,7 +1502,9 @@ public sealed partial class HtmlRenderer
         var transform = ParseCssTransform(styleMap, borderBoxX, borderBoxY, borderBoxWidth, borderBoxHeight, fontSize);
         var filterFunctions = ParseCssFilter(styleMap);
         var opacity = ParseCssOpacity(styleMap);
-        var clipPathShape = ParseClipPath(styleMap, borderBoxWidth, borderBoxHeight);
+        var clipPathShape = ParseClipPath(styleMap, borderBoxWidth, borderBoxHeight) is { } boxShape
+            ? OffsetClipShape(boxShape, borderBoxX, borderBoxY)
+            : null;
         var blendMode = ParseBlendMode(styleMap, "mix-blend-mode");
         var isIsolated = styleMap.TryGetValue("isolation", out var isolationValue) &&
                          string.Equals(isolationValue.Trim(), "isolate", StringComparison.OrdinalIgnoreCase);
@@ -1851,10 +1853,24 @@ public sealed partial class HtmlRenderer
             ? containingWidth
             : float.NaN;
 
+        // each estimate is a trial layout, needed for the line sizes and again for the item itself
+        var crossSizeEstimates = new Dictionary<(IRenderNode Node, float MainSize), float>();
+
+        float EstimateCrossSize(FlexItemLayoutInfo item, float mainSize)
+        {
+            if (!crossSizeEstimates.TryGetValue((item.Node, mainSize), out var estimate))
+            {
+                estimate = EstimateFlexItemCrossSize(item.Node, mainSize, isRowDirection, inheritedTextStyle, context, ColumnCrossAvailable(item));
+                crossSizeEstimates[(item.Node, mainSize)] = estimate;
+            }
+
+            return estimate;
+        }
+
         var lineCrossSizes = lines.Select(line => line.Count > 0
             ? line.Max(item => item.HasDefiniteCrossSize
                 ? item.CrossSize
-                : Math.Max(item.CrossSize, EstimateFlexItemCrossSize(item.Node, item.HypotheticalMainSize, isRowDirection, inheritedTextStyle, context, ColumnCrossAvailable(item))))
+                : Math.Max(item.CrossSize, EstimateCrossSize(item, item.HypotheticalMainSize)))
             : 0f).ToList();
         var totalCrossSize = lineCrossSizes.Sum() + Math.Max(0, lines.Count - 1) * crossGap;
         var remainingCrossSize = Math.Max(0f, containerCrossSize - totalCrossSize);
@@ -1940,7 +1956,7 @@ public sealed partial class HtmlRenderer
             var lineCrossSize = lineItems.Count > 0
                 ? lineItems.Max(entry => entry.Item.HasDefiniteCrossSize
                     ? entry.Item.CrossSize
-                    : Math.Max(entry.Item.CrossSize, EstimateFlexItemCrossSize(entry.Item.Node, entry.FinalMainSize, isRowDirection, inheritedTextStyle, context, ColumnCrossAvailable(entry.Item))))
+                    : Math.Max(entry.Item.CrossSize, EstimateCrossSize(entry.Item, entry.FinalMainSize)))
                 : 0f;
             finalLineCrossSizes.Add(lineCrossSize);
             var lineCrossPosition = currentCrossOffset;
@@ -1968,7 +1984,7 @@ public sealed partial class HtmlRenderer
                 var resolvedCrossSize = item.CrossSize;
                 var estimatedCrossSize = item.HasDefiniteCrossSize
                     ? 0f
-                    : EstimateFlexItemCrossSize(item.Node, finalMainSize, isRowDirection, inheritedTextStyle, context, ColumnCrossAvailable(item));
+                    : EstimateCrossSize(item, finalMainSize);
                 resolvedCrossSize = Math.Max(resolvedCrossSize, estimatedCrossSize);
                 if (string.Equals(alignItems, "stretch", StringComparison.OrdinalIgnoreCase) && !item.HasDefiniteCrossSize && lineCrossSize > 0f)
                 {
@@ -2316,7 +2332,7 @@ public sealed partial class HtmlRenderer
             .Where(child => child is ElementRenderNode || (child is TextRenderNode textNode && NormalizeWhitespace(textNode.Ref.Data).Length > 0))
             .ToList();
 
-        var explicitGridTemplateColumns = ResolveExplicitPropertyValue(node.Ref, node.ComputedStyle, "grid-template-columns");
+        var explicitGridTemplateColumns = styleMap.GetValueOrDefault("grid-template-columns") ?? string.Empty;
         var columnLineNames = new Dictionary<string, List<int>>(StringComparer.Ordinal);
         var rowLineNames = new Dictionary<string, List<int>>(StringComparer.Ordinal);
         var columns = ParseGridTrackListStructured(explicitGridTemplateColumns, containingWidth, resolvedColumnGap, gridItems.Count, columnLineNames);
@@ -2328,7 +2344,7 @@ public sealed partial class HtmlRenderer
 
         var gridVerticalBorderAndPadding = borderTop + borderBottom + paddingTop + paddingBottom;
         var containerHeight = ResolveDefiniteContentHeight(styleMap, containingWidth, gridVerticalBorderAndPadding);
-        var explicitGridTemplateRows = ResolveExplicitPropertyValue(node.Ref, node.ComputedStyle, "grid-template-rows");
+        var explicitGridTemplateRows = styleMap.GetValueOrDefault("grid-template-rows") ?? string.Empty;
         var rows = ParseGridTrackListStructured(explicitGridTemplateRows, containerHeight, lineNames: rowLineNames);
         var hasExplicitRowTracks = rows.Count > 0;
         var explicitRowCount = rows.Count;
@@ -3877,7 +3893,7 @@ public sealed partial class HtmlRenderer
             // does not define without the non-standard `-webkit-line-clamp` extension handled
             // separately above; a genuinely multi-line, non-clamped result here is left as-is.
             if ((isClampedLastLine && isLastLine) ||
-                (textStyle.TextOverflow == TextOverflowMode.Ellipsis && lines.Count == 1 && lineWidth > lineMaxWidth))
+                (textStyle.TextOverflow == TextOverflowMode.Ellipsis && lines.Count == 1 && lineWidth > lineMaxWidth + 0.01f))
             {
                 line = TruncateWithEllipsis(context, line, lineMaxWidth, textStyle);
                 lineWidth = MeasureTextWidth(context, line, textStyle);
@@ -4406,7 +4422,7 @@ public sealed partial class HtmlRenderer
     private static string PrepareFlexItemText(TextRenderNode node, RenderTextStyle textStyle, LayoutContext context)
     {
         var text = ExpandTabs(context, ApplyTextTransform(NormalizeWhitespace(node.Ref.Data, textStyle.WhiteSpace), textStyle.TextTransform, previousEndsWord: false), textStyle);
-        return textStyle.WhiteSpace is WhiteSpaceMode.Normal or WhiteSpaceMode.Nowrap or WhiteSpaceMode.PreLine ? text.Trim() : text;
+        return textStyle.WhiteSpace is WhiteSpaceMode.Normal or WhiteSpaceMode.Nowrap or WhiteSpaceMode.PreLine ? text.Trim(CollapsibleWhiteSpace) : text;
     }
 
     private static float MeasureFlexItemTextHeight(string text, float width, RenderTextStyle textStyle, LayoutContext context)
@@ -8791,7 +8807,7 @@ public sealed partial class HtmlRenderer
                 sourcePaint = new RenderImagePaint(image, false, false, RenderBackgroundPositionComponent.Zero, RenderBackgroundPositionComponent.Zero, RenderBackgroundSize.Auto);
             }
         }
-        else if (ParseGradientPaint(source, RenderColor.Transparent) is RenderGradientPaint gradient)
+        else if (ParseGradientPaint(source, RenderColor.Transparent, ParseLength(styleMap, "font-size", 16f, 16f, allowAuto: false)) is RenderGradientPaint gradient)
         {
             sourcePaint = gradient;
         }
@@ -9551,7 +9567,7 @@ public sealed partial class HtmlRenderer
                         repeatY is RenderBackgroundRepeat.Space or RenderBackgroundRepeat.Round ? repeatY : null);
                 }
             }
-            else if (ParseGradientPaint(item, RenderColor.Transparent) is RenderGradientPaint gradient)
+            else if (ParseGradientPaint(item, RenderColor.Transparent, ParseLength(styleMap, "font-size", 16f, 16f, allowAuto: false)) is RenderGradientPaint gradient)
             {
                 // A gradient fills the whole area unless it is explicitly sized, positioned or
                 // repeated differently.
@@ -9745,6 +9761,19 @@ public sealed partial class HtmlRenderer
 
         return null;
     }
+
+    /// <summary>
+    /// Moves a shape resolved against the border box (with its origin at the box's corner) to
+    /// the position of the box, as the clip is applied in the coordinates of the page.
+    /// </summary>
+    private static RenderClipShape OffsetClipShape(RenderClipShape shape, float x, float y) => shape switch
+    {
+        RenderClipCircle circle => circle with { CenterX = circle.CenterX + x, CenterY = circle.CenterY + y },
+        RenderClipEllipse ellipse => ellipse with { CenterX = ellipse.CenterX + x, CenterY = ellipse.CenterY + y },
+        RenderClipInset inset => inset with { Rect = inset.Rect with { X = inset.Rect.X + x, Y = inset.Rect.Y + y } },
+        RenderClipPolygon polygon => new RenderClipPolygon(polygon.Points.Select(point => (point.X + x, point.Y + y)).ToList()),
+        _ => shape,
+    };
 
     private static bool TryExtractShapeArguments(string text, string functionName, out string arguments)
     {
@@ -10511,20 +10540,20 @@ public sealed partial class HtmlRenderer
     // pure-CSS structure, this renderer still owns turning it into its own backend-agnostic
     // `RenderGradient`. `ParseGradient` returns null cleanly for anything it does not recognize
     // (including a plain color), so no name-prefix pre-check is needed before calling it.
-    private static RenderPaint ParseGradientPaint(string rawValue, RenderColor fallbackColor)
+    private static RenderPaint ParseGradientPaint(string rawValue, RenderColor fallbackColor, float emBase = 16f)
     {
         var source = new StringSource(rawValue.Trim());
 
         return source.ParseGradient() switch
         {
-            CssLinearGradientValue linear => new RenderGradientPaint(ConvertLinearGradient(linear, fallbackColor)),
-            CssRadialGradientValue radial => new RenderGradientPaint(ConvertRadialGradient(radial, fallbackColor)),
+            CssLinearGradientValue linear => new RenderGradientPaint(ConvertLinearGradient(linear, fallbackColor, emBase)),
+            CssRadialGradientValue radial => new RenderGradientPaint(ConvertRadialGradient(radial, fallbackColor, emBase)),
             CssConicGradientValue conic => new RenderGradientPaint(ConvertConicGradient(conic, fallbackColor)),
             _ => new RenderColorPaint(fallbackColor),
         };
     }
 
-    private static RenderGradient ConvertLinearGradient(CssLinearGradientValue gradient, RenderColor fallbackColor)
+    private static RenderGradient ConvertLinearGradient(CssLinearGradientValue gradient, RenderColor fallbackColor, float emBase)
     {
         // `.Angle` already defaults correctly to 180deg ("to bottom") when no direction was
         // authored - confirmed against AngleSharp.Css's own test suite, unlike the conic-gradient
@@ -10539,11 +10568,11 @@ public sealed partial class HtmlRenderer
         // the -90 shift has to happen here - confirmed by a real, visible bug this surfaced:
         // `to right` (CSS 90deg) rendered as horizontal stripes instead of vertical ones without it.
         var angleDegrees = ParseAngle(gradient.Angle.CssText) - 90f;
-        var stops = ConvertGradientStops(gradient.Stops, fallbackColor, isConic: false);
+        var stops = ConvertGradientStops(gradient.Stops, fallbackColor, isConic: false, emBase);
         return new RenderGradient(RenderGradientKind.Linear, stops, AngleDegrees: angleDegrees, Repeating: gradient.IsRepeating);
     }
 
-    private static RenderGradient ConvertRadialGradient(CssRadialGradientValue gradient, RenderColor fallbackColor)
+    private static RenderGradient ConvertRadialGradient(CssRadialGradientValue gradient, RenderColor fallbackColor, float emBase)
     {
         var (centerX, centerY) = ParsePosition(gradient.Position.CssText);
         var sizeKind = RenderGradientSizeKind.FarthestCorner;
@@ -10581,7 +10610,7 @@ public sealed partial class HtmlRenderer
             explicitRadiusY = TryParsePixelValue(gradient.MinorRadius.CssText, out var radiusY) ? radiusY : explicitRadiusX;
         }
 
-        var stops = ConvertGradientStops(gradient.Stops, fallbackColor, isConic: false);
+        var stops = ConvertGradientStops(gradient.Stops, fallbackColor, isConic: false, emBase);
         return new RenderGradient(
             RenderGradientKind.Radial,
             stops,
@@ -10722,7 +10751,7 @@ public sealed partial class HtmlRenderer
     /// while its position still goes through <see cref="ParseStopPosition"/> exactly as it always
     /// did, just fed that stop's own <c>Location.CssText</c> instead of a hand-split token.
     /// </summary>
-    private static IReadOnlyList<RenderGradientStop> ConvertGradientStops(ICssValue[] rawStops, RenderColor fallbackColor, bool isConic)
+    private static IReadOnlyList<RenderGradientStop> ConvertGradientStops(ICssValue[] rawStops, RenderColor fallbackColor, bool isConic, float emBase = 16f)
     {
         var stops = rawStops.OfType<CssGradientStopValue>().ToArray();
 
@@ -10741,13 +10770,19 @@ public sealed partial class HtmlRenderer
 
             if (stop.IsUndetermined)
             {
-                result.Add(new RenderGradientStop(autoPosition, color));
+                result.Add(new RenderGradientStop(autoPosition, color, IsAuto: true));
                 continue;
             }
 
             var positionText = stop.Location.CssText;
 
-            if (!isConic && TryParsePixelValue(positionText, out var pixels))
+            if (!isConic && TryParsePercentagePlusLength(positionText, emBase, out var fraction, out var offsetPixels))
+            {
+                result.Add(new RenderGradientStop(fraction, color, OffsetPixels: offsetPixels));
+                continue;
+            }
+
+            if (!isConic && TryParseStopLength(positionText, emBase, out var pixels))
             {
                 // An absolute-length stop position ("red 10px") cannot become a fraction until
                 // the gradient's own rendered geometry (line length/radius) is known, so the raw
@@ -10761,6 +10796,67 @@ public sealed partial class HtmlRenderer
         }
 
         return result;
+    }
+
+    /// <summary>
+    /// Parses a stop position like <c>calc(100% - 2rem)</c> into its fraction and its length.
+    /// </summary>
+    private static bool TryParsePercentagePlusLength(string value, float emBase, out float fraction, out float pixels)
+    {
+        fraction = 0f;
+        pixels = 0f;
+        var match = PercentagePlusLengthPattern.Match(value.Trim());
+
+        if (!match.Success)
+        {
+            return false;
+        }
+
+        var sign = match.Groups["op"].Value == "-" ? -1f : 1f;
+        var first = match.Groups["a"].Value;
+        var second = match.Groups["b"].Value;
+
+        if (first.EndsWith('%') && TryParseStopLength(second, emBase, out var length))
+        {
+            fraction = float.Parse(first[..^1], CultureInfo.InvariantCulture) / 100f;
+            pixels = sign * length;
+            return true;
+        }
+
+        if (second.EndsWith('%') && TryParseStopLength(first, emBase, out length))
+        {
+            fraction = sign * float.Parse(second[..^1], CultureInfo.InvariantCulture) / 100f;
+            pixels = length;
+            return true;
+        }
+
+        return false;
+    }
+
+    private static readonly System.Text.RegularExpressions.Regex PercentagePlusLengthPattern = new(
+        @"^calc\(\s*(?<a>-?[0-9]*\.?[0-9]+(%|px|r?em))\s*(?<op>[+-])\s*(?<b>[0-9]*\.?[0-9]+(%|px|r?em))\s*\)$",
+        System.Text.RegularExpressions.RegexOptions.CultureInvariant | System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+
+    /// <summary>
+    /// A stop position given as a length: the cascaded value is not computed yet, so <c>em</c>
+    /// refers to the element's font size and <c>rem</c> to the initial one (16px).
+    /// </summary>
+    private static bool TryParseStopLength(string value, float emBase, out float pixels)
+    {
+        var trimmed = value.Trim().ToLowerInvariant();
+        var (number, factor) = trimmed.EndsWith("rem", StringComparison.Ordinal) ? (trimmed[..^3], 16f)
+            : trimmed.EndsWith("em", StringComparison.Ordinal) ? (trimmed[..^2], emBase)
+            : trimmed.EndsWith("px", StringComparison.Ordinal) ? (trimmed[..^2], 1f)
+            : (string.Empty, 0f);
+
+        if (factor > 0f && float.TryParse(number, NumberStyles.Float, CultureInfo.InvariantCulture, out var amount))
+        {
+            pixels = amount * factor;
+            return true;
+        }
+
+        pixels = 0f;
+        return false;
     }
 
     private static float ParseStopPosition(string rawPosition, bool isConic = false)
@@ -11526,6 +11622,27 @@ public sealed partial class HtmlRenderer
     private static string NormalizeWhitespace(string value) => NormalizeWhitespace(value, WhiteSpaceMode.Normal);
 
     /// <summary>
+    /// The white space CSS collapses (CSS Text 3 §4): a no-break space (or any other Unicode
+    /// space) is not part of it and keeps its width, unlike for <see cref="char.IsWhiteSpace(char)"/>.
+    /// </summary>
+    private static bool IsCollapsibleWhiteSpace(char c) => c is ' ' or '\t' or '\n' or '\r' or '\f';
+
+    private static readonly char[] CollapsibleWhiteSpace = [' ', '\t', '\n', '\r', '\f'];
+
+    private static bool IsCollapsibleWhiteSpaceOnly(string text)
+    {
+        foreach (var c in text)
+        {
+            if (!IsCollapsibleWhiteSpace(c))
+            {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    /// <summary>
     /// Collapses or preserves whitespace per the resolved <c>white-space</c> value, matching the CSS
     /// spec's own collapsing/newline-preservation table: <c>normal</c>/<c>nowrap</c> collapse both
     /// runs of horizontal whitespace and newlines into a single space and trim the ends; <c>pre</c>/
@@ -11568,7 +11685,7 @@ public sealed partial class HtmlRenderer
                 continue;
             }
 
-            if (char.IsWhiteSpace(c))
+            if (IsCollapsibleWhiteSpace(c))
             {
                 if (!inWhitespace)
                 {
@@ -11583,7 +11700,7 @@ public sealed partial class HtmlRenderer
             inWhitespace = false;
         }
 
-        return preserveNewlines ? sb.ToString() : sb.ToString().Trim();
+        return preserveNewlines ? sb.ToString() : sb.ToString().Trim(CollapsibleWhiteSpace);
     }
 
     private readonly record struct RenderTextStyle(

@@ -2188,7 +2188,7 @@ public sealed partial class HtmlRenderer
                 var item = child switch
                 {
                     ElementRenderNode childElement => ComputeOuterIntrinsicWidths(childElement, textStyle, percentageBase, context),
-                    TextRenderNode textNode when !string.IsNullOrWhiteSpace(textNode.Ref.Data) => ComputeTextIntrinsicWidths(textNode.Ref.Data, textStyle, context, out _),
+                    TextRenderNode textNode when !IsCollapsibleWhiteSpaceOnly(textNode.Ref.Data) => ComputeTextIntrinsicWidths(textNode.Ref.Data, textStyle, context, out _),
                     _ => IntrinsicWidths.Zero,
                 };
 
@@ -2314,7 +2314,7 @@ public sealed partial class HtmlRenderer
     {
         widths = IntrinsicWidths.Zero;
         var items = FlattenDisplayContents(element.Children, context).OfType<ElementRenderNode>().ToList();
-        var columns = ParseGridTrackListStructured(ResolveExplicitPropertyValue(element.Ref, element.ComputedStyle, "grid-template-columns"), percentageBase, 0f, items.Count);
+        var columns = ParseGridTrackListStructured(styleMap.GetValueOrDefault("grid-template-columns") ?? string.Empty, percentageBase, 0f, items.Count);
         var areas = ParseGridTemplateAreas(styleMap.GetValueOrDefault("grid-template-areas"));
         var columnCount = Math.Max(columns.Count, areas.Count > 0 ? areas.Values.Max(area => area.Column + area.ColumnSpan) : 0);
 
@@ -2435,12 +2435,12 @@ public sealed partial class HtmlRenderer
 
             // NormalizeWhitespace trims a collapsed text node, but its leading/trailing space
             // still separates it from neighbouring inline content.
-            if (collapses && paragraphIndex == 0 && char.IsWhiteSpace(data[0]))
+            if (collapses && paragraphIndex == 0 && IsCollapsibleWhiteSpace(data[0]))
             {
                 paragraphWidth += spaceWidth;
             }
 
-            if (collapses && paragraphIndex == paragraphs.Length - 1 && char.IsWhiteSpace(data[^1]))
+            if (collapses && paragraphIndex == paragraphs.Length - 1 && IsCollapsibleWhiteSpace(data[^1]))
             {
                 paragraphWidth += spaceWidth;
             }

@@ -6368,6 +6368,79 @@ public sealed class HtmlRendererTests
     }
 
     [Fact]
+    public async Task RenderToPng_GradientToTransparentDoesNotDarken()
+    {
+        // found on MDN: the sidebar header faded white into `#0000` (transparent black) as grey
+        var document = await ParseAsync("""
+            <html><body style="margin:0; background-color:#ffffff">
+                <div style="width:100px; height:100px; background:linear-gradient(to bottom, #ffffff, #0000)"></div>
+            </body></html>
+            """);
+
+        var image = new HtmlRenderer().RenderToPng(document, new DefaultRenderDevice { ViewPortWidth = 100, ViewPortHeight = 100 });
+        using var bitmap = SkiaSharp.SKBitmap.Decode(image.Data);
+        var middle = bitmap.GetPixel(50, 50);
+
+        Assert.True(middle.Red > 250 && middle.Green > 250 && middle.Blue > 250, middle.ToString());
+    }
+
+    [Theory]
+    [InlineData("#ff0000 0 70%, #0000ff 100%")]
+    [InlineData("#ff0000 0 calc(100% - 2rem), #0000ff 100%")]
+    public async Task RenderToPng_GradientStopsAreResolvedAlongTheGradientLine(string stops)
+    {
+        // the line of `to bottom` is as long as the box is tall, not as its diagonal; a stop with
+        // two positions or a calc() position keeps its color between them
+        var document = await ParseAsync($"""
+            <html><body style="margin:0">
+                <div style="width:300px; height:100px; background:linear-gradient(to bottom, {stops})"></div>
+            </body></html>
+            """);
+
+        var image = new HtmlRenderer().RenderToPng(document, new DefaultRenderDevice { ViewPortWidth = 300, ViewPortHeight = 100 });
+        using var bitmap = SkiaSharp.SKBitmap.Decode(image.Data);
+        var top = bitmap.GetPixel(150, 2);
+        var solid = bitmap.GetPixel(150, 60);
+        var bottom = bitmap.GetPixel(150, 98);
+
+        Assert.True(top.Red > 250 && top.Blue < 5, top.ToString());
+        Assert.True(solid.Red > 250 && solid.Blue < 5, solid.ToString());
+        Assert.True(bottom.Blue > 230 && bottom.Red < 25, bottom.ToString());
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_ClipPathIsPlacedAtItsBox()
+    {
+        // found on GitHub: a loading placeholder below the page's top clipped itself away
+        var document = await ParseAsync("""
+            <html><body style="margin:0">
+                <div style="margin:30px 0 0 40px; width:100px; height:60px; clip-path: inset(10px 20px 5px 15px); background-color:#ff0000;"></div>
+            </body></html>
+            """);
+
+        var push = Assert.Single(BuildDisplayList(document).Commands.OfType<PushClipShapeCommand>());
+        var inset = Assert.IsType<RenderClipInset>(push.Shape);
+
+        Assert.Equal(55f, inset.Rect.X, precision: 1);
+        Assert.Equal(40f, inset.Rect.Y, precision: 1);
+        Assert.Equal(65f, inset.Rect.Width, precision: 1);
+        Assert.Equal(45f, inset.Rect.Height, precision: 1);
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_NoBreakSpaceIsNoCollapsibleWhiteSpace()
+    {
+        // found on GitHub: a loading placeholder holding just a no-break space had no height
+        var document = await ParseAsync("""
+            <html><body style="margin:0">
+                <div style="width:100px; background-color:#ff0000">&nbsp;</div>
+            </body></html>
+            """);
+
+        Assert.True(SingleFill(BuildDisplayList(document), Red).Rect.Height > 10f);
+    }
+
+    [Fact]
     public async Task BuildDisplayList_ClipPathPolygonProducesVerticesResolvedAgainstTheBox()
     {
         var document = await ParseAsync("""
@@ -8633,6 +8706,20 @@ public sealed class HtmlRendererTests
 
         Assert.Equal(40f, red.Width, precision: 2);
         Assert.Equal(80f, red.X, precision: 2);
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_TextFittingItsShrinkToFitBoxGetsNoEllipsis()
+    {
+        // found on GitHub: the repository name in its breadcrumb was cut, as the width of the
+        // text and the one of its box differed by a rounding error
+        var boxes = string.Concat(Enumerable.Range(0, 15).Select(i =>
+            $"<div style=\"display:flex\"><div style=\"width:{100 + i * 1.37f}px\"></div><a style=\"display:inline-flex; padding:0 6px\"><span style=\"display:inline-block; overflow:hidden; white-space:nowrap; text-overflow:ellipsis; font-weight:600; font-size:{12 + i * 0.25f}px\">AngleSharp</span></a></div>"));
+        var document = await ParseAsync($"<html><body style=\"margin:0\">{boxes}</body></html>");
+
+        var texts = BuildDisplayList(document).Commands.OfType<DrawTextCommand>().Select(command => command.Text).ToList();
+
+        Assert.Equal(15, texts.Count(text => text == "AngleSharp"));
     }
 
     [Fact]

@@ -61,6 +61,32 @@ internal sealed class CssAnimationTracker
     private readonly Dictionary<(IElement Element, string Name), double> _pausedAccumulatedMs = [];
     private readonly Dictionary<(IElement Element, string Name), double> _lastObservedClockMs = [];
 
+    // While a frame is painted, the animations of an element and the keyframes of a name stay the
+    // same, but they are asked for once per interpolatable property: each time, the element's
+    // cascade ran again and every rule of every style sheet was searched for the keyframes.
+    private Dictionary<IElement, List<CssAnimationSpec>>? _frameSpecs;
+    private Dictionary<(IDocument Document, string Name), IReadOnlyList<CssKeyframeStop>?>? _frameKeyframes;
+
+    /// <summary>
+    /// Caches the animations of elements and the keyframes they refer to until the returned
+    /// scope is disposed, i.e. for the duration of painting one frame.
+    /// </summary>
+    public IDisposable BeginFrame()
+    {
+        _frameSpecs = [];
+        _frameKeyframes = [];
+        return new FrameScope(this);
+    }
+
+    private sealed class FrameScope(CssAnimationTracker tracker) : IDisposable
+    {
+        public void Dispose()
+        {
+            tracker._frameSpecs = null;
+            tracker._frameKeyframes = null;
+        }
+    }
+
     /// <summary>
     /// Gets the animated value currently in effect for <paramref name="property"/> on
     /// <paramref name="element"/>, or null if no running `animation` on this element currently
@@ -72,8 +98,7 @@ internal sealed class CssAnimationTracker
     /// </summary>
     public string? GetAnimatedValue(IElement element, string property, double clockMs)
     {
-        var style = element.ComputeCurrentStyle();
-        var specs = ParseAnimationSpecs(style);
+        var specs = GetAnimationSpecs(element);
 
         if (specs.Count == 0)
         {
@@ -98,9 +123,41 @@ internal sealed class CssAnimationTracker
         return result;
     }
 
+    private List<CssAnimationSpec> GetAnimationSpecs(IElement element)
+    {
+        if (_frameSpecs is null)
+        {
+            return ParseAnimationSpecs(element.ComputeCurrentStyle());
+        }
+
+        if (!_frameSpecs.TryGetValue(element, out var specs))
+        {
+            specs = ParseAnimationSpecs(element.ComputeCurrentStyle());
+            _frameSpecs[element] = specs;
+        }
+
+        return specs;
+    }
+
+    private IReadOnlyList<CssKeyframeStop>? GetKeyframeStops(IElement element, string name)
+    {
+        if (_frameKeyframes is null || element.Owner is not { } document)
+        {
+            return FindKeyframeStops(element, name);
+        }
+
+        if (!_frameKeyframes.TryGetValue((document, name), out var stops))
+        {
+            stops = FindKeyframeStops(element, name);
+            _frameKeyframes[(document, name)] = stops;
+        }
+
+        return stops;
+    }
+
     private string? GetAnimatedValueForSpec(IElement element, CssAnimationSpec spec, string property, double clockMs)
     {
-        var keyframes = FindKeyframeStops(element, spec.Name);
+        var keyframes = GetKeyframeStops(element, spec.Name);
 
         if (keyframes is not { Count: > 0 })
         {

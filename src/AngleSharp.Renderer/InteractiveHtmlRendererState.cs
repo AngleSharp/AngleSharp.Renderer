@@ -277,7 +277,10 @@ internal sealed class InteractiveHtmlRendererState : IDomHarness
             throw new InvalidOperationException("No active document is available for painting.");
         }
 
-        return _renderer.RenderToPng(targetDocument, RenderDevice);
+        using (_animationTracker.BeginFrame())
+        {
+            return _renderer.RenderToPng(targetDocument, RenderDevice);
+        }
     }
 
     private static double Clamp(double value, double min, double max)

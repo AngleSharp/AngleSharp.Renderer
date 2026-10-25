@@ -708,30 +708,24 @@ public sealed partial class SkiaRenderBackend : IRenderBackend, ITextMeasurer
             Style = SKPaintStyle.Fill,
         };
 
-        var colors = gradient.Stops.Select(stop => new SKColor(stop.Color.R, stop.Color.G, stop.Color.B, stop.Color.A)).ToArray();
-
         var centerX = rect.X + (gradient.CenterX * rect.Width);
         var centerY = rect.Y + (gradient.CenterY * rect.Height);
-        var diagonal = (float)Math.Sqrt((rect.Width * rect.Width) + (rect.Height * rect.Height));
         var (unscaledRx, unscaledRy) = gradient.Kind == RenderGradientKind.Radial
             ? ComputeRadialRadii(gradient, rect, centerX, centerY)
             : (0f, 0f);
+        var lineLength = gradient.Kind == RenderGradientKind.Linear ? ComputeGradientLineLength(gradient, rect) : 0f;
 
         // An absolute-length stop position ("red 10px") only becomes a fraction once the
         // gradient's own rendered geometry is known - the gradient line's length for linear, the
         // resolved (pre-repeat-scale) radius for radial. Conic stops use angles, never lengths.
         var referenceLength = gradient.Kind switch
         {
-            RenderGradientKind.Linear => diagonal,
+            RenderGradientKind.Linear => lineLength,
             RenderGradientKind.Radial => Math.Max(unscaledRx, unscaledRy),
             _ => 0f,
         };
 
-        var rawPositions = gradient.Stops
-            .Select(stop => stop.AbsolutePositionPixels is { } pixels && referenceLength > 0f
-                ? Math.Clamp(pixels / referenceLength, 0f, 1f)
-                : stop.Position)
-            .ToArray();
+        var (colors, rawPositions) = ResolveGradientStops(gradient.Stops, referenceLength);
 
         var tileMode = gradient.Repeating ? SKShaderTileMode.Repeat : SKShaderTileMode.Clamp;
 
@@ -758,7 +752,7 @@ public sealed partial class SkiaRenderBackend : IRenderBackend, ITextMeasurer
 
         paint.Shader = gradient.Kind switch
         {
-            RenderGradientKind.Linear => CreateLinearGradientShader(gradient, centerX, centerY, diagonal, colors, positions, tileMode, repeatScale),
+            RenderGradientKind.Linear => CreateLinearGradientShader(gradient, centerX, centerY, lineLength, colors, positions, tileMode, repeatScale),
             RenderGradientKind.Radial => CreateRadialGradientShader(centerX, centerY, unscaledRx, unscaledRy, colors, positions, tileMode, repeatScale),
             RenderGradientKind.Conic => CreateConicGradientShader(gradient, centerX, centerY, colors, positions, tileMode, repeatScale),
             _ => throw new NotSupportedException($"Unsupported gradient kind: {gradient.Kind}"),
@@ -767,9 +761,115 @@ public sealed partial class SkiaRenderBackend : IRenderBackend, ITextMeasurer
         return paint;
     }
 
-    private static SKShader CreateLinearGradientShader(RenderGradient gradient, float centerX, float centerY, float diagonal, SKColor[] colors, float[] positions, SKShaderTileMode tileMode, float repeatScale)
+    /// <summary>
+    /// The length of the gradient line: it passes through the center of the box at the
+    /// gradient's angle and ends where the perpendicular lines through the corners cross it
+    /// (CSS Images 3 §3.1.1), e.g. the height of the box for `to bottom`.
+    /// </summary>
+    private static float ComputeGradientLineLength(RenderGradient gradient, RenderRect rect)
     {
-        var halfDiagonal = diagonal / 2f;
+        var angle = ((gradient.AngleDegrees % 360f) + 360f) % 360f * (Math.PI / 180d);
+        return (float)(Math.Abs(rect.Width * Math.Cos(angle)) + Math.Abs(rect.Height * Math.Sin(angle)));
+    }
+
+    /// <summary>
+    /// Resolves the stops to colors and positions in [0, 1] the way CSS does (CSS Images 3
+    /// §3.5.3): a position never precedes the one before it, and stops without one are spread
+    /// evenly between their neighbours. Colors are interpolated premultiplied by alpha, so a fully
+    /// transparent stop takes the color of its neighbours on either side (fading `white` to
+    /// `transparent` must not pass through grey, as `transparent` is transparent black).
+    /// </summary>
+    private static (SKColor[] Colors, float[] Positions) ResolveGradientStops(IReadOnlyList<RenderGradientStop> stops, float referenceLength)
+    {
+        var count = stops.Count;
+        var positions = new float?[count];
+
+        for (var i = 0; i < count; i++)
+        {
+            var stop = stops[i];
+
+            if (stop.IsAuto)
+            {
+                positions[i] = i == 0 ? 0f : i == count - 1 ? 1f : null;
+            }
+            else if (stop.AbsolutePositionPixels is { } pixels)
+            {
+                positions[i] = referenceLength > 0f ? pixels / referenceLength : stop.Position;
+            }
+            else
+            {
+                positions[i] = stop.Position + (referenceLength > 0f ? stop.OffsetPixels / referenceLength : 0f);
+            }
+        }
+
+        var max = float.NegativeInfinity;
+
+        for (var i = 0; i < count; i++)
+        {
+            if (positions[i] is { } position)
+            {
+                max = Math.Max(max, position);
+                positions[i] = max;
+            }
+        }
+
+        for (var i = 0; i < count; i++)
+        {
+            if (positions[i] is not null)
+            {
+                continue;
+            }
+
+            var end = i;
+
+            while (positions[end] is null)
+            {
+                end++;
+            }
+
+            var from = positions[i - 1]!.Value;
+            var to = positions[end]!.Value;
+
+            for (var j = i; j < end; j++)
+            {
+                positions[j] = from + ((to - from) * (j - i + 1) / (end - i + 1));
+            }
+        }
+
+        var colors = new List<SKColor>(count + 2);
+        var resolved = new List<float>(count + 2);
+
+        for (var i = 0; i < count; i++)
+        {
+            var color = stops[i].Color;
+            var position = Math.Clamp(positions[i]!.Value, 0f, 1f);
+
+            if (color.A == 0)
+            {
+                var before = i > 0 ? stops[i - 1].Color : color;
+                var after = i < count - 1 ? stops[i + 1].Color : color;
+                colors.Add(new SKColor(before.R, before.G, before.B, 0));
+                resolved.Add(position);
+
+                if (before != after)
+                {
+                    colors.Add(new SKColor(after.R, after.G, after.B, 0));
+                    resolved.Add(position);
+                }
+
+                continue;
+            }
+
+            colors.Add(new SKColor(color.R, color.G, color.B, color.A));
+            resolved.Add(position);
+        }
+
+        return (colors.ToArray(), resolved.ToArray());
+    }
+
+    private static SKShader CreateLinearGradientShader(RenderGradient gradient, float centerX, float centerY, float lineLength, SKColor[] colors, float[] positions, SKShaderTileMode tileMode, float repeatScale)
+    {
+        var halfDiagonal = lineLength / 2f;
         var radians = (gradient.AngleDegrees % 360f + 360f) % 360f;
         var angle = radians * (Math.PI / 180d);
         var dx = (float)Math.Cos(angle);

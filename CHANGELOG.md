@@ -5,6 +5,8 @@ Released on Sunday, October 25 2026.
 - Improved the layout of pages with many inline SVGs: how the page styles an inline SVG is resolved once per layout pass instead of every time the SVG is measured or laid out
 - Improved the layout of deep pages: the cascaded declarations of an element are taken from the render tree instead of running the cascade for the element and all of its ancestors
 - Improved the layout of pages with large `style` elements: the rules declaring `-webkit-line-clamp` and `overflow-wrap` are collected once per layout pass instead of once per element
+- Improved painting pages with running CSS animations: the animations of an element and their keyframes are looked up once per frame instead of once per animatable property (each running the element's cascade and searching all style sheets)
+- Improved the layout of grids and flex containers: the grid templates are taken from the style map instead of running the cascade again, and the cross size of a flex item is estimated once
 - Fixed percentage heights resolving against the containing block's width: they now refer to its height when it is definite (the viewport for the root element), and are `auto` otherwise
 - Fixed a row flex container laid out as an item of a column flex container taking its width as its height
 - Fixed a column flex container being at least as tall as it is wide, and using the height it gets from its own flex container
@@ -32,7 +34,13 @@ Released on Sunday, October 25 2026.
 - Fixed positioned or z-indexed boxes being laid out after their siblings (in painting order): e.g. a `position: relative; z-index: 1` box moved below the boxes following it, flex items with a `z-index` changed their order, and absolutely positioned boxes lost their static position; they are now laid out in document order and only painted above the in-flow content
 - Fixed `backdrop-filter` inside an element with `isolation: isolate` filtering the page behind that element instead of its content (e.g. GitHub's header buttons showed white): isolation only opens a group when something inside blends
 - Fixed items of a column flex container that are not stretched (e.g. `align-items: center`) having no width instead of being as wide as their content, which hid GitHub's repository tabs
-- Added synthetic bold for faces lighter than the requested weight (`font-synthesis: weight`), e.g. variable web fonts
+- Fixed `text-overflow: ellipsis` cutting text that fits its shrink-to-fit box, as the widths of both differed by a rounding error (e.g. the repository name in GitHub's breadcrumb)
+- Fixed `clip-path` shapes being placed at the top left of the page instead of at their box, which clipped away boxes that were not there (e.g. GitHub's loading placeholders)
+- Fixed a no-break space being collapsed and trimmed like white space, so a block holding only `&nbsp;` had no height
+- Fixed linear gradients spanning the diagonal of their box instead of their gradient line (e.g. the height of the box for `to bottom`), which stretched them and cut their ends
+- Fixed gradient stops with `calc()` (e.g. `calc(100% - 2rem)`) or `em`/`rem` positions being placed at the start, stops without a position not being spread between their neighbours, and positions before the previous one not being moved up to it
+- Fixed gradients to a transparent color (e.g. `#0000`, `transparent`) passing through grey instead of fading out, as colors were not interpolated premultiplied by alpha (e.g. MDN's sidebar header)
+- Added synthetic bold for faces lighter than the requested weight (`font-synthesis: weight`), e.g. variable web fonts: the glyph outlines are stroked by 1/16 em, so it is heavier than the regular text on every platform (Skia's fake bold came out lighter than CoreText's regular rendering on macOS)
 
 # 0.8.1
 
