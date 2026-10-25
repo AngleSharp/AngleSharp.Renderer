@@ -103,7 +103,7 @@ internal static class SkiaTextShaping
             font.Faces ?? FontFaceSet.Empty,
             font.FontWeight);
 
-        return new SKPaint
+        var paint = new SKPaint
         {
             IsAntialias = true,
             SubpixelText = false,
@@ -115,7 +115,38 @@ internal static class SkiaTextShaping
             // already slanted, and skewing it again doubles the angle.
             TextSkewX = font.IsItalic && typeface.FontSlant == SKFontStyleSlant.Upright ? -0.25f : 0f,
         };
+
+        ApplySyntheticBold(paint, font, typeface);
+        return paint;
     }
+
+    /// <summary>
+    /// Emboldens the glyphs by stroking their outlines along with filling them (which leaves the
+    /// advances as they are), when the face is lighter than asked for. Skia's own fake bold is
+    /// not used: on macOS it switches the glyphs from CoreText's rasterization, which renders
+    /// them noticeably heavier, to plain outlines, so the "bold" text came out lighter than the
+    /// regular one there.
+    /// </summary>
+    private static void ApplySyntheticBold(SKPaint paint, RenderFont font, SKTypeface typeface)
+    {
+        var synthesize = NeedsSyntheticBold(font, typeface);
+        paint.Style = synthesize ? SKPaintStyle.StrokeAndFill : SKPaintStyle.Fill;
+        paint.StrokeWidth = synthesize ? font.FontSize * SyntheticBoldStrokeRatio : 0f;
+        paint.StrokeJoin = SKStrokeJoin.Round;
+    }
+
+    // about the offset Firefox draws its synthetic bold with (1/16 em)
+    private const float SyntheticBoldStrokeRatio = 1f / 16f;
+
+    /// <summary>
+    /// Bold is synthesized when the resolved face is lighter than asked for (CSS Fonts 4 §5.2,
+    /// font-synthesis: weight), e.g. a variable web font whose weight axis cannot be set here, or
+    /// a family that only comes in one weight.
+    /// </summary>
+    private static bool NeedsSyntheticBold(RenderFont font, SKTypeface typeface) =>
+        font.FontWeight >= SyntheticBoldThreshold && typeface.FontWeight < SyntheticBoldThreshold;
+
+    private const float SyntheticBoldThreshold = 600f;
 
     /// <summary>
     /// Resolves a CSS font-family list to a typeface, honouring the declared fallback order.
@@ -274,6 +305,7 @@ internal static class SkiaTextShaping
         var fallbackPaint = paint.Clone();
         fallbackPaint.Typeface = typeface;
         fallbackPaint.TextSkewX = font.IsItalic && typeface.FontSlant == SKFontStyleSlant.Upright ? -0.25f : 0f;
+        ApplySyntheticBold(fallbackPaint, font, typeface);
         return fallbackPaint;
     }
 

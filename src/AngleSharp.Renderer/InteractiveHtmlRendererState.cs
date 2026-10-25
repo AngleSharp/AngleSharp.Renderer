@@ -1,4 +1,5 @@
 using AngleSharp.Css;
+using AngleSharp.Css.Dom;
 using AngleSharp.Dom;
 using AngleSharp.Renderer.Rendering;
 using System.Linq;
@@ -143,7 +144,7 @@ internal sealed class InteractiveHtmlRendererState : IDomHarness
         if (targetDocument is not null)
         {
             var metrics = HtmlRenderer.CaptureLayoutMetrics(targetDocument, RenderDevice);
-            nextHovered = FindTopMostElementAt(metrics, _mousePosition.X, _mousePosition.Y);
+            nextHovered = HitTesting.FindTopMostElementAt(metrics, _mousePosition.X, _mousePosition.Y);
         }
 
         if (ReferenceEquals(_hoveredElement, nextHovered))
@@ -210,39 +211,6 @@ internal sealed class InteractiveHtmlRendererState : IDomHarness
         _transitionTracker.NotifyElementsMayHaveChanged(affectedElements);
     }
 
-    private static IElement? FindTopMostElementAt(IReadOnlyDictionary<IElement, HtmlRenderer.ElementLayoutMetrics> metrics, double x, double y)
-    {
-        return metrics
-            .Where(pair => Contains(pair.Value, x, y))
-            .OrderByDescending(pair => GetDepth(pair.Key))
-            .ThenBy(pair => Math.Max(0f, pair.Value.BorderBoxWidth) * Math.Max(0f, pair.Value.BorderBoxHeight))
-            .Select(pair => pair.Key)
-            .FirstOrDefault();
-    }
-
-    private static bool Contains(HtmlRenderer.ElementLayoutMetrics metrics, double x, double y)
-    {
-        var left = metrics.BorderBoxX;
-        var top = metrics.BorderBoxY;
-        var right = metrics.BorderBoxX + metrics.BorderBoxWidth;
-        var bottom = metrics.BorderBoxY + metrics.BorderBoxHeight;
-
-        return x >= left && x <= right && y >= top && y <= bottom;
-    }
-
-    private static int GetDepth(IElement element)
-    {
-        var depth = 0;
-        var current = element.ParentElement;
-
-        while (current is not null)
-        {
-            depth++;
-            current = current.ParentElement;
-        }
-
-        return depth;
-    }
 
     public void AdvanceTime(TimeSpan delta)
     {
@@ -269,6 +237,12 @@ internal sealed class InteractiveHtmlRendererState : IDomHarness
         return _animationTracker.GetAnimatedValue(element, property, _clockMs);
     }
 
+    /// <summary>
+    /// Gets the animated value of a property, given the element's computed style.
+    /// </summary>
+    internal string? GetAnimatedValue(IElement element, string property, ICssStyleDeclaration computedStyle) =>
+        _animationTracker.GetAnimatedValue(element, property, _clockMs, computedStyle);
+
     public RenderedImage PaintToPng()
     {
         var targetDocument = Context.Active;
@@ -277,7 +251,10 @@ internal sealed class InteractiveHtmlRendererState : IDomHarness
             throw new InvalidOperationException("No active document is available for painting.");
         }
 
-        return _renderer.RenderToPng(targetDocument, RenderDevice);
+        using (_animationTracker.BeginFrame())
+        {
+            return _renderer.RenderToPng(targetDocument, RenderDevice);
+        }
     }
 
     private static double Clamp(double value, double min, double max)

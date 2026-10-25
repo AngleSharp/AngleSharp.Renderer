@@ -198,7 +198,15 @@ public sealed record RenderGradient(
 /// The stop's position as an absolute length in pixels (`red 10px`), if it was given as one
 /// rather than a percentage/unitless fraction; otherwise <see langword="null"/>.
 /// </param>
-public sealed record RenderGradientStop(float Position, RenderColor Color, float? AbsolutePositionPixels = null);
+/// <param name="OffsetPixels">
+/// A length added to the fraction <see cref="Position"/> (`calc(100% - 2rem)`), resolved by the
+/// backend like <see cref="AbsolutePositionPixels"/>.
+/// </param>
+/// <param name="IsAuto">
+/// Whether the stop has no position of its own: it is then placed halfway between its
+/// neighbours (CSS Images 3 §3.5.3), and <see cref="Position"/> only holds an estimate.
+/// </param>
+public sealed record RenderGradientStop(float Position, RenderColor Color, float? AbsolutePositionPixels = null, float OffsetPixels = 0f, bool IsAuto = false);
 
 /// <summary>
 /// Describes the available gradient kinds.

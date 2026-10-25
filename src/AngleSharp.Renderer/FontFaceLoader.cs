@@ -105,11 +105,12 @@ internal static class FontFaceLoader
         try
         {
             var target = new Url(document.BaseUrl, url);
-            var download = loader.FetchAsync(DocumentRequest.Get(target, source: document, referer: document.BaseUri));
+            var download = loader.FetchAsync(HtmlRenderer.CreateResourceRequest(target, document, "*/*"));
             var response = download.Task.GetAwaiter().GetResult();
 
-            if (response?.Content is null)
+            if (response?.Content is null || !HtmlRenderer.IsSuccessStatus(response))
             {
+                response?.Dispose();
                 return false;
             }
 

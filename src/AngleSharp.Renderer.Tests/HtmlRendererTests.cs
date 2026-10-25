@@ -293,6 +293,25 @@ public sealed class HtmlRendererTests
     }
 
     [Fact]
+    public async Task BuildDisplayList_BackgroundImageIsRequestedAsAnImage()
+    {
+        // found on www.florian-rappl.de: its server refuses images asked for as documents (406)
+        var configuration = Configuration.Default
+            .WithCss()
+            .With(new ImageOnlyRequester(Convert.FromBase64String("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAACklEQVR4nGMAAQABAA4A4cQTmwAAAABJRU5ErkJggg==")))
+            .WithDefaultLoader(new LoaderOptions { IsResourceLoadingEnabled = true });
+        var document = await ParseAsync("""
+            <html><body>
+                <div style="width:80px; height:60px; background-image: url(http://assets.test/tile.png);"></div>
+            </body></html>
+            """, configuration, "http://example.test/");
+
+        var displayList = new HtmlRenderer().BuildDisplayList(document, new DefaultRenderDevice { ViewPortWidth = 240, ViewPortHeight = 160 });
+
+        Assert.Single(displayList.Commands.OfType<FillRectCommand>().Where(fill => fill.Paint is RenderImagePaint));
+    }
+
+    [Fact]
     public async Task BuildDisplayList_FetchesAndCachesHttpBackgroundImagePerDocument()
     {
         var requester = new SingleResponseImageRequester(Convert.FromBase64String("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAACklEQVR4nGMAAQABAA4A4cQTmwAAAABJRU5ErkJggg=="));
@@ -439,6 +458,157 @@ public sealed class HtmlRendererTests
         var frameBackground = Assert.Single(displayList.Commands.OfType<FillRectCommand>()
             .Where(command => command.Color.Equals(new RenderColor(237, 243, 247))));
         Assert.Equal(146f, frameBackground.Rect.Height);
+    }
+
+    private static RenderRect FillOf(DisplayList displayList, RenderColor color) =>
+        Assert.Single(displayList.Commands.OfType<FillRectCommand>().Where(command => command.Color.Equals(color))).Rect;
+
+    private static async Task<DisplayList> LayoutAsync(string html)
+    {
+        var document = await ParseAsync(html);
+        return new HtmlRenderer().BuildDisplayList(document, new DefaultRenderDevice { ViewPortWidth = 500, ViewPortHeight = 300, FontSize = 16f });
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_PercentageHeightInAnAutoHeightParentIsAuto()
+    {
+        // CSS 2.1, 10.5: without a definite containing block height, a percentage height is auto
+        var displayList = await LayoutAsync("""
+            <html><body style="margin:0">
+                <div><div style="height:50%; background-color:#112233"><div style="height:20px"></div></div></div>
+            </body></html>
+            """);
+
+        Assert.Equal(20f, FillOf(displayList, new RenderColor(0x11, 0x22, 0x33)).Height);
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_PercentageHeightsOfTheRootAndBodyFillTheViewport()
+    {
+        var displayList = await LayoutAsync("""
+            <html style="height:100%"><body style="margin:0; height:100%">
+                <div style="height:50%; background-color:#112233"></div>
+            </body></html>
+            """);
+
+        Assert.Equal(150f, FillOf(displayList, new RenderColor(0x11, 0x22, 0x33)).Height);
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_FlexContainerWithPercentageHeightInAnAutoHeightParentIsSizedByItsContent()
+    {
+        var displayList = await LayoutAsync("""
+            <html><body style="margin:0">
+                <header><div style="display:flex; align-items:center; height:100%; background-color:#112233"><div style="height:30px; width:40px"></div></div></header>
+            </body></html>
+            """);
+
+        Assert.Equal(30f, FillOf(displayList, new RenderColor(0x11, 0x22, 0x33)).Height);
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_FlexItemPercentageHeightRefersToTheContainerHeight()
+    {
+        var displayList = await LayoutAsync("""
+            <html><body style="margin:0">
+                <div style="display:flex; height:54px"><nav style="height:100%; width:40px; background-color:#112233"></nav></div>
+            </body></html>
+            """);
+
+        Assert.Equal(54f, FillOf(displayList, new RenderColor(0x11, 0x22, 0x33)).Height);
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_RowFlexContainerInAColumnTakesItsHeightFromTheMainAxis()
+    {
+        // the row container's height is its main size in the column, not its cross size (the width)
+        var displayList = await LayoutAsync("""
+            <html><body style="margin:0">
+                <div style="display:flex; flex-direction:column; width:400px">
+                    <div style="display:flex; background-color:#112233"><div style="height:30px; width:40px"></div></div>
+                </div>
+            </body></html>
+            """);
+
+        var row = FillOf(displayList, new RenderColor(0x11, 0x22, 0x33));
+        Assert.Equal(400f, row.Width);
+        Assert.Equal(30f, row.Height);
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_ColumnFlexContainerIsAsTallAsItsItems()
+    {
+        // it was at least as tall as it is wide, taking its width (the cross size) for its height
+        var displayList = await LayoutAsync("""
+            <html><body style="margin:0">
+                <header style="display:flex; flex-direction:column; background-color:#112233"><div style="height:36px"></div><nav style="min-height:48px"></nav></header>
+            </body></html>
+            """);
+
+        Assert.Equal(84f, FillOf(displayList, new RenderColor(0x11, 0x22, 0x33)).Height);
+    }
+
+    [Theory]
+    [InlineData("height:auto")]
+    [InlineData("height:fit-content")]
+    public async Task BuildDisplayList_FlexItemWithAnAutoHeightIsSizedByItsContent(string height)
+    {
+        // an authored `height: auto` counted as a definite height
+        var displayList = await LayoutAsync($"""
+            <html><body style="margin:0">
+                <div style="display:flex; align-items:center"><div style="display:flex; flex-direction:column; flex:1; {height}; background-color:#112233"><i style="display:block; height:20px"></i></div></div>
+            </body></html>
+            """);
+
+        Assert.Equal(20f, FillOf(displayList, new RenderColor(0x11, 0x22, 0x33)).Height);
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_StretchedColumnFlexContainerDistributesItsHeight()
+    {
+        var displayList = await LayoutAsync("""
+            <html><body style="margin:0">
+                <div style="display:flex; height:100px">
+                    <div style="display:flex; flex-direction:column; justify-content:flex-end; width:50px"><div style="height:20px; background-color:#112233"></div></div>
+                </div>
+            </body></html>
+            """);
+
+        Assert.Equal(80f, FillOf(displayList, new RenderColor(0x11, 0x22, 0x33)).Y);
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_GridItemSpanningAFlexibleRowDoesNotGrowTheOtherRows()
+    {
+        // found on MDN: a tall sidebar spanning both rows made the min-content header row as tall
+        var displayList = await LayoutAsync("""
+            <html><body style="margin:0">
+                <div style="display:grid; grid-template-columns:100px 100px; grid-template-rows:min-content 1fr; grid-template-areas:'side head' 'side body'">
+                    <div style="grid-area:side; height:500px"></div>
+                    <div style="grid-area:head; height:40px"></div>
+                    <div style="grid-area:body; height:20px; background-color:#112233"></div>
+                </div>
+            </body></html>
+            """);
+
+        Assert.Equal(40f, FillOf(displayList, new RenderColor(0x11, 0x22, 0x33)).Y);
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_GridTrackListFromACustomPropertyIsUsed()
+    {
+        // the cascaded (not computed) value would still be the unresolved var()
+        var displayList = await LayoutAsync("""
+            <html><body style="margin:0">
+                <div style="--columns: 100px 200px; display:grid; grid-template-columns:var(--columns)">
+                    <div></div><div style="height:20px; background-color:#112233"></div>
+                </div>
+            </body></html>
+            """);
+
+        var second = FillOf(displayList, new RenderColor(0x11, 0x22, 0x33));
+        Assert.Equal(100f, second.X);
+        Assert.Equal(200f, second.Width);
     }
 
     [Fact]
@@ -1894,6 +2064,37 @@ public sealed class HtmlRendererTests
     }
 
     [Fact]
+    public async Task BuildDisplayList_GridAutoRowsAreNotStretchedWithAlignContentStart()
+    {
+        var displayList = await LayoutAsync("""
+            <html><body style="margin:0">
+                <div style="display:grid; height:40px; align-content:start">
+                    <div style="height:10px"></div>
+                    <div style="height:10px; background-color:#112233"></div>
+                </div>
+            </body></html>
+            """);
+
+        Assert.Equal(10f, FillOf(displayList, new RenderColor(0x11, 0x22, 0x33)).Y);
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_HiddenChildrenDoNotTakeAGridCell()
+    {
+        // found on MDN: hidden mobile-only items pushed the menu into the wrong column
+        var displayList = await LayoutAsync("""
+            <html><body style="margin:0">
+                <div style="display:grid; grid-template-columns:50px 50px">
+                    <div style="display:none"></div>
+                    <div style="height:10px; background-color:#112233"></div>
+                </div>
+            </body></html>
+            """);
+
+        Assert.Equal(0f, FillOf(displayList, new RenderColor(0x11, 0x22, 0x33)).X);
+    }
+
+    [Fact]
     public async Task BuildDisplayList_AppliesAutoPlacementAcrossImplicitTracks()
     {
         var document = await ParseAsync("""
@@ -1921,17 +2122,15 @@ public sealed class HtmlRendererTests
             .ThenBy(command => command.Rect.X)
             .ToArray();
 
-        // Implicit auto rows now size to their own content (10px, each item's actual height),
-        // the same way auto columns already did - this used to assert 20 (containerHeight/rowCount,
-        // 40/2), a coarse guess from before implicit rows grew to fit content like explicit Auto
-        // tracks do (see GrowGridTrackSize).
+        // Implicit auto rows size to their content (10px each) and are then stretched to fill the
+        // grid's definite 40px height (align-content: normal, CSS Grid 1, 11.8), i.e. 20px each.
         Assert.Equal(3, childBackgrounds.Length);
         Assert.Equal(0f, childBackgrounds[0].Rect.X);
         Assert.Equal(0f, childBackgrounds[0].Rect.Y);
         Assert.Equal(50f, childBackgrounds[1].Rect.X);
         Assert.Equal(0f, childBackgrounds[1].Rect.Y);
         Assert.Equal(0f, childBackgrounds[2].Rect.X);
-        Assert.Equal(10f, childBackgrounds[2].Rect.Y);
+        Assert.Equal(20f, childBackgrounds[2].Rect.Y);
     }
 
     [Fact]
@@ -3347,6 +3546,36 @@ public sealed class HtmlRendererTests
         Assert.True(redIndex >= 0);
         Assert.True(blueIndex >= 0);
         Assert.True(blueIndex > redIndex);
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_PaintsHigherZIndexAboveRelativeSiblingInMixedStackingScene()
+    {
+        var document = await ParseAsync("""
+            <html><body>
+                <div style="position:relative; width:700px; height:330px;">
+                    <div style="position:absolute; left:40px; top:40px; width:300px; height:180px; background-color:#d7e8f6; z-index:1;">base</div>
+                    <div style="position:relative; left:70px; top:35px; width:240px; height:130px; background-color:#f0dfc7; z-index:2;">relative</div>
+                    <div style="position:absolute; left:210px; top:100px; width:220px; height:120px; background-color:#eadcf0; z-index:4;">higher</div>
+                    <div style="position:absolute; left:340px; top:150px; width:220px; height:120px; background-color:#dcebd8; z-index:3;">middle</div>
+                    <div style="position:absolute; left:500px; top:40px; width:180px; height:100px; background-color:#f0d7d7; z-index:-1;">negative</div>
+                </div>
+            </body></html>
+            """);
+
+        var displayList = new HtmlRenderer().BuildDisplayList(document, new DefaultRenderDevice
+        {
+            ViewPortWidth = 960,
+            ViewPortHeight = 420,
+        });
+
+        var fills = displayList.Commands.OfType<FillRectCommand>().ToArray();
+        var relativeIndex = Array.FindIndex(fills, fill => fill.Color.Equals(new RenderColor(240, 223, 199)));
+        var higherIndex = Array.FindIndex(fills, fill => fill.Color.Equals(new RenderColor(234, 220, 240)));
+
+        Assert.True(relativeIndex >= 0);
+        Assert.True(higherIndex >= 0);
+        Assert.True(higherIndex > relativeIndex, "The z-index 4 box must paint above the z-index 2 relative box.");
     }
 
     [Fact]
@@ -5637,6 +5866,54 @@ public sealed class HtmlRendererTests
         Assert.Contains(displayList.Commands, c => c is DrawTextCommand t && t.Text == "hello world");
     }
 
+    [Theory]
+    // found on GitHub: icon buttons showed a placeholder "Button" label, flex buttons their label twice
+    [InlineData("<button><span>Save</span></button>", "Save")]
+    [InlineData("<button><svg width=\"10\" height=\"10\"></svg>Save</button>", "Save")]
+    [InlineData("<button style=\"display:flex\">Save</button>", "Save")]
+    [InlineData("<button style=\"display:grid\">Save</button>", "Save")]
+    public async Task BuildDisplayList_ButtonContentIsDrawnOnce(string markup, string label)
+    {
+        var document = await ParseAsync($"<html><body>{markup}</body></html>");
+
+        var displayList = new HtmlRenderer().BuildDisplayList(document, new DefaultRenderDevice { ViewPortWidth = 300, ViewPortHeight = 100 });
+        var texts = displayList.Commands.OfType<DrawTextCommand>().Select(t => t.Text.Trim()).Where(t => t.Length > 0).ToList();
+
+        Assert.Equal([label], texts);
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_ButtonGeneratedContentIsDrawn()
+    {
+        // found on MDN: the chevrons of its menu buttons (:after) only took space
+        var document = await ParseAsync("""
+            <html><head><style>button::after { content: ""; display: inline-block; width: 10px; height: 10px; background-color: #ff0000 }</style></head>
+            <body><button>Save</button></body></html>
+            """);
+
+        var displayList = new HtmlRenderer().BuildDisplayList(document, new DefaultRenderDevice { ViewPortWidth = 300, ViewPortHeight = 100 });
+        var texts = displayList.Commands.OfType<DrawTextCommand>().Select(t => t.Text.Trim()).Where(t => t.Length > 0).ToList();
+
+        Assert.Equal(["Save"], texts);
+        Assert.Equal(10f, SingleFill(displayList, Red).Rect.Width, precision: 2);
+    }
+
+    [Theory]
+    // found on MDN, whose icons are boxes with background-color: currentcolor and a mask
+    [InlineData("color:#ff0000; background-color:currentcolor")]
+    [InlineData("color:#ff0000; background-color:currentColor")]
+    [InlineData("color:#ff0000; background-color:CURRENTCOLOR")]
+    public async Task BuildDisplayList_CurrentColorIsTheElementsColor(string style)
+    {
+        var document = await ParseAsync($"""
+            <html><body style="margin:0; color:#0000ff">
+                <div style="width:20px; height:10px; {style}"></div>
+            </body></html>
+            """);
+
+        Assert.Equal(20f, SingleFill(BuildDisplayList(document), Red).Rect.Width, precision: 2);
+    }
+
     [Fact]
     public async Task BuildDisplayList_HiddenInputPaintsNothingAtAll()
     {
@@ -5712,6 +5989,21 @@ public sealed class HtmlRendererTests
         var push = Assert.Single(displayList.Commands.OfType<PushTransformCommand>());
         Assert.Equal(20f, push.Transform.E, precision: 3);
         Assert.Equal(10f, push.Transform.F, precision: 3);
+    }
+
+    [Theory]
+    // custom properties are only substituted in the computed value
+    [InlineData("<style>.box { --x: 15px; transform: translate(var(--x), 8px) }</style><div class=\"box\" style=\"width:40px; height:20px\"></div>", 15f, 8f)]
+    [InlineData("<div style=\"--x: 15px; width:40px; height:20px; transform: translate(var(--x), 8px)\"></div>", 15f, 8f)]
+    [InlineData("<style>.box { --x: 50%; transform: translateX(var(--x)) }</style><div class=\"box\" style=\"width:40px; height:20px\"></div>", 20f, 0f)]
+    public async Task BuildDisplayList_TransformWithCustomPropertiesIsApplied(string body, float x, float y)
+    {
+        var document = await ParseAsync($"<html><body>{body}</body></html>");
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, new DefaultRenderDevice { ViewPortWidth = 200, ViewPortHeight = 200 });
+        var push = Assert.Single(displayList.Commands.OfType<PushTransformCommand>());
+        Assert.Equal(x, push.Transform.E, precision: 3);
+        Assert.Equal(y, push.Transform.F, precision: 3);
     }
 
     [Fact]
@@ -6095,6 +6387,79 @@ public sealed class HtmlRendererTests
     }
 
     [Fact]
+    public async Task RenderToPng_GradientToTransparentDoesNotDarken()
+    {
+        // found on MDN: the sidebar header faded white into `#0000` (transparent black) as grey
+        var document = await ParseAsync("""
+            <html><body style="margin:0; background-color:#ffffff">
+                <div style="width:100px; height:100px; background:linear-gradient(to bottom, #ffffff, #0000)"></div>
+            </body></html>
+            """);
+
+        var image = new HtmlRenderer().RenderToPng(document, new DefaultRenderDevice { ViewPortWidth = 100, ViewPortHeight = 100 });
+        using var bitmap = SkiaSharp.SKBitmap.Decode(image.Data);
+        var middle = bitmap.GetPixel(50, 50);
+
+        Assert.True(middle.Red > 250 && middle.Green > 250 && middle.Blue > 250, middle.ToString());
+    }
+
+    [Theory]
+    [InlineData("#ff0000 0 70%, #0000ff 100%")]
+    [InlineData("#ff0000 0 calc(100% - 2rem), #0000ff 100%")]
+    public async Task RenderToPng_GradientStopsAreResolvedAlongTheGradientLine(string stops)
+    {
+        // the line of `to bottom` is as long as the box is tall, not as its diagonal; a stop with
+        // two positions or a calc() position keeps its color between them
+        var document = await ParseAsync($"""
+            <html><body style="margin:0">
+                <div style="width:300px; height:100px; background:linear-gradient(to bottom, {stops})"></div>
+            </body></html>
+            """);
+
+        var image = new HtmlRenderer().RenderToPng(document, new DefaultRenderDevice { ViewPortWidth = 300, ViewPortHeight = 100 });
+        using var bitmap = SkiaSharp.SKBitmap.Decode(image.Data);
+        var top = bitmap.GetPixel(150, 2);
+        var solid = bitmap.GetPixel(150, 60);
+        var bottom = bitmap.GetPixel(150, 98);
+
+        Assert.True(top.Red > 250 && top.Blue < 5, top.ToString());
+        Assert.True(solid.Red > 250 && solid.Blue < 5, solid.ToString());
+        Assert.True(bottom.Blue > 230 && bottom.Red < 25, bottom.ToString());
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_ClipPathIsPlacedAtItsBox()
+    {
+        // found on GitHub: a loading placeholder below the page's top clipped itself away
+        var document = await ParseAsync("""
+            <html><body style="margin:0">
+                <div style="margin:30px 0 0 40px; width:100px; height:60px; clip-path: inset(10px 20px 5px 15px); background-color:#ff0000;"></div>
+            </body></html>
+            """);
+
+        var push = Assert.Single(BuildDisplayList(document).Commands.OfType<PushClipShapeCommand>());
+        var inset = Assert.IsType<RenderClipInset>(push.Shape);
+
+        Assert.Equal(55f, inset.Rect.X, precision: 1);
+        Assert.Equal(40f, inset.Rect.Y, precision: 1);
+        Assert.Equal(65f, inset.Rect.Width, precision: 1);
+        Assert.Equal(45f, inset.Rect.Height, precision: 1);
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_NoBreakSpaceIsNoCollapsibleWhiteSpace()
+    {
+        // found on GitHub: a loading placeholder holding just a no-break space had no height
+        var document = await ParseAsync("""
+            <html><body style="margin:0">
+                <div style="width:100px; background-color:#ff0000">&nbsp;</div>
+            </body></html>
+            """);
+
+        Assert.True(SingleFill(BuildDisplayList(document), Red).Rect.Height > 10f);
+    }
+
+    [Fact]
     public async Task BuildDisplayList_ClipPathPolygonProducesVerticesResolvedAgainstTheBox()
     {
         var document = await ParseAsync("""
@@ -6431,6 +6796,27 @@ public sealed class HtmlRendererTests
     }
 
     [Fact]
+    public async Task BuildDisplayList_WebkitLineClampFromAStyleElementFollowsTheMatchingElements()
+    {
+        var document = await ParseAsync("""
+            <html><head><style>.clamp { -webkit-line-clamp: 2 }</style></head><body>
+                <div id="a" class="clamp" style="width:60px; overflow:hidden;">one two three four five six seven eight</div>
+                <div id="b" style="width:60px; overflow:hidden;">one two three four five six seven eight</div>
+            </body></html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var device = new DefaultRenderDevice { ViewPortWidth = 200, ViewPortHeight = 400, FontSize = 16f };
+        var before = renderer.BuildDisplayList(document, device).Commands.OfType<DrawTextCommand>().Count();
+        document.GetElementById("b")!.ClassList.Add("clamp");
+        var after = renderer.BuildDisplayList(document, device).Commands.OfType<DrawTextCommand>().Count();
+
+        // "a" is clamped to 2 lines in both renders; "b" only once the class reaches it
+        Assert.True(before > 4);
+        Assert.Equal(4, after);
+    }
+
+    [Fact]
     public async Task BuildDisplayList_WebkitLineClampHasNoEffectWhenTextFitsWithinTheLimit()
     {
         var document = await ParseAsync("""
@@ -6556,6 +6942,22 @@ public sealed class HtmlRendererTests
 
         Assert.True(lines.Length > 3, $"Expected more than three wrapped lines, got: {string.Join(" | ", lines)}");
         Assert.DoesNotContain(lines, line => line.StartsWith("ABCDEFGHIJKLMNOPQRSTUVWXYZ", StringComparison.Ordinal));
+    }
+
+    [Theory]
+    [InlineData("8/21/2026", "8/21/2026")]
+    [InlineData("2024-2026", "2024-2026")]
+    [InlineData("client/server", "client/|server")]
+    public async Task BuildDisplayList_OverlongWordsBreakAfterSlashesAndHyphensButNotBeforeDigits(string word, string expected)
+    {
+        // found on www.florian-rappl.de: a date badge a hair too narrow showed "8/ 21/ 2026"
+        var document = await ParseAsync($"""
+            <html><body style="margin:0"><div style="width:20px">{word}</div><div style="width:20px">{word}</div></body></html>
+            """);
+
+        var lines = BuildDisplayList(document).Commands.OfType<DrawTextCommand>().Select(command => command.Text).ToArray();
+
+        Assert.Equal(expected + "|" + expected, string.Join("|", lines));
     }
 
     [Fact]
@@ -7985,13 +8387,31 @@ public sealed class HtmlRendererTests
     [Fact]
     public async Task BuildDisplayList_IsolationIsolateOpensANormalBlendGroup()
     {
-        var document = await ParseAsync("<html><body><div style=\"isolation:isolate; width:40px; height:40px\"></div></body></html>");
+        var document = await ParseAsync("<html><body><div style=\"isolation:isolate; width:40px; height:40px\"><div style=\"mix-blend-mode:multiply; height:10px\"></div></div></body></html>");
 
         var displayList = BuildDisplayList(document);
 
-        var push = Assert.Single(displayList.Commands.OfType<PushBlendModeCommand>());
-        Assert.Equal(RenderBlendMode.Normal, push.Mode);
-        Assert.Single(displayList.Commands.OfType<PopBlendModeCommand>());
+        var pushes = displayList.Commands.OfType<PushBlendModeCommand>().ToList();
+        Assert.Equal([RenderBlendMode.Normal, RenderBlendMode.Multiply], pushes.Select(p => p.Mode));
+        Assert.Equal(2, displayList.Commands.OfType<PopBlendModeCommand>().Count());
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_IsolationWithoutBlendingInsideOpensNoGroup()
+    {
+        // found on GitHub: a group around the page hid its header from the backdrop-filter of its buttons
+        var document = await ParseAsync("""
+            <html><body style="isolation:isolate">
+                <div style="background-color:#000000; padding:10px">
+                    <div style="backdrop-filter:blur(4px); width:40px; height:20px"></div>
+                </div>
+            </body></html>
+            """);
+
+        var displayList = BuildDisplayList(document);
+
+        Assert.Empty(displayList.Commands.OfType<PushBlendModeCommand>());
+        Assert.Single(displayList.Commands.OfType<DrawBackdropFilterCommand>());
     }
 
     [Fact]
@@ -8223,6 +8643,324 @@ public sealed class HtmlRendererTests
 
         Assert.Equal(50f, SingleFill(displayList, Red).Rect.Width, precision: 2);
         Assert.Equal(250f, SingleFill(displayList, Green).Rect.Width, precision: 2);
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_FlexItemMarginsAreOutsideTheirMainSize()
+    {
+        var document = await ParseAsync("""
+            <html><body style="margin:0">
+                <div style="display:flex; width:300px">
+                    <div style="width:50px; height:10px; background-color:#ff0000"></div>
+                    <div style="width:50px; height:10px; margin-left:20px; margin-right:10px; background-color:#00ff00"></div>
+                    <div style="width:50px; height:10px; background-color:#0000ff"></div>
+                </div>
+            </body></html>
+            """);
+
+        var displayList = BuildDisplayList(document);
+        var green = SingleFill(displayList, Green).Rect;
+
+        Assert.Equal(70f, green.X, precision: 2);
+        Assert.Equal(50f, green.Width, precision: 2);
+        Assert.Equal(130f, SingleFill(displayList, Blue).Rect.X, precision: 2);
+    }
+
+    [Theory]
+    [InlineData("margin-right:auto", 0f, 250f)]
+    [InlineData("margin-left:auto", 200f, 250f)]
+    [InlineData("margin:0 auto", 100f, 250f)]
+    public async Task BuildDisplayList_FlexItemAutoMarginsTakeTheFreeSpace(string redMargin, float expectedRedX, float expectedGreenX)
+    {
+        // e.g. MDN's breadcrumbs (margin-right: auto) push the other items to the end
+        var document = await ParseAsync($"""
+            <html><body style="margin:0">
+                <div style="display:flex; justify-content:center; width:300px">
+                    <div style="width:50px; height:10px; {redMargin}; background-color:#ff0000"></div>
+                    <div style="width:50px; height:10px; background-color:#00ff00"></div>
+                </div>
+            </body></html>
+            """);
+
+        var displayList = BuildDisplayList(document);
+
+        Assert.Equal(expectedRedX, SingleFill(displayList, Red).Rect.X, precision: 2);
+        Assert.Equal(expectedGreenX, SingleFill(displayList, Green).Rect.X, precision: 2);
+    }
+
+    [Theory]
+    [InlineData("justify-content:end")]
+    [InlineData("justify-content:flex-end")]
+    [InlineData("justify-content:safe end")]
+    [InlineData("justify-content:right")]
+    public async Task BuildDisplayList_FlexJustifyContentUnderstandsBoxAlignmentKeywords(string justifyContent)
+    {
+        var document = await ParseAsync($"""
+            <html><body style="margin:0">
+                <div style="display:flex; {justifyContent}; width:300px">
+                    <div style="width:50px; height:10px; background-color:#ff0000"></div>
+                </div>
+            </body></html>
+            """);
+
+        Assert.Equal(250f, SingleFill(BuildDisplayList(document), Red).Rect.X, precision: 2);
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_FlexTextRunsAreItemsOfTheirOwnSize()
+    {
+        var document = await ParseAsync("""
+            <html><body style="margin:0">
+                <div style="display:flex; width:300px">Text<div style="width:20px; height:10px; background-color:#ff0000"></div></div>
+                <div style="display:flex; width:300px; background-color:#00ff00"><div style="display:flex">Text</div></div>
+            </body></html>
+            """);
+
+        var displayList = BuildDisplayList(document);
+        var redX = SingleFill(displayList, Red).Rect.X;
+
+        // after the text, which is about 30px wide at 16px
+        Assert.InRange(redX, 20f, 60f);
+        Assert.Equal(0f, displayList.Commands.OfType<DrawTextCommand>().First().X, precision: 2);
+        Assert.True(SingleFill(displayList, Green).Rect.Height >= 16f);
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_CenteredColumnFlexItemsAreAsWideAsTheirContent()
+    {
+        // found on GitHub: its repository tabs are centered in column flex items and vanished
+        var document = await ParseAsync("""
+            <html><body style="margin:0">
+                <div style="display:flex; flex-direction:column; align-items:center; width:200px">
+                    <div style="display:inline-flex; height:10px; background-color:#ff0000"><span style="display:inline-block; width:40px"></span></div>
+                </div>
+            </body></html>
+            """);
+
+        var red = SingleFill(BuildDisplayList(document), Red).Rect;
+
+        Assert.Equal(40f, red.Width, precision: 2);
+        Assert.Equal(80f, red.X, precision: 2);
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_TextFittingItsShrinkToFitBoxGetsNoEllipsis()
+    {
+        // found on GitHub: the repository name in its breadcrumb was cut, as the width of the
+        // text and the one of its box differed by a rounding error
+        var boxes = string.Concat(Enumerable.Range(0, 15).Select(i =>
+            $"<div style=\"display:flex\"><div style=\"width:{100 + i * 1.37f}px\"></div><a style=\"display:inline-flex; padding:0 6px\"><span style=\"display:inline-block; overflow:hidden; white-space:nowrap; text-overflow:ellipsis; font-weight:600; font-size:{12 + i * 0.25f}px\">AngleSharp</span></a></div>"));
+        var document = await ParseAsync($"<html><body style=\"margin:0\">{boxes}</body></html>");
+
+        var texts = BuildDisplayList(document).Commands.OfType<DrawTextCommand>().Select(command => command.Text).ToList();
+
+        Assert.Equal(15, texts.Count(text => text == "AngleSharp"));
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_ZIndexedBoxKeepsItsPlaceButPaintsAbove()
+    {
+        // found on GitHub: its header (position: relative; z-index: 32) moved below the page
+        var document = await ParseAsync("""
+            <html><body style="margin:0">
+                <div style="position:relative; z-index:1; height:20px; margin-bottom:-10px; background-color:#ff0000"></div>
+                <div style="height:20px; background-color:#00ff00"></div>
+            </body></html>
+            """);
+
+        var displayList = BuildDisplayList(document);
+        var fills = displayList.Commands.OfType<FillRectCommand>().ToList();
+        var red = SingleFill(displayList, Red);
+        var green = SingleFill(displayList, Green);
+
+        Assert.Equal(0f, red.Rect.Y, precision: 2);
+        Assert.Equal(10f, green.Rect.Y, precision: 2);
+        Assert.True(fills.IndexOf(red) > fills.IndexOf(green));
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_ZIndexedFlexItemsKeepTheirOrder()
+    {
+        var document = await ParseAsync("""
+            <html><body style="margin:0">
+                <div style="display:flex">
+                    <div style="position:relative; z-index:2; width:20px; height:10px; background-color:#ff0000"></div>
+                    <div style="width:20px; height:10px; background-color:#00ff00"></div>
+                    <div style="z-index:1; width:20px; height:10px; background-color:#0000ff"></div>
+                </div>
+            </body></html>
+            """);
+
+        var displayList = BuildDisplayList(document);
+
+        Assert.Equal(0f, SingleFill(displayList, Red).Rect.X, precision: 2);
+        Assert.Equal(20f, SingleFill(displayList, Green).Rect.X, precision: 2);
+        Assert.Equal(40f, SingleFill(displayList, Blue).Rect.X, precision: 2);
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_AbsolutelyPositionedBoxAfterAZIndexedBoxKeepsItsStaticPosition()
+    {
+        var document = await ParseAsync("""
+            <html><body style="margin:0">
+                <div style="position:relative; z-index:1; height:20px"></div>
+                <div style="position:absolute; width:10px; height:10px; background-color:#ff0000"></div>
+                <div style="height:30px"></div>
+            </body></html>
+            """);
+
+        Assert.Equal(20f, SingleFill(BuildDisplayList(document), Red).Rect.Y, precision: 2);
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_ShrinkToFitGridIsAsWideAsItsColumns()
+    {
+        // found on GitHub: the label and icons of its buttons (a grid in an inline-flex) overlapped
+        var document = await ParseAsync("""
+            <html><body style="margin:0">
+                <div style="display:inline-block; background-color:#0000ff">
+                    <div style="display:grid; grid-template-columns:min-content minmax(0, auto) min-content; column-gap:5px">
+                        <div style="width:10px; height:10px; background-color:#ff0000"></div>
+                        <div style="width:20px; height:10px; background-color:#00ff00"></div>
+                        <div style="width:10px; height:10px; background-color:#ffff00"></div>
+                    </div>
+                </div>
+            </body></html>
+            """);
+
+        var displayList = BuildDisplayList(document);
+
+        Assert.Equal(50f, SingleFill(displayList, Blue).Rect.Width, precision: 2);
+        Assert.Equal(15f, SingleFill(displayList, Green).Rect.X, precision: 2);
+        Assert.Equal(40f, SingleFill(displayList, new RenderColor(255, 255, 0)).Rect.X, precision: 2);
+    }
+
+    [Theory]
+    [InlineData("display:flex")]
+    [InlineData("display:block")]
+    [InlineData("display:grid")]
+    public async Task BuildDisplayList_BlockLevelButtonIsAsWideAsItsContent(string display)
+    {
+        var document = await ParseAsync($"""
+            <html><body style="margin:0">
+                <button style="{display}; padding:0; border:0; background-color:#ff0000"><span style="display:inline-block; width:30px; height:10px"></span></button>
+            </body></html>
+            """);
+
+        Assert.Equal(30f, SingleFill(BuildDisplayList(document), Red).Rect.Width, precision: 2);
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_AbsolutelyPositionedFlexChildrenAreNoFlexItems()
+    {
+        // found on MDN: the chevron of its Baseline box (position: absolute; right: 1rem)
+        var document = await ParseAsync("""
+            <html><body style="margin:0">
+                <div style="display:flex; align-items:center; position:relative; width:300px; height:40px; padding-right:40px">
+                    <div style="width:50px; height:10px; margin-left:auto; background-color:#00ff00"></div>
+                    <div style="position:absolute; right:10px; width:20px; height:20px; background-color:#ff0000"></div>
+                </div>
+            </body></html>
+            """);
+
+        var displayList = BuildDisplayList(document, width: 500);
+        var red = SingleFill(displayList, Red).Rect;
+
+        Assert.Equal(250f, SingleFill(displayList, Green).Rect.X, precision: 2);
+        Assert.Equal(310f, red.X, precision: 2);
+        // top: auto keeps it where it would be as the only (centered) item
+        Assert.Equal(10f, red.Y, precision: 2);
+    }
+
+    [Theory]
+    [InlineData("left:0; top:0; right:0; bottom:0", 0f, 200f, 0f, 100f)]
+    [InlineData("left:10px; top:10px; bottom:20px; width:50px", 10f, 50f, 10f, 70f)]
+    [InlineData("inset:5px", 5f, 190f, 5f, 90f)]
+    [InlineData("top:10%; bottom:10%; left:0; width:10px", 0f, 10f, 10f, 80f)]
+    [InlineData("top:0; bottom:0; left:0; width:10px; padding:5px; margin:10px", 10f, 20f, 10f, 80f)]
+    public async Task BuildDisplayList_AbsolutelyPositionedBoxStretchesBetweenTopAndBottom(string offsets, float x, float width, float y, float height)
+    {
+        var document = await ParseAsync($"""
+            <html><body style="margin:0">
+                <div style="position:relative; width:200px; height:100px"><div style="position:absolute; {offsets}; background-color:#ff0000"></div></div>
+            </body></html>
+            """);
+
+        var red = SingleFill(BuildDisplayList(document), Red).Rect;
+
+        Assert.Equal(x, red.X, precision: 1);
+        Assert.Equal(width, red.Width, precision: 1);
+        Assert.Equal(y, red.Y, precision: 1);
+        Assert.Equal(height, red.Height, precision: 1);
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_FixedBoxStretchesBetweenTopAndBottomOfTheViewport()
+    {
+        var document = await ParseAsync("""
+            <html><body style="margin:0">
+                <div style="position:fixed; top:10px; bottom:30px; left:0; width:20px; background-color:#ff0000"></div>
+            </body></html>
+            """);
+
+        var displayList = new HtmlRenderer().BuildDisplayList(document, new DefaultRenderDevice { ViewPortWidth = 200, ViewPortHeight = 300 });
+
+        Assert.Equal(260f, SingleFill(displayList, Red).Rect.Height, precision: 1);
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_AbsolutelyPositionedBoxWithAutoOffsetsStaysInPlace()
+    {
+        var document = await ParseAsync("""
+            <html><body style="margin:0">
+                <div style="position:relative; padding-left:20px">
+                    <div style="height:30px"></div>
+                    <div style="position:absolute; width:10px; height:10px; background-color:#ff0000"></div>
+                    <div style="position:absolute; top:0; width:10px; height:10px; background-color:#00ff00"></div>
+                </div>
+            </body></html>
+            """);
+
+        var displayList = BuildDisplayList(document);
+        var red = SingleFill(displayList, Red).Rect;
+        var green = SingleFill(displayList, Green).Rect;
+
+        Assert.Equal(20f, red.X, precision: 2);
+        Assert.Equal(30f, red.Y, precision: 2);
+        Assert.Equal(20f, green.X, precision: 2);
+        Assert.Equal(0f, green.Y, precision: 2);
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_FlexContainerWithoutItemsKeepsItsSize()
+    {
+        var document = await ParseAsync("""
+            <html><body style="margin:0">
+                <div style="display:flex; width:100px; height:40px; background-color:#ff0000"></div>
+            </body></html>
+            """);
+
+        var red = SingleFill(BuildDisplayList(document), Red).Rect;
+
+        Assert.Equal(100f, red.Width, precision: 2);
+        Assert.Equal(40f, red.Height, precision: 2);
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_LetterSpacingCountsInTheMaxContentWidth()
+    {
+        // found on MDN: its "Widely available" pill wrapped, being a little too narrow
+        var document = await ParseAsync("""
+            <html><body style="margin:0">
+                <div style="float:left; clear:left; background-color:#ff0000">aa bb</div>
+                <div style="float:left; clear:left; letter-spacing:4px; background-color:#00ff00">aa bb</div>
+            </body></html>
+            """);
+
+        var displayList = BuildDisplayList(document);
+
+        // the spacing goes between all of the five characters
+        Assert.Equal(SingleFill(displayList, Red).Rect.Width + 16f, SingleFill(displayList, Green).Rect.Width, precision: 1);
     }
 
     [Theory]
@@ -8956,6 +9694,29 @@ public sealed class HtmlRendererTests
         document.Head?.Prepend(resetStyle);
 
         return document;
+    }
+
+    private sealed class ImageOnlyRequester(byte[] imageData) : BaseRequester
+    {
+        public override bool SupportsProtocol(string protocol) =>
+            string.Equals(protocol, "http", StringComparison.OrdinalIgnoreCase);
+
+        protected override Task<IResponse?> PerformRequestAsync(Request request, CancellationToken cancel)
+        {
+            var acceptsImages = request.Headers.TryGetValue("Accept", out var accept) && accept.Contains("image/", StringComparison.Ordinal);
+            var response = new DefaultResponse
+            {
+                Address = request.Address,
+                StatusCode = acceptsImages ? HttpStatusCode.OK : HttpStatusCode.NotAcceptable,
+                Headers = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+                {
+                    ["Content-Type"] = acceptsImages ? "image/png" : "text/html",
+                },
+                Content = new MemoryStream(acceptsImages ? imageData : "<h1>Not acceptable</h1>"u8.ToArray()),
+            };
+
+            return Task.FromResult<IResponse?>(response);
+        }
     }
 
     private sealed class SingleResponseImageRequester : BaseRequester

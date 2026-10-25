@@ -148,6 +148,35 @@ public sealed class FontFaceTests
     }
 
     [Fact]
+    public async Task Weight_IsSynthesizedForAFaceWithoutABoldWeight()
+    {
+        // a single face covering all weights, like a variable font (e.g. Inter on MDN)
+        var css = $"@font-face {{ font-family: 'Solo'; font-weight: 100 900; src: url({SerifDataUri}) format('truetype'); }}";
+
+        var regular = CountInk(new HtmlRenderer().RenderToPng(await ParseAsync(css, "Solo", 400f), Device()).Data);
+        var bold = CountInk(new HtmlRenderer().RenderToPng(await ParseAsync(css, "Solo", 700f), Device()).Data);
+
+        Assert.True(bold > regular * 1.15, $"bold {bold} vs regular {regular}");
+    }
+
+    private static int CountInk(byte[] png)
+    {
+        using var bitmap = SKBitmap.Decode(png);
+        var count = 0;
+
+        for (var y = 0; y < bitmap.Height; y++)
+        {
+            for (var x = 0; x < bitmap.Width; x++)
+            {
+                var pixel = bitmap.GetPixel(x, y);
+                count += pixel.Red + pixel.Green + pixel.Blue < 384 ? 1 : 0;
+            }
+        }
+
+        return count;
+    }
+
+    [Fact]
     public async Task GenericFamilies_CannotBeOverridden()
     {
         // serif is a keyword, not a family name, so a face may not take it over.

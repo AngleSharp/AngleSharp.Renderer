@@ -283,6 +283,24 @@ public sealed class ElementCssomViewExtensionsTests
         Assert.Equal(0d, viewportB.GetScrollTop());
     }
 
+    [Theory]
+    // found on www.florian-rappl.de: an empty, collapsed panel overflowing onto the navigation took its clicks
+    [InlineData("<div style='height:0'><ul id='under' style='height:100px; margin:0'></ul></div><nav id='top' style='position:relative; z-index:4; height:50px'><a id='hit' href='#' style='display:block; height:50px'>Link</a></nav>", 30, "hit")]
+    [InlineData("<div id='hit' style='position:absolute; top:0; width:100px; height:100px; z-index:2'></div><div style='position:absolute; top:0; width:100px; height:100px; z-index:1'><span style='display:block; height:80px'>deep</span></div>", 30, "hit")]
+    [InlineData("<div style='position:relative; height:100px'><div id='hit' style='position:absolute; left:0; top:0; right:0; bottom:0'></div></div><div style='margin-top:-100px; height:100px'><p style='margin:0'>in flow</p></div>", 10, "hit")]
+    [InlineData("<div style='height:100px; overflow:hidden'><div style='height:100px'></div><div id='clipped' style='height:100px'></div></div><div id='hit' style='height:100px'></div>", 150, "hit")]
+    [InlineData("<div id='hit' style='height:100px'><div style='height:100px; pointer-events:none'><span style='display:block; height:100px'>pass</span></div></div>", 50, "hit")]
+    public async Task DomHarness_HitTestsTheTopMostPaintedElement(string body, double y, string expected)
+    {
+        var context = BrowsingContext.New(CreateConfiguration(160, 400));
+        var document = await context.OpenAsync(request => request.Content($"<html><head><style>html, body {{ margin: 0; padding: 0; }}</style></head><body>{body}</body></html>"));
+        var harness = context.GetDomHarness();
+
+        harness.MousePosition = (20d, y);
+
+        Assert.Equal(expected, harness.HoveredElement?.Id);
+    }
+
     [Fact]
     public async Task DomHarness_RaisesPaintInvalidated_OnInteractionChanges()
     {
