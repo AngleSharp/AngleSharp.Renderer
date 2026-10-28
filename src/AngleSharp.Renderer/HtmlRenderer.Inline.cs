@@ -759,6 +759,21 @@ public sealed partial class HtmlRenderer
             var indent = !textIndentConsumed ? textStyle.TextIndent + textStyle.MarkerIndent : 0f;
             var available = Math.Max(0f, lineAvailable - indent);
 
+            // A line whose first unbreakable unit does not fit beside the floats moves down to
+            // where one of them ends, until it fits or no float is left beside it (CSS 2.1 §9.5).
+            if (lineAvailable < contentWidth && pieces[lineStartIndex].Kind != InlinePieceKind.BlockInInline)
+            {
+                var firstUnitWidth = MeasureFirstLineUnit(pieces, lineStartIndex);
+
+                while (firstUnitWidth > available + 0.01f && lineAvailable < contentWidth && floats.NextBottomBelow(lineTop) is var nextBottom && !float.IsNaN(nextBottom))
+                {
+                    lineTop = nextBottom;
+                    (lineLeft, lineRight) = floats.GetBand(lineTop, textStyle.FontSize * textStyle.LineHeightMultiplier, contentX, contentX + contentWidth);
+                    lineAvailable = Math.Max(0f, lineRight - lineLeft);
+                    available = Math.Max(0f, lineAvailable - indent);
+                }
+            }
+
             // A block-level box nested in inline content gets a line of its own.
             if (pieces[lineStartIndex].Kind == InlinePieceKind.BlockInInline)
             {
@@ -817,8 +832,11 @@ public sealed partial class HtmlRenderer
             // `-webkit-line-clamp` ends the content after its last line, which shows an ellipsis
             // when anything was cut; `text-overflow: ellipsis` truncates every overflowing line.
             var isLastLine = forcedBreak || !HasContentBeforeNextBlock(pieces, lineStartIndex);
-            var clamped = hasLineBox && textStyle.LineClamp > 0 && lineCount + 1 >= textStyle.LineClamp &&
-                          pieces.Skip(lineStartIndex).Any(static piece => !piece.Trimmed && (piece.CountsAsContent || piece.Kind == InlinePieceKind.BlockInInline));
+            var lineClamp = context.LineClampScopes.TryPeek(out var scope) ? scope : null;
+            var isClampLine = lineClamp is not null ? lineClamp.Remaining == 1 : textStyle.LineClamp > 0 && lineCount + 1 >= textStyle.LineClamp;
+            var clamped = hasLineBox && isClampLine &&
+                          (pieces.Skip(lineStartIndex).Any(static piece => !piece.Trimmed && (piece.CountsAsContent || piece.Kind == InlinePieceKind.BlockInInline)) ||
+                           lineClamp is not null && nodes.Count > 0 && HasRenderedContentAfter(lineClamp.Root, nodes[^1].Ref));
 
             if (clamped || (hasLineBox && textStyle.TextOverflow == TextOverflowMode.Ellipsis && MeasureLinePieces(linePieces) > available + 0.01f))
             {
@@ -855,7 +873,12 @@ public sealed partial class HtmlRenderer
             textIndentConsumed = true;
             lineCount++;
 
-            if (lineTop > maxY || clamped)
+            if (lineClamp is not null)
+            {
+                lineClamp.Remaining--;
+            }
+
+            if (lineTop > maxY || clamped || lineClamp is { Remaining: <= 0 })
             {
                 break;
             }
@@ -900,6 +923,41 @@ public sealed partial class HtmlRenderer
     /// its last piece. A line always takes at least one breakable unit, so an overlong unit
     /// overflows instead of looping forever.
     /// </summary>
+    /// <summary>
+    /// The width of the unbreakable unit a line starting at <paramref name="start"/> begins with,
+    /// i.e. what has to fit beside the floats, without changing the pieces as BuildLine does.
+    /// </summary>
+    private static float MeasureFirstLineUnit(List<InlinePiece> pieces, int start)
+    {
+        var index = start;
+
+        while (index < pieces.Count && pieces[index].Kind == InlinePieceKind.Space && pieces[index].Collapsible)
+        {
+            index++;
+        }
+
+        var width = 0f;
+
+        for (; index < pieces.Count; index++)
+        {
+            var piece = pieces[index];
+
+            if (piece.Kind is InlinePieceKind.ForcedBreak or InlinePieceKind.BlockInInline or InlinePieceKind.Space)
+            {
+                break;
+            }
+
+            width += piece.Width;
+
+            if (piece.BreakAfter)
+            {
+                break;
+            }
+        }
+
+        return width;
+    }
+
     private static int BuildLine(List<InlinePiece> pieces, int start, float available, LayoutContext context, out bool forcedBreak)
     {
         forcedBreak = false;
@@ -1908,7 +1966,9 @@ public sealed partial class HtmlRenderer
     /// <summary>
     /// Lays out <paramref name="element"/> at the origin into a throwaway display list, capturing
     /// its own border box and the last text baseline painted inside it. Layout metrics recorded
-    /// during the trial never reach a real <see cref="CaptureLayoutMetrics"/> capture.
+    /// during the trial never reach a real <see cref="CaptureLayoutMetrics"/> capture. A flex or
+    /// grid item is blockified and lays out its contents as a block of its own (e.g. a
+    /// <c>&lt;span&gt;</c> item gets the height of its line boxes, not of its inline box).
     /// </summary>
     private static (ElementLayoutMetrics? Metrics, float? LastBaselineY, float? FirstBaselineY) TrialLayout(
         ElementRenderNode element,
@@ -1916,11 +1976,23 @@ public sealed partial class HtmlRenderer
         RenderTextStyle inheritedStyle,
         LayoutContext context,
         float forcedBorderBoxWidth,
-        bool isAtomicInline)
+        bool isAtomicInline,
+        bool isFlexOrGridItem = false)
     {
         var capture = new LayoutCapture();
         var previous = s_layoutCapture.Value;
         s_layoutCapture.Value = capture;
+
+        // a trial must not use up the lines of a clamped box it is measured in
+        var lineClamp = context.LineClampScopes.TryPeek(out var scope) ? scope : null;
+
+        if (lineClamp is not null)
+        {
+            context.LineClampScopes.Push(lineClamp.Clone());
+        }
+
+        // the sticky boxes of a trial are never placed
+        context.StickyFlows.Push([]);
 
         try
         {
@@ -1945,7 +2017,8 @@ public sealed partial class HtmlRenderer
                 displayList: new DisplayList { Fonts = context.Fonts },
                 maxY: float.MaxValue,
                 forcedBorderBoxWidth: forcedBorderBoxWidth,
-                isAtomicInline: isAtomicInline);
+                isAtomicInline: isAtomicInline,
+                isFlexItem: isFlexOrGridItem);
 
             var snapshot = capture.Snapshot();
             return (snapshot.TryGetValue(element.Ref, out var metrics) ? metrics : null, capture.LastBaselineY, capture.FirstBaselineY);
@@ -1953,6 +2026,13 @@ public sealed partial class HtmlRenderer
         finally
         {
             s_layoutCapture.Value = previous;
+
+            context.StickyFlows.Pop();
+
+            if (lineClamp is not null)
+            {
+                context.LineClampScopes.Pop();
+            }
         }
     }
 
@@ -2037,6 +2117,17 @@ public sealed partial class HtmlRenderer
 
         width = objectFitClip?.Width ?? imageRect.Width;
         return true;
+    }
+
+    /// <summary>
+    /// An auto content height within <c>min-height</c> and <c>max-height</c>, as LayoutElement
+    /// clamps it once the content is laid out.
+    /// </summary>
+    private static float ClampToMinMaxHeight(Dictionary<string, string> styleMap, float contentHeight, float heightReference, float verticalExtras)
+    {
+        contentHeight = Math.Max(contentHeight, ResolveAuthoredDimension(styleMap, "min-height", heightReference, 0f, verticalExtras));
+        var maxHeight = ResolveAuthoredDimension(styleMap, "max-height", heightReference, float.NaN, verticalExtras);
+        return float.IsNaN(maxHeight) ? contentHeight : Math.Min(contentHeight, maxHeight);
     }
 
     private static float ClampToMinMaxWidth(Dictionary<string, string> styleMap, float contentWidth, float containingWidth, float horizontalExtras)

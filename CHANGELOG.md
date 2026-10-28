@@ -1,3 +1,19 @@
+# 0.9.0
+
+Released on Friday, October 30 2026.
+
+- Fixed `-webkit-line-clamp` counting lines per inline run instead of across the nested blocks of the clamped box (e.g. paragraphs in a clamped card), which now ends after its last line
+- Fixed gaps with font- or viewport-relative units (e.g. Tailwind's `gap-4`, i.e. `gap: 1rem`) being ignored in grid and flex containers
+- Fixed images (and other replaced elements) with `border-radius` not being clipped to its curve (e.g. a `rounded-full` avatar painted square)
+- Fixed `line-height` lengths (e.g. `16px`, or `1rem` as in Tailwind's `text-xs`) being ignored in favor of the inherited (or default) line height
+- Fixed inline-level flex items and non-stretched grid items (e.g. a `<span>`) being as tall as their inline box instead of their line boxes, which let text overflow them at the bottom (e.g. tag pills with padding)
+- Fixed words breaking after a hyphen or slash in a box sized to fit them (e.g. a flex item with the max-content width of `c-sharp`), as the width came out of the box arithmetic a fraction of a pixel short
+- Added grid track alignment: `justify-content` and `align-content` (`start`, `end`, `center`, `space-between`, `space-around`, `space-evenly`, with `safe`) position the tracks of a grid whose tracks do not fill it
+- Added lines moving down past floats: a line whose first word does not fit beside the floats moves down to where one of them ends, until it fits or no float is beside it
+- Added `writing-mode` on flex, grid and table containers: a container whose writing mode differs from its parent's lays out its items along its own axes (e.g. a `vertical-rl` flex container runs its main axis downwards)
+- Added nested writing modes in the same orientation: a `vertical-lr` element in `vertical-rl` content (or the reverse) stacks its blocks in its own direction
+- Added `position: sticky` inside orthogonal flows (e.g. in a `vertical-rl` box), which used to stay static
+
 # 0.8.2
 
 Released on Sunday, October 25 2026.

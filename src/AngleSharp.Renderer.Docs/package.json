@@ -1,6 +1,6 @@
 {
   "name": "@anglesharp/renderer",
-  "version": "0.8.2",
+  "version": "0.9.0",
   "preview": true,
   "description": "The doclet for the AngleSharp.Renderer documentation.",
   "keywords": [

@@ -12,10 +12,11 @@ using AngleSharp.Renderer.Rendering;
 /// </summary>
 /// <remarks>
 /// Layout always runs horizontally, in the logical coordinates of a <em>system</em>: x along the
-/// inline axis, y along the block axis. An element whose writing mode is orthogonal to the system
-/// its box sits in (a vertical element in horizontal content, or the reverse) starts a new system:
+/// inline axis, y along the block axis. An element whose writing mode runs along other axes than
+/// the system its box sits in (orthogonally, as a vertical element in horizontal content, or with
+/// the block direction reversed, as <c>vertical-lr</c> in <c>vertical-rl</c>) starts a new system:
 /// its content is laid out horizontally at the origin and its commands are wrapped in the
-/// transform that maps that system onto its content box (<see cref="ResolveOrthogonalFlowTransform"/>).
+/// transform that maps that system onto its content box (<see cref="ResolveFlowTransform"/>).
 /// The physical properties of every element whose box sits in a vertical system (width/height,
 /// margin/padding/border sides, insets, corners) are remapped to the logical ones when its style
 /// map is built. Text in a vertical system is drawn sideways by the system's rotation; upright
@@ -41,6 +42,14 @@ public sealed partial class HtmlRenderer
     }
 
     private static bool IsVerticalMode(WritingModeKind mode) => mode != WritingModeKind.HorizontalTb;
+
+    /// <summary>
+    /// Whether content in <paramref name="mode"/> needs a system of its own inside
+    /// <paramref name="system"/>: its axes run differently, either orthogonally or (e.g.
+    /// <c>vertical-lr</c> in <c>vertical-rl</c>) with the block direction reversed.
+    /// </summary>
+    private static bool StartsWritingModeSystem(WritingModeKind mode, WritingModeKind system) =>
+        LogicalToPhysical(mode) != LogicalToPhysical(system);
 
     private static WritingModeKind ParseWritingMode(string? value, WritingModeKind inherited) =>
         value?.Trim().ToLowerInvariant() switch
@@ -87,7 +96,7 @@ public sealed partial class HtmlRenderer
         if (node is ElementRenderNode element)
         {
             var ownMode = ParseWritingMode(element.ComputedStyle.GetPropertyValue("writing-mode"), WritingModeKind.HorizontalTb);
-            contentSystem = IsVerticalMode(ownMode) != IsVerticalMode(boxSystem) ? ownMode : boxSystem;
+            contentSystem = StartsWritingModeSystem(ownMode, boxSystem) ? ownMode : boxSystem;
 
             if (IsVerticalMode(boxSystem))
             {
@@ -110,10 +119,9 @@ public sealed partial class HtmlRenderer
     private static WritingModeKind GetContentSystem(IElement element, LayoutContext context) =>
         context.ContentSystems.TryGetValue(element, out var system) ? system : WritingModeKind.HorizontalTb;
 
-    /// <summary>Whether an element's content runs orthogonally to the system its box sits in.</summary>
-    private static bool IsOrthogonalFlow(IElement element, LayoutContext context) =>
-        IsVerticalMode(GetContentSystem(element, context)) !=
-        IsVerticalMode(context.BoxSystems.TryGetValue(element, out var boxSystem) ? boxSystem : WritingModeKind.HorizontalTb);
+    /// <summary>Whether an element's content is laid out in another system than its box.</summary>
+    private static bool StartsWritingModeSystem(IElement element, LayoutContext context) =>
+        StartsWritingModeSystem(GetContentSystem(element, context), context.BoxSystems.TryGetValue(element, out var boxSystem) ? boxSystem : WritingModeKind.HorizontalTb);
 
     /// <summary>
     /// The inline size of an orthogonal flow: the box's (logical) height when it has one, else
@@ -137,21 +145,118 @@ public sealed partial class HtmlRenderer
     }
 
     /// <summary>
-    /// Lays out the content of an orthogonal flow at the origin of its own system, as a block
-    /// formatting context of the given inline size, and returns its block size.
+    /// Lays out the content of a system at its origin, as a block formatting context of the
+    /// given inline size, and returns its block size. Its sticky boxes are only placed once the
+    /// system is (see <see cref="ResolveFlowStickyBoxes"/>).
     /// </summary>
-    private static float LayoutOrthogonalFlowContent(IReadOnlyList<IRenderNode> children, RenderTextStyle flowStyle, float inlineSize, LayoutContext context, DisplayList displayList)
+    private static float LayoutOrthogonalFlowContent(IReadOnlyList<IRenderNode> children, RenderTextStyle flowStyle, float inlineSize, LayoutContext context, DisplayList displayList, out List<DeferredStickyBox> stickyBoxes)
     {
         var cursorY = 0f;
         var previousMarginBottom = 0f;
         var suppressTopMargin = false;
         var textIndentConsumed = false;
         var floats = new FloatArea();
+        stickyBoxes = [];
+        context.StickyFlows.Push(stickyBoxes);
+        context.StickyScopes.Push([]);
 
-        LayoutFlowChildren(children, 0f, 0f, inlineSize, ref cursorY, ref previousMarginBottom, ref suppressTopMargin, floats, ref textIndentConsumed, flowStyle, context, displayList, float.MaxValue, float.NaN, 0f, 0f, inlineSize, float.NaN, []);
+        try
+        {
+            LayoutFlowChildren(children, 0f, 0f, inlineSize, ref cursorY, ref previousMarginBottom, ref suppressTopMargin, floats, ref textIndentConsumed, flowStyle, context, displayList, float.MaxValue, float.NaN, 0f, 0f, inlineSize, float.NaN, []);
 
-        var blockSize = cursorY + previousMarginBottom;
-        return float.IsNaN(floats.Bottom) ? blockSize : Math.Max(blockSize, floats.Bottom);
+            var blockSize = cursorY + previousMarginBottom;
+            blockSize = float.IsNaN(floats.Bottom) ? blockSize : Math.Max(blockSize, floats.Bottom);
+            ResolveStickyBoxes(displayList, context.StickyScopes.Peek(), new RenderRect(0f, 0f, inlineSize, blockSize), context);
+            return blockSize;
+        }
+        finally
+        {
+            context.StickyScopes.Pop();
+            context.StickyFlows.Pop();
+        }
+    }
+
+    private static bool IsItemContainer(Dictionary<string, string> styleMap) =>
+        IsFlexContainer(styleMap) || IsGridContainer(styleMap) ||
+        GetDisplay(styleMap) is "table" or "inline-table";
+
+    /// <summary>
+    /// The content of a flex, grid or table container in a system of its own: the container is
+    /// laid out again at the origin of that system, as a bare container of the given inline size
+    /// (and block size, when definite), so its items follow its own axes; its box (margins,
+    /// border, padding, background, positioning) is the block laid out in the enclosing system.
+    /// Returns the block size of the content.
+    /// </summary>
+    private static float LayoutContainerInOwnSystem(ElementRenderNode node, RenderTextStyle flowStyle, float inlineSize, float blockSize, LayoutContext context, DisplayList displayList, out List<DeferredStickyBox> stickyBoxes)
+    {
+        var element = node.Ref;
+        var map = CreateStyleMap(node.ComputedStyle, element, context);
+
+        if (IsVerticalMode(flowStyle.FlowMode))
+        {
+            RemapStyleMapToLogical(map, flowStyle.FlowMode);
+        }
+
+        foreach (var property in map.Keys.Where(IsBoxProperty).ToList())
+        {
+            map.Remove(property);
+            (map as StyleMap)?.ClearRawLength(property);
+        }
+
+        map["width"] = FormattableString.Invariant($"{inlineSize}px");
+
+        if (!float.IsNaN(blockSize))
+        {
+            map["height"] = FormattableString.Invariant($"{blockSize}px");
+        }
+
+        var hadMap = context.StyleMapCache.Remove(element, out var boxMap);
+        context.StyleMapCache[element] = map;
+        stickyBoxes = [];
+        context.StickyFlows.Push(stickyBoxes);
+        context.StickyScopes.Push([]);
+
+        try
+        {
+            var cursorY = 0f;
+            var previousMarginBottom = 0f;
+            var suppressTopMargin = false;
+            var textIndentConsumed = false;
+
+            LayoutNode(node, 0f, 0f, inlineSize, ref cursorY, ref previousMarginBottom, ref suppressTopMargin, new FloatArea(), ref textIndentConsumed, flowStyle, context, displayList, float.MaxValue);
+
+            ResolveStickyBoxes(displayList, context.StickyScopes.Peek(), new RenderRect(0f, 0f, inlineSize, cursorY), context);
+            return cursorY;
+        }
+        finally
+        {
+            context.StickyScopes.Pop();
+            context.StickyFlows.Pop();
+
+            if (hadMap)
+            {
+                context.StyleMapCache[element] = boxMap!;
+            }
+            else
+            {
+                context.StyleMapCache.Remove(element);
+            }
+        }
+
+        // what the box in the enclosing system already does
+        static bool IsBoxProperty(string property) =>
+            property.StartsWith("margin", StringComparison.Ordinal) ||
+            property.StartsWith("padding", StringComparison.Ordinal) ||
+            (property.StartsWith("border", StringComparison.Ordinal) && property is not ("border-collapse" or "border-spacing")) ||
+            property.StartsWith("background", StringComparison.Ordinal) ||
+            property.StartsWith("outline", StringComparison.Ordinal) ||
+            property.StartsWith("mask", StringComparison.Ordinal) ||
+            property.StartsWith("min-", StringComparison.Ordinal) ||
+            property.StartsWith("max-", StringComparison.Ordinal) ||
+            property.StartsWith("overflow", StringComparison.Ordinal) ||
+            property is "height" or "box-shadow" or "box-sizing" or "position" or "top" or "right" or "bottom" or "left" or "inset" or
+                "float" or "clear" or "transform" or "translate" or "rotate" or "scale" or "opacity" or "filter" or "backdrop-filter" or
+                "z-index" or "clip-path" or "mix-blend-mode" or "aspect-ratio" or "-webkit-line-clamp" or "visibility";
     }
 
     /// <summary>
@@ -170,7 +275,10 @@ public sealed partial class HtmlRenderer
 
         try
         {
-            return LayoutOrthogonalFlowContent(OrderChildrenForPainting(element.Children, context).ToList(), flowStyle, inlineSize, context, new DisplayList { Fonts = context.Fonts });
+            var scratch = new DisplayList { Fonts = context.Fonts };
+            return IsItemContainer(styleMap)
+                ? LayoutContainerInOwnSystem(element, flowStyle, inlineSize, float.NaN, context, scratch, out _)
+                : LayoutOrthogonalFlowContent(OrderChildrenForPainting(element.Children, context).ToList(), flowStyle, inlineSize, context, scratch, out _);
         }
         finally
         {
@@ -239,11 +347,13 @@ public sealed partial class HtmlRenderer
     }
 
     /// <summary>
-    /// The transform that places the content of an orthogonal flow, laid out horizontally at the
-    /// origin with the given inline size, into its content box (given in the logical coordinates
-    /// of the system its box sits in): its inline axis runs along that system's block axis.
+    /// The transform that places the content of a system, laid out horizontally at the origin
+    /// with the given inline and block size, into its content box (given in the logical
+    /// coordinates of the system its box sits in): for an orthogonal flow its inline axis runs
+    /// along that system's block axis, for a parallel one (<c>vertical-lr</c> in
+    /// <c>vertical-rl</c>) its block axis runs the other way.
     /// </summary>
-    private static RenderTransform2D ResolveOrthogonalFlowTransform(WritingModeKind mode, WritingModeKind boxSystem, float contentX, float contentY, float contentWidth, float contentHeight)
+    private static RenderTransform2D ResolveFlowTransform(WritingModeKind mode, WritingModeKind boxSystem, float contentX, float contentY, float inlineSize, float blockSize)
     {
         var own = LogicalToPhysical(mode);
         var outer = LogicalToPhysical(boxSystem);
@@ -254,9 +364,8 @@ public sealed partial class HtmlRenderer
         var c = (outer.A * own.C) + (outer.B * own.D);
         var d = (outer.C * own.C) + (outer.D * own.D);
 
-        // The content's inline size is the box's height, its block size the box's width; the
-        // corner the logical origin lands on is wherever the mapped box starts.
-        var corners = new[] { (0f, 0f), (contentHeight, 0f), (0f, contentWidth), (contentHeight, contentWidth) }
+        // The corner the logical origin lands on is wherever the mapped box starts.
+        var corners = new[] { (0f, 0f), (inlineSize, 0f), (0f, blockSize), (inlineSize, blockSize) }
             .Select(corner => ((a * corner.Item1) + (c * corner.Item2), (b * corner.Item1) + (d * corner.Item2)))
             .ToArray();
         var minX = corners.Min(corner => corner.Item1);

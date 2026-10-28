@@ -45,6 +45,27 @@ public sealed class DisplayList
     }
 
     /// <summary>
+    /// Replaces a command (found by identity, as records compare by value) with another one,
+    /// e.g. a placeholder transform whose value is only known after later layout.
+    /// </summary>
+    /// <param name="command">The command to replace.</param>
+    /// <param name="replacement">The command taking its place.</param>
+    /// <returns>Whether the command was found.</returns>
+    internal bool ReplaceCommand(RenderCommand command, RenderCommand replacement)
+    {
+        for (var index = 0; index < _commands.Count; index++)
+        {
+            if (ReferenceEquals(_commands[index], command))
+            {
+                _commands[index] = replacement;
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    /// <summary>
     /// Moves a contiguous range of already-appended commands to the current end of the list,
     /// preserving their own relative order. Used for a stuck `position: sticky` element painted as
     /// a normal, in-sequence page child (so its layout - cursor advancement, margin collapse - stays
