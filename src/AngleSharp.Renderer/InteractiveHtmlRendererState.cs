@@ -19,6 +19,8 @@ internal sealed class InteractiveHtmlRendererState : IDomHarness
     private readonly CssAnimationTracker _animationTracker = new();
     private double _clockMs;
     private IElement? _hoveredElement;
+    private IDocument? _frameDocument;
+    private bool _isFrameScrollShiftable;
     private (double X, double Y) _mousePosition;
 
     private sealed class ElementInteractionState
@@ -133,6 +135,18 @@ internal sealed class InteractiveHtmlRendererState : IDomHarness
         }
 
         state.ScrollTop = next;
+        PaintInvalidated?.Invoke(this, EventArgs.Empty);
+    }
+
+    public void SetHoveredElement(IElement? element)
+    {
+        if (ReferenceEquals(_hoveredElement, element))
+        {
+            return;
+        }
+
+        _hoveredElement = element;
+        UpdateForcedHoverChain(element);
         PaintInvalidated?.Invoke(this, EventArgs.Empty);
     }
 
@@ -254,6 +268,37 @@ internal sealed class InteractiveHtmlRendererState : IDomHarness
         using (_animationTracker.BeginFrame())
         {
             return _renderer.RenderToPng(targetDocument, RenderDevice);
+        }
+    }
+
+    public RenderedFrame PrepareFrame(int overscan = 0)
+    {
+        var targetDocument = Context.Active
+            ?? throw new InvalidOperationException("No active document is available for painting.");
+
+        // Overscan is only right for pages scrolling as a whole: boxes attached to the viewport
+        // would be painted relative to the surface instead. Whether a page has any is only known
+        // once it is laid out, so the previous frame decides and a wrong guess is laid out again.
+        if (!ReferenceEquals(_frameDocument, targetDocument))
+        {
+            _frameDocument = targetDocument;
+            _isFrameScrollShiftable = false;
+        }
+
+        var scrollTop = targetDocument.DocumentElement is { } root ? GetScrollTop(root, double.MaxValue) : 0d;
+
+        using (_animationTracker.BeginFrame())
+        {
+            var frame = _renderer.PrepareFrame(targetDocument, RenderDevice, scrollTop, _isFrameScrollShiftable ? overscan : 0);
+
+            if (frame.OverscanTop > 0 && !frame.IsScrollShiftable)
+            {
+                frame = _renderer.PrepareFrame(targetDocument, RenderDevice, scrollTop, 0);
+            }
+
+            _isFrameScrollShiftable = frame.IsScrollShiftable;
+            frame.IsAnimating = _animationTracker.IsAnimating || _transitionTracker.HasRunningTransitions;
+            return frame;
         }
     }
 

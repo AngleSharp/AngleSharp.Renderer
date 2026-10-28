@@ -30,6 +30,27 @@ internal sealed class CssTransitionTracker
     public void AdvanceTime(TimeSpan delta) => _clockMs += delta.TotalMilliseconds;
 
     /// <summary>
+    /// Gets if a transition has not reached its end yet. Runs are only pruned when they are
+    /// asked for, so this looks at the clock instead (an element removed mid-transition is never
+    /// asked for again).
+    /// </summary>
+    public bool HasRunningTransitions
+    {
+        get
+        {
+            foreach (var run in _activeRuns.Values)
+            {
+                if (_clockMs - run.StartMs - run.Spec.DelayMs < run.Spec.DurationMs)
+                {
+                    return true;
+                }
+            }
+
+            return false;
+        }
+    }
+
+    /// <summary>
     /// Gets the interpolated value currently in effect for <paramref name="property"/> on
     /// <paramref name="element"/> if a transition is actively running for it (mid-delay returns the
     /// starting value; a completed run is pruned and returns null so the natural value shows), or

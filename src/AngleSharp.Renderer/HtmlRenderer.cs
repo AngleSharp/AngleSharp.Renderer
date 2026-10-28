@@ -476,14 +476,14 @@ public sealed partial class HtmlRenderer
         return (float)harness.GetScrollTop(scrollingElement, double.MaxValue);
     }
 
-    private static DisplayList BuildDisplayList(IDocument document, RenderViewport viewport, LayoutContext context, IRenderDevice renderDevice, float scrollOffsetY = 0f, bool measureFullExtent = false)
+    private static DisplayList BuildDisplayList(IDocument document, RenderViewport viewport, LayoutContext context, IRenderDevice renderDevice, float scrollOffsetY = 0f, bool measureFullExtent = false, float surfaceExtraHeight = 0f)
     {
         var previous = s_layoutPass.Value;
         s_layoutPass.Value = new LayoutPass();
 
         try
         {
-            return BuildDisplayListCore(document, viewport, context, renderDevice, scrollOffsetY, measureFullExtent);
+            return BuildDisplayListCore(document, viewport, context, renderDevice, scrollOffsetY, measureFullExtent, surfaceExtraHeight);
         }
         finally
         {
@@ -491,10 +491,12 @@ public sealed partial class HtmlRenderer
         }
     }
 
-    private static DisplayList BuildDisplayListCore(IDocument document, RenderViewport viewport, LayoutContext context, IRenderDevice renderDevice, float scrollOffsetY, bool measureFullExtent)
+    // surfaceExtraHeight: the rows the raster surface has below the viewport (an interactive
+    // frame's overscan), which are painted like the viewport but play no role in layout
+    private static DisplayList BuildDisplayListCore(IDocument document, RenderViewport viewport, LayoutContext context, IRenderDevice renderDevice, float scrollOffsetY, bool measureFullExtent, float surfaceExtraHeight)
     {
         var displayList = new DisplayList { Fonts = context.Fonts };
-        displayList.FillRect(new RenderRect(0f, 0f, viewport.Width, viewport.Height), RenderColor.White);
+        displayList.FillRect(new RenderRect(0f, 0f, viewport.Width, viewport.Height + surfaceExtraHeight), RenderColor.White);
 
         var window = document.DefaultView;
         if (window is null)
@@ -615,7 +617,7 @@ public sealed partial class HtmlRenderer
         if (canvasBackground is { } propagated)
         {
             var canvasBuffer = new DisplayList();
-            var canvasHeight = Math.Max(viewport.Height + scrollOffsetY, cursorY + scrollOffsetY);
+            var canvasHeight = Math.Max(viewport.Height + surfaceExtraHeight + scrollOffsetY, cursorY + scrollOffsetY);
             PaintBoxBackground(canvasBuffer, propagated.StyleMap, propagated.Box, 0f, -scrollOffsetY, viewport.Width, canvasHeight, default, default);
             displayList.InsertRange(1, canvasBuffer.Commands);
         }
@@ -3764,7 +3766,9 @@ public sealed partial class HtmlRenderer
             inheritedTextStyle,
             context,
             displayList,
-            maxY);
+            maxY,
+            // a grid item is blockified, e.g. an `<a>` card is as tall as its block content
+            isFlexItem: true);
 
         return cursorY;
     }
@@ -5529,6 +5533,7 @@ public sealed partial class HtmlRenderer
         AddIfPresent(map, "display", displayValue);
         AddIfPresent(map, "visibility", style.GetVisibility());
         AddIfPresent(map, "pointer-events", style.GetPropertyValue("pointer-events"));
+        AddIfPresent(map, "cursor", style.GetPropertyValue("cursor"));
         AddIfPresent(map, "writing-mode", style.GetPropertyValue("writing-mode"));
         AddIfPresent(map, "text-orientation", style.GetPropertyValue("text-orientation"));
         AddLengthProperty(map, style, "width", explicitDeclarations);
@@ -6801,18 +6806,23 @@ public sealed partial class HtmlRenderer
 
         var naturalWidth = imageResource.NaturalWidth;
         var naturalHeight = imageResource.NaturalHeight;
+        var isWidthAuto = float.IsNaN(width);
+        var isHeightAuto = float.IsNaN(height);
+        var (minWidth, maxWidth, minHeight, maxHeight) = ResolveReplacedSizeConstraints(styleMap, containingWidth);
 
-        if (float.IsNaN(width) && float.IsNaN(height))
+        if (isWidthAuto && isHeightAuto)
         {
             width = naturalWidth;
             height = naturalHeight;
         }
-        else if (float.IsNaN(width) && !float.IsNaN(height) && naturalWidth > 0f)
+        else if (isWidthAuto && naturalHeight > 0f)
         {
+            height = Math.Clamp(height, minHeight, Math.Max(minHeight, maxHeight));
             width = (height / naturalHeight) * naturalWidth;
         }
-        else if (!float.IsNaN(width) && float.IsNaN(height) && naturalHeight > 0f)
+        else if (isHeightAuto && naturalWidth > 0f)
         {
+            width = Math.Clamp(width, minWidth, Math.Max(minWidth, maxWidth));
             height = (width / naturalWidth) * naturalHeight;
         }
 
@@ -6822,6 +6832,16 @@ public sealed partial class HtmlRenderer
             height = naturalHeight;
         }
 
+        if (isWidthAuto && isHeightAuto)
+        {
+            (width, height) = ConstrainReplacedSize(width, height, minWidth, maxWidth, minHeight, maxHeight);
+        }
+        else
+        {
+            width = Math.Clamp(width, minWidth, Math.Max(minWidth, maxWidth));
+            height = Math.Clamp(height, minHeight, Math.Max(minHeight, maxHeight));
+        }
+
         var boxRect = new RenderRect(x, y, width, height);
         var (paintRect, needsClip) = ResolveObjectFitRect(boxRect, naturalWidth, naturalHeight, styleMap);
 
@@ -6829,6 +6849,84 @@ public sealed partial class HtmlRenderer
         rect = paintRect;
         clipRect = needsClip ? boxRect : null;
         return true;
+    }
+
+    /// <summary>
+    /// The min/max sizes of a replaced element; a percentage height has no definite reference
+    /// here, so it does not constrain.
+    /// </summary>
+    private static (float MinWidth, float MaxWidth, float MinHeight, float MaxHeight) ResolveReplacedSizeConstraints(Dictionary<string, string> styleMap, float containingWidth)
+    {
+        static float OrDefault(float value, float fallback) => float.IsNaN(value) ? fallback : value;
+        static bool IsPercentage(Dictionary<string, string> styleMap, string property) =>
+            styleMap.TryGetValue(property, out var value) && value.TrimEnd().EndsWith('%');
+
+        var minWidth = OrDefault(ParseLength(styleMap, "min-width", containingWidth, float.NaN, allowAuto: true), 0f);
+        var maxWidth = OrDefault(ParseLength(styleMap, "max-width", containingWidth, float.NaN, allowAuto: true), float.PositiveInfinity);
+        var minHeight = IsPercentage(styleMap, "min-height") ? 0f : OrDefault(ParseLength(styleMap, "min-height", containingWidth, float.NaN, allowAuto: true), 0f);
+        var maxHeight = IsPercentage(styleMap, "max-height") ? float.PositiveInfinity : OrDefault(ParseLength(styleMap, "max-height", containingWidth, float.NaN, allowAuto: true), float.PositiveInfinity);
+        return (Math.Max(0f, minWidth), maxWidth, Math.Max(0f, minHeight), maxHeight);
+    }
+
+    /// <summary>
+    /// Fits the natural size of a replaced element with auto width and height into its min/max
+    /// sizes, keeping its aspect ratio where possible (CSS 2.1 §10.4, the table).
+    /// </summary>
+    private static (float Width, float Height) ConstrainReplacedSize(float w, float h, float minW, float maxW, float minH, float maxH)
+    {
+        maxW = Math.Max(minW, maxW);
+        maxH = Math.Max(minH, maxH);
+
+        if (w <= 0f || h <= 0f)
+        {
+            return (Math.Clamp(w, minW, maxW), Math.Clamp(h, minH, maxH));
+        }
+
+        if (w > maxW && h > maxH)
+        {
+            return maxW / w <= maxH / h
+                ? (maxW, Math.Max(minH, maxW * h / w))
+                : (Math.Max(minW, maxH * w / h), maxH);
+        }
+
+        if (w < minW && h < minH)
+        {
+            return minW / w <= minH / h
+                ? (Math.Min(maxW, minH * w / h), minH)
+                : (minW, Math.Min(maxH, minW * h / w));
+        }
+
+        if (w < minW && h > maxH)
+        {
+            return (minW, maxH);
+        }
+
+        if (w > maxW && h < minH)
+        {
+            return (maxW, minH);
+        }
+
+        if (w > maxW)
+        {
+            return (maxW, Math.Max(maxW * h / w, minH));
+        }
+
+        if (w < minW)
+        {
+            return (minW, Math.Min(minW * h / w, maxH));
+        }
+
+        if (h > maxH)
+        {
+            return (Math.Max(maxH * w / h, minW), maxH);
+        }
+
+        if (h < minH)
+        {
+            return (Math.Min(minH * w / h, maxW), minH);
+        }
+
+        return (w, h);
     }
 
     /// <summary>

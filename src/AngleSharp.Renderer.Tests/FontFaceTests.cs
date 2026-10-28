@@ -71,6 +71,33 @@ public sealed class FontFaceTests
         Assert.Equal(reference, decoded);
     }
 
+    [Fact]
+    public async Task WebFontFace_KeepsGlyphsBeyondTheShortLocaRange()
+    {
+        // Source Sans Pro (SIL OFL) declares short loca offsets; its glyphs, rebuilt without the
+        // point compression, outgrow them. The glyphs at the end of the table (here "i", a
+        // composite, and "+") used to come out empty.
+        var html =
+            "<html><head><style>" +
+            $"@font-face {{ font-family: 'Embedded'; src: url({FixtureDataUri("SourceSansPro-Regular.woff2", "woff2")}) format('woff2'); }}" +
+            "body { margin: 0; font-family: 'Embedded'; font-size: 32px; }" +
+            "</style></head><body>i+</body></html>";
+        var document = await BrowsingContext.New(Configuration.Default.WithCss()).OpenAsync(request => request.Content(html));
+        var image = new HtmlRenderer().RenderToPng(document, new DefaultRenderDevice { ViewPortWidth = 60, ViewPortHeight = 60 });
+        using var bitmap = SKBitmap.Decode(image.Data);
+        var inked = 0;
+
+        for (var y = 0; y < bitmap.Height; y++)
+        {
+            for (var x = 0; x < bitmap.Width; x++)
+            {
+                inked += bitmap.GetPixel(x, y).Red < 128 ? 1 : 0;
+            }
+        }
+
+        Assert.True(inked > 50, $"Only {inked} pixels were inked, so the glyphs are missing.");
+    }
+
     private static string FixtureDataUri(string fileName, string format) =>
         $"data:font/{format};base64,{Convert.ToBase64String(File.ReadAllBytes(Path.Combine(AppContext.BaseDirectory, "fonts", fileName)))}";
 

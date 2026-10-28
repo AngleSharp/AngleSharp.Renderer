@@ -428,6 +428,19 @@ public sealed record PushTransformCommand(RenderTransform2D Transform) : RenderC
 public sealed record PopTransformCommand : RenderCommand;
 
 /// <summary>
+/// Marks the start of a box attached to the viewport (`position: fixed`), up to the matching
+/// <see cref="PopViewportAnchorCommand"/>. Backends paint the commands in between like any
+/// other; a repositioned frame (<see cref="RenderedFrame.Reposition"/>) keeps them in place
+/// while the rest of the page scrolls.
+/// </summary>
+public sealed record PushViewportAnchorCommand : RenderCommand;
+
+/// <summary>
+/// Ends the box started by the matching <see cref="PushViewportAnchorCommand"/>.
+/// </summary>
+public sealed record PopViewportAnchorCommand : RenderCommand;
+
+/// <summary>
 /// Begins applying a CSS `filter` to every following command, up to the matching
 /// <see cref="PopFilterCommand"/> - background, border, outline, and children all render under it,
 /// mirroring how <see cref="PushTransformCommand"/> wraps the whole element it is set on.

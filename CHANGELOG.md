@@ -1,6 +1,12 @@
-# 0.9.0
+# 0.9.1
 
 Released on Friday, October 30 2026.
+
+- Improved performance by caching fonts and using direct pixel manipulation
+
+# 0.9.0
+
+Released on Wednesday, October 28 2026.
 
 - Fixed `-webkit-line-clamp` counting lines per inline run instead of across the nested blocks of the clamped box (e.g. paragraphs in a clamped card), which now ends after its last line
 - Fixed gaps with font- or viewport-relative units (e.g. Tailwind's `gap-4`, i.e. `gap: 1rem`) being ignored in grid and flex containers

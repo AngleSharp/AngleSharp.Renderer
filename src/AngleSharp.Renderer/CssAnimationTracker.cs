@@ -73,10 +73,17 @@ internal sealed class CssAnimationTracker
     /// </summary>
     public IDisposable BeginFrame()
     {
+        IsAnimating = false;
         _frameSpecs = [];
         _frameKeyframes = [];
         return new FrameScope(this);
     }
+
+    /// <summary>
+    /// Gets if an animation observed in the last frame (see <see cref="BeginFrame"/>) is still
+    /// playing, i.e., is not paused and has not ended (it may still be in its delay).
+    /// </summary>
+    public bool IsAnimating { get; private set; }
 
     private sealed class FrameScope(CssAnimationTracker tracker) : IDisposable
     {
@@ -179,6 +186,11 @@ internal sealed class CssAnimationTracker
         var effectiveClockMs = ResolveEffectiveClockMs(element, spec, clockMs);
         var elapsedMs = effectiveClockMs - startMs - spec.DelayMs;
         var totalDurationMs = spec.DurationMs * spec.IterationCount;
+
+        if (!spec.IsPaused && (elapsedMs < totalDurationMs || double.IsPositiveInfinity(totalDurationMs)))
+        {
+            IsAnimating = true;
+        }
 
         if (elapsedMs < 0d)
         {
