@@ -2795,6 +2795,42 @@ public sealed class VisualConformanceTests
     }
 
     [Fact]
+    public async Task RenderToPng_RendersShapedText()
+    {
+        var document = await ParseAsync("""
+            <html>
+              <head>
+                <style>
+                  html, body { margin: 0; padding: 0; background-color: white; font-family: sans-serif; font-size: 20px; }
+                  p { margin: 4px 8px; }
+                  .off { font-feature-settings: "liga" 0, "kern" 0; }
+                </style>
+              </head>
+              <body>
+                <p>office flow AVATAR Wolf</p>
+                <p class="off">office flow AVATAR Wolf</p>
+                <p dir="rtl" style="direction: rtl">مرحبا بالعالم (لا)</p>
+                <p>नमस्ते क्षत्रिय</p>
+              </body>
+            </html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var image = renderer.RenderToPng(document, new DefaultRenderDevice
+        {
+            ViewPortWidth = 300,
+            ViewPortHeight = 150,
+            FontSize = 20f,
+        });
+
+        VisualSnapshotVerifier.VerifyOrCreate(
+          snapshotName: "renders-shaped-text.png",
+          actualPng: image.Data,
+          perChannelTolerance: TextRenderingToleranceChannel,
+          maxDifferentPixels: TextRenderingToleranceMaxPixels);
+    }
+
+    [Fact]
     public async Task RenderToPng_RendersBlendModesBackgroundClipAndOutlineOffset()
     {
         var document = await ParseAsync("""
@@ -3109,6 +3145,178 @@ public sealed class VisualConformanceTests
         // area rather than adding to the declared size.
         VisualSnapshotVerifier.VerifyOrCreate(
           snapshotName: "border-box-sizing-keeps-the-declared-width.png",
+          actualPng: image.Data,
+          perChannelTolerance: 0,
+          maxDifferentPixels: 0);
+    }
+
+    [Fact]
+    public async Task RenderToPng_AlignsGridTracksWithinTheContainer()
+    {
+        var document = await ParseAsync("""
+            <html>
+              <head><style>html, body { margin: 0; padding: 0; } .grid { display:grid; grid-template-columns:20px 20px; grid-template-rows:20px 20px; gap:4px; width:100px; height:80px; margin-bottom:10px; background-color:rgb(230,230,230); } .grid div { background-color:rgb(0,0,200); }</style></head>
+              <body>
+                <div class="grid" style="justify-content:center; align-content:center"><div></div><div></div><div></div><div></div></div>
+                <div class="grid" style="justify-content:space-between; align-content:end"><div></div><div></div><div></div><div></div></div>
+                <div class="grid" style="justify-content:space-evenly; align-content:space-around"><div></div><div></div><div></div><div></div></div>
+              </body>
+            </html>
+            """);
+
+        var image = new HtmlRenderer().RenderToPng(document, new DefaultRenderDevice { ViewPortWidth = 120, ViewPortHeight = 280 });
+
+        VisualSnapshotVerifier.VerifyOrCreate(
+          snapshotName: "aligns-grid-tracks-within-the-container.png",
+          actualPng: image.Data,
+          perChannelTolerance: 0,
+          maxDifferentPixels: 0);
+    }
+
+    [Fact]
+    public async Task RenderToPng_MovesLinesDownPastFloatsTheyDoNotFitBeside()
+    {
+        // the 80px boxes are the "words": 50px are free beside the first float, 100px beside the second
+        var document = await ParseAsync("""
+            <html>
+              <head><style>html, body { margin: 0; padding: 0; } span { display:inline-block; width:80px; height:20px; vertical-align:top; }</style></head>
+              <body>
+                <div style="width:200px; line-height:20px; font-size:0">
+                  <div style="float:left; width:150px; height:30px; background-color:rgb(255,0,0)"></div>
+                  <div style="float:left; clear:left; width:100px; height:30px; background-color:rgb(255,165,0)"></div>
+                  <span style="background-color:rgb(0,0,200)"></span>
+                  <span style="background-color:rgb(0,180,0)"></span>
+                  <span style="background-color:rgb(150,0,150)"></span>
+                </div>
+              </body>
+            </html>
+            """);
+
+        var image = new HtmlRenderer().RenderToPng(document, new DefaultRenderDevice { ViewPortWidth = 200, ViewPortHeight = 120 });
+
+        VisualSnapshotVerifier.VerifyOrCreate(
+          snapshotName: "moves-lines-down-past-floats-they-do-not-fit-beside.png",
+          actualPng: image.Data,
+          perChannelTolerance: 0,
+          maxDifferentPixels: 0);
+    }
+
+    [Fact]
+    public async Task RenderToPng_LineClampCountsTheLinesOfNestedBlocks()
+    {
+        // transparent text on fixed lines: the paragraphs' backgrounds show which lines are kept
+        var document = await ParseAsync("""
+            <html>
+              <head><style>html, body { margin: 0; padding: 0; } p { margin:0; color:transparent }</style></head>
+              <body>
+                <div style="overflow:hidden; -webkit-line-clamp:3; width:100px; line-height:20px; background-color:rgb(230,230,230)">
+                  <p style="background-color:rgb(255,0,0)">a</p>
+                  <p style="background-color:rgb(0,180,0)">b<br>c<br>d</p>
+                  <p style="background-color:rgb(0,0,200)">e</p>
+                </div>
+              </body>
+            </html>
+            """);
+
+        var image = new HtmlRenderer().RenderToPng(document, new DefaultRenderDevice { ViewPortWidth = 120, ViewPortHeight = 120 });
+
+        VisualSnapshotVerifier.VerifyOrCreate(
+          snapshotName: "line-clamp-counts-the-lines-of-nested-blocks.png",
+          actualPng: image.Data,
+          perChannelTolerance: 0,
+          maxDifferentPixels: 0);
+    }
+
+    [Fact]
+    public async Task RenderToPng_LaysOutFlexGridAndTableContainersInTheirOwnWritingMode()
+    {
+        var document = await ParseAsync("""
+            <html>
+              <head><style>html, body { margin: 0; padding: 0; } td { padding:0; width:20px; height:20px; }</style></head>
+              <body style="display:flex; gap:10px; align-items:flex-start">
+                <div style="display:flex; writing-mode:vertical-rl; gap:5px; height:100px; padding:5px; background-color:rgb(230,230,230)">
+                  <div style="width:20px; height:20px; background-color:rgb(255,0,0)"></div>
+                  <div style="width:30px; height:30px; background-color:rgb(0,180,0)"></div>
+                  <div style="width:20px; height:20px; background-color:rgb(0,0,200)"></div>
+                </div>
+                <div style="display:grid; writing-mode:vertical-rl; grid-template-columns:20px 30px; grid-template-rows:20px 30px; padding:5px; background-color:rgb(230,230,230)">
+                  <div style="background-color:rgb(255,0,0)"></div><div style="background-color:rgb(0,180,0)"></div><div style="background-color:rgb(0,0,200)"></div>
+                </div>
+                <table style="writing-mode:vertical-rl; border-spacing:5px; background-color:rgb(230,230,230)">
+                  <tr><td style="background-color:rgb(255,0,0)"></td><td style="background-color:rgb(0,180,0)"></td></tr>
+                  <tr><td style="background-color:rgb(0,0,200)"></td><td></td></tr>
+                </table>
+              </body>
+            </html>
+            """);
+
+        var image = new HtmlRenderer().RenderToPng(document, new DefaultRenderDevice { ViewPortWidth = 220, ViewPortHeight = 120 });
+
+        VisualSnapshotVerifier.VerifyOrCreate(
+          snapshotName: "lays-out-flex-grid-and-table-containers-in-their-own-writing-mode.png",
+          actualPng: image.Data,
+          perChannelTolerance: 0,
+          maxDifferentPixels: 0);
+    }
+
+    [Fact]
+    public async Task RenderToPng_NestedVerticalLrStacksItsBlocksTheOtherWay()
+    {
+        var document = await ParseAsync("""
+            <html>
+              <head><style>html, body { margin: 0; padding: 0; } i { display:block; width:20px; height:20px; }</style></head>
+              <body>
+                <div style="writing-mode:vertical-rl; width:160px; height:60px; background-color:rgb(230,230,230)">
+                  <i style="background-color:rgb(255,0,0)"></i>
+                  <div style="writing-mode:vertical-lr; background-color:rgb(255,220,150)">
+                    <i style="background-color:rgb(0,180,0)"></i>
+                    <i style="width:30px; background-color:rgb(0,0,200)"></i>
+                  </div>
+                  <i style="background-color:rgb(255,0,0)"></i>
+                </div>
+              </body>
+            </html>
+            """);
+
+        var image = new HtmlRenderer().RenderToPng(document, new DefaultRenderDevice { ViewPortWidth = 160, ViewPortHeight = 60 });
+
+        VisualSnapshotVerifier.VerifyOrCreate(
+          snapshotName: "nested-vertical-lr-stacks-its-blocks-the-other-way.png",
+          actualPng: image.Data,
+          perChannelTolerance: 0,
+          maxDifferentPixels: 0);
+    }
+
+    [Fact]
+    public async Task RenderToPng_StickyBoxInVerticalFlowStaysPinnedWhileScrolledPastIt()
+    {
+        var renderDevice = new DefaultRenderDevice
+        {
+            ViewPortWidth = 100,
+            ViewPortHeight = 100,
+            DeviceWidth = 100,
+            DeviceHeight = 100,
+            FontSize = 16,
+        };
+        var configuration = Configuration.Default.WithCss().WithRenderDevice(renderDevice);
+        var document = await ParseAsync("""
+            <html>
+              <head><style>html, body { margin: 0; padding: 0; }</style></head>
+              <body>
+                <div style="writing-mode:vertical-rl; width:100px; height:400px; background-image:linear-gradient(rgb(255,255,0), rgb(0,180,0))">
+                  <div style="position:sticky; top:10px; width:40px; height:30px; background-color:rgb(0,0,200)"></div>
+                </div>
+              </body>
+            </html>
+            """, configuration);
+
+        document.Context.GetDomHarness();
+        document.DocumentElement.SetScrollTop(150);
+
+        var image = new HtmlRenderer().RenderToPng(document, renderDevice);
+
+        VisualSnapshotVerifier.VerifyOrCreate(
+          snapshotName: "sticky-box-in-vertical-flow-stays-pinned-while-scrolled-past-it.png",
           actualPng: image.Data,
           perChannelTolerance: 0,
           maxDifferentPixels: 0);

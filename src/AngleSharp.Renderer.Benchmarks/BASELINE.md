@@ -35,6 +35,10 @@ Against `AngleSharp` 1.8.1, `AngleSharp.Css` 1.1.2 (both via `PackageReference`)
 | **Layout only: `BuildDisplayList`** | **364 ms** | **194.14 MB** |
 | Full pipeline: layout + Skia rasterization + PNG encoding (`RenderToPng`) | 527 ms | 199.41 MB |
 
+> **Note (2026-10-28):** the tables above predate HarfBuzz text shaping and were measured on the
+> Apple M5. The shaping change was measured before/after on a different machine (see the last
+> History entry); re-run these tables on the M5 to refresh them.
+
 **Cumulative improvement over the original, pre-optimization baseline: ~9.5x faster, ~7.5x less
 allocation** on `BuildDisplayList` (net10.0: 2,415 ms / 1,456 MB &rarr; 255 ms / 194 MB). The
 net8.0 mean above carries a wide error margin in this particular short-job run (~285ms on a 364ms
@@ -206,3 +210,37 @@ BenchmarkDotNet refuses to run outside `Release` and warns loudly if it detects 
 unoptimized build - always use `-c Release`. Update the tables above (and the date) after a
 meaningful optimization lands, so this file keeps tracking the current baseline rather than one
 frozen the day it was first written.
+
+### 2026-10-28, HarfBuzz text shaping (cost, plus a width cache in `SkiaTextMeasurer`)
+
+Measured on a different machine than the tables above, so only the before/after pair is
+comparable: AMD Ryzen 7 3700X (16 threads), Linux (WSL2), .NET SDK 10.0.100, `short` job.
+"Before" is commit `59b892a` (unshaped `canvas.DrawText`), "shaped" is HarfBuzz shaping in
+`SkiaTextShaping` without any caching, "shaped + cache" adds the per-thread width cache that
+`SkiaTextMeasurer.MeasureWidth` now keeps (keyed by text and `RenderFont`, cleared at 16,384
+entries).
+
+| `BuildDisplayList` | net10.0 Mean | net8.0 Mean | Allocated |
+|---|---:|---:|---:|
+| before | 423 ms | 401 ms | 119.9 MB |
+| shaped | 443 ms | 509 ms | 142.4 MB |
+| shaped + cache | 409 ms | 355 ms | 121.7 MB |
+
+| `RenderToPng` | net10.0 Mean | net8.0 Mean | Allocated |
+|---|---:|---:|---:|
+| before | 2,630 ms | 2,586 ms | 124.7 MB |
+| shaped | 2,923 ms | 2,988 ms | 148.1 MB |
+| shaped + cache | 2,867 ms | 2,963 ms | 127.3 MB |
+
+The short job's error margins are wide on this machine (up to +/-30 ms StdDev for layout), so the
+layout means are best read as "back to parity" with the cache; allocation is deterministic and
+ends up +1.8 MB (+1.5%). Painting keeps a real cost of roughly +9-15% on the full pipeline: every
+painted run is shaped once more when it is drawn (lines are mostly unique, so a paint-side cache
+would rarely hit).
+
+Nested trial layouts: a probe laying out 20 copies of inline-blocks nested 1-5 deep (each with a
+12-word sentence) in a 300px box. The number of `MeasureWidth` calls is identical before and after
+(trial layouts multiply it by ~2-2.5x per level: 1,280 / 4,020 / 9,760 / 21,500 / 41,946), and
+with the width cache the repeated calls cost a dictionary lookup instead of a shaping pass, so the
+time per layout did not grow (before: 17 / 36 / 89 / 160 / 154 ms, after: 19 / 45 / 76 / 133 /
+123 ms for depths 1-5; single runs of 5 layouts, so +/-20%).

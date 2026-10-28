@@ -125,10 +125,27 @@ public sealed partial class HtmlRenderer
         Dictionary<(IElement Element, float Width), float> MeasuredHeights,
         Dictionary<IElement, WritingModeKind> BoxSystems,
         Dictionary<IElement, WritingModeKind> ContentSystems,
-        Dictionary<IElement, ICssStyleDeclaration> SpecifiedStyles)
+        Dictionary<IElement, ICssStyleDeclaration> SpecifiedStyles,
+        Stack<LineClampScope> LineClampScopes,
+        Stack<List<DeferredStickyBox>> StickyFlows)
     {
         // only needed for what the render tree does not hold (e.g. ::placeholder), so it is built on demand
         public IStyleCollection? StyleCollection => LazyStyleCollection.Value;
+    }
+
+    /// <summary>
+    /// The lines a box with `-webkit-line-clamp` has left for its content. Every line laid out
+    /// inside it counts, in nested blocks too; once none is left, the rest of its content is not
+    /// laid out (so the box ends after the last line), and that line shows an ellipsis when
+    /// anything follows it.
+    /// </summary>
+    private sealed class LineClampScope(IElement root, int remaining)
+    {
+        public IElement Root { get; } = root;
+
+        public int Remaining { get; set; } = remaining;
+
+        public LineClampScope Clone() => new(Root, Remaining);
     }
 
     private sealed class LayoutCapture
@@ -182,6 +199,12 @@ public sealed partial class HtmlRenderer
 
         foreach (var (element, elementMetrics) in metrics)
         {
+            // Anonymous table boxes are not part of the document, so they are never hit.
+            if (IsAnonymousTableBox(element))
+            {
+                continue;
+            }
+
             result[element] = context.StyleMapCache.TryGetValue(element, out var styleMap)
                 ? elementMetrics with { Layer = ResolveHitTestLayer(element, styleMap, context) }
                 : elementMetrics;
@@ -305,7 +328,7 @@ public sealed partial class HtmlRenderer
             defaultFontFamily = styleMap.TryGetValue("font-family", out var family) && !string.IsNullOrWhiteSpace(family)
                 ? family.Trim('\'', '"', ' ')
                 : defaultFontFamily;
-            defaultLineHeight = ParseLineHeight(styleMap, defaultLineHeight);
+            defaultLineHeight = ParseLineHeight(styleMap, defaultFontSize, defaultLineHeight);
             defaultTextColor = ParseColor(styleMap.TryGetValue("color", out var colorValue) ? colorValue : null, defaultTextColor);
         }
 
@@ -360,7 +383,11 @@ public sealed partial class HtmlRenderer
             BoxSystems: new Dictionary<IElement, WritingModeKind>(ReferenceEqualityComparer.Instance),
             ContentSystems: new Dictionary<IElement, WritingModeKind>(ReferenceEqualityComparer.Instance),
             // The cascaded declarations of the render tree's elements (see GetExplicitDeclarations).
-            SpecifiedStyles: new Dictionary<IElement, ICssStyleDeclaration>(ReferenceEqualityComparer.Instance));
+            SpecifiedStyles: new Dictionary<IElement, ICssStyleDeclaration>(ReferenceEqualityComparer.Instance),
+            // The `-webkit-line-clamp` boxes being laid out, innermost on top (see LineClampScope).
+            LineClampScopes: new Stack<LineClampScope>(),
+            // The sticky boxes of the writing-mode systems being laid out (see ResolveFlowStickyBoxes).
+            StickyFlows: new Stack<List<DeferredStickyBox>>());
     }
 
     /// <summary>
@@ -478,6 +505,7 @@ public sealed partial class HtmlRenderer
         PrepareDocumentForRendering(document);
 
         var renderTree = window.Render(renderDevice);
+        BuildAnonymousTableBoxes(renderTree);
         CollectSpecifiedStyles(renderTree, context);
         ResolveWritingModeSystems(renderTree, WritingModeKind.HorizontalTb, context);
 
@@ -542,10 +570,11 @@ public sealed partial class HtmlRenderer
             var pageStyle = textStyle with { WritingMode = pageSystem, FlowMode = pageSystem };
             var inlineSize = Math.Max(0f, viewport.Height - (2f * context.Padding));
             var flowStart = displayList.Commands.Count;
-            LayoutOrthogonalFlowContent(OrderChildrenForPainting(root.Children, context).ToList(), pageStyle, inlineSize, context, displayList);
-            displayList.InsertRange(flowStart, [new PushTransformCommand(ResolveOrthogonalFlowTransform(pageSystem, WritingModeKind.HorizontalTb, contentX, contentY, contentWidth, inlineSize))]);
+            LayoutOrthogonalFlowContent(OrderChildrenForPainting(root.Children, context).ToList(), pageStyle, inlineSize, context, displayList, out var pageStickyBoxes);
+            var pageTransform = ResolveFlowTransform(pageSystem, WritingModeKind.HorizontalTb, contentX, contentY, inlineSize, contentWidth);
+            displayList.InsertRange(flowStart, [new PushTransformCommand(pageTransform)]);
             displayList.PopTransform();
-            context.StickyScopes.Peek().Clear();
+            ResolveFlowStickyBoxes(pageStickyBoxes, pageTransform, context);
         }
         else
         {
@@ -701,6 +730,12 @@ public sealed partial class HtmlRenderer
         float contentOffsetY = 0f,
         bool mainAxisMarginsPlaced = false)
     {
+        // nothing after the last line of a clamped box is laid out
+        if (context.LineClampScopes.TryPeek(out var lineClamp) && lineClamp.Remaining <= 0)
+        {
+            return;
+        }
+
         switch (node)
         {
             case TextRenderNode textNode:
@@ -764,10 +799,17 @@ public sealed partial class HtmlRenderer
 
         var display = GetDisplay(styleMap);
 
-        if (string.Equals(display, "table", StringComparison.OrdinalIgnoreCase) ||
-            string.Equals(display, "inline-table", StringComparison.OrdinalIgnoreCase))
+        // A flex, grid or table container in a writing-mode system of its own is laid out as a
+        // block, whose content is the container laid out again in that system (see
+        // LayoutContainerInOwnSystem).
+        var startsSystem = formControlKind == FormControlKind.None && !IsReplacedElement(element) &&
+                           StartsWritingModeSystem(ParseWritingMode(styleMap.GetValueOrDefault("writing-mode"), inheritedTextStyle.WritingMode), inheritedTextStyle.FlowMode);
+
+        if (!startsSystem &&
+            (string.Equals(display, "table", StringComparison.OrdinalIgnoreCase) ||
+             string.Equals(display, "inline-table", StringComparison.OrdinalIgnoreCase)))
         {
-            LayoutTable(node, containingX, containingWidth, ref cursorY, ref previousBlockMarginBottom, ref suppressNextBlockTopMargin, floats, inheritedTextStyle, context, displayList, maxY, positionedContainingX, positionedContainingY, positionedContainingWidth, positionedContainingHeight, forcedBorderBoxWidth);
+            LayoutTable(node, containingX, containingWidth, ref cursorY, ref previousBlockMarginBottom, ref suppressNextBlockTopMargin, floats, inheritedTextStyle, context, displayList, maxY, positionedContainingX, positionedContainingY, positionedContainingWidth, positionedContainingHeight, forcedBorderBoxWidth, containingHeight);
             return;
         }
 
@@ -825,9 +867,9 @@ public sealed partial class HtmlRenderer
         var floatSide = GetFloat(styleMap);
         var isFloat = floatSide is "left" or "right";
         var isOutOfFlow = IsOutOfFlowPositioned(styleMap);
-        // An orthogonal flow (see HtmlRenderer.WritingModes.cs) is always a formatting context of its own.
+        // A writing-mode system of its own (see HtmlRenderer.WritingModes.cs) is always a formatting context of its own.
         var establishesContext = EstablishesBlockFormattingContext(styleMap, isFloat, isOutOfFlow, isAtomicInline, isFlexItem) ||
-                                 IsVerticalMode(currentTextStyle.WritingMode) != IsVerticalMode(inheritedTextStyle.FlowMode);
+                                 StartsWritingModeSystem(currentTextStyle.WritingMode, inheritedTextStyle.FlowMode);
 
         // `clear` moves a box below the floats on the side(s) it must not sit next to.
         var clearance = isOutOfFlow ? float.NaN : floats.GetClearance(GetClear(styleMap));
@@ -1245,7 +1287,7 @@ public sealed partial class HtmlRenderer
         // a control painting its own label (or selected option) has no children to lay out as items
         var layoutsItems = formControlKind is not (FormControlKind.Select or FormControlKind.Button);
 
-        if (layoutsItems && IsFlexContainer(styleMap))
+        if (layoutsItems && !startsSystem && IsFlexContainer(styleMap))
         {
             LayoutFlexContainer(
                 node,
@@ -1281,7 +1323,7 @@ public sealed partial class HtmlRenderer
             return;
         }
 
-        if (layoutsItems && IsGridContainer(styleMap))
+        if (layoutsItems && !startsSystem && IsGridContainer(styleMap))
         {
             LayoutGridContainer(
                 node,
@@ -1317,6 +1359,15 @@ public sealed partial class HtmlRenderer
         var isOrthogonalFlow = IsVerticalMode(currentTextStyle.WritingMode) != IsVerticalMode(inheritedTextStyle.FlowMode) &&
                                formControlKind == FormControlKind.None &&
                                !IsReplacedElement(element);
+        var isParallelFlow = !isOrthogonalFlow &&
+                             StartsWritingModeSystem(currentTextStyle.WritingMode, inheritedTextStyle.FlowMode) &&
+                             formControlKind == FormControlKind.None &&
+                             !IsReplacedElement(element);
+
+        if (currentTextStyle.LineClamp > 0)
+        {
+            context.LineClampScopes.Push(new LineClampScope(element, currentTextStyle.LineClamp));
+        }
 
         if (isOrthogonalFlow)
         {
@@ -1326,20 +1377,42 @@ public sealed partial class HtmlRenderer
             var flowStyle = currentTextStyle with { FlowMode = currentTextStyle.WritingMode };
             var inlineSize = ResolveOrthogonalInlineSize(node, styleMap, flowStyle, resolvedContentHeight, heightReference, verticalBorderAndPadding, context);
             var flowStart = displayList.Commands.Count;
-            var blockSize = LayoutOrthogonalFlowContent(orderedChildren, flowStyle, inlineSize, context, displayList);
+            var blockSize = IsItemContainer(styleMap)
+                ? LayoutContainerInOwnSystem(node, flowStyle, inlineSize, specifiedContentWidth, context, displayList, out var flowStickyBoxes)
+                : LayoutOrthogonalFlowContent(orderedChildren, flowStyle, inlineSize, context, displayList, out flowStickyBoxes);
 
             if (float.IsNaN(specifiedContentWidth) && float.IsNaN(forcedBorderBoxWidth))
             {
                 contentWidth = ClampToMinMaxWidth(styleMap, blockSize, flowContainingWidth, horizontalBorderAndPadding);
             }
 
-            displayList.InsertRange(flowStart, [new PushTransformCommand(ResolveOrthogonalFlowTransform(currentTextStyle.WritingMode, inheritedTextStyle.FlowMode, contentX, contentY + contentOffsetY, contentWidth, inlineSize))]);
+            var flowTransform = ResolveFlowTransform(currentTextStyle.WritingMode, inheritedTextStyle.FlowMode, contentX, contentY + contentOffsetY, inlineSize, contentWidth);
+            displayList.InsertRange(flowStart, [new PushTransformCommand(flowTransform)]);
             displayList.PopTransform();
+            ResolveFlowStickyBoxes(flowStickyBoxes, flowTransform, context);
             resolvedContentHeight = inlineSize;
             childCursorY = contentY + inlineSize;
+        }
+        else if (isParallelFlow)
+        {
+            // A parallel flow (e.g. vertical-lr content in a vertical-rl box): the same inline
+            // axis, but its blocks stack the other way, so it is laid out on its own and flipped
+            // into the content box once its block size is known.
+            var flowStyle = currentTextStyle with { FlowMode = currentTextStyle.WritingMode };
+            var flowStart = displayList.Commands.Count;
+            var blockSize = IsItemContainer(styleMap)
+                ? LayoutContainerInOwnSystem(node, flowStyle, contentWidth, resolvedContentHeight, context, displayList, out var flowStickyBoxes)
+                : LayoutOrthogonalFlowContent(orderedChildren, flowStyle, contentWidth, context, displayList, out flowStickyBoxes);
+            var flowHeight = float.IsNaN(resolvedContentHeight)
+                ? ClampToMinMaxHeight(styleMap, blockSize, heightReference, verticalBorderAndPadding)
+                : resolvedContentHeight;
 
-            // Sticky boxes in there were registered in the flow's own coordinates.
-            context.StickyScopes.Peek().Clear();
+            var flowTransform = ResolveFlowTransform(currentTextStyle.WritingMode, inheritedTextStyle.FlowMode, contentX, contentY + contentOffsetY, contentWidth, flowHeight);
+            displayList.InsertRange(flowStart, [new PushTransformCommand(flowTransform)]);
+            displayList.PopTransform();
+            ResolveFlowStickyBoxes(flowStickyBoxes, flowTransform, context);
+            resolvedContentHeight = flowHeight;
+            childCursorY = contentY + flowHeight;
         }
         else if (TryResolveColumnLayout(styleMap, contentWidth, currentTextStyle.FontSize, out var columnLayout))
         {
@@ -1382,6 +1455,11 @@ public sealed partial class HtmlRenderer
                 childPositionedContainingWidth,
                 childPositionedContainingHeight,
                 negativeZIndexRanges);
+        }
+
+        if (currentTextStyle.LineClamp > 0)
+        {
+            context.LineClampScopes.Pop();
         }
 
         // A box with its own formatting context grows to contain the floats inside it.
@@ -1486,6 +1564,13 @@ public sealed partial class HtmlRenderer
 
         if (TryResolveReplacedElementImage(node, styleMap, flowContainingWidth, borderBoxX + borderLeft + paddingLeft, borderBoxY + borderTop + paddingTop, out var image, out var imageRect, out var objectFitClipRect))
         {
+            var roundedContentClip = GetRoundedContentClip(box.BorderRadius, borderBoxX, borderBoxY, borderBoxWidth, borderBoxHeight, new EdgeSizes(borderTop, borderRight, borderBottom, borderLeft), new EdgeSizes(paddingTop, paddingRight, paddingBottom, paddingLeft));
+
+            if (roundedContentClip is { } contentClip)
+            {
+                displayList.PushClip(contentClip.Rect, contentClip.Radii);
+            }
+
             if (objectFitClipRect is { } objectFitClip)
             {
                 displayList.PushClip(objectFitClip, RenderCornerRadii.Zero);
@@ -1494,6 +1579,11 @@ public sealed partial class HtmlRenderer
             (currentTextStyle.IsHidden ? new DisplayList() : displayList).DrawImage(imageRect, image!);
 
             if (objectFitClipRect is not null)
+            {
+                displayList.PopClip();
+            }
+
+            if (roundedContentClip is not null)
             {
                 displayList.PopClip();
             }
@@ -2270,6 +2360,13 @@ public sealed partial class HtmlRenderer
 
         if (TryResolveReplacedElementImage(node, styleMap, containingWidth, borderBoxX + borderLeft + paddingLeft, borderBoxY + borderTop + paddingTop, out var image, out var imageRect, out var objectFitClipRect))
         {
+            var roundedContentClip = GetRoundedContentClip(box.BorderRadius, borderBoxX, borderBoxY, borderBoxWidth, borderBoxHeight, new EdgeSizes(borderTop, borderRight, borderBottom, borderLeft), new EdgeSizes(paddingTop, paddingRight, paddingBottom, paddingLeft));
+
+            if (roundedContentClip is { } contentClip)
+            {
+                displayList.PushClip(contentClip.Rect, contentClip.Radii);
+            }
+
             if (objectFitClipRect is { } objectFitClip)
             {
                 displayList.PushClip(objectFitClip, RenderCornerRadii.Zero);
@@ -2278,6 +2375,11 @@ public sealed partial class HtmlRenderer
             (inheritedTextStyle.IsHidden ? new DisplayList() : displayList).DrawImage(imageRect, image!);
 
             if (objectFitClipRect is not null)
+            {
+                displayList.PopClip();
+            }
+
+            if (roundedContentClip is not null)
             {
                 displayList.PopClip();
             }
@@ -2304,7 +2406,7 @@ public sealed partial class HtmlRenderer
 
                 if (isRowDirection && alignItems is "center" or "flex-end")
                 {
-                    var freeSpace = Math.Max(0f, usedContentHeight - MeasureBorderBoxHeight(child, containingWidth, inheritedTextStyle, context));
+                    var freeSpace = Math.Max(0f, usedContentHeight - MeasureBorderBoxHeight(child, containingWidth, inheritedTextStyle, context, isFlexItem: false));
                     childCursorY += alignItems == "center" ? freeSpace / 2f : freeSpace;
                 }
 
@@ -2728,6 +2830,8 @@ public sealed partial class HtmlRenderer
 
         var columnSizes = columns.Select(t => t.Pixels).ToList();
         var rowSizes = rows.Select(t => t.Pixels).ToList();
+        var columnAlignment = ResolveGridContentAlignment(justifyContent, columnSizes, resolvedColumnGap, containingWidth);
+        var rowAlignment = ResolveGridContentAlignment(styleMap.GetValueOrDefault("align-content")?.Trim().ToLowerInvariant(), rowSizes, resolvedRowGap, containerHeight);
 
         // Pass 2: lay out every item for real, against the now-fully-resolved track sizes.
         foreach (var child in gridItems)
@@ -2747,10 +2851,10 @@ public sealed partial class HtmlRenderer
 
             var contentX = borderBoxX + borderLeft + paddingLeft;
             var contentY = borderBoxY + borderTop + paddingTop;
-            var cellX = contentX + GetGridTrackOffset(columnSizes, effectivePlacementColumn.LineIndex, resolvedColumnGap);
-            var cellY = contentY + GetGridTrackOffset(rowSizes, effectivePlacementRow.LineIndex, resolvedRowGap);
-            var cellWidth = GetGridTrackSpanSize(columnSizes, effectivePlacementColumn.LineIndex, effectivePlacementColumn.Span, resolvedColumnGap, containingWidth);
-            var cellHeight = GetGridTrackSpanSize(rowSizes, effectivePlacementRow.LineIndex, effectivePlacementRow.Span, resolvedRowGap, containingWidth);
+            var cellX = contentX + columnAlignment.Offset + GetGridTrackOffset(columnSizes, effectivePlacementColumn.LineIndex, resolvedColumnGap + columnAlignment.Spacing);
+            var cellY = contentY + rowAlignment.Offset + GetGridTrackOffset(rowSizes, effectivePlacementRow.LineIndex, resolvedRowGap + rowAlignment.Spacing);
+            var cellWidth = GetGridTrackSpanSize(columnSizes, effectivePlacementColumn.LineIndex, effectivePlacementColumn.Span, resolvedColumnGap + columnAlignment.Spacing, containingWidth);
+            var cellHeight = GetGridTrackSpanSize(rowSizes, effectivePlacementRow.LineIndex, effectivePlacementRow.Span, resolvedRowGap + rowAlignment.Spacing, containingWidth);
             var childStyleMap = GetOrCreateStyleMap(context, elementChild.Ref, elementChild.ComputedStyle);
             var childBox = ResolveBoxStyle(childStyleMap, elementChild.Ref);
             var childHorizontalExtras = childBox.BorderWidth.Left + childBox.BorderWidth.Right + childBox.Padding.Left + childBox.Padding.Right;
@@ -2776,7 +2880,7 @@ public sealed partial class HtmlRenderer
 
             if (float.IsNaN(childContentHeight) && alignSelf != GridSelfAlignment.Stretch)
             {
-                var measured = TrialLayout(elementChild, childBorderBoxWidth, inheritedTextStyle, context, childBorderBoxWidth, isAtomicInline: false).Metrics?.BorderBoxHeight ?? 0f;
+                var measured = TrialLayout(elementChild, childBorderBoxWidth, inheritedTextStyle, context, childBorderBoxWidth, isAtomicInline: false, isFlexOrGridItem: true).Metrics?.BorderBoxHeight ?? 0f;
                 childContentHeight = Math.Max(0f, measured - childVerticalExtras);
                 resolvedChildContentHeight = childContentHeight;
             }
@@ -2920,6 +3024,55 @@ public sealed partial class HtmlRenderer
         cursorY = flowBorderBoxY + borderBoxHeight;
         previousBlockMarginBottom = effectiveMarginBottom + context.ParagraphSpacing;
         suppressNextBlockTopMargin = false;
+    }
+
+    /// <summary>
+    /// Where `justify-content`/`align-content` put the grid tracks within the content box when
+    /// they do not fill it (CSS Box Alignment 3 §5.1): the offset of the first track and the
+    /// spacing added to every gap. `normal`/`stretch` already grew the `auto` tracks instead.
+    /// Without a definite size there is no free space. Overflowing tracks still shift for `center`
+    /// and `end` (unless `safe`), while distributed alignment falls back to `start` or `center`.
+    /// </summary>
+    private static (float Offset, float Spacing) ResolveGridContentAlignment(string? value, IReadOnlyList<float> tracks, float gap, float available)
+    {
+        if (string.IsNullOrEmpty(value) || tracks.Count == 0 || float.IsNaN(available))
+        {
+            return (0f, 0f);
+        }
+
+        var isSafe = value.StartsWith("safe ", StringComparison.Ordinal);
+
+        if (isSafe || value.StartsWith("unsafe ", StringComparison.Ordinal))
+        {
+            value = value[(value.IndexOf(' ') + 1)..].Trim();
+        }
+
+        var freeSpace = available - tracks.Sum() - gap * (tracks.Count - 1);
+
+        if (freeSpace < 0f)
+        {
+            if (isSafe)
+            {
+                return (0f, 0f);
+            }
+
+            value = value switch
+            {
+                "space-between" => "start",
+                "space-around" or "space-evenly" => "center",
+                _ => value,
+            };
+        }
+
+        return value switch
+        {
+            "center" => (freeSpace / 2f, 0f),
+            "end" or "flex-end" or "right" => (freeSpace, 0f),
+            "space-between" when tracks.Count > 1 => (0f, freeSpace / (tracks.Count - 1)),
+            "space-around" => (freeSpace / tracks.Count / 2f, freeSpace / tracks.Count),
+            "space-evenly" => (freeSpace / (tracks.Count + 1), freeSpace / (tracks.Count + 1)),
+            _ => (0f, 0f),
+        };
     }
 
     private static float GetGridTrackOffset(IReadOnlyList<float> tracks, int index, float gap)
@@ -3294,6 +3447,31 @@ public sealed partial class HtmlRenderer
 
         var pixels = ParseLengthValue(text, float.NaN, allowAuto: false);
         return float.IsNaN(pixels) ? 0f : Math.Max(0f, pixels);
+    }
+
+    /// <summary>
+    /// The content of a replaced element (e.g. an image) is clipped to the inner curve of its
+    /// `border-radius` at the content edge; null when that curve has no rounded corner left.
+    /// </summary>
+    private static (RenderRect Rect, RenderCornerRadii Radii)? GetRoundedContentClip(RenderCornerRadii borderRadius, float x, float y, float width, float height, EdgeSizes border, EdgeSizes padding)
+    {
+        var radii = borderRadius.ClampToBox(width, height).Inset(
+            border.Top + padding.Top,
+            border.Right + padding.Right,
+            border.Bottom + padding.Bottom,
+            border.Left + padding.Left);
+
+        if (radii.IsZero)
+        {
+            return null;
+        }
+
+        var rect = new RenderRect(
+            x + border.Left + padding.Left,
+            y + border.Top + padding.Top,
+            Math.Max(0f, width - border.Left - border.Right - padding.Left - padding.Right),
+            Math.Max(0f, height - border.Top - border.Bottom - padding.Top - padding.Bottom));
+        return (rect, radii);
     }
 
     private static float? ParseGridGap(Dictionary<string, string> styleMap, string propertyName, float relativeTo, int tokenIndex)
@@ -3911,7 +4089,7 @@ public sealed partial class HtmlRenderer
         suppressNextBlockTopMargin = false;
 
         var (bandLeft, bandRight) = floats.GetBand(cursorY, textStyle.FontSize * textStyle.LineHeightMultiplier, containingX, containingX + containingWidth);
-        LayoutWrappedText(text, bandLeft, bandRight - bandLeft, ref cursorY, textStyle, context, displayList, maxY, textIndentConsumed ? 0f : textStyle.TextIndent + textStyle.MarkerIndent);
+        LayoutWrappedText(text, bandLeft, bandRight - bandLeft, ref cursorY, textStyle, context, displayList, maxY, textIndentConsumed ? 0f : textStyle.TextIndent + textStyle.MarkerIndent, textNode);
         textIndentConsumed = true;
     }
 
@@ -3924,7 +4102,8 @@ public sealed partial class HtmlRenderer
         LayoutContext context,
         DisplayList displayList,
         float maxY,
-        float firstLineIndent)
+        float firstLineIndent,
+        INode? source = null)
     {
         var lineHeight = textStyle.FontSize * textStyle.LineHeightMultiplier;
         var forcedBreakLines = new HashSet<int>();
@@ -3937,7 +4116,22 @@ public sealed partial class HtmlRenderer
         // browser's `-webkit-line-clamp` removes them from the box's own content height too.
         var isClampedLastLine = false;
 
-        if (textStyle.LineClamp > 0 && lines.Count > textStyle.LineClamp)
+        if (context.LineClampScopes.TryPeek(out var lineClamp))
+        {
+            // the lines left in the clamped box, which may continue after this text
+            if (lines.Count > lineClamp.Remaining)
+            {
+                lines = [.. lines.Take(lineClamp.Remaining)];
+                isClampedLastLine = true;
+            }
+            else if (lines.Count == lineClamp.Remaining && lines.Count > 0 && source is not null)
+            {
+                isClampedLastLine = HasRenderedContentAfter(lineClamp.Root, source);
+            }
+
+            lineClamp.Remaining -= lines.Count;
+        }
+        else if (textStyle.LineClamp > 0 && lines.Count > textStyle.LineClamp)
         {
             lines = [.. lines.Take(textStyle.LineClamp)];
             isClampedLastLine = true;
@@ -3946,9 +4140,8 @@ public sealed partial class HtmlRenderer
         for (var index = 0; index < lines.Count; index++)
         {
             var line = lines[index];
-            RecordColumnContentStart(cursorY);
+            RecordColumnLine(cursorY, cursorY + lineHeight);
             cursorY += lineHeight;
-            RecordColumnBreakCandidate(cursorY);
 
             if (cursorY > maxY)
             {
@@ -3997,14 +4190,16 @@ public sealed partial class HtmlRenderer
             {
                 var runX = lineX;
 
-                foreach (var run in GetVisualRuns(line, textStyle.Direction == TextDirection.Rtl))
+                foreach (var (run, isRightToLeft) in BidiAlgorithm.GetVisualRuns(line, textStyle.Direction == TextDirection.Rtl))
                 {
+                    var runStyle = textStyle with { IsRightToLeftRun = isRightToLeft };
+
                     if (!string.IsNullOrWhiteSpace(run))
                     {
-                        DrawStyledText(context, displayList, run, runX, baselineY, textStyle);
+                        DrawStyledText(context, displayList, run, runX, baselineY, runStyle);
                     }
 
-                    runX += MeasureTextWidth(context, run, textStyle) + (CountSpaces(run) * textStyle.WordSpacing);
+                    runX += MeasureTextWidth(context, run, runStyle) + (CountSpaces(run) * textStyle.WordSpacing);
                 }
 
                 continue;
@@ -4047,37 +4242,6 @@ public sealed partial class HtmlRenderer
         }
 
         return count;
-    }
-
-    /// <summary>
-    /// One line of text as runs in visual order (UAX #9): each run is a maximal stretch at one
-    /// embedding level, right-to-left runs already reversed and mirrored.
-    /// </summary>
-    private static List<string> GetVisualRuns(string line, bool isRightToLeft)
-    {
-        var levels = BidiAlgorithm.GetLevels(line, isRightToLeft);
-        var order = BidiAlgorithm.GetVisualOrder(levels);
-        var runs = new List<string>();
-        var position = 0;
-
-        while (position < order.Length)
-        {
-            var level = levels[order[position]];
-            var end = position;
-
-            while (end + 1 < order.Length && levels[order[end + 1]] == level && Math.Abs(order[end + 1] - order[end]) == 1)
-            {
-                end++;
-            }
-
-            var first = Math.Min(order[position], order[end]);
-            var last = Math.Max(order[position], order[end]);
-            var run = new string(line.AsSpan(first, last - first + 1).ToArray().Where(static c => !BidiAlgorithm.IsFormattingCharacter(c)).ToArray());
-            runs.Add((level & 1) == 1 ? ReverseForDisplay(run) : run);
-            position = end + 1;
-        }
-
-        return runs;
     }
 
     /// <summary>
@@ -4516,13 +4680,13 @@ public sealed partial class HtmlRenderer
     /// The border-box height of an element laid out at the given border-box width, by a trial
     /// layout, cached for the render (nested flex containers would otherwise multiply them).
     /// </summary>
-    private static float MeasureBorderBoxHeight(ElementRenderNode element, float borderBoxWidth, RenderTextStyle inheritedTextStyle, LayoutContext context)
+    private static float MeasureBorderBoxHeight(ElementRenderNode element, float borderBoxWidth, RenderTextStyle inheritedTextStyle, LayoutContext context, bool isFlexItem = true)
     {
         var key = (element.Ref, borderBoxWidth);
 
         if (!context.MeasuredHeights.TryGetValue(key, out var height))
         {
-            height = TrialLayout(element, borderBoxWidth, inheritedTextStyle, context, borderBoxWidth, isAtomicInline: false).Metrics?.BorderBoxHeight ?? 0f;
+            height = TrialLayout(element, borderBoxWidth, inheritedTextStyle, context, borderBoxWidth, isAtomicInline: false, isFlexOrGridItem: isFlexItem).Metrics?.BorderBoxHeight ?? 0f;
             context.MeasuredHeights[key] = height;
         }
 
@@ -4584,7 +4748,7 @@ public sealed partial class HtmlRenderer
             ? family.Trim('\'', '"', ' ')
             : inherited.FontFamily;
 
-        var lineHeight = ParseLineHeight(styleMap, inherited.LineHeightMultiplier);
+        var lineHeight = ParseLineHeight(styleMap, fontSize, inherited.LineHeightMultiplier);
         var color = ParseColor(styleMap.TryGetValue("color", out var colorValue) ? colorValue : null, inherited.Color);
         var fontWeight = ParseFontWeight(styleMap, inherited.FontWeight);
         var isItalic = ParseFontStyle(styleMap, inherited.IsItalic);
@@ -4609,13 +4773,19 @@ public sealed partial class HtmlRenderer
         var tabSize = ParseTabSize(styleMap, fontSize, inherited.TabSize, inherited.TabSizeIsLength, out var tabSizeIsLength);
         var variantCaps = ParseFontVariantCaps(styleMap, inherited.VariantCaps);
         var fontStretch = ParseFontStretch(styleMap, inherited.FontStretch);
+        var featureProperties = ParseFontFeatureProperties(styleMap, inherited.FeatureProperties);
+        var fontFeatures = featureProperties == inherited.FeatureProperties ? inherited.FontFeatures : ResolveFontFeatures(featureProperties);
+        var language = styleMap.TryGetValue("lang", out var languageValue) && !string.IsNullOrWhiteSpace(languageValue) ? languageValue.Trim() : inherited.Language;
 
         return new RenderTextStyle(fontSize, color, fontFamily, lineHeight, fontWeight, isItalic, underline, strikeThrough, decorationColor, decorationStyle, textAlign, letterSpacing, textIndent, verticalAlignOffset, textShadows, whiteSpace, wordBreak, overflowWrap, textOverflow, lineClamp, direction, textTransform, wordSpacing, textAlignLast, hyphens, tabSize, tabSizeIsLength, variantCaps, fontStretch,
             IsHidden: ResolveIsHidden(styleMap, inherited.IsHidden),
             WritingMode: ParseWritingMode(styleMap.GetValueOrDefault("writing-mode"), inherited.WritingMode),
             TextOrientation: ParseTextOrientation(styleMap.GetValueOrDefault("text-orientation"), inherited.TextOrientation),
             // The system text is laid out in only changes at an orthogonal flow (LayoutElement).
-            FlowMode: inherited.FlowMode);
+            FlowMode: inherited.FlowMode,
+            FeatureProperties: featureProperties,
+            FontFeatures: fontFeatures,
+            Language: language);
     }
 
     /// <summary>
@@ -4922,7 +5092,11 @@ public sealed partial class HtmlRenderer
         return (underline, strikeThrough);
     }
 
-    private static float ParseLineHeight(Dictionary<string, string> styleMap, float defaultValue)
+    /// <summary>
+    /// The line height as a multiple of <paramref name="fontSize"/>. A length (the computed value
+    /// of e.g. `line-height: 1rem` or `150%`) is absolute, so it becomes the ratio to the font size.
+    /// </summary>
+    private static float ParseLineHeight(Dictionary<string, string> styleMap, float fontSize, float defaultValue)
     {
         if (!styleMap.TryGetValue("line-height", out var value) || string.IsNullOrWhiteSpace(value))
         {
@@ -4940,6 +5114,11 @@ public sealed partial class HtmlRenderer
         if (float.TryParse(normalized, NumberStyles.Float, CultureInfo.InvariantCulture, out var unitless))
         {
             return unitless;
+        }
+
+        if (fontSize > 0f && TryParsePixelValue(normalized, out var pixels))
+        {
+            return pixels / fontSize;
         }
 
         return defaultValue;
@@ -5208,6 +5387,21 @@ public sealed partial class HtmlRenderer
             ? computed
             : styleCollection.ComputeDeclarations(element);
 
+    /// <summary>
+    /// Gaps are only parsed as px or %, so an authored gap takes the computed value, which has
+    /// font- and viewport-relative units (e.g. gap: 1rem) resolved but keeps percentages.
+    /// </summary>
+    private static string? ResolveGapValue(ICssStyleDeclaration computedStyle, string propertyName, string? explicitValue)
+    {
+        if (string.IsNullOrWhiteSpace(explicitValue))
+        {
+            return explicitValue;
+        }
+
+        var computedValue = computedStyle.GetPropertyValue(propertyName);
+        return string.IsNullOrWhiteSpace(computedValue) ? explicitValue : computedValue;
+    }
+
     private static string ReadExplicitOrComputed(ICssStyleDeclaration explicitDeclarations, ICssStyleDeclaration computedStyle, string propertyName)
     {
         var explicitValue = explicitDeclarations.GetPropertyValue(propertyName);
@@ -5444,11 +5638,11 @@ public sealed partial class HtmlRenderer
         if (isGridContainer || isFlexContainer)
         {
             var explicitColumnGap = explicitDeclarations is not null ? ReadExplicitOrComputed(explicitDeclarations, style, "column-gap") : ResolveExplicitPropertyValue(element, style, "column-gap");
-            AddIfPresent(map, "column-gap", string.IsNullOrWhiteSpace(explicitColumnGap) ? ParseStyleAttributeValue(inlineStyle, "column-gap") : explicitColumnGap);
+            AddIfPresent(map, "column-gap", ResolveGapValue(style, "column-gap", string.IsNullOrWhiteSpace(explicitColumnGap) ? ParseStyleAttributeValue(inlineStyle, "column-gap") : explicitColumnGap));
             var explicitRowGap = explicitDeclarations is not null ? ReadExplicitOrComputed(explicitDeclarations, style, "row-gap") : ResolveExplicitPropertyValue(element, style, "row-gap");
-            AddIfPresent(map, "row-gap", string.IsNullOrWhiteSpace(explicitRowGap) ? ParseStyleAttributeValue(inlineStyle, "row-gap") : explicitRowGap);
+            AddIfPresent(map, "row-gap", ResolveGapValue(style, "row-gap", string.IsNullOrWhiteSpace(explicitRowGap) ? ParseStyleAttributeValue(inlineStyle, "row-gap") : explicitRowGap));
             var explicitGap = explicitDeclarations is not null ? ReadExplicitOrComputed(explicitDeclarations, style, "gap") : ResolveExplicitPropertyValue(element, style, "gap");
-            AddIfPresent(map, "gap", string.IsNullOrWhiteSpace(explicitGap) ? ParseStyleAttributeValue(inlineStyle, "gap") : explicitGap);
+            AddIfPresent(map, "gap", ResolveGapValue(style, "gap", string.IsNullOrWhiteSpace(explicitGap) ? ParseStyleAttributeValue(inlineStyle, "gap") : explicitGap));
         }
 
         var explicitGridColumn = explicitDeclarations is not null ? ReadExplicitOrComputed(explicitDeclarations, style, "grid-column") : ResolveExplicitPropertyValue(element, style, "grid-column");
@@ -5525,6 +5719,7 @@ public sealed partial class HtmlRenderer
             AddIfPresent(map, "column-rule-width", style.GetPropertyValue("column-rule-width"));
             AddIfPresent(map, "column-rule-style", style.GetPropertyValue("column-rule-style"));
             AddIfPresent(map, "column-rule-color", style.GetPropertyValue("column-rule-color"));
+            AddIfPresent(map, "column-fill", style.GetPropertyValue("column-fill"));
 
             if (!isGridContainer && !isFlexContainer)
             {
@@ -5581,6 +5776,16 @@ public sealed partial class HtmlRenderer
         AddIfPresent(map, "hyphens", style.GetPropertyValue("hyphens"));
         AddIfPresent(map, "tab-size", style.GetPropertyValue("tab-size"));
         AddIfPresent(map, "font-variant-caps", style.GetPropertyValue("font-variant-caps"));
+        AddIfPresent(map, "font-feature-settings", style.GetPropertyValue("font-feature-settings"));
+        AddIfPresent(map, "font-kerning", style.GetPropertyValue("font-kerning"));
+        AddIfPresent(map, "font-variant-ligatures", style.GetPropertyValue("font-variant-ligatures"));
+        AddIfPresent(map, "font-variant-numeric", style.GetPropertyValue("font-variant-numeric"));
+        AddIfPresent(map, "font-variant-east-asian", style.GetPropertyValue("font-variant-east-asian"));
+
+        // The element's language (`lang`, element semantics rather than CSS) rides along so that
+        // ResolveTextStyle inherits it like a property; shaping uses it. A pseudo-element reads its
+        // host's attribute, which is the language it inherits anyway.
+        AddIfPresent(map, "lang", element?.GetAttribute("lang") ?? element?.GetAttribute("xml:lang"));
         AddIfPresent(map, "font-stretch", style.GetPropertyValue("font-stretch"));
         AddIfPresent(map, "text-transform", style.GetPropertyValue("text-transform"));
         AddIfPresent(map, "line-height", style.GetLineHeight());
@@ -5888,7 +6093,7 @@ public sealed partial class HtmlRenderer
             if (childBox.BorderWidth.Top <= 0f &&
                 ParseLength(childStyle, "padding-top", containingWidth, childBox.Padding.Top, allowAuto: false) <= 0f &&
                 !EstablishesBlockFormattingContext(childStyle, isFloat, isOutOfFlow, isAtomicInline: false, isFlexItem: false) &&
-                !IsOrthogonalFlow(childElement.Ref, context) &&
+                !StartsWritingModeSystem(childElement.Ref, context) &&
                 TryGetFirstCollapsibleChildTopMargin(childElement, containingWidth, context, out var grandchildMarginTop))
             {
                 marginTop = CollapseMargins(marginTop, grandchildMarginTop);
@@ -6487,6 +6692,34 @@ public sealed partial class HtmlRenderer
     /// pseudo-element whose `content` is a single `url()`. A pseudo-element proxies its host's tag
     /// name and attributes, so it is only ever judged by its generated content.
     /// </summary>
+    /// <summary>
+    /// Whether anything rendered follows <paramref name="node"/> (and its descendants) inside
+    /// <paramref name="root"/>: text other than white space, or a replaced element.
+    /// </summary>
+    private static bool HasRenderedContentAfter(IElement root, INode node)
+    {
+        for (var current = node; current is not null && current != root; current = current.Parent)
+        {
+            for (var sibling = current.NextSibling; sibling is not null; sibling = sibling.NextSibling)
+            {
+                if (HasRenderedContent(sibling))
+                {
+                    return true;
+                }
+            }
+        }
+
+        return false;
+
+        static bool HasRenderedContent(INode node) => node switch
+        {
+            IText text => !string.IsNullOrWhiteSpace(text.Data),
+            IElement element => !string.Equals(element.ComputeCurrentStyle().GetDisplay()?.Trim(), "none", StringComparison.OrdinalIgnoreCase) &&
+                                (IsReplacedElement(element) || element.ChildNodes.Any(HasRenderedContent)),
+            _ => false,
+        };
+    }
+
     private static bool IsReplacedElement(IElement element) => element is IPseudoElement
         ? s_generatedContentImages.TryGetValue(element, out _)
         : string.Equals(element.LocalName, "img", StringComparison.OrdinalIgnoreCase) ||
@@ -8743,7 +8976,7 @@ public sealed partial class HtmlRenderer
         for (var i = shadows.Count - 1; i >= 0; i--)
         {
             var shadow = shadows[i];
-            displayList.DrawTextShadow(text, x + shadow.OffsetX, y + shadow.OffsetY, shadow.Color, textStyle.FontSize, textStyle.FontFamily, textStyle.FontWeight, textStyle.IsItalic, shadow.BlurRadius, textStyle.LetterSpacing, textStyle.FontStretch);
+            displayList.DrawTextShadow(text, x + shadow.OffsetX, y + shadow.OffsetY, shadow.Color, textStyle.FontSize, textStyle.FontFamily, textStyle.FontWeight, textStyle.IsItalic, shadow.BlurRadius, textStyle.LetterSpacing, textStyle.FontStretch, textStyle.IsRightToLeftRun, textStyle.FontFeatures, textStyle.Language, textStyle.ShapingContextBefore, textStyle.ShapingContextAfter);
         }
     }
 
@@ -11355,6 +11588,10 @@ public sealed partial class HtmlRenderer
     /// </summary>
     private static IReadOnlyList<string> WrapText(LayoutContext context, string text, float maxWidth, RenderTextStyle textStyle)
     {
+        // a width taken from measured text (e.g. a max-content flex item) can come out of the box
+        // arithmetic slightly smaller than the text, which must still fit (as in the inline layout)
+        maxWidth += 0.01f;
+
         if (textStyle.WordBreak == WordBreakMode.BreakAll)
         {
             return WrapTextCharacterWise(context, StripSoftHyphens(text), maxWidth, textStyle);
@@ -11617,11 +11854,11 @@ public sealed partial class HtmlRenderer
     private const string EllipsisCharacter = "…";
 
     /// <summary>
-    /// Truncates <paramref name="text"/> to the longest prefix (by rune, not raw UTF-16 char, so a
-    /// truncation point never lands inside a surrogate pair) whose width plus the ellipsis
+    /// Truncates <paramref name="text"/> to the longest prefix (by glyph cluster, so a truncation
+    /// point never lands inside a surrogate pair, a ligature or a conjunct) whose width plus the ellipsis
     /// character's own width still fits within <paramref name="maxWidth"/>, then appends it - the
     /// approach every real browser's own `text-overflow: ellipsis` uses (truncate, do not scale or
-    /// reflow). Binary search over rune count, not a linear scan, since <see cref="MeasureTextWidth"/>
+    /// reflow). Binary search over the clusters, not a linear scan, since <see cref="MeasureTextWidth"/>
     /// goes through the backend's own font shaping and this runs on already-overflowing text on the
     /// hot layout path.
     /// </summary>
@@ -11634,14 +11871,14 @@ public sealed partial class HtmlRenderer
             return EllipsisCharacter;
         }
 
-        var runes = text.EnumerateRunes().ToArray();
+        var clusterEnds = GetClusterEnds(context, text, textStyle);
         var low = 0;
-        var high = runes.Length;
+        var high = clusterEnds.Count;
 
         while (low < high)
         {
             var mid = (low + high + 1) / 2;
-            var prefixWidth = MeasureTextWidth(context, string.Concat(runes.Take(mid).Select(r => r.ToString())), textStyle);
+            var prefixWidth = MeasureTextWidth(context, text[..clusterEnds[mid - 1]], textStyle);
 
             if (prefixWidth + ellipsisWidth <= maxWidth)
             {
@@ -11653,8 +11890,15 @@ public sealed partial class HtmlRenderer
             }
         }
 
-        return string.Concat(runes.Take(low).Select(r => r.ToString())) + EllipsisCharacter;
+        return (low == 0 ? string.Empty : text[..clusterEnds[low - 1]]) + EllipsisCharacter;
     }
+
+    /// <summary>
+    /// The ends of the glyph clusters of <paramref name="text"/> (ascending, the last one is its
+    /// length): where it may be cut, e.g. before an ellipsis.
+    /// </summary>
+    private static List<int> GetClusterEnds(LayoutContext context, string text, RenderTextStyle textStyle) =>
+        [.. context.TextMeasurer.GetClusterBoundaries(text, ToRenderFont(textStyle, context.Fonts)).Where(boundary => boundary > 0)];
 
     private static RenderFont ToRenderFont(RenderTextStyle textStyle, FontFaceSet fonts) => new(
         textStyle.FontFamily,
@@ -11663,7 +11907,12 @@ public sealed partial class HtmlRenderer
         textStyle.IsItalic,
         textStyle.LetterSpacing,
         fonts,
-        textStyle.FontStretch);
+        textStyle.FontStretch,
+        textStyle.IsRightToLeftRun,
+        textStyle.FontFeatures,
+        textStyle.Language,
+        textStyle.ShapingContextBefore,
+        textStyle.ShapingContextAfter);
 
     /// <summary>
     /// Measures text the way <see cref="DrawStyledText"/> paints it: soft hyphens are invisible
@@ -11837,7 +12086,13 @@ public sealed partial class HtmlRenderer
         bool IsHidden = false,
         WritingModeKind WritingMode = WritingModeKind.HorizontalTb,
         TextOrientationKind TextOrientation = TextOrientationKind.Mixed,
-        WritingModeKind FlowMode = WritingModeKind.HorizontalTb);
+        WritingModeKind FlowMode = WritingModeKind.HorizontalTb,
+        bool IsRightToLeftRun = false,
+        FontFeatureProperties FeatureProperties = default,
+        string? FontFeatures = null,
+        string? Language = null,
+        string? ShapingContextBefore = null,
+        string? ShapingContextAfter = null);
 
     private enum TextAlign
     {

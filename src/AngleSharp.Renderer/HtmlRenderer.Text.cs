@@ -246,6 +246,115 @@ public sealed partial class HtmlRenderer
         return runs;
     }
 
+    /// <summary>
+    /// The inherited properties that select OpenType features, each as authored (or inherited).
+    /// </summary>
+    private readonly record struct FontFeatureProperties(string? Settings, string? Kerning, string? Ligatures, string? Numeric, string? EastAsian);
+
+    private static FontFeatureProperties ParseFontFeatureProperties(Dictionary<string, string> styleMap, FontFeatureProperties inherited)
+    {
+        return new FontFeatureProperties(
+            Read("font-feature-settings", inherited.Settings),
+            Read("font-kerning", inherited.Kerning),
+            Read("font-variant-ligatures", inherited.Ligatures),
+            Read("font-variant-numeric", inherited.Numeric),
+            Read("font-variant-east-asian", inherited.EastAsian));
+
+        string? Read(string propertyName, string? inheritedValue) =>
+            styleMap.TryGetValue(propertyName, out var value) && !string.IsNullOrWhiteSpace(value) ? value.Trim() : inheritedValue;
+    }
+
+    private static readonly IReadOnlyDictionary<string, string> s_featureKeywords = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+    {
+        ["none"] = "liga=0,clig=0,dlig=0,hlig=0,calt=0",
+        ["common-ligatures"] = "liga,clig",
+        ["no-common-ligatures"] = "liga=0,clig=0",
+        ["discretionary-ligatures"] = "dlig",
+        ["no-discretionary-ligatures"] = "dlig=0",
+        ["historical-ligatures"] = "hlig",
+        ["no-historical-ligatures"] = "hlig=0",
+        ["contextual"] = "calt",
+        ["no-contextual"] = "calt=0",
+        ["lining-nums"] = "lnum",
+        ["oldstyle-nums"] = "onum",
+        ["proportional-nums"] = "pnum",
+        ["tabular-nums"] = "tnum",
+        ["diagonal-fractions"] = "frac",
+        ["stacked-fractions"] = "afrc",
+        ["ordinal"] = "ordn",
+        ["slashed-zero"] = "zero",
+        ["jis78"] = "jp78",
+        ["jis83"] = "jp83",
+        ["jis90"] = "jp90",
+        ["jis04"] = "jp04",
+        ["simplified"] = "smpl",
+        ["traditional"] = "trad",
+        ["full-width"] = "fwid",
+        ["proportional-width"] = "pwid",
+        ["ruby"] = "ruby",
+    };
+
+    /// <summary>
+    /// The OpenType features (HarfBuzz syntax, comma separated) the font properties select, in
+    /// the order of CSS Fonts 4 §7.2, so later ones win: <c>font-kerning</c>, the
+    /// <c>font-variant-*</c> keywords, then <c>font-feature-settings</c>. <see langword="null"/>
+    /// when everything is at its default.
+    /// </summary>
+    private static string? ResolveFontFeatures(FontFeatureProperties properties)
+    {
+        var features = new List<string>();
+
+        switch (properties.Kerning?.Trim().ToLowerInvariant())
+        {
+            case "none":
+                features.Add("kern=0");
+                break;
+            case "normal":
+                features.Add("kern=1");
+                break;
+        }
+
+        foreach (var value in new[] { properties.Ligatures, properties.Numeric, properties.EastAsian })
+        {
+            foreach (var keyword in (value ?? string.Empty).Split(' ', StringSplitOptions.RemoveEmptyEntries))
+            {
+                if (s_featureKeywords.TryGetValue(keyword, out var mapped))
+                {
+                    features.Add(mapped);
+                }
+            }
+        }
+
+        if (properties.Settings is { } settings && !string.Equals(settings.Trim(), "normal", StringComparison.OrdinalIgnoreCase))
+        {
+            foreach (var entry in settings.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+            {
+                var parts = entry.Split(' ', StringSplitOptions.RemoveEmptyEntries);
+                var tag = parts[0].Trim('"', '\'');
+
+                if (tag.Length != 4)
+                {
+                    continue;
+                }
+
+                var setting = parts.Length < 2 ? "1" : parts[1].ToLowerInvariant() switch
+                {
+                    "on" => "1",
+                    "off" => "0",
+                    var number when int.TryParse(number, NumberStyles.Integer, CultureInfo.InvariantCulture, out var parsed) && parsed >= 0 => parsed.ToString(CultureInfo.InvariantCulture),
+                    _ => null,
+                };
+
+                if (setting is not null)
+                {
+                    features.Add($"{tag}={setting}");
+                }
+            }
+        }
+
+        return features.Count == 0 ? null : string.Join(',', features);
+    }
+
     private static RenderTextStyle WithSmallCapsSize(RenderTextStyle style) =>
         style with { FontSize = style.FontSize * SmallCapsScale, VariantCaps = FontVariantCapsMode.Normal };
 
@@ -326,6 +435,11 @@ public sealed partial class HtmlRenderer
             style.DecorationColor,
             style.DecorationStyle,
             style.LetterSpacing,
-            style.FontStretch);
+            style.FontStretch,
+            style.IsRightToLeftRun,
+            style.FontFeatures,
+            style.Language,
+            style.ShapingContextBefore,
+            style.ShapingContextAfter);
     }
 }

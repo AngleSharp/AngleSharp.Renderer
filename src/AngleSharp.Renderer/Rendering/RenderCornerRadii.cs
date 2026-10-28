@@ -62,6 +62,18 @@ public readonly record struct RenderCornerRadii(
             BottomLeftX * scale, BottomLeftY * scale);
     }
 
+    /// <summary>
+    /// The radii of the inner curve of a box whose edges are inset by the given widths, e.g. the
+    /// padding or content edge of a border box with these radii. Each radius shrinks by the width
+    /// of its adjacent edge and turns square once that width exceeds it
+    /// (https://www.w3.org/TR/css-backgrounds-3/#corner-shaping).
+    /// </summary>
+    public RenderCornerRadii Inset(float top, float right, float bottom, float left) => new(
+        Math.Max(0f, TopLeftX - left), Math.Max(0f, TopLeftY - top),
+        Math.Max(0f, TopRightX - right), Math.Max(0f, TopRightY - top),
+        Math.Max(0f, BottomRightX - right), Math.Max(0f, BottomRightY - bottom),
+        Math.Max(0f, BottomLeftX - left), Math.Max(0f, BottomLeftY - bottom));
+
     private static float SafeRatio(float available, float requested) =>
         requested > 0f ? available / requested : float.MaxValue;
 }

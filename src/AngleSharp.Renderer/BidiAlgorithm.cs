@@ -6,7 +6,8 @@ using System.Linq;
 /// <summary>
 /// The Unicode Bidirectional Algorithm (UAX #9) for one line of text: explicit embeddings,
 /// overrides and isolates (rules X1-X10), the weak, neutral and implicit rules (W1-W7, N1-N2,
-/// I1-I2), trailing whitespace (L1), reordering (L2) and mirroring (L4).
+/// I1-I2), trailing whitespace (L1) and reordering (L2). Mirroring (L4) is left to shaping,
+/// which mirrors the glyphs of right-to-left runs.
 /// </summary>
 /// <remarks>
 /// .NET exposes no Bidi_Class data, so <see cref="GetClass"/> derives it from script ranges and
@@ -210,27 +211,37 @@ internal static class BidiAlgorithm
         return order;
     }
 
-    /// <summary>The mirrored glyph of a Bidi_Mirrored character in right-to-left text (L4).</summary>
-    public static char Mirror(char value) => value switch
+    /// <summary>
+    /// One line of text as runs in visual order: each run is a maximal stretch at one embedding
+    /// level, in logical order and without formatting characters; shaping reverses and mirrors
+    /// the right-to-left ones.
+    /// </summary>
+    public static List<(string Text, bool IsRightToLeft)> GetVisualRuns(string line, bool isRightToLeft)
     {
-        '(' => ')',
-        ')' => '(',
-        '[' => ']',
-        ']' => '[',
-        '{' => '}',
-        '}' => '{',
-        '<' => '>',
-        '>' => '<',
-        '«' => '»',
-        '»' => '«',
-        '‹' => '›',
-        '›' => '‹',
-        '≤' => '≥',
-        '≥' => '≤',
-        '⟨' => '⟩',
-        '⟩' => '⟨',
-        _ => value,
-    };
+        var levels = GetLevels(line, isRightToLeft);
+        var order = GetVisualOrder(levels);
+        var runs = new List<(string Text, bool IsRightToLeft)>();
+        var position = 0;
+
+        while (position < order.Length)
+        {
+            var level = levels[order[position]];
+            var end = position;
+
+            while (end + 1 < order.Length && levels[order[end + 1]] == level && Math.Abs(order[end + 1] - order[end]) == 1)
+            {
+                end++;
+            }
+
+            var first = Math.Min(order[position], order[end]);
+            var last = Math.Max(order[position], order[end]);
+            var run = new string(line.AsSpan(first, last - first + 1).ToArray().Where(static c => !IsFormattingCharacter(c)).ToArray());
+            runs.Add((run, (level & 1) == 1));
+            position = end + 1;
+        }
+
+        return runs;
+    }
 
     /// <summary>
     /// Whether a character is an explicit formatting character or the placeholder, none of

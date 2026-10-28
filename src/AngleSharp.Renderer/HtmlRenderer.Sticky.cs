@@ -1,5 +1,7 @@
 namespace AngleSharp.Renderer;
 
+using System.Linq;
+
 using AngleSharp.Css.RenderTree;
 using AngleSharp.Dom;
 using AngleSharp.Renderer.Rendering;
@@ -34,6 +36,18 @@ public sealed partial class HtmlRenderer
         IElement Element,
         Dictionary<string, string> Style,
         ElementLayoutMetrics Metrics);
+
+    /// <summary>
+    /// A sticky box inside a writing-mode system, whose offset waits until the system is placed:
+    /// its commands are already wrapped in <paramref name="Placeholder"/>, and
+    /// <paramref name="ToOuter"/> maps its coordinates to those of the systems placed so far.
+    /// </summary>
+    private sealed record DeferredStickyBox(
+        DisplayList DisplayList,
+        PushTransformCommand Placeholder,
+        StickyBox Sticky,
+        RenderRect ContainingBlock,
+        RenderTransform2D ToOuter);
 
     /// <summary>Catches the metrics a sticky element records for itself while it is laid out.</summary>
     private sealed class StickyProbe(IElement element)
@@ -161,10 +175,21 @@ public sealed partial class HtmlRenderer
             }
 
             var count = Math.Min(sticky.Count, commands.Count - start);
-            var (offsetX, offsetY) = ComputeStickyOffset(sticky, containingBlock, context);
 
             // A sticky box is positioned, so it paints over the in-flow content after it.
             displayList.MoveRangeToEnd(start, count);
+
+            // Inside a writing-mode system the viewport is only known once the system is placed.
+            if (context.StickyFlows.TryPeek(out var flow))
+            {
+                var placeholder = new PushTransformCommand(RenderTransform2D.Identity);
+                displayList.InsertRange(displayList.Commands.Count - count, [placeholder]);
+                displayList.PopTransform();
+                flow.Add(new DeferredStickyBox(displayList, placeholder, sticky, containingBlock, RenderTransform2D.Identity));
+                continue;
+            }
+
+            var (offsetX, offsetY) = ComputeStickyOffset(sticky, containingBlock, GetStickyViewport(context));
 
             if (offsetX == 0f && offsetY == 0f)
             {
@@ -173,23 +198,88 @@ public sealed partial class HtmlRenderer
 
             displayList.InsertRange(displayList.Commands.Count - count, [new PushTransformCommand(RenderTransform2D.Translate(offsetX, offsetY))]);
             displayList.PopTransform();
-
-            var metrics = sticky.Metrics;
-            RecordLayoutMetrics(
-                sticky.Element,
-                metrics.BorderBoxX + offsetX,
-                metrics.BorderBoxY + offsetY,
-                metrics.BorderBoxWidth,
-                metrics.BorderBoxHeight,
-                metrics.BorderLeft,
-                metrics.BorderRight,
-                metrics.BorderTop,
-                metrics.BorderBottom,
-                metrics.PaddingLeft,
-                metrics.PaddingRight,
-                metrics.PaddingTop,
-                metrics.PaddingBottom);
+            RecordStickyMetrics(sticky, offsetX, offsetY);
         }
+    }
+
+    /// <summary>
+    /// Places the sticky boxes of a writing-mode system once the transform from its coordinates
+    /// to the enclosing ones is known: inside another system they wait for that one, else they
+    /// stick against the viewport as seen in their own coordinates, where their (logical)
+    /// insets apply.
+    /// </summary>
+    private static void ResolveFlowStickyBoxes(List<DeferredStickyBox> stickyBoxes, RenderTransform2D toOuter, LayoutContext context)
+    {
+        if (stickyBoxes.Count == 0)
+        {
+            return;
+        }
+
+        if (context.StickyFlows.TryPeek(out var outerFlow))
+        {
+            outerFlow.AddRange(stickyBoxes.Select(deferred => deferred with { ToOuter = RenderTransform2D.Multiply(toOuter, deferred.ToOuter) }));
+            return;
+        }
+
+        var viewport = GetStickyViewport(context);
+
+        foreach (var deferred in stickyBoxes)
+        {
+            var toPage = RenderTransform2D.Multiply(toOuter, deferred.ToOuter);
+            var localViewport = MapRect(Invert(toPage), viewport);
+            var (offsetX, offsetY) = ComputeStickyOffset(deferred.Sticky, deferred.ContainingBlock, localViewport);
+
+            if ((offsetX != 0f || offsetY != 0f) &&
+                deferred.DisplayList.ReplaceCommand(deferred.Placeholder, new PushTransformCommand(RenderTransform2D.Translate(offsetX, offsetY))))
+            {
+                RecordStickyMetrics(deferred.Sticky, offsetX, offsetY);
+            }
+        }
+
+        static RenderTransform2D Invert(RenderTransform2D m)
+        {
+            var determinant = (m.A * m.D) - (m.B * m.C);
+            return new RenderTransform2D(
+                m.D / determinant,
+                -m.B / determinant,
+                -m.C / determinant,
+                m.A / determinant,
+                ((m.C * m.F) - (m.D * m.E)) / determinant,
+                ((m.B * m.E) - (m.A * m.F)) / determinant);
+        }
+
+        static RenderRect MapRect(RenderTransform2D m, RenderRect rect)
+        {
+            var corners = new[] { (rect.X, rect.Y), (rect.X + rect.Width, rect.Y), (rect.X, rect.Y + rect.Height), (rect.X + rect.Width, rect.Y + rect.Height) }
+                .Select(corner => ((m.A * corner.Item1) + (m.C * corner.Item2) + m.E, (m.B * corner.Item1) + (m.D * corner.Item2) + m.F))
+                .ToArray();
+            var left = corners.Min(corner => corner.Item1);
+            var top = corners.Min(corner => corner.Item2);
+            return new RenderRect(left, top, corners.Max(corner => corner.Item1) - left, corners.Max(corner => corner.Item2) - top);
+        }
+    }
+
+    /// <summary>The viewport sticky boxes stay inside, in page coordinates.</summary>
+    private static RenderRect GetStickyViewport(LayoutContext context) =>
+        new(context.Padding, context.Padding, context.Width - (2f * context.Padding), context.Height - (2f * context.Padding));
+
+    private static void RecordStickyMetrics(StickyBox sticky, float offsetX, float offsetY)
+    {
+        var metrics = sticky.Metrics;
+        RecordLayoutMetrics(
+            sticky.Element,
+            metrics.BorderBoxX + offsetX,
+            metrics.BorderBoxY + offsetY,
+            metrics.BorderBoxWidth,
+            metrics.BorderBoxHeight,
+            metrics.BorderLeft,
+            metrics.BorderRight,
+            metrics.BorderTop,
+            metrics.BorderBottom,
+            metrics.PaddingLeft,
+            metrics.PaddingRight,
+            metrics.PaddingTop,
+            metrics.PaddingBottom);
     }
 
     /// <summary>
@@ -198,14 +288,14 @@ public sealed partial class HtmlRenderer
     /// <c>bottom</c>, <c>left</c> over <c>right</c>), but never so far that its margin box leaves
     /// the containing block.
     /// </summary>
-    private static (float X, float Y) ComputeStickyOffset(StickyBox sticky, RenderRect containingBlock, LayoutContext context)
+    private static (float X, float Y) ComputeStickyOffset(StickyBox sticky, RenderRect containingBlock, RenderRect viewport)
     {
         var style = sticky.Style;
         var box = sticky.Metrics;
-        var viewportLeft = context.Padding;
-        var viewportTop = context.Padding;
-        var viewportRight = context.Width - context.Padding;
-        var viewportBottom = context.Height - context.Padding;
+        var viewportLeft = viewport.X;
+        var viewportTop = viewport.Y;
+        var viewportRight = viewport.X + viewport.Width;
+        var viewportBottom = viewport.Y + viewport.Height;
         var viewportWidth = viewportRight - viewportLeft;
         var viewportHeight = viewportBottom - viewportTop;
 

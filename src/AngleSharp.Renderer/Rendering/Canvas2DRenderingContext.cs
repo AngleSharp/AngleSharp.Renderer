@@ -237,10 +237,65 @@ public sealed class Canvas2DRenderingContext : ICanvasRenderingContext2D
             return;
         }
 
-        using var paint = CreatePaint(_fillColor, SKPaintStyle.Fill);
-        using var typeface = SKTypeface.Default;
-        using var font = new SKFont(typeface, ParseFontSize(_font));
-        _canvas.DrawText(text, x + _translateX, y + _translateY, font, paint);
+        // Shaped and resolved like HTML text: the font list falls back per character, and
+        // right-to-left runs are reordered within the left-to-right paragraph.
+        var font = ParseFont(_font) with { Language = ResolveLanguage(Host) };
+        using var paint = Skia.SkiaTextShaping.CreateTextPaint(font);
+        paint.Color = _fillColor;
+        Skia.SkiaTextShaping.DrawParagraph(_canvas, paint, text, x + _translateX, y + _translateY, font, isRightToLeft: false);
+    }
+
+    /// <summary>
+    /// The CSS <c>font</c> shorthand of the context (<c>[italic] [bold|weight] size family</c>);
+    /// the generic family when none is given.
+    /// </summary>
+    private static Rendering.RenderFont ParseFont(string font)
+    {
+        var tokens = font.Split(' ', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+        var isItalic = false;
+        var weight = 400f;
+        var size = 10f;
+        var familyStart = tokens.Length;
+
+        for (var index = 0; index < tokens.Length; index++)
+        {
+            var token = tokens[index].ToLowerInvariant();
+
+            if (token is "italic" or "oblique")
+            {
+                isItalic = true;
+            }
+            else if (token is "bold" or "bolder")
+            {
+                weight = 700f;
+            }
+            else if (float.TryParse(token, System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out var numericWeight))
+            {
+                weight = numericWeight;
+            }
+            else if (token.EndsWith("px", StringComparison.Ordinal))
+            {
+                size = ParseFontSize(token);
+                familyStart = index + 1;
+                break;
+            }
+        }
+
+        var family = familyStart < tokens.Length ? string.Join(' ', tokens[familyStart..]) : "sans-serif";
+        return new Rendering.RenderFont(family, size, weight, isItalic, 0f);
+    }
+
+    private static string? ResolveLanguage(IHtmlCanvasElement host)
+    {
+        for (AngleSharp.Dom.IElement? element = host; element is not null; element = element.ParentElement)
+        {
+            if (element.GetAttribute("lang") is { } language && !string.IsNullOrWhiteSpace(language))
+            {
+                return language.Trim();
+            }
+        }
+
+        return null;
     }
 
     /// <summary>

@@ -1,6 +1,7 @@
 namespace AngleSharp.Renderer.Skia.Svg;
 
 using AngleSharp.Dom;
+using AngleSharp.Renderer.Rendering;
 
 using SkiaSharp;
 
@@ -480,16 +481,20 @@ internal static class SvgElementRenderer
             TextSize = state.FontSize,
         };
 
-        var width = measurePaint.MeasureText(text);
+        // Shaped like HTML text (kerning, ligatures, joining scripts, font fallback), in visual
+        // order with `direction` as the paragraph direction.
+        var font = new RenderFont(state.FontFamily, state.FontSize, state.FontWeight, state.IsItalic, 0f, Language: state.Language);
+        var width = SkiaTextShaping.MeasureParagraph(measurePaint, text, font, state.IsRightToLeft);
         var ascent = -measurePaint.FontMetrics.Ascent;
         var descent = measurePaint.FontMetrics.Descent;
         var bounds = new SKRect(cursorX, y - ascent, cursorX + width, y + descent);
 
+        // `start` and `end` follow the direction: right-to-left text starts at its right edge
         var anchorOffset = state.TextAnchor switch
         {
             SvgTextAnchor.Middle => -width / 2f,
-            SvgTextAnchor.End => -width,
-            _ => 0f,
+            SvgTextAnchor.End => state.IsRightToLeft ? 0f : -width,
+            _ => state.IsRightToLeft ? -width : 0f,
         };
 
         var drawX = cursorX + anchorOffset;
@@ -500,7 +505,7 @@ internal static class SvgElementRenderer
         {
             fillPaint.Typeface = measurePaint.Typeface;
             fillPaint.TextSize = state.FontSize;
-            canvas.DrawText(text, drawX, y, fillPaint);
+            SkiaTextShaping.DrawParagraph(canvas, fillPaint, text, drawX, y, font, state.IsRightToLeft);
         }
 
         using var strokePaint = state.CreateStrokePaint(bounds, context, viewport);
@@ -509,10 +514,10 @@ internal static class SvgElementRenderer
         {
             strokePaint.Typeface = measurePaint.Typeface;
             strokePaint.TextSize = state.FontSize;
-            canvas.DrawText(text, drawX, y, strokePaint);
+            SkiaTextShaping.DrawParagraph(canvas, strokePaint, text, drawX, y, font, state.IsRightToLeft);
         }
 
-        cursorX += width;
+        cursorX += state.IsRightToLeft ? -width : width;
     }
 
     private static string NormalizeWhitespace(string text)

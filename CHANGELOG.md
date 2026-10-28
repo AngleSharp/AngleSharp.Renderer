@@ -1,3 +1,32 @@
+# 0.9.0
+
+Released on Friday, October 30 2026.
+
+- Fixed `-webkit-line-clamp` counting lines per inline run instead of across the nested blocks of the clamped box (e.g. paragraphs in a clamped card), which now ends after its last line
+- Fixed gaps with font- or viewport-relative units (e.g. Tailwind's `gap-4`, i.e. `gap: 1rem`) being ignored in grid and flex containers
+- Fixed images (and other replaced elements) with `border-radius` not being clipped to its curve (e.g. a `rounded-full` avatar painted square)
+- Fixed `line-height` lengths (e.g. `16px`, or `1rem` as in Tailwind's `text-xs`) being ignored in favor of the inherited (or default) line height
+- Fixed inline-level flex items and non-stretched grid items (e.g. a `<span>`) being as tall as their inline box instead of their line boxes, which let text overflow them at the bottom (e.g. tag pills with padding)
+- Fixed words breaking after a hyphen or slash in a box sized to fit them (e.g. a flex item with the max-content width of `c-sharp`), as the width came out of the box arithmetic a fraction of a pixel short
+- Added grid track alignment: `justify-content` and `align-content` (`start`, `end`, `center`, `space-between`, `space-around`, `space-evenly`, with `safe`) position the tracks of a grid whose tracks do not fill it
+- Added lines moving down past floats: a line whose first word does not fit beside the floats moves down to where one of them ends, until it fits or no float is beside it
+- Added `writing-mode` on flex, grid and table containers: a container whose writing mode differs from its parent's lays out its items along its own axes (e.g. a `vertical-rl` flex container runs its main axis downwards)
+- Added nested writing modes in the same orientation: a `vertical-lr` element in `vertical-rl` content (or the reverse) stacks its blocks in its own direction
+- Added `position: sticky` inside orthogonal flows (e.g. in a `vertical-rl` box), which used to stay static
+- Added anonymous table objects: stray `display: table-cell` boxes (e.g. `<div style="display:table-cell">` used for layout) form a row of an anonymous table, rows outside a table get one, and text or other content directly inside a table or row is wrapped in an anonymous row or cell instead of being dropped
+- Added percentage table heights (e.g. `table { height: 50% }`), resolved against a definite containing block height
+- Added `column-span: all` in multi-column containers: the spanner is laid out across all columns, and the content on each side of it is balanced separately
+- Added text shaping with HarfBuzz (via `SkiaSharp.HarfBuzz`): kerning and ligatures (e.g. `fi`, `fl`), Arabic joining and complex scripts such as Devanagari, measured and painted from the same shaped glyphs, so line breaking, alignment and table widths use the shaped advances
+- Added `font-feature-settings`, `font-kerning`, `font-variant-ligatures` and `font-variant-numeric` (e.g. `font-feature-settings: "liga" 0` turns ligatures off, `tabular-nums` selects tabular figures); a non-zero `letter-spacing` turns optional ligatures off
+- Added Noto Sans Devanagari as a bundled fallback font (its OFL license is included in the package), so Devanagari renders without an installed font
+- Changed right-to-left text in the display list: `DrawTextCommand.Text` is now in logical order with `IsRightToLeft` set, and shaping reverses and mirrors it (it used to be reversed and mirrored by layout)
+- Changed `text-overflow: ellipsis` to cut at glyph clusters (`ITextMeasurer.GetClusterBoundaries`, which defaults to grapheme clusters for custom measurers), so it never splits a ligature or conjunct
+- Improved SVG `text`/`tspan`, which is shaped the same way as HTML text, reordered by the bidi algorithm with `direction` as its paragraph direction (which also decides where `text-anchor: start` and `end` are), and in its `lang`
+- Added `lang` to text shaping, so fonts with language-specific forms use them (e.g. the Marathi forms of Noto Sans Devanagari for `lang="mr"`)
+- Added joining across element boundaries: an Arabic word split by an inline element (e.g. one letter in `<b>`) keeps its joined forms
+- Changed Canvas 2D `fillText` to use the context's `font` (family, size, weight, style) with the same fonts, shaping and bidi reordering as HTML text instead of the host's default typeface
+- Added fragmentation in multi-column containers: `break-before`/`break-after` (`column` forces a new column, `avoid`), `break-inside: avoid`, `orphans`/`widows` (lines of a paragraph are no longer left alone at the top or bottom of a column), `column-fill: auto|balance` with a definite height (balanced by default), and blocks without lines splitting across columns
+
 # 0.8.2
 
 Released on Sunday, October 25 2026.

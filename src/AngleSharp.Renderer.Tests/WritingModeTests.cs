@@ -2,6 +2,7 @@ namespace AngleSharp.Renderer.Tests;
 
 using AngleSharp;
 using AngleSharp.Css;
+using AngleSharp.Dom;
 using AngleSharp.Renderer.Rendering;
 
 /// <summary>
@@ -195,6 +196,159 @@ public sealed class WritingModeTests
         Assert.Equal(await HorizontalLineHeightAsync(), PhysicalRect(displayList, SingleFill(displayList, Red)).Width, precision: 2);
     }
 
+    [Fact]
+    public async Task VerticalLrInVerticalRl_StacksItsBlocksLeftToRight()
+    {
+        var displayList = await LayoutAsync("""
+            <div style="writing-mode:vertical-rl; width:200px; height:100px">
+                <div style="width:20px; height:20px; background-color:#ff0000"></div>
+                <div style="writing-mode:vertical-lr">
+                    <div style="width:20px; height:20px; background-color:#00ff00"></div>
+                    <div style="width:20px; height:20px; background-color:#0000ff"></div>
+                </div>
+            </div>
+            """);
+
+        // the outer blocks stack from the right; the inner box takes the next 40px and stacks its own from its left
+        Assert.Equal(new RenderRect(180f, 0f, 20f, 20f), PhysicalRect(displayList, SingleFill(displayList, Red)));
+        Assert.Equal(new RenderRect(140f, 0f, 20f, 20f), PhysicalRect(displayList, SingleFill(displayList, Green)));
+        Assert.Equal(new RenderRect(160f, 0f, 20f, 20f), PhysicalRect(displayList, SingleFill(displayList, Blue)));
+    }
+
+    [Fact]
+    public async Task VerticalRlInVerticalLr_StacksItsBlocksRightToLeft()
+    {
+        var displayList = await LayoutAsync("""
+            <div style="writing-mode:vertical-lr; width:200px; height:100px">
+                <div style="width:20px; height:20px; background-color:#ff0000"></div>
+                <div style="writing-mode:vertical-rl; width:60px">
+                    <div style="width:20px; height:20px; background-color:#00ff00"></div>
+                    <div style="width:20px; height:20px; background-color:#0000ff"></div>
+                </div>
+            </div>
+            """);
+
+        Assert.Equal(new RenderRect(0f, 0f, 20f, 20f), PhysicalRect(displayList, SingleFill(displayList, Red)));
+        Assert.Equal(new RenderRect(60f, 0f, 20f, 20f), PhysicalRect(displayList, SingleFill(displayList, Green)));
+        Assert.Equal(new RenderRect(40f, 0f, 20f, 20f), PhysicalRect(displayList, SingleFill(displayList, Blue)));
+    }
+
+    [Fact]
+    public async Task StickyInVerticalFlow_PinsToThePhysicalTopOnceScrolledPastIt()
+    {
+        // `top` is the inline-start inset of a box in vertical-rl content: it sticks along the inline axis
+        var displayList = await LayoutAsync("""
+            <div style="writing-mode:vertical-rl; width:100px; height:600px">
+                <div style="position:sticky; top:10px; width:30px; height:40px; background-color:#00ff00"></div>
+            </div>
+            """, scrollTop: 200);
+
+        Assert.Equal(new RenderRect(70f, 10f, 30f, 40f), PhysicalRect(displayList, SingleFill(displayList, Green)));
+    }
+
+    [Fact]
+    public async Task StickyInVerticalFlow_StaysInsideItsContainingBlock()
+    {
+        var displayList = await LayoutAsync("""
+            <div style="writing-mode:vertical-rl; width:100px; height:300px">
+                <div style="position:sticky; top:10px; width:30px; height:40px; background-color:#00ff00"></div>
+            </div>
+            <div style="height:600px"></div>
+            """, scrollTop: 280);
+
+        // the flow ends 20px below the viewport top, so the box cannot stick further than its end
+        Assert.Equal(new RenderRect(70f, -20f, 30f, 40f), PhysicalRect(displayList, SingleFill(displayList, Green)));
+    }
+
+    [Fact]
+    public async Task StickyInVerticalPage_PinsToThePhysicalTop()
+    {
+        var displayList = await LayoutAsync("""
+            <style>html { writing-mode: vertical-rl }</style>
+            <div style="width:30px; height:900px">
+                <div style="position:sticky; top:10px; width:30px; height:40px; background-color:#00ff00"></div>
+            </div>
+            """, scrollTop: 200);
+
+        Assert.Equal(10f, PhysicalRect(displayList, SingleFill(displayList, Green)).Y, precision: 2);
+    }
+
+    [Fact]
+    public async Task VerticalFlexContainer_RunsItsMainAxisDownwards()
+    {
+        var displayList = await LayoutAsync("""
+            <div style="display:flex; writing-mode:vertical-rl; width:100px; height:200px">
+                <div style="width:30px; height:20px; background-color:#ff0000"></div>
+                <div style="width:30px; height:40px; background-color:#00ff00"></div>
+            </div>
+            """);
+
+        // the main axis is the container's inline axis (down), the cross axis its block axis (leftwards)
+        Assert.Equal(new RenderRect(70f, 0f, 30f, 20f), PhysicalRect(displayList, SingleFill(displayList, Red)));
+        Assert.Equal(new RenderRect(70f, 20f, 30f, 40f), PhysicalRect(displayList, SingleFill(displayList, Green)));
+    }
+
+    [Fact]
+    public async Task VerticalGridContainer_PlacesColumnsDownwardsAndRowsLeftwards()
+    {
+        var displayList = await LayoutAsync("""
+            <div style="display:grid; writing-mode:vertical-rl; grid-template-columns:20px 30px; grid-template-rows:40px; width:100px; height:200px">
+                <div style="background-color:#ff0000"></div>
+                <div style="background-color:#00ff00"></div>
+            </div>
+            """);
+
+        // columns run along the inline axis (down), rows along the block axis (from the right)
+        Assert.Equal(new RenderRect(60f, 0f, 40f, 20f), PhysicalRect(displayList, SingleFill(displayList, Red)));
+        Assert.Equal(new RenderRect(60f, 20f, 40f, 30f), PhysicalRect(displayList, SingleFill(displayList, Green)));
+    }
+
+    [Fact]
+    public async Task VerticalGridContainer_IsAsWideAsItsRowsAsAFlexItem()
+    {
+        var displayList = await LayoutAsync("""
+            <div style="display:flex">
+                <div style="display:grid; writing-mode:vertical-rl; grid-template-columns:20px 30px; grid-template-rows:40px 25px; background-color:#ff0000"></div>
+            </div>
+            """);
+
+        // its width is the block size of its rows, its height the inline size of its columns
+        Assert.Equal(new RenderRect(0f, 0f, 65f, 50f), PhysicalRect(displayList, SingleFill(displayList, Red)));
+    }
+
+    [Fact]
+    public async Task VerticalTable_PutsRowsSideBySideFromTheRight()
+    {
+        var displayList = await LayoutAsync("""
+            <table style="writing-mode:vertical-rl; border-spacing:0">
+                <tr><td style="padding:0; width:30px; height:20px; background-color:#ff0000"></td><td style="padding:0; width:30px; height:40px; background-color:#00ff00"></td></tr>
+                <tr><td style="padding:0; width:10px; height:20px; background-color:#0000ff"></td><td style="padding:0"></td></tr>
+            </table>
+            """);
+
+        // rows are columns from the right, the cells of a row go down
+        Assert.Equal(new RenderRect(10f, 0f, 30f, 20f), PhysicalRect(displayList, SingleFill(displayList, Red)));
+        Assert.Equal(new RenderRect(10f, 20f, 30f, 40f), PhysicalRect(displayList, SingleFill(displayList, Green)));
+        Assert.Equal(new RenderRect(0f, 0f, 10f, 20f), PhysicalRect(displayList, SingleFill(displayList, Blue)));
+    }
+
+    [Fact]
+    public async Task HorizontalFlexContainerInVerticalContent_RunsItsMainAxisToTheRight()
+    {
+        var displayList = await LayoutAsync("""
+            <div style="writing-mode:vertical-rl; width:200px; height:100px">
+                <div style="display:flex; writing-mode:horizontal-tb; width:100px; height:30px">
+                    <div style="width:20px; background-color:#ff0000"></div>
+                    <div style="width:40px; background-color:#00ff00"></div>
+                </div>
+            </div>
+            """);
+
+        // the horizontal box is the first block of the vertical content (at its right), its items run rightwards
+        Assert.Equal(new RenderRect(100f, 0f, 20f, 30f), PhysicalRect(displayList, SingleFill(displayList, Red)));
+        Assert.Equal(new RenderRect(120f, 0f, 40f, 30f), PhysicalRect(displayList, SingleFill(displayList, Green)));
+    }
+
     /// <summary>The height of one line of the same text laid out horizontally.</summary>
     private static async Task<float> HorizontalLineHeightAsync()
     {
@@ -202,17 +356,24 @@ public sealed class WritingModeTests
         return MathF.Round(SingleFill(displayList, Red).Rect.Height, 2);
     }
 
-    private static async Task<DisplayList> LayoutAsync(string bodyHtml)
+    private static async Task<DisplayList> LayoutAsync(string bodyHtml, double scrollTop = 0)
     {
-        var context = BrowsingContext.New(Configuration.Default.WithCss());
-        var document = await context.OpenAsync(request => request.Content($"<html><body style=\"margin:0\">{bodyHtml}</body></html>"));
-
-        return new HtmlRenderer().BuildDisplayList(document, new DefaultRenderDevice
+        var renderDevice = new DefaultRenderDevice
         {
             ViewPortWidth = 400,
             ViewPortHeight = 300,
             FontSize = 16f,
-        });
+        };
+        var context = BrowsingContext.New(Configuration.Default.WithCss().WithRenderDevice(renderDevice));
+        var document = await context.OpenAsync(request => request.Content($"<html><body style=\"margin:0\">{bodyHtml}</body></html>"));
+
+        if (scrollTop > 0)
+        {
+            context.GetDomHarness();
+            document.DocumentElement.SetScrollTop(scrollTop);
+        }
+
+        return new HtmlRenderer().BuildDisplayList(document, renderDevice);
     }
 
     /// <summary>The composition of every transform open around <paramref name="target"/>.</summary>
