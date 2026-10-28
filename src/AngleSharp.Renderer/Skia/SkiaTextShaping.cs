@@ -9,14 +9,15 @@ using System.Threading;
 using AngleSharp.Renderer.Rendering;
 
 using SkiaSharp;
+using SkiaSharp.HarfBuzz;
 
 /// <summary>
 /// Shared text configuration for the Skia backend.
 /// </summary>
 /// <remarks>
-/// Measuring and painting have to resolve the same typeface and apply the same paint settings,
-/// otherwise layout is computed against a font that never reaches the canvas. Both paths go
-/// through this type so they cannot drift apart.
+/// Measuring and painting have to resolve the same typeface, apply the same paint settings and
+/// shape the same way, otherwise layout is computed against glyphs that never reach the canvas.
+/// Both paths go through this type (<see cref="ShapeText"/>) so they cannot drift apart.
 /// </remarks>
 internal static class SkiaTextShaping
 {
@@ -305,32 +306,46 @@ internal static class SkiaTextShaping
         var fallbackPaint = paint.Clone();
         fallbackPaint.Typeface = typeface;
         fallbackPaint.TextSkewX = font.IsItalic && typeface.FontSlant == SKFontStyleSlant.Upright ? -0.25f : 0f;
-        ApplySyntheticBold(fallbackPaint, font, typeface);
+
+        // a stroke paint (SVG `stroke`) outlines the glyphs and has to stay one
+        if (paint.Style != SKPaintStyle.Stroke)
+        {
+            ApplySyntheticBold(fallbackPaint, font, typeface);
+        }
+
         return fallbackPaint;
     }
 
     /// <summary>
-    /// Draws text the way <see cref="MeasureTextWidth"/> measures it: per fallback run, and
-    /// character by character when letter spacing is in play.
+    /// Draws text exactly as <see cref="MeasureTextWidth"/> measures it: shaped with HarfBuzz
+    /// (see <see cref="ShapeText"/>) and painted as positioned glyphs, one text blob per run.
     /// </summary>
     public static void DrawText(SKCanvas canvas, SKPaint paint, string text, float x, float y, float letterSpacing, RenderFont? font = null)
     {
-        if (SplitFallbackRuns(paint, text, font) is not { } runs)
-        {
-            DrawSingleTypefaceText(canvas, paint, text, x, y, letterSpacing);
-            return;
-        }
+        var shaped = ShapeText(paint, text, letterSpacing, font);
 
-        var cursorX = x;
-
-        foreach (var (runText, typeface) in runs)
+        foreach (var run in shaped.Runs)
         {
-            var runPaint = ReferenceEquals(typeface, paint.Typeface) ? paint : CreateFallbackPaint(paint, typeface, font!.Value);
+            if (run.Glyphs.Length == 0)
+            {
+                continue;
+            }
+
+            var runPaint = ReferenceEquals(run.Typeface, paint.Typeface) || font is null ? paint : CreateFallbackPaint(paint, run.Typeface, font.Value);
 
             try
             {
-                DrawSingleTypefaceText(canvas, runPaint, runText, cursorX, y, letterSpacing);
-                cursorX += MeasureSingleTypefaceText(runPaint, runText, letterSpacing) + (letterSpacing > 0f ? letterSpacing : 0f);
+                using var skFont = runPaint.ToFont();
+                using var builder = new SKTextBlobBuilder();
+                var buffer = builder.AllocatePositionedRun(skFont, run.Glyphs.Length);
+                buffer.SetGlyphs(run.Glyphs);
+                buffer.SetPositions(run.Positions);
+                using var blob = builder.Build();
+
+                if (blob is not null)
+                {
+                    canvas.DrawText(blob, x, y, runPaint);
+                }
             }
             finally
             {
@@ -339,24 +354,6 @@ internal static class SkiaTextShaping
                     runPaint.Dispose();
                 }
             }
-        }
-    }
-
-    private static void DrawSingleTypefaceText(SKCanvas canvas, SKPaint paint, string text, float x, float y, float letterSpacing)
-    {
-        if (letterSpacing <= 0f)
-        {
-            canvas.DrawText(text, x, y, paint);
-            return;
-        }
-
-        var cursorX = x;
-
-        foreach (var character in text)
-        {
-            var glyph = character.ToString();
-            canvas.DrawText(glyph, cursorX, y, paint);
-            cursorX += paint.MeasureText(glyph) + letterSpacing;
         }
     }
 
@@ -462,52 +459,277 @@ internal static class SkiaTextShaping
     }
 
     /// <summary>
-    /// Measures the advance width, mirroring how the backend lays glyphs out when letter
-    /// spacing is in play.
+    /// Measures a line of text that no layout has split into bidi runs (SVG text, Canvas 2D), as
+    /// <see cref="DrawParagraph"/> paints it.
     /// </summary>
-    public static float MeasureTextWidth(SKPaint paint, string text, float letterSpacing, RenderFont? font = null)
+    public static float MeasureParagraph(SKPaint paint, string text, RenderFont font, bool isRightToLeft)
     {
-        if (SplitFallbackRuns(paint, text, font) is not { } runs)
+        if (!BidiAlgorithm.RequiresReordering(text, isRightToLeft))
         {
-            return MeasureSingleTypefaceText(paint, text, letterSpacing);
+            return MeasureTextWidth(paint, text, font.LetterSpacing, font with { IsRightToLeft = false });
         }
 
         var width = 0f;
 
-        foreach (var (runText, typeface) in runs)
+        foreach (var (run, runIsRightToLeft) in BidiAlgorithm.GetVisualRuns(text, isRightToLeft))
         {
-            if (ReferenceEquals(typeface, paint.Typeface))
-            {
-                width += MeasureSingleTypefaceText(paint, runText, letterSpacing);
-            }
-            else
-            {
-                using var runPaint = CreateFallbackPaint(paint, typeface, font!.Value);
-                width += MeasureSingleTypefaceText(runPaint, runText, letterSpacing);
-            }
-
-            width += letterSpacing > 0f ? letterSpacing : 0f;
+            width += MeasureTextWidth(paint, run, font.LetterSpacing, font with { IsRightToLeft = runIsRightToLeft });
         }
 
-        return letterSpacing > 0f ? width - letterSpacing : width;
+        return width;
     }
 
-    private static float MeasureSingleTypefaceText(SKPaint paint, string text, float letterSpacing)
+    /// <summary>
+    /// Draws a line of text that no layout has split into bidi runs: its runs in visual order
+    /// (UAX #9, with <paramref name="isRightToLeft"/> as the paragraph direction), left to right
+    /// from <paramref name="x"/>, each shaped in its own direction.
+    /// </summary>
+    public static void DrawParagraph(SKCanvas canvas, SKPaint paint, string text, float x, float y, RenderFont font, bool isRightToLeft)
     {
-        if (letterSpacing <= 0f)
+        if (!BidiAlgorithm.RequiresReordering(text, isRightToLeft))
         {
-            return paint.MeasureText(text);
+            DrawText(canvas, paint, text, x, y, font.LetterSpacing, font with { IsRightToLeft = false });
+            return;
         }
 
-        var width = 0f;
-
-        foreach (var character in text)
+        foreach (var (run, runIsRightToLeft) in BidiAlgorithm.GetVisualRuns(text, isRightToLeft))
         {
-            width += paint.MeasureText(character.ToString()) + letterSpacing;
+            var runFont = font with { IsRightToLeft = runIsRightToLeft };
+            DrawText(canvas, paint, run, x, y, font.LetterSpacing, runFont);
+            x += MeasureTextWidth(paint, run, font.LetterSpacing, runFont);
         }
-
-        return width > 0f ? width - letterSpacing : 0f;
     }
+
+    /// <summary>
+    /// Measures the advance width of <paramref name="text"/> as <see cref="DrawText"/> paints it.
+    /// </summary>
+    public static float MeasureTextWidth(SKPaint paint, string text, float letterSpacing, RenderFont? font = null) =>
+        ShapeText(paint, text, letterSpacing, font).Width;
+
+    /// <summary>
+    /// The boundaries (UTF-16 offsets, ascending, starting with 0) of the clusters HarfBuzz forms
+    /// for <paramref name="text"/>: the units text may be cut into without breaking a glyph.
+    /// </summary>
+    public static IReadOnlyList<int> GetClusterBoundaries(SKPaint paint, string text, RenderFont? font = null)
+    {
+        var boundaries = new SortedSet<int> { 0 };
+
+        foreach (var run in ShapeText(paint, text, font?.LetterSpacing ?? 0f, font).Runs)
+        {
+            foreach (var cluster in run.Clusters)
+            {
+                boundaries.Add((int)cluster);
+            }
+        }
+
+        boundaries.Add(text.Length);
+        return [.. boundaries];
+    }
+
+    /// <summary>
+    /// The glyphs of one typeface, positioned relative to the origin of the whole text, in
+    /// visual order.
+    /// </summary>
+    private sealed record GlyphRun(SKTypeface Typeface, ushort[] Glyphs, SKPoint[] Positions, uint[] Clusters);
+
+    private sealed record ShapedText(List<GlyphRun> Runs, float Width);
+
+    /// <summary>
+    /// Shapes text with HarfBuzz: split into runs of one typeface (<see cref="SplitFallbackRuns"/>)
+    /// and one script, each shaped in the run direction of <paramref name="font"/> (or its
+    /// script's, for right-to-left scripts) with the font's OpenType features, the whole text as context. Runs are placed
+    /// in visual order, so the first logical run is the rightmost one in right-to-left text.
+    /// Letter spacing goes after every cluster but the last and turns optional ligatures off.
+    /// </summary>
+    private static ShapedText ShapeText(SKPaint paint, string text, float letterSpacing, RenderFont? font)
+    {
+        var runs = new List<GlyphRun>();
+
+        if (string.IsNullOrEmpty(text) || paint.Typeface is not { } primary)
+        {
+            return new ShapedText(runs, 0f);
+        }
+
+        var isRightToLeft = font?.IsRightToLeft ?? false;
+        var features = ResolveFeatures(letterSpacing, font?.FontFeatures);
+        var segments = new List<(int Start, int Length, SKTypeface Typeface, HarfBuzzSharp.Script Script)>();
+        var offset = 0;
+
+        // Context from across an element boundary is handed to HarfBuzz around the text, so
+        // joining continues across it without being shaped (or measured) here.
+        var contextBefore = font?.ContextBefore ?? string.Empty;
+        var shapedText = contextBefore.Length == 0 && string.IsNullOrEmpty(font?.ContextAfter) ? text : contextBefore + text + font?.ContextAfter;
+
+        foreach (var (runText, typeface) in SplitFallbackRuns(paint, text, font) ?? [(text, primary)])
+        {
+            foreach (var (start, length, script) in SplitScripts(text, offset, runText.Length))
+            {
+                segments.Add((start, length, typeface, script));
+            }
+
+            offset += runText.Length;
+        }
+
+        if (isRightToLeft)
+        {
+            segments.Reverse();
+        }
+
+        var penX = 0f;
+        var spacingCount = 0;
+
+        foreach (var (start, length, typeface, script) in segments)
+        {
+            var hbFont = GetHarfBuzzFont(typeface);
+            var scale = paint.TextSize / hbFont.UnitsPerEm;
+
+            // Strong right-to-left characters always resolve to an odd bidi level (UAX #9 I1/I2),
+            // so a right-to-left script is shaped right to left even where the caller has not
+            // resolved the levels yet (layout measures words before reordering lines, SVG text
+            // never does): HarfBuzz shapes e.g. Arabic differently when forced left to right.
+            // Everything else (neutrals, or Latin under an override) takes the run direction.
+            using var buffer = new HarfBuzzSharp.Buffer();
+            buffer.AddUtf16(shapedText, contextBefore.Length + start, length);
+            buffer.Direction = isRightToLeft || script.HorizontalDirection == HarfBuzzSharp.Direction.RightToLeft
+                ? HarfBuzzSharp.Direction.RightToLeft
+                : HarfBuzzSharp.Direction.LeftToRight;
+            buffer.Language = GetLanguage(font?.Language);
+            buffer.GuessSegmentProperties();
+            hbFont.Font.Shape(buffer, features);
+
+            var infos = buffer.GetGlyphInfoSpan();
+            var positions = buffer.GetGlyphPositionSpan();
+            var glyphs = new ushort[infos.Length];
+            var points = new SKPoint[infos.Length];
+            var clusters = new uint[infos.Length];
+
+            for (var index = 0; index < infos.Length; index++)
+            {
+                glyphs[index] = (ushort)infos[index].Codepoint;
+                clusters[index] = infos[index].Cluster - (uint)contextBefore.Length;
+                points[index] = new SKPoint(penX + (positions[index].XOffset * scale), -positions[index].YOffset * scale);
+                penX += positions[index].XAdvance * scale;
+
+                // spacing follows the last glyph of every cluster
+                if (letterSpacing != 0f && (index + 1 == infos.Length || infos[index + 1].Cluster != infos[index].Cluster))
+                {
+                    penX += letterSpacing;
+                    spacingCount++;
+                }
+            }
+
+            runs.Add(new GlyphRun(typeface, glyphs, points, clusters));
+        }
+
+        // no spacing after the last cluster
+        return new ShapedText(runs, spacingCount > 0 ? penX - letterSpacing : penX);
+    }
+
+    // Without a `lang` the language is fixed rather than HarfBuzz's default (the host locale), so
+    // results do not depend on the machine.
+    private static readonly HarfBuzzSharp.Language DefaultLanguage = new("und");
+
+    private static readonly ConcurrentDictionary<string, HarfBuzzSharp.Language> Languages = new(StringComparer.OrdinalIgnoreCase);
+
+    private static HarfBuzzSharp.Language GetLanguage(string? language) =>
+        string.IsNullOrWhiteSpace(language) ? DefaultLanguage : Languages.GetOrAdd(language, static tag => new HarfBuzzSharp.Language(tag));
+
+    private static readonly HarfBuzzSharp.Feature[] NoLigatures = ParseFeatures("liga=0,clig=0,dlig=0,hlig=0");
+
+    /// <summary>
+    /// The features to shape with: optional ligatures off under letter spacing (CSS Text 3
+    /// §8.2), then those of the font's <c>font-variant-*</c>/<c>font-kerning</c>/
+    /// <c>font-feature-settings</c>, which come later and so take precedence.
+    /// </summary>
+    private static HarfBuzzSharp.Feature[] ResolveFeatures(float letterSpacing, string? fontFeatures)
+    {
+        var declared = string.IsNullOrEmpty(fontFeatures) ? [] : ParsedFeatures.GetOrAdd(fontFeatures, ParseFeatures);
+        return letterSpacing != 0f ? [.. NoLigatures, .. declared] : declared;
+    }
+
+    private static readonly ConcurrentDictionary<string, HarfBuzzSharp.Feature[]> ParsedFeatures = new(StringComparer.Ordinal);
+
+    private static HarfBuzzSharp.Feature[] ParseFeatures(string features)
+    {
+        var parsed = new List<HarfBuzzSharp.Feature>();
+
+        foreach (var entry in features.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+        {
+            if (HarfBuzzSharp.Feature.TryParse(entry, out var feature))
+            {
+                parsed.Add(feature);
+            }
+        }
+
+        return [.. parsed];
+    }
+
+    /// <summary>
+    /// Splits a range of <paramref name="text"/> into runs of one script, as HarfBuzz shapes one
+    /// script at a time. Characters of no particular script (spaces, punctuation, digits,
+    /// combining marks) stay with the run they are in, or join the first run when they lead.
+    /// </summary>
+    private static List<(int Start, int Length, HarfBuzzSharp.Script Script)> SplitScripts(string text, int start, int length)
+    {
+        var result = new List<(int Start, int Length, HarfBuzzSharp.Script Script)>();
+        var runStart = start;
+        var runScript = HarfBuzzSharp.Script.Invalid;
+        var end = start + length;
+        var index = start;
+
+        while (index < end)
+        {
+            var codepoint = char.IsSurrogatePair(text, index) ? char.ConvertToUtf32(text, index) : text[index];
+            var script = HarfBuzzSharp.UnicodeFunctions.Default.GetScript((uint)codepoint);
+
+            if (script != HarfBuzzSharp.Script.Common && script != HarfBuzzSharp.Script.Inherited && script != HarfBuzzSharp.Script.Unknown)
+            {
+                if (runScript != HarfBuzzSharp.Script.Invalid && script != runScript)
+                {
+                    result.Add((runStart, index - runStart, runScript));
+                    runStart = index;
+                }
+
+                runScript = script;
+            }
+
+            index += codepoint > 0xFFFF ? 2 : 1;
+        }
+
+        result.Add((runStart, end - runStart, runScript));
+        return result;
+    }
+
+    /// <summary>A HarfBuzz font for a typeface, kept with the blob and face behind it.</summary>
+    private sealed class HarfBuzzFont(HarfBuzzSharp.Blob blob, HarfBuzzSharp.Face face, HarfBuzzSharp.Font font, int unitsPerEm)
+    {
+        public HarfBuzzSharp.Blob Blob { get; } = blob;
+
+        public HarfBuzzSharp.Face Face { get; } = face;
+
+        public HarfBuzzSharp.Font Font { get; } = font;
+
+        public int UnitsPerEm { get; } = unitsPerEm;
+    }
+
+    // Typefaces are themselves cached for the life of the process (bundled, installed and
+    // @font-face ones alike), so their HarfBuzz fonts are too. Shaping with a font is thread safe.
+    private static readonly ConcurrentDictionary<SKTypeface, HarfBuzzFont> HarfBuzzFonts = new(ReferenceEqualityComparer.Instance);
+
+    private static HarfBuzzFont GetHarfBuzzFont(SKTypeface typeface) =>
+        HarfBuzzFonts.GetOrAdd(typeface, static typeface =>
+        {
+            // the blob takes over the stream (it may point straight into its memory)
+            var blob = typeface.OpenStream(out var index).ToHarfBuzzBlob();
+            var face = new HarfBuzzSharp.Face(blob, index);
+            var unitsPerEm = Math.Max(1, face.UnitsPerEm);
+            var font = new HarfBuzzSharp.Font(face);
+
+            // positions in font units, scaled to the font size by the caller
+            font.SetScale(unitsPerEm, unitsPerEm);
+            font.SetFunctionsOpenType();
+            return new HarfBuzzFont(blob, face, font, unitsPerEm);
+        });
 
     private static IReadOnlyDictionary<string, BundledFontFamily> CreateBundledFonts()
     {
@@ -517,12 +739,17 @@ internal static class SkiaTextShaping
         var serifBold = LoadBundledTypeface("DejaVuSerif-Bold.ttf");
         var monoRegular = LoadBundledTypeface("DejaVuSansMono.ttf");
         var monoBold = LoadBundledTypeface("DejaVuSansMono-Bold.ttf");
+        var devanagari = LoadBundledTypeface("NotoSansDevanagari-Regular.ttf");
 
         return new Dictionary<string, BundledFontFamily>(StringComparer.OrdinalIgnoreCase)
         {
             ["sans-serif"] = new BundledFontFamily(sansRegular, sansBold),
             ["serif"] = new BundledFontFamily(serifRegular, serifBold),
             ["monospace"] = new BundledFontFamily(monoRegular, monoBold),
+
+            // Only a fallback for the scripts the DejaVu fonts lack, never a generic family; its
+            // bold is synthesized.
+            ["devanagari"] = new BundledFontFamily(devanagari, devanagari),
         };
     }
 

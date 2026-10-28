@@ -8723,6 +8723,124 @@ public sealed class HtmlRendererTests
     }
 
     [Fact]
+    public async Task BuildDisplayList_ColumnSpanAllSpansTheColumnsAndBalancesEachSideSeparately()
+    {
+        var document = await ParseAsync("""
+            <html><body>
+                <div style="width:300px; column-count:2; column-gap:20px; line-height:20px; background-color:#0000ff">
+                    <p style="margin:0">A</p><p style="margin:0">B</p>
+                    <div style="column-span:all; height:30px; background-color:#ff0000"></div>
+                    <p style="margin:0">C</p><p style="margin:0">D</p><p style="margin:0">E</p><p style="margin:0">F</p>
+                </div>
+            </body></html>
+            """);
+
+        var displayList = BuildDisplayList(document);
+        var clips = displayList.Commands.OfType<PushClipCommand>().Select(clip => clip.Rect).ToList();
+
+        Assert.Equal(new RenderRect(0f, 20f, 300f, 30f), SingleFill(displayList, Red).Rect);
+        Assert.Equal(90f, SingleFill(displayList, Blue).Rect.Height, precision: 2);
+        Assert.Equal(4, clips.Count);
+        Assert.All(clips.Take(2), clip => Assert.Equal((0f, 20f), (clip.Y, clip.Height)));
+        Assert.All(clips.Skip(2), clip => Assert.Equal((50f, 40f), (clip.Y, clip.Height)));
+    }
+
+    [Theory]
+    [InlineData("", -40f)]
+    [InlineData("break-inside:avoid", -20f)]
+    public async Task BuildDisplayList_BreakInsideAvoidKeepsABlockInOneColumn(string breakInside, float secondColumnShift)
+    {
+        var document = await ParseAsync($$"""
+            <html><body>
+                <div style="width:300px; column-count:2; line-height:20px">
+                    <p style="margin:0">A</p>
+                    <div style="{{breakInside}}"><p style="margin:0">B</p><p style="margin:0">C</p></div>
+                </div>
+            </body></html>
+            """);
+
+        var translations = BuildDisplayList(document).Commands.OfType<PushTransformCommand>().Select(t => t.Transform).ToList();
+
+        Assert.Equal(2, translations.Count);
+        Assert.Equal(secondColumnShift, translations[1].F, precision: 2);
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_BreakBeforeColumnStartsANewColumn()
+    {
+        var document = await ParseAsync("""
+            <html><body>
+                <div style="width:300px; column-count:2; line-height:20px">
+                    <p style="margin:0">A</p><p style="margin:0">B</p><p style="margin:0; break-before:column">C</p>
+                </div>
+            </body></html>
+            """);
+
+        var displayList = BuildDisplayList(document);
+        var clips = displayList.Commands.OfType<PushClipCommand>().ToList();
+        var translations = displayList.Commands.OfType<PushTransformCommand>().Select(t => t.Transform).ToList();
+
+        Assert.Equal(40f, clips[0].Rect.Height, precision: 2);
+        Assert.Equal(-40f, translations[1].F, precision: 2);
+    }
+
+    [Theory]
+    [InlineData("", -60f)]
+    [InlineData("orphans:1; widows:3", -40f)]
+    public async Task BuildDisplayList_OrphansAndWidowsChooseTheBreakLine(string lineCounts, float secondColumnShift)
+    {
+        var document = await ParseAsync($$"""
+            <html><body>
+                <div style="width:300px; column-count:2; line-height:20px; {{lineCounts}}">
+                    <p style="margin:0; white-space:pre-line">1
+            2
+            3
+            4
+            5</p>
+                </div>
+            </body></html>
+            """);
+
+        var translations = BuildDisplayList(document).Commands.OfType<PushTransformCommand>().Select(t => t.Transform).ToList();
+
+        Assert.Equal(2, translations.Count);
+        Assert.Equal(secondColumnShift, translations[1].F, precision: 2);
+    }
+
+    [Theory]
+    [InlineData("auto", 1)]
+    [InlineData("balance", 2)]
+    public async Task BuildDisplayList_ColumnFillDecidesHowADefiniteHeightIsFilled(string columnFill, int expectedColumns)
+    {
+        var document = await ParseAsync($$"""
+            <html><body>
+                <div style="width:300px; height:100px; column-count:2; column-fill:{{columnFill}}; line-height:20px">
+                    <p style="margin:0">A</p><p style="margin:0">B</p><p style="margin:0">C</p>
+                </div>
+            </body></html>
+            """);
+
+        Assert.Equal(expectedColumns, BuildDisplayList(document).Commands.OfType<PushClipCommand>().Count());
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_ABlockWithoutLinesSplitsAcrossColumns()
+    {
+        var document = await ParseAsync("""
+            <html><body>
+                <div style="width:300px; column-count:2">
+                    <div style="height:100px; background-color:#ff0000"></div>
+                </div>
+            </body></html>
+            """);
+
+        var clips = BuildDisplayList(document).Commands.OfType<PushClipCommand>().ToList();
+
+        Assert.Equal(2, clips.Count);
+        Assert.All(clips, clip => Assert.Equal(50f, clip.Rect.Height, precision: 2));
+    }
+
+    [Fact]
     public async Task BuildDisplayList_ColumnWidthDerivesTheColumnCount()
     {
         var document = await ParseAsync("""
@@ -9869,8 +9987,10 @@ public sealed class HtmlRendererTests
 
         var text = Assert.Single(BuildDisplayList(document).Commands.OfType<DrawTextCommand>());
 
-        // The logical "shalom olam" is drawn right-to-left: last letter first, words swapped.
-        Assert.Equal("\u05dd\u05dc\u05d5\u05e2 \u05dd\u05d5\u05dc\u05e9", text.Text);
+        // The logical "shalom olam" is one right-to-left run; shaping draws it last letter first
+        // (see TextShapingTests for the glyph order).
+        Assert.Equal("\u05e9\u05dc\u05d5\u05dd \u05e2\u05d5\u05dc\u05dd", text.Text);
+        Assert.True(text.IsRightToLeft);
     }
 
     [Fact]
@@ -9880,7 +10000,8 @@ public sealed class HtmlRendererTests
 
         var texts = BuildDisplayList(document).Commands.OfType<DrawTextCommand>().ToList();
 
-        Assert.Equal(["abc", "\u05d2\u05d1\u05d0", "def"], texts.Select(t => t.Text.Trim()));
+        Assert.Equal(["abc", "\u05d0\u05d1\u05d2", "def"], texts.Select(t => t.Text.Trim()));
+        Assert.Equal([false, true, false], texts.Select(t => t.IsRightToLeft));
         Assert.True(texts[0].X < texts[1].X && texts[1].X < texts[2].X);
     }
 
@@ -9889,11 +10010,13 @@ public sealed class HtmlRendererTests
     {
         var document = await ParseAsync("<html><body><p style=\"direction:rtl\">\u05d0\u05d1 <b>\u05d2\u05d3</b> (1)</p></body></html>");
 
-        var texts = BuildDisplayList(document).Commands.OfType<DrawTextCommand>().OrderBy(t => t.X).Select(t => t.Text.Trim()).ToList();
+        var texts = BuildDisplayList(document).Commands.OfType<DrawTextCommand>().OrderBy(t => t.X).Where(t => t.Text.Trim().Length > 0).ToList();
 
         // Right-to-left from the right edge: "אב", then the bold "גד", then "(1)" - so visually,
-        // left to right, the mirrored "(1)" comes first and "אב" last.
-        Assert.Equal(["(1)", "\u05d3\u05d2", "\u05d1\u05d0"], texts.Where(t => t.Length > 0));
+        // left to right, "(1)" comes first and "אב" last. The brackets are right-to-left runs of
+        // their own (mirrored when shaped), around the left-to-right digit.
+        Assert.Equal([")", "1", "(", "\u05d2\u05d3", "\u05d0\u05d1"], texts.Select(t => t.Text.Trim()));
+        Assert.Equal([true, false, true, true, true], texts.Select(t => t.IsRightToLeft));
     }
 
     [Fact]
@@ -9901,9 +10024,10 @@ public sealed class HtmlRendererTests
     {
         var document = await ParseAsync("<html><body><p>ab <span style=\"direction:rtl; unicode-bidi:bidi-override\">xyz</span> cd</p></body></html>");
 
-        var texts = BuildDisplayList(document).Commands.OfType<DrawTextCommand>().Select(t => t.Text.Trim()).ToList();
+        var texts = BuildDisplayList(document).Commands.OfType<DrawTextCommand>().ToList();
 
-        Assert.Contains("zyx", texts);
+        // Overridden to right to left, so shaped (and drawn) as "zyx".
+        Assert.Contains(texts, t => t.Text.Trim() == "xyz" && t.IsRightToLeft);
     }
 
     [Fact]
@@ -9913,7 +10037,10 @@ public sealed class HtmlRendererTests
 
         var text = Assert.Single(BuildDisplayList(document).Commands.OfType<DrawTextCommand>());
 
-        Assert.Equal("(\u05d1) \u05d0", text.Text);
+        // One right-to-left run in logical order; shaping mirrors the brackets
+        // (TextShapingTests.RightToLeftRuns_MirrorBrackets).
+        Assert.Equal("\u05d0 (\u05d1)", text.Text);
+        Assert.True(text.IsRightToLeft);
     }
 
     private static readonly RenderColor FormControlAccentColorForTests = new(26, 115, 232);

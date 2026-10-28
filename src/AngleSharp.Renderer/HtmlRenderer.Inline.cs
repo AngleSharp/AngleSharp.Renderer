@@ -58,6 +58,8 @@ public sealed partial class HtmlRenderer
                 return;
             }
 
+            var outerColumnParagraph = BeginColumnParagraph(run[0]);
+
             if (run.All(static node => node is TextRenderNode) && !floats.HasFloatsBelow(cursorY))
             {
                 // A run of bare text keeps the dedicated paragraph path, which also implements
@@ -91,6 +93,7 @@ public sealed partial class HtmlRenderer
                     paintOrder);
             }
 
+            EndColumnParagraph(outerColumnParagraph);
             run.Clear();
             runHasInlineContent = false;
         }
@@ -124,6 +127,7 @@ public sealed partial class HtmlRenderer
 
             var blockTextIndentConsumed = false;
             var childRangeStart = displayList.Commands.Count;
+            var childTop = cursorY;
 
             LayoutNode(
                 node: child,
@@ -146,6 +150,7 @@ public sealed partial class HtmlRenderer
                 positionedContainingHeight: positionedContainingHeight);
 
             RecordColumnBreakCandidate(cursorY);
+            RecordColumnBlockBreaks(child, childTop, cursorY);
 
             if (IsNegativeZIndexChild(child, context) && !IsStickyElement(child, context))
             {
@@ -353,11 +358,11 @@ public sealed partial class HtmlRenderer
         /// <summary>A preserved tab: a space piece whose width reaches the next tab stop.</summary>
         public bool IsTab { get; init; }
 
-        public InlinePiece WithText(string text, float width) => new()
+        public InlinePiece WithText(string text, float width, RenderTextStyle? style = null) => new()
         {
             Kind = Kind,
             Text = text,
-            Style = Style,
+            Style = style ?? Style,
             StyleId = StyleId,
             Width = width,
             BreakAfter = BreakAfter,
@@ -745,6 +750,8 @@ public sealed partial class HtmlRenderer
         {
             return;
         }
+
+        ApplyShapingContext(pieces, context);
 
         var lineStartIndex = 0;
         var emittedAnyLine = false;
@@ -1326,17 +1333,11 @@ public sealed partial class HtmlRenderer
     }
 
     /// <summary>
-    /// The longest grapheme-cluster prefix of <paramref name="text"/> that fits into <paramref name="width"/>.
+    /// The longest cluster prefix of <paramref name="text"/> that fits into <paramref name="width"/>.
     /// </summary>
     private static string FitTextPrefix(LayoutContext context, string text, float width, RenderTextStyle style)
     {
-        var boundaries = new List<int>();
-        var enumerator = StringInfo.GetTextElementEnumerator(text);
-
-        while (enumerator.MoveNext())
-        {
-            boundaries.Add(enumerator.ElementIndex + ((string)enumerator.Current).Length);
-        }
+        var boundaries = GetClusterEnds(context, text, style);
 
         var low = 0;
         var high = boundaries.Count;
@@ -1491,8 +1492,7 @@ public sealed partial class HtmlRenderer
 
         var lineHeight = Math.Max(maxAbove + maxBelow, edgeAlignedHeight);
         var baselineY = lineTop + maxAbove;
-        RecordColumnContentStart(lineTop);
-        RecordColumnBreakCandidate(lineTop + lineHeight);
+        RecordColumnLine(lineTop, lineTop + lineHeight);
 
         PaintInlineBoxFragments(linePieces, baselineY, displayList);
 
@@ -1513,6 +1513,7 @@ public sealed partial class HtmlRenderer
                 while (runEnd < visualOrder.Count &&
                        visualOrder[runEnd].Kind is InlinePieceKind.Text or InlinePieceKind.Space &&
                        visualOrder[runEnd].StyleId == piece.StyleId &&
+                       visualOrder[runEnd].Style.IsRightToLeftRun == piece.Style.IsRightToLeftRun &&
                        ReferenceEquals(visualOrder[runEnd].Box, piece.Box) &&
                        !(splitAtSpaces && (visualOrder[runEnd].Kind == InlinePieceKind.Space || visualOrder[runEnd - 1].Kind == InlinePieceKind.Space)) &&
                        !visualOrder[runEnd].IsTab && !visualOrder[runEnd - 1].IsTab)
@@ -1538,11 +1539,12 @@ public sealed partial class HtmlRenderer
                     }
                 }
 
+                // A right-to-left run is shaped from its logical text: its pieces in reverse.
                 var run = new StringBuilder();
 
                 for (var runIndex = first; runIndex <= last; runIndex++)
                 {
-                    run.Append(visualOrder[runIndex].Text);
+                    run.Append(visualOrder[piece.Style.IsRightToLeftRun ? first + last - runIndex : runIndex].Text);
                 }
 
                 var text = run.ToString();
@@ -1552,7 +1554,17 @@ public sealed partial class HtmlRenderer
                 {
                     var runX = visualOrder[first].X;
                     var textBaseline = baselineY + piece.Style.VerticalAlignOffset;
-                    DrawStyledText(context, displayList, text, runX, textBaseline, piece.Style);
+
+                    // shaped with the context of its logically first and last pieces
+                    var logicalFirst = visualOrder[piece.Style.IsRightToLeftRun ? last : first];
+                    var logicalLast = visualOrder[piece.Style.IsRightToLeftRun ? first : last];
+                    var runStyle = piece.Style with
+                    {
+                        ShapingContextBefore = logicalFirst.Style.ShapingContextBefore,
+                        ShapingContextAfter = logicalLast.Style.ShapingContextAfter,
+                    };
+
+                    DrawStyledText(context, displayList, text, runX, textBaseline, runStyle);
                 }
 
                 index = runEnd;
@@ -1718,21 +1730,20 @@ public sealed partial class HtmlRenderer
                 var last = Math.Max(order[position], order[end]) - pieceStarts[owner];
                 var fragment = piece.Text.Substring(first, last - first + 1);
 
-                if ((level & 1) == 1)
-                {
-                    fragment = ReverseForDisplay(fragment);
-                }
+                // A right-to-left fragment stays in logical order; shaping reverses and mirrors it.
+                var fragmentIsRightToLeft = (level & 1) == 1;
 
-                if (first == 0 && last == piece.Text.Length - 1 && (level & 1) == 0)
+                if (first == 0 && last == piece.Text.Length - 1 && fragmentIsRightToLeft == piece.Style.IsRightToLeftRun)
                 {
                     result.Add(piece);
                 }
                 else
                 {
+                    var style = piece.Style with { IsRightToLeftRun = fragmentIsRightToLeft };
                     var width = piece.Kind == InlinePieceKind.Space && fragment.Length == piece.Text.Length
                         ? piece.Width
-                        : MeasureTextWidth(context, fragment, piece.Style) + (piece.Kind == InlinePieceKind.Space ? piece.Style.WordSpacing * fragment.Length : 0f);
-                    result.Add(piece.WithText(fragment, width));
+                        : MeasureTextWidth(context, fragment, style) + (piece.Kind == InlinePieceKind.Space ? style.WordSpacing * fragment.Length : 0f);
+                    result.Add(piece.WithText(fragment, width, style));
                 }
             }
             else if (position == end || !result.Contains(piece))
@@ -1748,28 +1759,62 @@ public sealed partial class HtmlRenderer
     }
 
     /// <summary>
-    /// Right-to-left text in visual order: reversed by grapheme cluster (so combining marks and
-    /// surrogate pairs stay intact) and mirrored.
+    /// Gives every text piece that touches another one across an inline box edge (no space or
+    /// anything else between them, e.g. <c>ab&lt;b&gt;cd&lt;/b&gt;</c>) a few characters of its
+    /// neighbours as shaping context, so contextual forms such as Arabic joining continue across
+    /// the element boundary, and measures it again with that context.
     /// </summary>
-    private static string ReverseForDisplay(string text)
+    private static void ApplyShapingContext(List<InlinePiece> pieces, LayoutContext context)
     {
-        var elements = new List<string>();
-        var enumerator = System.Globalization.StringInfo.GetTextElementEnumerator(text);
+        // HarfBuzz looks at no more than a handful of characters of context
+        const int ContextLength = 8;
+        var before = new string?[pieces.Count];
+        var after = new string?[pieces.Count];
+        var previous = -1;
+        var any = false;
 
-        while (enumerator.MoveNext())
+        for (var index = 0; index < pieces.Count; index++)
         {
-            elements.Add(enumerator.GetTextElement());
+            var piece = pieces[index];
+
+            if (piece.Kind is InlinePieceKind.BoxStart or InlinePieceKind.BoxEnd)
+            {
+                continue;
+            }
+
+            if (piece.Kind != InlinePieceKind.Text || piece.Text.Length == 0)
+            {
+                previous = -1;
+                continue;
+            }
+
+            if (previous >= 0 && !ReferenceEquals(pieces[previous].Box, piece.Box))
+            {
+                var previousText = pieces[previous].Text;
+                before[index] = previousText[Math.Max(0, previousText.Length - ContextLength)..];
+                after[previous] = piece.Text[..Math.Min(piece.Text.Length, ContextLength)];
+                any = true;
+            }
+
+            previous = index;
         }
 
-        var builder = new StringBuilder(text.Length);
-
-        for (var index = elements.Count - 1; index >= 0; index--)
+        if (!any)
         {
-            var element = elements[index];
-            builder.Append(element.Length == 1 ? BidiAlgorithm.Mirror(element[0]) : element);
+            return;
         }
 
-        return builder.ToString();
+        for (var index = 0; index < pieces.Count; index++)
+        {
+            if (before[index] is null && after[index] is null)
+            {
+                continue;
+            }
+
+            var piece = pieces[index];
+            var style = piece.Style with { ShapingContextBefore = before[index], ShapingContextAfter = after[index] };
+            pieces[index] = piece.WithText(piece.Text, MeasureTextWidth(context, piece.Text, style), style);
+        }
     }
 
     /// <summary>
@@ -1983,6 +2028,10 @@ public sealed partial class HtmlRenderer
         var previous = s_layoutCapture.Value;
         s_layoutCapture.Value = capture;
 
+        // a trial is laid out elsewhere, so its lines are no column break candidates
+        var previousColumnBreaks = s_columnBreakCapture.Value;
+        s_columnBreakCapture.Value = null;
+
         // a trial must not use up the lines of a clamped box it is measured in
         var lineClamp = context.LineClampScopes.TryPeek(out var scope) ? scope : null;
 
@@ -2026,6 +2075,7 @@ public sealed partial class HtmlRenderer
         finally
         {
             s_layoutCapture.Value = previous;
+            s_columnBreakCapture.Value = previousColumnBreaks;
 
             context.StickyFlows.Pop();
 

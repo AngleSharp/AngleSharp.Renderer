@@ -401,6 +401,113 @@ public sealed class TableLayoutTests
         Assert.Equal(40f, SingleFill(displayList, Yellow).Rect.Y);
     }
 
+    [Fact]
+    public async Task StrayTableCells_FormOneRowOfAnAnonymousTable()
+    {
+        var displayList = await LayoutAsync("""
+            <div style="display:table-cell; width:20px; height:10px; background-color:#ff0000"></div>
+            <div style="display:table-cell; width:30px; height:15px; background-color:#00ff00"></div>
+            <div style="height:5px; background-color:#0000ff"></div>
+            """);
+
+        // The anonymous table has the initial `border-spacing: 0`; cells stretch to the row.
+        Assert.Equal(new RenderRect(0f, 0f, 20f, 15f), SingleFill(displayList, Red).Rect);
+        Assert.Equal(new RenderRect(20f, 0f, 30f, 15f), SingleFill(displayList, Green).Rect);
+        Assert.Equal(15f, SingleFill(displayList, Blue).Rect.Y);
+    }
+
+    [Fact]
+    public async Task StrayTableRows_AreWrappedInAnAnonymousTableThatInheritsTableProperties()
+    {
+        var displayList = await LayoutAsync("""
+            <div style="border-spacing:5px">
+              <div style="display:table-row"><span style="display:table-cell; width:10px; height:10px; background-color:#ff0000"></span></div>
+              <div style="display:table-row"><span style="display:table-cell; width:10px; height:10px; background-color:#00ff00"></span></div>
+            </div>
+            """);
+
+        Assert.Equal(new RenderRect(5f, 5f, 10f, 10f), SingleFill(displayList, Red).Rect);
+        Assert.Equal(new RenderRect(5f, 20f, 10f, 10f), SingleFill(displayList, Green).Rect);
+    }
+
+    [Fact]
+    public async Task TextDirectlyInsideATable_IsWrappedInAnAnonymousRowAndCell()
+    {
+        var displayList = await LayoutAsync("""
+            <div style="display:table; border-spacing:0">
+              Hello
+              <div style="display:table-row"><div style="display:table-cell">World</div></div>
+            </div>
+            """);
+
+        var hello = SingleText(displayList, "Hello");
+        var world = SingleText(displayList, "World");
+
+        Assert.Equal(hello.X, world.X, precision: 2);
+        Assert.True(world.Y > hello.Y);
+    }
+
+    [Fact]
+    public async Task ContentInsideATableRow_IsWrappedInAnAnonymousCell()
+    {
+        var displayList = await LayoutAsync("""
+            <div style="display:table; border-spacing:0">
+              <div style="display:table-row">
+                <div style="display:table-cell; width:20px; height:10px; background-color:#ff0000"></div>
+                <span>tail</span>
+              </div>
+            </div>
+            """);
+
+        Assert.Equal(20f, SingleText(displayList, "tail").X, precision: 2);
+    }
+
+    [Fact]
+    public async Task WhiteSpaceBetweenStrayCells_DoesNotBreakTheRow()
+    {
+        var displayList = await LayoutAsync("""
+            <div>
+              before
+              <span style="display:table-cell; background-color:#ff0000">a</span>
+              <span style="display:table-cell; background-color:#00ff00">b</span>
+              after
+            </div>
+            """);
+
+        Assert.Equal(SingleFill(displayList, Red).Rect.Y, SingleFill(displayList, Green).Rect.Y);
+        Assert.True(SingleFill(displayList, Green).Rect.X > SingleFill(displayList, Red).Rect.X);
+        Assert.Single(displayList.Commands.OfType<DrawTextCommand>(), text => text.Text.Contains("before"));
+        Assert.Single(displayList.Commands.OfType<DrawTextCommand>(), text => text.Text.Contains("after"));
+    }
+
+    [Fact]
+    public async Task PercentageTableHeight_ResolvesAgainstADefiniteContainingBlockHeight()
+    {
+        var displayList = await LayoutAsync("""
+            <div style="height:200px">
+              <table style="height:50%; border-spacing:0; background-color:#ffff00">
+                <tr><td style="padding:0; width:10px; height:10px"></td></tr>
+              </table>
+            </div>
+            """);
+
+        Assert.Equal(100f, SingleFill(displayList, Yellow).Rect.Height);
+    }
+
+    [Fact]
+    public async Task PercentageTableHeight_IsAutoWithoutADefiniteContainingBlockHeight()
+    {
+        var displayList = await LayoutAsync("""
+            <div>
+              <table style="height:50%; border-spacing:0; background-color:#ffff00">
+                <tr><td style="padding:0; width:10px; height:10px"></td></tr>
+              </table>
+            </div>
+            """);
+
+        Assert.Equal(10f, SingleFill(displayList, Yellow).Rect.Height);
+    }
+
     private static async Task<DisplayList> LayoutAsync(string bodyHtml)
     {
         var context = BrowsingContext.New(Configuration.Default.WithCss());

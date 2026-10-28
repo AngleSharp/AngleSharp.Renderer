@@ -19,6 +19,14 @@ public sealed class SkiaTextMeasurer : ITextMeasurer
     [ThreadStatic]
     private static Dictionary<RenderFont, SKPaint>? t_paints;
 
+    // Shaping a word is far costlier than looking it up, and layout measures the same words over
+    // and over (every trial layout of an inline-block measures its content again). A width only
+    // depends on the text and the font, so it is cached per thread, cleared when it gets large.
+    private const int MaxCachedWidths = 16384;
+
+    [ThreadStatic]
+    private static Dictionary<(string Text, RenderFont Font), float>? t_widths;
+
     /// <inheritdoc />
     public float MeasureWidth(string text, RenderFont font)
     {
@@ -27,8 +35,26 @@ public sealed class SkiaTextMeasurer : ITextMeasurer
             return 0f;
         }
 
-        return SkiaTextShaping.MeasureTextWidth(GetPaint(font), text, font.LetterSpacing, font);
+        var widths = t_widths ??= [];
+
+        if (widths.TryGetValue((text, font), out var width))
+        {
+            return width;
+        }
+
+        if (widths.Count >= MaxCachedWidths)
+        {
+            widths.Clear();
+        }
+
+        width = SkiaTextShaping.MeasureTextWidth(GetPaint(font), text, font.LetterSpacing, font);
+        widths[(text, font)] = width;
+        return width;
     }
+
+    /// <inheritdoc />
+    public IReadOnlyList<int> GetClusterBoundaries(string text, RenderFont font) =>
+        string.IsNullOrEmpty(text) ? [0] : SkiaTextShaping.GetClusterBoundaries(GetPaint(font), text, font);
 
     private static SKPaint GetPaint(RenderFont font)
     {

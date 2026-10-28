@@ -73,7 +73,9 @@ internal readonly record struct SvgPaintState(
     float FontWeight,
     bool IsItalic,
     SvgTextAnchor TextAnchor,
-    SKColor CurrentColor)
+    SKColor CurrentColor,
+    bool IsRightToLeft = false,
+    string? Language = null)
 {
     public static SvgPaintState Initial { get; } = new(
         Fill: SvgPaintValue.FromColor(SKColors.Black),
@@ -96,7 +98,32 @@ internal readonly record struct SvgPaintState(
     /// SVG-internal &lt;style&gt; rules, then an inline `style` attribute.
     /// </summary>
     public SvgPaintState Resolve(IElement element, SvgRenderContext context, SvgViewport viewport) =>
-        ResolveDeclarations(ReadDeclarations(element, context), viewport);
+        ResolveDeclarations(ReadDeclarations(element, context), viewport) with { Language = ResolveLanguage(element, Language) };
+
+    /// <summary>
+    /// The language of the element's text (shaping takes it into account): its own <c>lang</c>
+    /// or <c>xml:lang</c>, else the inherited one, else that of the nearest ancestor that has one,
+    /// which reaches into the host page for an inline SVG.
+    /// </summary>
+    private static string? ResolveLanguage(IElement element, string? inherited)
+    {
+        for (var current = element; current is not null; current = current.ParentElement)
+        {
+            var language = current.GetAttribute("lang") ?? current.GetAttribute("xml:lang");
+
+            if (!string.IsNullOrWhiteSpace(language))
+            {
+                return language.Trim();
+            }
+
+            if (inherited is not null)
+            {
+                return inherited;
+            }
+        }
+
+        return null;
+    }
 
     /// <summary>
     /// Layers <paramref name="declarations"/> (property name to value) over this inherited state -
@@ -195,7 +222,12 @@ internal readonly record struct SvgPaintState(
             };
         }
 
-        return new SvgPaintState(fill, fillOpacity, stroke, strokeOpacity, strokeWidth, opacity, fillRule, fontFamily, fontSize, fontWeight, isItalic, textAnchor, currentColor);
+        // `direction` sets the paragraph direction of text (and what `start`/`end` anchors mean)
+        var isRightToLeft = TryGetDeclaration(declarations, "direction", out var directionValue)
+            ? string.Equals(directionValue.Trim(), "rtl", StringComparison.OrdinalIgnoreCase)
+            : IsRightToLeft;
+
+        return new SvgPaintState(fill, fillOpacity, stroke, strokeOpacity, strokeWidth, opacity, fillRule, fontFamily, fontSize, fontWeight, isItalic, textAnchor, currentColor, isRightToLeft, Language);
     }
 
     public SKPaint? CreateFillPaint(SKRect bounds, SvgRenderContext context, SvgViewport viewport) =>
@@ -330,7 +362,7 @@ internal readonly record struct SvgPaintState(
     public static readonly string[] PresentationProperties =
     [
         "fill", "stroke", "fill-opacity", "stroke-opacity", "stroke-width", "opacity", "fill-rule",
-        "font-family", "font-size", "font-weight", "font-style", "text-anchor", "color",
+        "font-family", "font-size", "font-weight", "font-style", "text-anchor", "color", "direction",
     ];
 
     private static Dictionary<string, string> ReadDeclarations(IElement element, SvgRenderContext context)

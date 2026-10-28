@@ -2,8 +2,10 @@ namespace AngleSharp.Renderer;
 
 using System.Globalization;
 using System.Linq;
+using System.Runtime.CompilerServices;
 
 using AngleSharp.Css.Dom;
+using AngleSharp.Css.Parser;
 using AngleSharp.Css.RenderTree;
 using AngleSharp.Dom;
 using AngleSharp.Renderer.Rendering;
@@ -84,6 +86,187 @@ public sealed partial class HtmlRenderer
         public required int ColumnCount { get; init; }
 
         public required bool CollapseBorders { get; init; }
+    }
+
+    /// <summary>
+    /// The detached elements standing in for anonymous table boxes, so hit testing can skip them.
+    /// </summary>
+    private static readonly ConditionalWeakTable<IElement, object> s_anonymousTableBoxes = new();
+
+    private static bool IsAnonymousTableBox(IElement element) => s_anonymousTableBoxes.TryGetValue(element, out _);
+
+    private static string GetTableRole(IRenderNode node) =>
+        node is ElementRenderNode element ? element.ComputedStyle.GetDisplay()?.Trim().ToLowerInvariant() ?? string.Empty : string.Empty;
+
+    private static bool IsRowGroupRole(string role) => role is "table-row-group" or "table-header-group" or "table-footer-group";
+
+    /// <summary>The children a table box takes as they are (CSS 2.1 §17.2.1, "proper table child").</summary>
+    private static bool IsProperTableChildRole(string role) =>
+        role is "table-row" or "table-caption" or "table-column" or "table-column-group" || IsRowGroupRole(role);
+
+    /// <summary>
+    /// Nodes that never generate a box of their own: collapsible white space and
+    /// <c>display: none</c> elements. They neither start nor break a run of table parts.
+    /// </summary>
+    private static bool IsTableNeutral(IRenderNode node) => node switch
+    {
+        TextRenderNode text => NormalizeWhitespace(text.Ref.Data).Length == 0,
+        ElementRenderNode => !GeneratesBoxes(node),
+        _ => false,
+    };
+
+    /// <summary>
+    /// Generates the anonymous table objects of CSS 2.1 §17.2.1 in the render tree, so that the
+    /// table layout only ever sees well-formed tables: content of a table or row group that is
+    /// not a row is wrapped in an anonymous row, content of a row that is not a cell in an
+    /// anonymous cell, consecutive cells outside a row in an anonymous row, and consecutive rows,
+    /// row groups, captions and columns outside a table in an anonymous table. White space between
+    /// table parts is dropped. An anonymous box is a detached element whose computed style holds
+    /// its <c>display</c> plus the inherited properties of its parent, so everything else is its
+    /// initial value. Runs once per render, before anything reads the tree; a second pass would
+    /// find nothing left to wrap.
+    /// </summary>
+    private static void BuildAnonymousTableBoxes(IRenderNode node)
+    {
+        if (node is ElementRenderNode element && element.Children is List<IRenderNode> children &&
+            element.Ref is not IPseudoElement && GeneratesBoxes(element) && !IsReplacedElement(element.Ref))
+        {
+            var role = GetTableRole(element);
+
+            switch (role)
+            {
+                case "table" or "inline-table":
+                    WrapMissingChildren(element, children, child => !IsProperTableChildRole(GetTableRole(child)), "table-row");
+                    break;
+                case "table-row-group" or "table-header-group" or "table-footer-group":
+                    WrapMissingChildren(element, children, child => GetTableRole(child) != "table-row", "table-row");
+                    break;
+                case "table-row":
+                    WrapMissingChildren(element, children, child => GetTableRole(child) != "table-cell", "table-cell");
+                    break;
+                case "table-column" or "table-column-group":
+                    break;
+                default:
+                    WrapMissingParents(element, children, child => GetTableRole(child) == "table-cell", "table-row");
+                    WrapMissingParents(element, children, child => IsProperTableChildRole(GetTableRole(child)), role is "inline" ? "inline-table" : "table");
+                    break;
+            }
+        }
+
+        foreach (var child in node.Children)
+        {
+            BuildAnonymousTableBoxes(child);
+        }
+    }
+
+    /// <summary>
+    /// Wraps every run of children matching <paramref name="isMisplaced"/> into an anonymous box.
+    /// A run that would generate nothing (white space, <c>display: none</c>) is not wrapped and
+    /// its white space is dropped.
+    /// </summary>
+    private static void WrapMissingChildren(ElementRenderNode parent, List<IRenderNode> children, Func<IRenderNode, bool> isMisplaced, string display)
+    {
+        var result = new List<IRenderNode>(children.Count);
+        var run = new List<IRenderNode>();
+
+        void Flush()
+        {
+            if (run.All(IsTableNeutral))
+            {
+                result.AddRange(run.Where(node => node is not TextRenderNode));
+            }
+            else
+            {
+                result.Add(CreateAnonymousTableBox(parent, display, run));
+            }
+
+            run = [];
+        }
+
+        foreach (var child in children)
+        {
+            if (isMisplaced(child))
+            {
+                run.Add(child);
+                continue;
+            }
+
+            Flush();
+            result.Add(child);
+        }
+
+        Flush();
+        children.Clear();
+        children.AddRange(result);
+    }
+
+    /// <summary>
+    /// Wraps every run of consecutive children matching <paramref name="isOrphan"/> into an
+    /// anonymous box. White space and <c>display: none</c> elements between them belong to the run
+    /// (the white space is dropped); those before the first and after the last stay outside.
+    /// </summary>
+    private static void WrapMissingParents(ElementRenderNode parent, List<IRenderNode> children, Func<IRenderNode, bool> isOrphan, string display)
+    {
+        if (!children.Any(isOrphan))
+        {
+            return;
+        }
+
+        var result = new List<IRenderNode>(children.Count);
+        var index = 0;
+
+        while (index < children.Count)
+        {
+            if (!isOrphan(children[index]))
+            {
+                result.Add(children[index++]);
+                continue;
+            }
+
+            var run = new List<IRenderNode>();
+            var end = index;
+
+            for (var next = index; next < children.Count && (isOrphan(children[next]) || IsTableNeutral(children[next])); next++)
+            {
+                if (isOrphan(children[next]))
+                {
+                    end = next;
+                }
+            }
+
+            for (var member = index; member <= end; member++)
+            {
+                if (children[member] is not TextRenderNode)
+                {
+                    run.Add(children[member]);
+                }
+            }
+
+            result.Add(CreateAnonymousTableBox(parent, display, run));
+            index = end + 1;
+        }
+
+        children.Clear();
+        children.AddRange(result);
+    }
+
+    private static ElementRenderNode CreateAnonymousTableBox(ElementRenderNode parent, string display, List<IRenderNode> children)
+    {
+        var document = parent.Ref.Owner!;
+        var element = document.CreateElement("div");
+        var style = new CssParser(new CssParserOptions(), document.Context).ParseDeclaration(string.Empty)!;
+
+        foreach (var property in parent.ComputedStyle)
+        {
+            if (property.CanBeInherited && !string.IsNullOrEmpty(property.Value))
+            {
+                style.SetProperty(property.Name, property.Value);
+            }
+        }
+
+        style.SetProperty("display", display);
+        s_anonymousTableBoxes.AddOrUpdate(element, display);
+        return new ElementRenderNode(element, parent, children, style, style);
     }
 
     private static bool HasDisplay(ElementRenderNode node, string display) =>
@@ -740,7 +923,8 @@ public sealed partial class HtmlRenderer
         float positionedContainingY,
         float positionedContainingWidth,
         float positionedContainingHeight,
-        float forcedBorderBoxWidth)
+        float forcedBorderBoxWidth,
+        float containingHeight = float.NaN)
     {
         var structure = GetTableStructure(tableNode, context);
         var styleMap = GetOrCreateStyleMap(context, tableNode.Ref, tableNode.ComputedStyle);
@@ -910,11 +1094,10 @@ public sealed partial class HtmlRenderer
         var cellHeights = new float[cellCount];
         var cellBaselines = new float[cellCount];
 
-        // Percentage row and cell heights refer to the table's height, and count for nothing
-        // while that is not definite.
-        var definiteTableHeight = styleMap.TryGetValue("height", out var tableHeight) && TryParsePercentage(tableHeight, out _)
-            ? float.NaN
-            : ResolveAuthoredDimension(styleMap, "height", flowWidth, float.NaN, verticalExtras);
+        // A percentage table height refers to the containing block's height (and is `auto` while
+        // that is not definite); percentage row and cell heights refer to the table's height, and
+        // count for nothing while that is not definite.
+        var definiteTableHeight = ResolveAuthoredDimension(styleMap, "height", containingHeight, float.NaN, verticalExtras);
         var percentageHeightBase = float.IsNaN(definiteTableHeight) ? 0f : definiteTableHeight;
 
         for (var row = 0; row < rowCount; row++)

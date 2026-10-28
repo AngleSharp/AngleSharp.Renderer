@@ -20,6 +20,9 @@ public sealed partial class SkiaRenderBackend : IRenderBackend, ITextMeasurer
     public float MeasureWidth(string text, RenderFont font) => _textMeasurer.MeasureWidth(text, font);
 
     /// <inheritdoc />
+    public IReadOnlyList<int> GetClusterBoundaries(string text, RenderFont font) => _textMeasurer.GetClusterBoundaries(text, font);
+
+    /// <inheritdoc />
     public RenderedImage RenderToPng(DisplayList displayList, RenderViewport viewport)
     {
         ArgumentNullException.ThrowIfNull(displayList);
@@ -1010,7 +1013,12 @@ public sealed partial class SkiaRenderBackend : IRenderBackend, ITextMeasurer
             command.IsItalic,
             command.LetterSpacing,
             fonts,
-            command.FontStretch);
+            command.FontStretch,
+            command.IsRightToLeft,
+            command.FontFeatures,
+            command.Language,
+            command.ContextBefore,
+            command.ContextAfter);
 
         using var paint = SkiaTextShaping.CreateTextPaint(font);
         paint.Color = ToSkColor(command.Color);
@@ -1052,7 +1060,12 @@ public sealed partial class SkiaRenderBackend : IRenderBackend, ITextMeasurer
             command.IsItalic,
             command.LetterSpacing,
             fonts,
-            command.FontStretch);
+            command.FontStretch,
+            command.IsRightToLeft,
+            command.FontFeatures,
+            command.Language,
+            command.ContextBefore,
+            command.ContextAfter);
 
         using var paint = SkiaTextShaping.CreateTextPaint(font);
         paint.Color = ToSkColor(command.Color);

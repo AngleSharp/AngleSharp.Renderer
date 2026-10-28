@@ -61,6 +61,10 @@ Inline content is laid out in line boxes, so nested inline elements keep their o
 Generic font families like `serif`, `sans-serif`, and `monospace` always map to fonts bundled with the renderer, so they render the same on every machine.
 Named families resolve only when installed on the host (or declared via `@font-face`), so prefer generic families when you need predictable output in visual tests.
 
+Text is shaped with HarfBuzz, so kerning and ligatures (`fi`, `fl`) apply, Arabic letters join, and complex scripts such as Devanagari form their conjuncts.
+`font-feature-settings`, `font-kerning`, `font-variant-ligatures` and `font-variant-numeric` select the OpenType features of the font; a non-zero `letter-spacing` turns optional ligatures off.
+The bundled fonts cover Latin, Greek, Cyrillic, Hebrew and Arabic (DejaVu) and Devanagari (Noto Sans Devanagari, used only as a fallback); other scripts need an installed font or an `@font-face` that covers them.
+
 ## Visual Testing
 
 The test suite uses PNG snapshots under `verification-assets/`. Missing baselines are created automatically unless strict mode is enabled with `ANGLESHARP_SNAPSHOT_STRICT=1`.

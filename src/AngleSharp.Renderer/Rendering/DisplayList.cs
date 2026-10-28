@@ -296,12 +296,17 @@ public sealed class DisplayList
         RenderColor? decorationColor = null,
         RenderTextDecorationStyle decorationStyle = RenderTextDecorationStyle.Solid,
         float letterSpacing = 0f,
-        float fontStretch = 100f)
+        float fontStretch = 100f,
+        bool isRightToLeft = false,
+        string? fontFeatures = null,
+        string? language = null,
+        string? contextBefore = null,
+        string? contextAfter = null)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(text);
         ArgumentException.ThrowIfNullOrWhiteSpace(fontFamily);
 
-        Add(new DrawTextCommand(text, x, y, color, fontSize, fontFamily, fontWeight, isItalic, underline, strikeThrough, decorationColor ?? color, decorationStyle, letterSpacing, fontStretch));
+        Add(new DrawTextCommand(text, x, y, color, fontSize, fontFamily, fontWeight, isItalic, underline, strikeThrough, decorationColor ?? color, decorationStyle, letterSpacing, fontStretch, isRightToLeft, fontFeatures, language, contextBefore, contextAfter));
     }
 
     /// <summary>
@@ -318,12 +323,17 @@ public sealed class DisplayList
         bool isItalic,
         float blurRadius,
         float letterSpacing,
-        float fontStretch = 100f)
+        float fontStretch = 100f,
+        bool isRightToLeft = false,
+        string? fontFeatures = null,
+        string? language = null,
+        string? contextBefore = null,
+        string? contextAfter = null)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(text);
         ArgumentException.ThrowIfNullOrWhiteSpace(fontFamily);
 
-        Add(new DrawTextShadowCommand(text, x, y, color, fontSize, fontFamily, fontWeight, isItalic, blurRadius, letterSpacing, fontStretch));
+        Add(new DrawTextShadowCommand(text, x, y, color, fontSize, fontFamily, fontWeight, isItalic, blurRadius, letterSpacing, fontStretch, isRightToLeft, fontFeatures, language, contextBefore, contextAfter));
     }
 }
 
@@ -452,7 +462,9 @@ public sealed record PushBlendModeCommand(RenderBlendMode Mode) : RenderCommand;
 public sealed record PopBlendModeCommand : RenderCommand;
 
 /// <summary>
-/// Draws a single line of text at a baseline position.
+/// Draws a single line of text at a baseline position. The text is shaped (see
+/// <see cref="RenderFont"/> for <c>IsRightToLeft</c> and <c>FontFeatures</c>) exactly as it was
+/// measured during layout.
 /// </summary>
 public sealed record DrawTextCommand(
     string Text,
@@ -468,7 +480,12 @@ public sealed record DrawTextCommand(
     RenderColor DecorationColor,
     RenderTextDecorationStyle DecorationStyle,
     float LetterSpacing,
-    float FontStretch = 100f) : RenderCommand
+    float FontStretch = 100f,
+    bool IsRightToLeft = false,
+    string? FontFeatures = null,
+    string? Language = null,
+    string? ContextBefore = null,
+    string? ContextAfter = null) : RenderCommand
 {
     /// <summary>
     /// Indicates whether the command should be rendered with a bold typeface.
@@ -492,7 +509,12 @@ public sealed record DrawTextShadowCommand(
     bool IsItalic,
     float BlurRadius,
     float LetterSpacing,
-    float FontStretch = 100f) : RenderCommand
+    float FontStretch = 100f,
+    bool IsRightToLeft = false,
+    string? FontFeatures = null,
+    string? Language = null,
+    string? ContextBefore = null,
+    string? ContextAfter = null) : RenderCommand
 {
     /// <summary>
     /// Indicates whether the command should be rendered with a bold typeface.

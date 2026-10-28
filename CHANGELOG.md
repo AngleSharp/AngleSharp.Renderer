@@ -13,6 +13,19 @@ Released on Friday, October 30 2026.
 - Added `writing-mode` on flex, grid and table containers: a container whose writing mode differs from its parent's lays out its items along its own axes (e.g. a `vertical-rl` flex container runs its main axis downwards)
 - Added nested writing modes in the same orientation: a `vertical-lr` element in `vertical-rl` content (or the reverse) stacks its blocks in its own direction
 - Added `position: sticky` inside orthogonal flows (e.g. in a `vertical-rl` box), which used to stay static
+- Added anonymous table objects: stray `display: table-cell` boxes (e.g. `<div style="display:table-cell">` used for layout) form a row of an anonymous table, rows outside a table get one, and text or other content directly inside a table or row is wrapped in an anonymous row or cell instead of being dropped
+- Added percentage table heights (e.g. `table { height: 50% }`), resolved against a definite containing block height
+- Added `column-span: all` in multi-column containers: the spanner is laid out across all columns, and the content on each side of it is balanced separately
+- Added text shaping with HarfBuzz (via `SkiaSharp.HarfBuzz`): kerning and ligatures (e.g. `fi`, `fl`), Arabic joining and complex scripts such as Devanagari, measured and painted from the same shaped glyphs, so line breaking, alignment and table widths use the shaped advances
+- Added `font-feature-settings`, `font-kerning`, `font-variant-ligatures` and `font-variant-numeric` (e.g. `font-feature-settings: "liga" 0` turns ligatures off, `tabular-nums` selects tabular figures); a non-zero `letter-spacing` turns optional ligatures off
+- Added Noto Sans Devanagari as a bundled fallback font (its OFL license is included in the package), so Devanagari renders without an installed font
+- Changed right-to-left text in the display list: `DrawTextCommand.Text` is now in logical order with `IsRightToLeft` set, and shaping reverses and mirrors it (it used to be reversed and mirrored by layout)
+- Changed `text-overflow: ellipsis` to cut at glyph clusters (`ITextMeasurer.GetClusterBoundaries`, which defaults to grapheme clusters for custom measurers), so it never splits a ligature or conjunct
+- Improved SVG `text`/`tspan`, which is shaped the same way as HTML text, reordered by the bidi algorithm with `direction` as its paragraph direction (which also decides where `text-anchor: start` and `end` are), and in its `lang`
+- Added `lang` to text shaping, so fonts with language-specific forms use them (e.g. the Marathi forms of Noto Sans Devanagari for `lang="mr"`)
+- Added joining across element boundaries: an Arabic word split by an inline element (e.g. one letter in `<b>`) keeps its joined forms
+- Changed Canvas 2D `fillText` to use the context's `font` (family, size, weight, style) with the same fonts, shaping and bidi reordering as HTML text instead of the host's default typeface
+- Added fragmentation in multi-column containers: `break-before`/`break-after` (`column` forces a new column, `avoid`), `break-inside: avoid`, `orphans`/`widows` (lines of a paragraph are no longer left alone at the top or bottom of a column), `column-fill: auto|balance` with a definite height (balanced by default), and blocks without lines splitting across columns
 
 # 0.8.2
 

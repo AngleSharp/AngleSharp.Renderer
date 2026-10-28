@@ -199,6 +199,12 @@ public sealed partial class HtmlRenderer
 
         foreach (var (element, elementMetrics) in metrics)
         {
+            // Anonymous table boxes are not part of the document, so they are never hit.
+            if (IsAnonymousTableBox(element))
+            {
+                continue;
+            }
+
             result[element] = context.StyleMapCache.TryGetValue(element, out var styleMap)
                 ? elementMetrics with { Layer = ResolveHitTestLayer(element, styleMap, context) }
                 : elementMetrics;
@@ -499,6 +505,7 @@ public sealed partial class HtmlRenderer
         PrepareDocumentForRendering(document);
 
         var renderTree = window.Render(renderDevice);
+        BuildAnonymousTableBoxes(renderTree);
         CollectSpecifiedStyles(renderTree, context);
         ResolveWritingModeSystems(renderTree, WritingModeKind.HorizontalTb, context);
 
@@ -802,7 +809,7 @@ public sealed partial class HtmlRenderer
             (string.Equals(display, "table", StringComparison.OrdinalIgnoreCase) ||
              string.Equals(display, "inline-table", StringComparison.OrdinalIgnoreCase)))
         {
-            LayoutTable(node, containingX, containingWidth, ref cursorY, ref previousBlockMarginBottom, ref suppressNextBlockTopMargin, floats, inheritedTextStyle, context, displayList, maxY, positionedContainingX, positionedContainingY, positionedContainingWidth, positionedContainingHeight, forcedBorderBoxWidth);
+            LayoutTable(node, containingX, containingWidth, ref cursorY, ref previousBlockMarginBottom, ref suppressNextBlockTopMargin, floats, inheritedTextStyle, context, displayList, maxY, positionedContainingX, positionedContainingY, positionedContainingWidth, positionedContainingHeight, forcedBorderBoxWidth, containingHeight);
             return;
         }
 
@@ -4133,9 +4140,8 @@ public sealed partial class HtmlRenderer
         for (var index = 0; index < lines.Count; index++)
         {
             var line = lines[index];
-            RecordColumnContentStart(cursorY);
+            RecordColumnLine(cursorY, cursorY + lineHeight);
             cursorY += lineHeight;
-            RecordColumnBreakCandidate(cursorY);
 
             if (cursorY > maxY)
             {
@@ -4184,14 +4190,16 @@ public sealed partial class HtmlRenderer
             {
                 var runX = lineX;
 
-                foreach (var run in GetVisualRuns(line, textStyle.Direction == TextDirection.Rtl))
+                foreach (var (run, isRightToLeft) in BidiAlgorithm.GetVisualRuns(line, textStyle.Direction == TextDirection.Rtl))
                 {
+                    var runStyle = textStyle with { IsRightToLeftRun = isRightToLeft };
+
                     if (!string.IsNullOrWhiteSpace(run))
                     {
-                        DrawStyledText(context, displayList, run, runX, baselineY, textStyle);
+                        DrawStyledText(context, displayList, run, runX, baselineY, runStyle);
                     }
 
-                    runX += MeasureTextWidth(context, run, textStyle) + (CountSpaces(run) * textStyle.WordSpacing);
+                    runX += MeasureTextWidth(context, run, runStyle) + (CountSpaces(run) * textStyle.WordSpacing);
                 }
 
                 continue;
@@ -4234,37 +4242,6 @@ public sealed partial class HtmlRenderer
         }
 
         return count;
-    }
-
-    /// <summary>
-    /// One line of text as runs in visual order (UAX #9): each run is a maximal stretch at one
-    /// embedding level, right-to-left runs already reversed and mirrored.
-    /// </summary>
-    private static List<string> GetVisualRuns(string line, bool isRightToLeft)
-    {
-        var levels = BidiAlgorithm.GetLevels(line, isRightToLeft);
-        var order = BidiAlgorithm.GetVisualOrder(levels);
-        var runs = new List<string>();
-        var position = 0;
-
-        while (position < order.Length)
-        {
-            var level = levels[order[position]];
-            var end = position;
-
-            while (end + 1 < order.Length && levels[order[end + 1]] == level && Math.Abs(order[end + 1] - order[end]) == 1)
-            {
-                end++;
-            }
-
-            var first = Math.Min(order[position], order[end]);
-            var last = Math.Max(order[position], order[end]);
-            var run = new string(line.AsSpan(first, last - first + 1).ToArray().Where(static c => !BidiAlgorithm.IsFormattingCharacter(c)).ToArray());
-            runs.Add((level & 1) == 1 ? ReverseForDisplay(run) : run);
-            position = end + 1;
-        }
-
-        return runs;
     }
 
     /// <summary>
@@ -4796,13 +4773,19 @@ public sealed partial class HtmlRenderer
         var tabSize = ParseTabSize(styleMap, fontSize, inherited.TabSize, inherited.TabSizeIsLength, out var tabSizeIsLength);
         var variantCaps = ParseFontVariantCaps(styleMap, inherited.VariantCaps);
         var fontStretch = ParseFontStretch(styleMap, inherited.FontStretch);
+        var featureProperties = ParseFontFeatureProperties(styleMap, inherited.FeatureProperties);
+        var fontFeatures = featureProperties == inherited.FeatureProperties ? inherited.FontFeatures : ResolveFontFeatures(featureProperties);
+        var language = styleMap.TryGetValue("lang", out var languageValue) && !string.IsNullOrWhiteSpace(languageValue) ? languageValue.Trim() : inherited.Language;
 
         return new RenderTextStyle(fontSize, color, fontFamily, lineHeight, fontWeight, isItalic, underline, strikeThrough, decorationColor, decorationStyle, textAlign, letterSpacing, textIndent, verticalAlignOffset, textShadows, whiteSpace, wordBreak, overflowWrap, textOverflow, lineClamp, direction, textTransform, wordSpacing, textAlignLast, hyphens, tabSize, tabSizeIsLength, variantCaps, fontStretch,
             IsHidden: ResolveIsHidden(styleMap, inherited.IsHidden),
             WritingMode: ParseWritingMode(styleMap.GetValueOrDefault("writing-mode"), inherited.WritingMode),
             TextOrientation: ParseTextOrientation(styleMap.GetValueOrDefault("text-orientation"), inherited.TextOrientation),
             // The system text is laid out in only changes at an orthogonal flow (LayoutElement).
-            FlowMode: inherited.FlowMode);
+            FlowMode: inherited.FlowMode,
+            FeatureProperties: featureProperties,
+            FontFeatures: fontFeatures,
+            Language: language);
     }
 
     /// <summary>
@@ -5736,6 +5719,7 @@ public sealed partial class HtmlRenderer
             AddIfPresent(map, "column-rule-width", style.GetPropertyValue("column-rule-width"));
             AddIfPresent(map, "column-rule-style", style.GetPropertyValue("column-rule-style"));
             AddIfPresent(map, "column-rule-color", style.GetPropertyValue("column-rule-color"));
+            AddIfPresent(map, "column-fill", style.GetPropertyValue("column-fill"));
 
             if (!isGridContainer && !isFlexContainer)
             {
@@ -5792,6 +5776,16 @@ public sealed partial class HtmlRenderer
         AddIfPresent(map, "hyphens", style.GetPropertyValue("hyphens"));
         AddIfPresent(map, "tab-size", style.GetPropertyValue("tab-size"));
         AddIfPresent(map, "font-variant-caps", style.GetPropertyValue("font-variant-caps"));
+        AddIfPresent(map, "font-feature-settings", style.GetPropertyValue("font-feature-settings"));
+        AddIfPresent(map, "font-kerning", style.GetPropertyValue("font-kerning"));
+        AddIfPresent(map, "font-variant-ligatures", style.GetPropertyValue("font-variant-ligatures"));
+        AddIfPresent(map, "font-variant-numeric", style.GetPropertyValue("font-variant-numeric"));
+        AddIfPresent(map, "font-variant-east-asian", style.GetPropertyValue("font-variant-east-asian"));
+
+        // The element's language (`lang`, element semantics rather than CSS) rides along so that
+        // ResolveTextStyle inherits it like a property; shaping uses it. A pseudo-element reads its
+        // host's attribute, which is the language it inherits anyway.
+        AddIfPresent(map, "lang", element?.GetAttribute("lang") ?? element?.GetAttribute("xml:lang"));
         AddIfPresent(map, "font-stretch", style.GetPropertyValue("font-stretch"));
         AddIfPresent(map, "text-transform", style.GetPropertyValue("text-transform"));
         AddIfPresent(map, "line-height", style.GetLineHeight());
@@ -8982,7 +8976,7 @@ public sealed partial class HtmlRenderer
         for (var i = shadows.Count - 1; i >= 0; i--)
         {
             var shadow = shadows[i];
-            displayList.DrawTextShadow(text, x + shadow.OffsetX, y + shadow.OffsetY, shadow.Color, textStyle.FontSize, textStyle.FontFamily, textStyle.FontWeight, textStyle.IsItalic, shadow.BlurRadius, textStyle.LetterSpacing, textStyle.FontStretch);
+            displayList.DrawTextShadow(text, x + shadow.OffsetX, y + shadow.OffsetY, shadow.Color, textStyle.FontSize, textStyle.FontFamily, textStyle.FontWeight, textStyle.IsItalic, shadow.BlurRadius, textStyle.LetterSpacing, textStyle.FontStretch, textStyle.IsRightToLeftRun, textStyle.FontFeatures, textStyle.Language, textStyle.ShapingContextBefore, textStyle.ShapingContextAfter);
         }
     }
 
@@ -11860,11 +11854,11 @@ public sealed partial class HtmlRenderer
     private const string EllipsisCharacter = "…";
 
     /// <summary>
-    /// Truncates <paramref name="text"/> to the longest prefix (by rune, not raw UTF-16 char, so a
-    /// truncation point never lands inside a surrogate pair) whose width plus the ellipsis
+    /// Truncates <paramref name="text"/> to the longest prefix (by glyph cluster, so a truncation
+    /// point never lands inside a surrogate pair, a ligature or a conjunct) whose width plus the ellipsis
     /// character's own width still fits within <paramref name="maxWidth"/>, then appends it - the
     /// approach every real browser's own `text-overflow: ellipsis` uses (truncate, do not scale or
-    /// reflow). Binary search over rune count, not a linear scan, since <see cref="MeasureTextWidth"/>
+    /// reflow). Binary search over the clusters, not a linear scan, since <see cref="MeasureTextWidth"/>
     /// goes through the backend's own font shaping and this runs on already-overflowing text on the
     /// hot layout path.
     /// </summary>
@@ -11877,14 +11871,14 @@ public sealed partial class HtmlRenderer
             return EllipsisCharacter;
         }
 
-        var runes = text.EnumerateRunes().ToArray();
+        var clusterEnds = GetClusterEnds(context, text, textStyle);
         var low = 0;
-        var high = runes.Length;
+        var high = clusterEnds.Count;
 
         while (low < high)
         {
             var mid = (low + high + 1) / 2;
-            var prefixWidth = MeasureTextWidth(context, string.Concat(runes.Take(mid).Select(r => r.ToString())), textStyle);
+            var prefixWidth = MeasureTextWidth(context, text[..clusterEnds[mid - 1]], textStyle);
 
             if (prefixWidth + ellipsisWidth <= maxWidth)
             {
@@ -11896,8 +11890,15 @@ public sealed partial class HtmlRenderer
             }
         }
 
-        return string.Concat(runes.Take(low).Select(r => r.ToString())) + EllipsisCharacter;
+        return (low == 0 ? string.Empty : text[..clusterEnds[low - 1]]) + EllipsisCharacter;
     }
+
+    /// <summary>
+    /// The ends of the glyph clusters of <paramref name="text"/> (ascending, the last one is its
+    /// length): where it may be cut, e.g. before an ellipsis.
+    /// </summary>
+    private static List<int> GetClusterEnds(LayoutContext context, string text, RenderTextStyle textStyle) =>
+        [.. context.TextMeasurer.GetClusterBoundaries(text, ToRenderFont(textStyle, context.Fonts)).Where(boundary => boundary > 0)];
 
     private static RenderFont ToRenderFont(RenderTextStyle textStyle, FontFaceSet fonts) => new(
         textStyle.FontFamily,
@@ -11906,7 +11907,12 @@ public sealed partial class HtmlRenderer
         textStyle.IsItalic,
         textStyle.LetterSpacing,
         fonts,
-        textStyle.FontStretch);
+        textStyle.FontStretch,
+        textStyle.IsRightToLeftRun,
+        textStyle.FontFeatures,
+        textStyle.Language,
+        textStyle.ShapingContextBefore,
+        textStyle.ShapingContextAfter);
 
     /// <summary>
     /// Measures text the way <see cref="DrawStyledText"/> paints it: soft hyphens are invisible
@@ -12080,7 +12086,13 @@ public sealed partial class HtmlRenderer
         bool IsHidden = false,
         WritingModeKind WritingMode = WritingModeKind.HorizontalTb,
         TextOrientationKind TextOrientation = TextOrientationKind.Mixed,
-        WritingModeKind FlowMode = WritingModeKind.HorizontalTb);
+        WritingModeKind FlowMode = WritingModeKind.HorizontalTb,
+        bool IsRightToLeftRun = false,
+        FontFeatureProperties FeatureProperties = default,
+        string? FontFeatures = null,
+        string? Language = null,
+        string? ShapingContextBefore = null,
+        string? ShapingContextAfter = null);
 
     private enum TextAlign
     {

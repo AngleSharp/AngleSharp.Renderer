@@ -2795,6 +2795,42 @@ public sealed class VisualConformanceTests
     }
 
     [Fact]
+    public async Task RenderToPng_RendersShapedText()
+    {
+        var document = await ParseAsync("""
+            <html>
+              <head>
+                <style>
+                  html, body { margin: 0; padding: 0; background-color: white; font-family: sans-serif; font-size: 20px; }
+                  p { margin: 4px 8px; }
+                  .off { font-feature-settings: "liga" 0, "kern" 0; }
+                </style>
+              </head>
+              <body>
+                <p>office flow AVATAR Wolf</p>
+                <p class="off">office flow AVATAR Wolf</p>
+                <p dir="rtl" style="direction: rtl">مرحبا بالعالم (لا)</p>
+                <p>नमस्ते क्षत्रिय</p>
+              </body>
+            </html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var image = renderer.RenderToPng(document, new DefaultRenderDevice
+        {
+            ViewPortWidth = 300,
+            ViewPortHeight = 150,
+            FontSize = 20f,
+        });
+
+        VisualSnapshotVerifier.VerifyOrCreate(
+          snapshotName: "renders-shaped-text.png",
+          actualPng: image.Data,
+          perChannelTolerance: TextRenderingToleranceChannel,
+          maxDifferentPixels: TextRenderingToleranceMaxPixels);
+    }
+
+    [Fact]
     public async Task RenderToPng_RendersBlendModesBackgroundClipAndOutlineOffset()
     {
         var document = await ParseAsync("""
