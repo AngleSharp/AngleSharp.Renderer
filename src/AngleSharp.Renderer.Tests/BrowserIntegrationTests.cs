@@ -140,6 +140,21 @@ public sealed class BrowserIntegrationTests
     }
 
     [Fact]
+    public async Task SvgBackgroundImage_IsDrawnAtItsNaturalSize()
+    {
+        // an SVG is rasterized oversampled, which must not make it larger (dev.to's check marks)
+        var document = await LoadAsync("""
+            <style>body { margin: 0 }</style>
+            <div style="width: 40px; height: 40px; background: rgb(255, 0, 0) url(&quot;data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='10'%3E%3Crect width='10' height='10' fill='%2300f'/%3E%3C/svg%3E&quot;) no-repeat"></div>
+            """);
+
+        using var rendered = SKBitmap.Decode(Render(document));
+
+        Assert.Equal(new SKColor(0, 0, 255), rendered.GetPixel(5, 5));
+        Assert.Equal(new SKColor(255, 0, 0), rendered.GetPixel(15, 15));
+    }
+
+    [Fact]
     public async Task HarnessStillAppliesAnimations()
     {
         var document = await LoadAsync("""

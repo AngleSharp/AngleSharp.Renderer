@@ -674,7 +674,8 @@ public sealed partial class SkiaRenderBackend : IPixelRenderBackend, ITextMeasur
             return paint;
         }
 
-        var (drawWidth, drawHeight) = ResolveBackgroundImageSize(imagePaint.Size, image.Width, image.Height, rect.Width, rect.Height);
+        // the natural size, not the decoded one: an SVG is rasterized oversampled
+        var (drawWidth, drawHeight) = ResolveBackgroundImageSize(imagePaint.Size, imagePaint.Image.Width, imagePaint.Image.Height, rect.Width, rect.Height);
 
         if (drawWidth <= 0f || drawHeight <= 0f)
         {

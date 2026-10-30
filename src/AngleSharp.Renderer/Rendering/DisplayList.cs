@@ -45,6 +45,12 @@ public sealed class DisplayList
     }
 
     /// <summary>
+    /// Removes the commands from the given index on, e.g. the ones of a layout to be redone.
+    /// </summary>
+    /// <param name="index">The position of the first command to remove.</param>
+    internal void RemoveFrom(int index) => _commands.RemoveRange(index, _commands.Count - index);
+
+    /// <summary>
     /// Replaces a command (found by identity, as records compare by value) with another one,
     /// e.g. a placeholder transform whose value is only known after later layout.
     /// </summary>

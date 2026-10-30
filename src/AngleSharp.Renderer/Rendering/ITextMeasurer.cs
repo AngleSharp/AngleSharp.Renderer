@@ -18,6 +18,14 @@ public interface ITextMeasurer
     float MeasureWidth(string text, RenderFont font);
 
     /// <summary>
+    /// Measures the x-height of the font (the height of its lowercase letters) in pixels, which
+    /// `vertical-align: middle` centers on. The default assumes half the font size.
+    /// </summary>
+    /// <param name="font">The font the text is rendered with.</param>
+    /// <returns>The x-height in pixels.</returns>
+    float MeasureXHeight(RenderFont font) => font.FontSize * 0.5f;
+
+    /// <summary>
     /// The offsets at which the text may be cut without breaking a glyph cluster (e.g. to
     /// truncate it with an ellipsis): ascending UTF-16 offsets, starting with 0 and ending with
     /// the length of the text. The default treats every grapheme cluster as one.

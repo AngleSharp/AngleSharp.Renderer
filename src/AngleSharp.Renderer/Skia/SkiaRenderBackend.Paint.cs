@@ -46,7 +46,8 @@ public sealed partial class SkiaRenderBackend
             return paint;
         }
 
-        var image = content is RenderImagePaint imagePaint ? DecodeImage(imagePaint.Image) : null;
+        var naturalImage = (content as RenderImagePaint)?.Image;
+        var image = naturalImage is not null ? DecodeImage(naturalImage) : null;
 
         if (content is RenderImagePaint && image is null)
         {
@@ -56,7 +57,7 @@ public sealed partial class SkiaRenderBackend
         // An image keeps its aspect ratio; a gradient has no intrinsic size, so `auto`, `cover`
         // and `contain` all make it as large as the area.
         var (tileWidth, tileHeight) = image is not null
-            ? ResolveBackgroundImageSize(size, image.Width, image.Height, area.Width, area.Height)
+            ? ResolveBackgroundImageSize(size, naturalImage!.Width, naturalImage.Height, area.Width, area.Height)
             : ResolveGradientTileSize(size, area.Width, area.Height);
 
         if (tileWidth <= 0f || tileHeight <= 0f)
