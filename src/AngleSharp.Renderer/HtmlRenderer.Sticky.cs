@@ -119,10 +119,16 @@ public sealed partial class HtmlRenderer
         var start = displayList.Commands.Count;
         var previousProbe = s_stickyProbe;
         var probe = isSticky ? new StickyProbe(node.Ref) : null;
+        var isViewportAnchored = string.Equals(GetPosition(styleMap), "fixed", StringComparison.Ordinal);
 
         if (probe is not null)
         {
             s_stickyProbe = probe;
+        }
+
+        if (isViewportAnchored)
+        {
+            displayList.Add(new PushViewportAnchorCommand());
         }
 
         context.StickyScopes.Push([]);
@@ -135,6 +141,11 @@ public sealed partial class HtmlRenderer
         {
             context.StickyScopes.Pop();
             s_stickyProbe = previousProbe;
+
+            if (isViewportAnchored)
+            {
+                displayList.Add(new PopViewportAnchorCommand());
+            }
         }
 
         if (probe?.Metrics is { } metrics && displayList.Commands.Count > start && context.StickyScopes.TryPeek(out var scope))

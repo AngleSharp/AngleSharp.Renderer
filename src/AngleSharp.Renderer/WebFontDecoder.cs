@@ -169,10 +169,18 @@ internal static class WebFontDecoder
 
         if (directory.FirstOrDefault(static table => table.Tag == GlyfTag) is { IsTransformed: true })
         {
-            var (glyf, loca, xMins) = ReconstructGlyf(raw[GlyfTag], indexFormat);
+            var (glyf, loca, xMins, usedFormat) = ReconstructGlyf(raw[GlyfTag], indexFormat);
             tables[GlyfTag] = glyf;
             tables[LocaTag] = loca;
             glyphXMins = xMins;
+
+            if (usedFormat != indexFormat && head is not null)
+            {
+                var patchedHead = head.ToArray();
+                BinaryPrimitives.WriteInt16BigEndian(patchedHead.AsSpan(50), usedFormat);
+                tables[HeadTag] = patchedHead;
+                indexFormat = usedFormat;
+            }
         }
 
         if (directory.FirstOrDefault(static table => table.Tag == HmtxTag) is { IsTransformed: true })
@@ -189,7 +197,12 @@ internal static class WebFontDecoder
     /// <summary>
     /// Rebuilds `glyf` and `loca` from the WOFF2 transformed glyph table (section 5.1).
     /// </summary>
-    private static (byte[] Glyf, byte[] Loca, short[] XMins) ReconstructGlyf(byte[] transformed, short indexFormat)
+    /// <remarks>
+    /// The glyphs are written without the point compression of the original, so the table can
+    /// outgrow the short `loca` format (offsets up to 128 KiB) the font declares; the long format
+    /// is used then, which the caller writes to `head`.
+    /// </remarks>
+    private static (byte[] Glyf, byte[] Loca, short[] XMins, short IndexFormat) ReconstructGlyf(byte[] transformed, short indexFormat)
     {
         var header = new ByteReader(transformed, 0);
         header.ReadUInt16(); // reserved
@@ -388,6 +401,11 @@ internal static class WebFontDecoder
         offsets[numGlyphs] = (uint)glyf.Length;
         var loca = new BigEndianWriter();
 
+        if (indexFormat == 0 && glyf.Length / 2 > ushort.MaxValue)
+        {
+            indexFormat = 1;
+        }
+
         foreach (var glyphOffset in offsets)
         {
             if (indexFormat == 0)
@@ -400,7 +418,7 @@ internal static class WebFontDecoder
             }
         }
 
-        return (glyf.ToArray(), loca.ToArray(), xMins);
+        return (glyf.ToArray(), loca.ToArray(), xMins, indexFormat);
     }
 
     /// <summary>

@@ -8,6 +8,7 @@ using System.Linq;
 /// <summary>
 /// Provides CSSOM View-style helpers for documents.
 /// </summary>
+[DomExposed("Document")]
 public static class DocumentCssomViewExtensions
 {
     /// <summary>
@@ -19,7 +20,9 @@ public static class DocumentCssomViewExtensions
         ArgumentNullException.ThrowIfNull(document);
 
         var harness = document.Context.GetDomHarness();
-        var metricsMap = HtmlRenderer.CaptureLayoutMetrics(document, harness.RenderDevice);
+        var metricsMap = harness is InteractiveHtmlRendererState state
+            ? state.GetLayoutMetrics(document)
+            : HtmlRenderer.CaptureLayoutMetrics(document, harness.RenderDevice);
         var targetElement = HitTesting.FindTopMostElementAt(metricsMap, x, y);
 
         if (targetElement is null)

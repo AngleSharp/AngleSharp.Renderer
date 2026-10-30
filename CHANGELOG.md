@@ -1,6 +1,30 @@
-# 0.9.0
+# 0.9.1
 
 Released on Friday, October 30 2026.
+
+- Improved performance by caching fonts and using direct pixel manipulation
+- Improved layout of a single-line column without a definite height (e.g. `body { display: flex; flex-direction: column }`): its items of an automatic height are measured by their actual layout instead of a trial layout of their whole subtree beforehand (dev.to's frames took 26% less time)
+- Improved preparing a render, which resolved the body's text style through a new style collection for every explicit property, and let inline SVGs share the render's style collection
+- Improved geometry reads (e.g. `getBoundingClientRect`, `offsetTop`, `scrollHeight`) to reuse the layout until the document, scroll, hover, viewport, or a frame changes it, instead of laying out the whole document on every read
+- Improved grid layout to measure an item once per render, which nested grids measured again for every pass of the outer grid
+- Fixed the items of a column without a definite height ignoring its `min-height` and `max-height`: they now grow into the space a `min-height` leaves (e.g. a `min-height: 100vh` page whose main column has `flex-grow: 1`), are justified within it, and shrink to a `max-height`
+- Fixed form controls (e.g. text fields) losing their padding and border to their content under `box-sizing: border-box`
+- Fixed the content of a button taller than its content (e.g. an icon button stretched by `inset`) sticking to its top instead of being centered vertically
+- Fixed grid items ignoring their margins: `auto` margins now center an item (e.g. `margin: 0 auto; width: 640px`), other margins shrink a stretched item and take space in its row
+- Fixed `grid-gap`, `grid-row-gap`, and `grid-column-gap` (the legacy names of the gaps) being ignored
+- Fixed a grid collapsing its bottom margin with the margin of the box before it, and a box with a formatting context of its own collapsing its bottom margin with its last child
+- Fixed absolutely positioned children of a block of an automatic height (e.g. `top: 50%` or `bottom: 0`) being placed against its width instead of its final height
+- Fixed the white space at the start and end of a line counting toward shrink-to-fit widths (e.g. a link as a flex item ending a few pixels short of its container's edge)
+- Fixed checkboxes and radio buttons with `appearance: none` still getting the native check painted over their own background
+- Fixed SVG background images of an automatic size being drawn three times their size (at the size they were rasterized at)
+- Fixed border and outline widths not being snapped to device pixels (e.g. a `1.5px` border is 1px wide in browsers, which made dev.to's text fields a pixel taller)
+- Fixed `vertical-align: middle` assuming an x-height of half the font size instead of the font's own (`ITextMeasurer.MeasureXHeight`, which defaults to half the font size)
+- Added the CSSOM View members of elements and documents to scripts (they lacked `DomExposed`), with properties like `offsetTop` exposed as properties
+- Added `scrollX`, `scrollY`, `pageXOffset`, `pageYOffset`, `scrollTo`, `scroll`, and `scrollBy` to the window
+
+# 0.9.0
+
+Released on Wednesday, October 28 2026.
 
 - Fixed `-webkit-line-clamp` counting lines per inline run instead of across the nested blocks of the clamped box (e.g. paragraphs in a clamped card), which now ends after its last line
 - Fixed gaps with font- or viewport-relative units (e.g. Tailwind's `gap-4`, i.e. `gap: 1rem`) being ignored in grid and flex containers

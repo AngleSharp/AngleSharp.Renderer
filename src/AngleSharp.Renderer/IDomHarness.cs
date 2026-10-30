@@ -35,6 +35,13 @@ public interface IDomHarness
     (double X, double Y) MousePosition { get; set; }
 
     /// <summary>
+    /// Sets the hovered element directly, e.g., found in a frame's <see cref="RenderedFrame.HitTestMap"/>,
+    /// which spares the layout setting <see cref="MousePosition"/> runs to hit test.
+    /// </summary>
+    /// <param name="element">The element below the pointer, if any.</param>
+    void SetHoveredElement(IElement? element);
+
+    /// <summary>
     /// Gets the horizontal scroll offset for the given element.
     /// </summary>
     double GetScrollLeft(IElement element, double maxLeft);
@@ -90,4 +97,16 @@ public interface IDomHarness
     /// Renders the active document to PNG using the harness-bound render device.
     /// </summary>
     RenderedImage PaintToPng();
+
+    /// <summary>
+    /// Lays out the active document into a frame at the current scroll position, which comes
+    /// with its hit-test map and scroll extent. Rasterizing it (<see cref="RenderedFrame.Rasterize"/>)
+    /// does not touch the DOM, so it may happen on another thread.
+    /// </summary>
+    /// <param name="overscan">
+    /// The rows to paint above and below the viewport, such that the frame can be scrolled
+    /// until the next one is ready. Only used for pages without fixed or sticky boxes.
+    /// </param>
+    /// <returns>The prepared frame.</returns>
+    RenderedFrame PrepareFrame(int overscan = 0);
 }

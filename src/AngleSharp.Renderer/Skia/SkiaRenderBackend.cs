@@ -1,5 +1,6 @@
 using AngleSharp.Renderer.Rendering;
 using System.Linq;
+using System.Runtime.InteropServices;
 
 using SkiaSharp;
 
@@ -12,7 +13,7 @@ namespace AngleSharp.Renderer.Skia;
 /// The backend also measures text, so a renderer using it lays out against the same advance
 /// widths it paints with.
 /// </remarks>
-public sealed partial class SkiaRenderBackend : IRenderBackend, ITextMeasurer
+public sealed partial class SkiaRenderBackend : IPixelRenderBackend, ITextMeasurer
 {
     private readonly SkiaTextMeasurer _textMeasurer = new();
 
@@ -25,16 +26,57 @@ public sealed partial class SkiaRenderBackend : IRenderBackend, ITextMeasurer
     /// <inheritdoc />
     public RenderedImage RenderToPng(DisplayList displayList, RenderViewport viewport)
     {
-        ArgumentNullException.ThrowIfNull(displayList);
+        using var surface = Rasterize(displayList, viewport);
+        using var image = surface.Snapshot();
+        using var data = image.Encode(SKEncodedImageFormat.Png, quality: 100)
+            ?? throw new InvalidOperationException("Unable to encode the rendered image as PNG.");
 
+        return new RenderedImage(data.ToArray(), viewport.Width, viewport.Height, "image/png");
+    }
+
+    /// <inheritdoc />
+    public RenderedPixels RenderToPixels(DisplayList displayList, RenderViewport viewport)
+    {
+        var pixels = new byte[viewport.Width * viewport.Height * 4];
+        var info = CreateImageInfo(viewport);
+        var handle = GCHandle.Alloc(pixels, GCHandleType.Pinned);
+
+        try
+        {
+            // the surface draws right into the returned buffer, nothing is encoded or copied
+            using var surface = SKSurface.Create(info, handle.AddrOfPinnedObject(), info.RowBytes)
+                ?? throw new InvalidOperationException("Unable to create a Skia surface.");
+            Draw(surface, displayList);
+        }
+        finally
+        {
+            handle.Free();
+        }
+
+        return new RenderedPixels(pixels, viewport.Width, viewport.Height);
+    }
+
+    private static SKSurface Rasterize(DisplayList displayList, RenderViewport viewport)
+    {
+        var surface = SKSurface.Create(CreateImageInfo(viewport))
+            ?? throw new InvalidOperationException("Unable to create a Skia surface.");
+        Draw(surface, displayList);
+        return surface;
+    }
+
+    private static SKImageInfo CreateImageInfo(RenderViewport viewport)
+    {
         if (viewport.IsEmpty)
         {
             throw new ArgumentOutOfRangeException(nameof(viewport), "Viewport dimensions must be positive.");
         }
 
-        var info = new SKImageInfo(viewport.Width, viewport.Height, SKColorType.Rgba8888, SKAlphaType.Premul);
-        using var surface = SKSurface.Create(info)
-            ?? throw new InvalidOperationException("Unable to create a Skia surface.");
+        return new SKImageInfo(viewport.Width, viewport.Height, SKColorType.Rgba8888, SKAlphaType.Premul);
+    }
+
+    private static void Draw(SKSurface surface, DisplayList displayList)
+    {
+        ArgumentNullException.ThrowIfNull(displayList);
 
         var canvas = surface.Canvas;
         canvas.Clear(SKColors.Transparent);
@@ -45,12 +87,6 @@ public sealed partial class SkiaRenderBackend : IRenderBackend, ITextMeasurer
         {
             DrawCommand(canvas, command, displayList.Fonts, state);
         }
-
-        using var image = surface.Snapshot();
-        using var data = image.Encode(SKEncodedImageFormat.Png, quality: 100)
-            ?? throw new InvalidOperationException("Unable to encode the rendered image as PNG.");
-
-        return new RenderedImage(data.ToArray(), viewport.Width, viewport.Height, "image/png");
     }
 
     private static void DrawCommand(SKCanvas canvas, RenderCommand command, FontFaceSet fonts, DrawState state)
@@ -631,15 +667,15 @@ public sealed partial class SkiaRenderBackend : IRenderBackend, ITextMeasurer
             return paint;
         }
 
-        using var data = SKData.CreateCopy(imagePaint.Image.Data);
-        using var image = SKImage.FromEncodedData(data);
+        var image = DecodeImage(imagePaint.Image);
 
-        if (image is null || image.Width <= 0 || image.Height <= 0)
+        if (image is null)
         {
             return paint;
         }
 
-        var (drawWidth, drawHeight) = ResolveBackgroundImageSize(imagePaint.Size, image.Width, image.Height, rect.Width, rect.Height);
+        // the natural size, not the decoded one: an SVG is rasterized oversampled
+        var (drawWidth, drawHeight) = ResolveBackgroundImageSize(imagePaint.Size, imagePaint.Image.Width, imagePaint.Image.Height, rect.Width, rect.Height);
 
         if (drawWidth <= 0f || drawHeight <= 0f)
         {
@@ -987,8 +1023,7 @@ public sealed partial class SkiaRenderBackend : IRenderBackend, ITextMeasurer
             return;
         }
 
-        using var data = SKData.CreateCopy(command.Image.Data);
-        using var image = SKImage.FromEncodedData(data);
+        var image = DecodeImage(command.Image);
         if (image is null)
         {
             return;

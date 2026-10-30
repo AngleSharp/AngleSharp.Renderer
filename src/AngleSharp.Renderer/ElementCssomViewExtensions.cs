@@ -8,6 +8,7 @@ using AngleSharp.Renderer;
 /// <summary>
 /// Provides CSSOM View-style geometry helpers for elements.
 /// </summary>
+[DomExposed("Element")]
 public static class ElementCssomViewExtensions
 {
     /// <summary>
@@ -56,6 +57,7 @@ public static class ElementCssomViewExtensions
     /// Returns the inner width including padding, excluding borders.
     /// </summary>
     [DomName("clientWidth")]
+    [DomAccessor(Accessors.Getter)]
     public static int GetClientWidth(this IElement element)
     {
         return GetRoundedDimension(element, static metrics => metrics.BorderBoxWidth - metrics.BorderLeft - metrics.BorderRight);
@@ -65,6 +67,7 @@ public static class ElementCssomViewExtensions
     /// Returns the left border width.
     /// </summary>
     [DomName("clientLeft")]
+    [DomAccessor(Accessors.Getter)]
     public static int GetClientLeft(this IElement element)
     {
         return GetRoundedDimension(element, static metrics => metrics.BorderLeft);
@@ -74,6 +77,7 @@ public static class ElementCssomViewExtensions
     /// Returns the inner height including padding, excluding borders.
     /// </summary>
     [DomName("clientHeight")]
+    [DomAccessor(Accessors.Getter)]
     public static int GetClientHeight(this IElement element)
     {
         return GetRoundedDimension(element, static metrics => metrics.BorderBoxHeight - metrics.BorderTop - metrics.BorderBottom);
@@ -83,6 +87,7 @@ public static class ElementCssomViewExtensions
     /// Returns the top border width.
     /// </summary>
     [DomName("clientTop")]
+    [DomAccessor(Accessors.Getter)]
     public static int GetClientTop(this IElement element)
     {
         return GetRoundedDimension(element, static metrics => metrics.BorderTop);
@@ -92,6 +97,7 @@ public static class ElementCssomViewExtensions
     /// Returns the width of the element's scrolling area.
     /// </summary>
     [DomName("scrollWidth")]
+    [DomAccessor(Accessors.Getter)]
     public static int GetScrollWidth(this IElement element)
     {
         return GetScrollExtents(element).Width;
@@ -101,6 +107,7 @@ public static class ElementCssomViewExtensions
     /// Returns the height of the element's scrolling area.
     /// </summary>
     [DomName("scrollHeight")]
+    [DomAccessor(Accessors.Getter)]
     public static int GetScrollHeight(this IElement element)
     {
         return GetScrollExtents(element).Height;
@@ -110,6 +117,7 @@ public static class ElementCssomViewExtensions
     /// Returns the current horizontal scroll position.
     /// </summary>
     [DomName("scrollLeft")]
+    [DomAccessor(Accessors.Getter)]
     public static double GetScrollLeft(this IElement element)
     {
         ArgumentNullException.ThrowIfNull(element);
@@ -123,6 +131,7 @@ public static class ElementCssomViewExtensions
     /// Sets the horizontal scroll position.
     /// </summary>
     [DomName("scrollLeft")]
+    [DomAccessor(Accessors.Setter)]
     public static void SetScrollLeft(this IElement element, double value)
     {
         ArgumentNullException.ThrowIfNull(element);
@@ -140,6 +149,7 @@ public static class ElementCssomViewExtensions
     /// Returns the current vertical scroll position.
     /// </summary>
     [DomName("scrollTop")]
+    [DomAccessor(Accessors.Getter)]
     public static double GetScrollTop(this IElement element)
     {
         ArgumentNullException.ThrowIfNull(element);
@@ -153,6 +163,7 @@ public static class ElementCssomViewExtensions
     /// Sets the vertical scroll position.
     /// </summary>
     [DomName("scrollTop")]
+    [DomAccessor(Accessors.Setter)]
     public static void SetScrollTop(this IElement element, double value)
     {
         ArgumentNullException.ThrowIfNull(element);
@@ -272,6 +283,7 @@ public static class ElementCssomViewExtensions
     /// Returns the border-box width.
     /// </summary>
     [DomName("offsetWidth")]
+    [DomAccessor(Accessors.Getter)]
     public static int GetOffsetWidth(this IElement element)
     {
         return GetRoundedDimension(element, static metrics => metrics.BorderBoxWidth);
@@ -281,6 +293,7 @@ public static class ElementCssomViewExtensions
     /// Returns the border-box height.
     /// </summary>
     [DomName("offsetHeight")]
+    [DomAccessor(Accessors.Getter)]
     public static int GetOffsetHeight(this IElement element)
     {
         return GetRoundedDimension(element, static metrics => metrics.BorderBoxHeight);
@@ -290,6 +303,7 @@ public static class ElementCssomViewExtensions
     /// Returns the left offset relative to the offset parent's padding edge.
     /// </summary>
     [DomName("offsetLeft")]
+    [DomAccessor(Accessors.Getter)]
     public static int GetOffsetLeft(this IElement element)
     {
         ArgumentNullException.ThrowIfNull(element);
@@ -314,6 +328,7 @@ public static class ElementCssomViewExtensions
     /// Returns the top offset relative to the offset parent's padding edge.
     /// </summary>
     [DomName("offsetTop")]
+    [DomAccessor(Accessors.Getter)]
     public static int GetOffsetTop(this IElement element)
     {
         ArgumentNullException.ThrowIfNull(element);
@@ -338,6 +353,7 @@ public static class ElementCssomViewExtensions
     /// Returns the nearest offset parent.
     /// </summary>
     [DomName("offsetParent")]
+    [DomAccessor(Accessors.Getter)]
     public static IElement? GetOffsetParent(this IElement element)
     {
         ArgumentNullException.ThrowIfNull(element);
@@ -385,7 +401,9 @@ public static class ElementCssomViewExtensions
         }
 
         var harness = owner.Context.GetDomHarness();
-        return HtmlRenderer.CaptureLayoutMetrics(owner, harness.RenderDevice);
+        return harness is InteractiveHtmlRendererState state
+            ? state.GetLayoutMetrics(owner)
+            : HtmlRenderer.CaptureLayoutMetrics(owner, harness.RenderDevice);
     }
 
     private static IDomHarness? GetInteractiveState(IElement element)

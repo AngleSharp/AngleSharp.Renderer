@@ -161,6 +161,37 @@ public sealed class TextMeasurementTests
             """));
     }
 
+    [Fact]
+    public async Task VerticalAlignMiddle_CentersOnTheMeasuredXHeight()
+    {
+        // `middle` centers a box on the baseline raised by half the x-height of the line's font
+        // (dev.to's "Remember me" checkbox), which the measurer knows
+        var context = BrowsingContext.New(Configuration.Default.WithCss());
+        var document = await context.OpenAsync(request => request.Content("""
+            <html><body style="margin:0; font-size:16px; line-height:24px">
+              <div>x<span style="display:inline-block; width:10px; height:10px; vertical-align:middle; background-color:#ff0000"></span></div>
+            </body></html>
+            """));
+
+        float BoxTop(float xHeight)
+        {
+            var renderer = new HtmlRenderer(new SkiaRenderBackend(), new XHeightTextMeasurer(xHeight));
+            var displayList = renderer.BuildDisplayList(document, new DefaultRenderDevice { ViewPortWidth = 200, ViewPortHeight = 100 });
+            return displayList.Commands.OfType<FillRectCommand>().Single(command => command.Color.Equals(new RenderColor(255, 0, 0))).Rect.Y;
+        }
+
+        Assert.Equal(BoxTop(8f) - 2f, BoxTop(12f), tolerance: 0.01f);
+    }
+
+    private sealed class XHeightTextMeasurer(float xHeight) : ITextMeasurer
+    {
+        private readonly SkiaTextMeasurer _inner = new();
+
+        public float MeasureWidth(string text, RenderFont font) => _inner.MeasureWidth(text, font);
+
+        public float MeasureXHeight(RenderFont font) => xHeight;
+    }
+
     private sealed class FixedWidthTextMeasurer(float widthPerCharacter) : ITextMeasurer
     {
         public int CallCount { get; private set; }

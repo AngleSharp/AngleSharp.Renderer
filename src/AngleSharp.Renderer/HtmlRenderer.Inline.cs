@@ -1482,7 +1482,7 @@ public sealed partial class HtmlRenderer
                         break;
                     }
 
-                    var above = ResolveAtomicAscent(measurement, blockStyle);
+                    var above = ResolveAtomicAscent(measurement, blockStyle, context);
                     maxAbove = Math.Max(maxAbove, above);
                     maxBelow = Math.Max(maxBelow, measurement.OuterHeight - above);
                     break;
@@ -1578,7 +1578,7 @@ public sealed partial class HtmlRenderer
                 {
                     "top" => lineTop,
                     "bottom" => lineTop + lineHeight - measurement.OuterHeight,
-                    _ => baselineY - ResolveAtomicAscent(measurement, blockStyle),
+                    _ => baselineY - ResolveAtomicAscent(measurement, blockStyle, context),
                 };
 
                 var atomicCursorY = marginBoxTop;
@@ -1820,9 +1820,13 @@ public sealed partial class HtmlRenderer
     /// <summary>
     /// Distance from the top of an atomic inline's margin box to the line's baseline.
     /// </summary>
-    private static float ResolveAtomicAscent(AtomicInlineMeasurement measurement, RenderTextStyle blockStyle) =>
+    /// <remarks>
+    /// `middle` centers the box on the baseline raised by half the x-height of the font the
+    /// line's text is drawn with.
+    /// </remarks>
+    private static float ResolveAtomicAscent(AtomicInlineMeasurement measurement, RenderTextStyle blockStyle, LayoutContext context) =>
         measurement.VerticalAlign == "middle"
-            ? (measurement.OuterHeight / 2f) + (blockStyle.FontSize * 0.25f)
+            ? (measurement.OuterHeight / 2f) + (context.TextMeasurer.MeasureXHeight(ToRenderFont(blockStyle, context.Fonts)) / 2f)
             : measurement.Baseline;
 
     /// <summary>
@@ -2022,7 +2026,8 @@ public sealed partial class HtmlRenderer
         LayoutContext context,
         float forcedBorderBoxWidth,
         bool isAtomicInline,
-        bool isFlexOrGridItem = false)
+        bool isFlexOrGridItem = false,
+        float maxY = float.MaxValue)
     {
         var capture = new LayoutCapture();
         var previous = s_layoutCapture.Value;
@@ -2064,7 +2069,7 @@ public sealed partial class HtmlRenderer
                 textStyle: inheritedStyle,
                 context: context,
                 displayList: new DisplayList { Fonts = context.Fonts },
-                maxY: float.MaxValue,
+                maxY: maxY,
                 forcedBorderBoxWidth: forcedBorderBoxWidth,
                 isAtomicInline: isAtomicInline,
                 isFlexItem: isFlexOrGridItem);
@@ -2350,11 +2355,24 @@ public sealed partial class HtmlRenderer
         var resultMin = 0f;
         var resultMax = 0f;
         var lineMax = 0f;
+        var lineHasContent = false;
+        // A collapsible space only counts between two pieces of content of a line, never at its
+        // start or end, and a run of them across elements is one space (CSS Text 3 §4.1).
+        var pendingSpace = 0f;
 
         void FlushLine()
         {
             resultMax = Math.Max(resultMax, lineMax);
             lineMax = 0f;
+            lineHasContent = false;
+            pendingSpace = 0f;
+        }
+
+        void AddContent(float width)
+        {
+            lineMax += pendingSpace + width;
+            pendingSpace = 0f;
+            lineHasContent = true;
         }
 
         void AccumulateInline(IRenderNode node, RenderTextStyle style)
@@ -2363,7 +2381,28 @@ public sealed partial class HtmlRenderer
             {
                 case TextRenderNode textNode:
                 {
-                    var widths = ComputeTextIntrinsicWidths(textNode.Ref.Data, style, context, out var forcedLines);
+                    var data = textNode.Ref.Data;
+
+                    if (data.Length == 0)
+                    {
+                        break;
+                    }
+
+                    var collapses = style.WhiteSpace is WhiteSpaceMode.Normal or WhiteSpaceMode.Nowrap or WhiteSpaceMode.PreLine;
+                    var spaceWidth = collapses ? MeasureTextWidth(context, " ", style) + style.WordSpacing : 0f;
+
+                    // of a run of spaces the first one stays (with its font)
+                    if (collapses && IsCollapsibleWhiteSpace(data[0]) && lineHasContent && pendingSpace == 0f)
+                    {
+                        pendingSpace = spaceWidth;
+                    }
+
+                    if (collapses && IsCollapsibleWhiteSpaceOnly(data))
+                    {
+                        break;
+                    }
+
+                    var widths = ComputeTextIntrinsicWidths(data, style, context, out var forcedLines);
 
                     for (var index = 0; index < forcedLines.Count; index++)
                     {
@@ -2372,7 +2411,12 @@ public sealed partial class HtmlRenderer
                             FlushLine();
                         }
 
-                        lineMax += forcedLines[index];
+                        AddContent(forcedLines[index]);
+                    }
+
+                    if (collapses && IsCollapsibleWhiteSpace(data[^1]))
+                    {
+                        pendingSpace = spaceWidth;
                     }
 
                     resultMin = Math.Max(resultMin, widths.Min);
@@ -2418,7 +2462,7 @@ public sealed partial class HtmlRenderer
 
                     if (isInline)
                     {
-                        lineMax += outer.Max;
+                        AddContent(outer.Max);
                     }
                     else
                     {
@@ -2574,18 +2618,8 @@ public sealed partial class HtmlRenderer
                 }
             }
 
-            // NormalizeWhitespace trims a collapsed text node, but its leading/trailing space
-            // still separates it from neighbouring inline content.
-            if (collapses && paragraphIndex == 0 && IsCollapsibleWhiteSpace(data[0]))
-            {
-                paragraphWidth += spaceWidth;
-            }
-
-            if (collapses && paragraphIndex == paragraphs.Length - 1 && IsCollapsibleWhiteSpace(data[^1]))
-            {
-                paragraphWidth += spaceWidth;
-            }
-
+            // NormalizeWhitespace trims a collapsed text node; whether its leading and trailing
+            // spaces separate it from neighbouring content is up to the line holding it.
             forcedLines.Add(paragraphWidth);
             max = Math.Max(max, paragraphWidth);
         }

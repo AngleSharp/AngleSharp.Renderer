@@ -19,7 +19,13 @@ internal sealed class InteractiveHtmlRendererState : IDomHarness
     private readonly CssAnimationTracker _animationTracker = new();
     private double _clockMs;
     private IElement? _hoveredElement;
+    private IDocument? _frameDocument;
+    private bool _isFrameScrollShiftable;
     private (double X, double Y) _mousePosition;
+    private IDocument? _metricsDocument;
+    private MutationObserver? _metricsObserver;
+    private IReadOnlyDictionary<IElement, HtmlRenderer.ElementLayoutMetrics>? _metrics;
+    private (int Width, int Height) _metricsViewport;
 
     private sealed class ElementInteractionState
     {
@@ -71,7 +77,7 @@ internal sealed class InteractiveHtmlRendererState : IDomHarness
 
             if (!hoverChanged)
             {
-                PaintInvalidated?.Invoke(this, EventArgs.Empty);
+                OnPaintInvalidated();
             }
         }
     }
@@ -103,7 +109,7 @@ internal sealed class InteractiveHtmlRendererState : IDomHarness
         }
 
         state.ScrollLeft = next;
-        PaintInvalidated?.Invoke(this, EventArgs.Empty);
+        OnPaintInvalidated();
     }
 
     /// <summary>
@@ -133,7 +139,19 @@ internal sealed class InteractiveHtmlRendererState : IDomHarness
         }
 
         state.ScrollTop = next;
-        PaintInvalidated?.Invoke(this, EventArgs.Empty);
+        OnPaintInvalidated();
+    }
+
+    public void SetHoveredElement(IElement? element)
+    {
+        if (ReferenceEquals(_hoveredElement, element))
+        {
+            return;
+        }
+
+        _hoveredElement = element;
+        UpdateForcedHoverChain(element);
+        OnPaintInvalidated();
     }
 
     private bool UpdateHoveredElementFromMousePosition()
@@ -143,7 +161,7 @@ internal sealed class InteractiveHtmlRendererState : IDomHarness
 
         if (targetDocument is not null)
         {
-            var metrics = HtmlRenderer.CaptureLayoutMetrics(targetDocument, RenderDevice);
+            var metrics = GetLayoutMetrics(targetDocument);
             nextHovered = HitTesting.FindTopMostElementAt(metrics, _mousePosition.X, _mousePosition.Y);
         }
 
@@ -154,7 +172,7 @@ internal sealed class InteractiveHtmlRendererState : IDomHarness
 
         _hoveredElement = nextHovered;
         UpdateForcedHoverChain(nextHovered);
-        PaintInvalidated?.Invoke(this, EventArgs.Empty);
+        OnPaintInvalidated();
         return true;
     }
 
@@ -216,7 +234,7 @@ internal sealed class InteractiveHtmlRendererState : IDomHarness
     {
         _clockMs += delta.TotalMilliseconds;
         _transitionTracker.AdvanceTime(delta);
-        PaintInvalidated?.Invoke(this, EventArgs.Empty);
+        OnPaintInvalidated();
     }
 
     public TimeSpan CurrentTime => TimeSpan.FromMilliseconds(_clockMs);
@@ -251,10 +269,93 @@ internal sealed class InteractiveHtmlRendererState : IDomHarness
             throw new InvalidOperationException("No active document is available for painting.");
         }
 
+        _metrics = null;
+
         using (_animationTracker.BeginFrame())
         {
             return _renderer.RenderToPng(targetDocument, RenderDevice);
         }
+    }
+
+    public RenderedFrame PrepareFrame(int overscan = 0)
+    {
+        var targetDocument = Context.Active
+            ?? throw new InvalidOperationException("No active document is available for painting.");
+
+        // Overscan is only right for pages scrolling as a whole: boxes attached to the viewport
+        // would be painted relative to the surface instead. Whether a page has any is only known
+        // once it is laid out, so the previous frame decides and a wrong guess is laid out again.
+        if (!ReferenceEquals(_frameDocument, targetDocument))
+        {
+            _frameDocument = targetDocument;
+            _isFrameScrollShiftable = false;
+        }
+
+        var scrollTop = targetDocument.DocumentElement is { } root ? GetScrollTop(root, double.MaxValue) : 0d;
+        _metrics = null;
+
+        using (_animationTracker.BeginFrame())
+        {
+            var frame = _renderer.PrepareFrame(targetDocument, RenderDevice, scrollTop, _isFrameScrollShiftable ? overscan : 0);
+
+            if (frame.OverscanTop > 0 && !frame.IsScrollShiftable)
+            {
+                frame = _renderer.PrepareFrame(targetDocument, RenderDevice, scrollTop, 0);
+            }
+
+            _isFrameScrollShiftable = frame.IsScrollShiftable;
+            frame.IsAnimating = _animationTracker.IsAnimating || _transitionTracker.HasRunningTransitions;
+            return frame;
+        }
+    }
+
+    /// <summary>
+    /// Gets the layout metrics of the given document, laid out again only when something may
+    /// have changed them. Script reads geometry (getBoundingClientRect, offsetTop, scrollHeight)
+    /// over and over, often for many elements in a row, and every capture is a full layout.
+    /// </summary>
+    /// <remarks>
+    /// The metrics are dropped by a mutation of the document (taken synchronously, so a script
+    /// changing a class and reading geometry right after sees the change), by anything that
+    /// invalidates the paint here (scrolling, hovering, time), by a frame being prepared (which
+    /// happens after resources such as style sheets, images, or fonts arrived), and by a
+    /// changed viewport.
+    /// </remarks>
+    internal IReadOnlyDictionary<IElement, HtmlRenderer.ElementLayoutMetrics> GetLayoutMetrics(IDocument document)
+    {
+        ArgumentNullException.ThrowIfNull(document);
+
+        var viewport = (RenderDevice.ViewPortWidth, RenderDevice.ViewPortHeight);
+
+        if (!ReferenceEquals(_metricsDocument, document))
+        {
+            _metricsObserver?.Disconnect();
+            _metricsObserver = new MutationObserver((_, _) => _metrics = null);
+            _metricsObserver.Connect(document, childList: true, subtree: true, attributes: true, characterData: true);
+            _metricsDocument = document;
+            _metrics = null;
+        }
+        else if (_metricsObserver!.Flush().ToArray().Length > 0)
+        {
+            _metrics = null;
+        }
+
+        var metrics = _metrics;
+
+        if (metrics is null || _metricsViewport != viewport)
+        {
+            metrics = HtmlRenderer.CaptureLayoutMetrics(document, RenderDevice);
+            _metrics = metrics;
+            _metricsViewport = viewport;
+        }
+
+        return metrics;
+    }
+
+    private void OnPaintInvalidated()
+    {
+        _metrics = null;
+        PaintInvalidated?.Invoke(this, EventArgs.Empty);
     }
 
     private static double Clamp(double value, double min, double max)

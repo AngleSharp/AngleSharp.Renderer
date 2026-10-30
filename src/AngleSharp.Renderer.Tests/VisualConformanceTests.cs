@@ -11,7 +11,7 @@ public sealed class VisualConformanceTests
     // Text glyph rasterization is delegated to the OS's own font engine (CoreText on macOS,
     // DirectWrite on Windows, FreeType on Linux - see AGENTS.md), and that engine's hinting and
     // anti-aliasing can differ across OS versions even on the *same* platform: CI is pinned to a
-    // specific runner image (macos-14 et al.), but a developer's local machine runs whatever OS
+    // specific runner image (macos-15 et al.), but a developer's local machine runs whatever OS
     // version they have, which can be materially newer. That produces a handful of glyph/border
     // edge pixels differing by a few intensity levels - not a rendering regression, since the same
     // input consistently produces the same *content*, just very slightly different anti-aliasing.

@@ -1,5 +1,7 @@
 using AngleSharp.Renderer.Rendering;
 
+using System.Runtime.CompilerServices;
+
 using SkiaSharp;
 
 namespace AngleSharp.Renderer.Skia;
@@ -9,6 +11,8 @@ namespace AngleSharp.Renderer.Skia;
 /// </summary>
 public sealed partial class SkiaRenderBackend
 {
+    private static readonly ConditionalWeakTable<byte[], DecodedImage> s_decodedImages = new();
+
     /// <summary>
     /// State that spans several commands of one render.
     /// </summary>
@@ -42,7 +46,8 @@ public sealed partial class SkiaRenderBackend
             return paint;
         }
 
-        using var image = content is RenderImagePaint imagePaint ? DecodeImage(imagePaint.Image) : null;
+        var naturalImage = (content as RenderImagePaint)?.Image;
+        var image = naturalImage is not null ? DecodeImage(naturalImage) : null;
 
         if (content is RenderImagePaint && image is null)
         {
@@ -52,7 +57,7 @@ public sealed partial class SkiaRenderBackend
         // An image keeps its aspect ratio; a gradient has no intrinsic size, so `auto`, `cover`
         // and `contain` all make it as large as the area.
         var (tileWidth, tileHeight) = image is not null
-            ? ResolveBackgroundImageSize(size, image.Width, image.Height, area.Width, area.Height)
+            ? ResolveBackgroundImageSize(size, naturalImage!.Width, naturalImage.Height, area.Width, area.Height)
             : ResolveGradientTileSize(size, area.Width, area.Height);
 
         if (tileWidth <= 0f || tileHeight <= 0f)
@@ -93,12 +98,29 @@ public sealed partial class SkiaRenderBackend
         return paint;
     }
 
-    private static SKImage? DecodeImage(RenderedImage image)
+    /// <summary>
+    /// Decodes an image once per payload: the renderer keeps the payloads of a document stable
+    /// across frames, so repainting (scrolling, animations) does not decode its images again.
+    /// The returned image is shared and must not be disposed.
+    /// </summary>
+    private static SKImage? DecodeImage(RenderedImage image) => DecodeImage(image.Data);
+
+    private static SKImage? DecodeImage(byte[] bytes)
     {
-        using var data = SKData.CreateCopy(image.Data);
-        var decoded = SKImage.FromEncodedData(data);
-        return decoded is { Width: > 0, Height: > 0 } ? decoded : null;
+        if (bytes.Length == 0)
+        {
+            return null;
+        }
+
+        return s_decodedImages.GetValue(bytes, static key =>
+        {
+            using var data = SKData.CreateCopy(key);
+            var decoded = SKImage.FromEncodedData(data);
+            return new DecodedImage(decoded is { Width: > 0, Height: > 0 } ? decoded : null);
+        }).Image;
     }
+
+    private sealed record DecodedImage(SKImage? Image);
 
     private static (float Width, float Height) ResolveGradientTileSize(RenderBackgroundSize size, float areaWidth, float areaHeight)
     {
@@ -163,12 +185,9 @@ public sealed partial class SkiaRenderBackend
             return;
         }
 
-        using var image = borderImage.Source switch
-        {
-            RenderImagePaint imagePaint => DecodeImage(imagePaint.Image),
-            RenderGradientPaint gradientPaint => RasterizeGradient(gradientPaint.Gradient, area.Width, area.Height),
-            _ => null,
-        };
+        // decoded images are cached, only a rasterized gradient belongs to this call
+        using var gradient = borderImage.Source is RenderGradientPaint gradientPaint ? RasterizeGradient(gradientPaint.Gradient, area.Width, area.Height) : null;
+        var image = borderImage.Source is RenderImagePaint imagePaint ? DecodeImage(imagePaint.Image) : gradient;
 
         if (image is null)
         {

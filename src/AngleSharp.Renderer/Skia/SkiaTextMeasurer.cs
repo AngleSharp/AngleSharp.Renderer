@@ -27,6 +27,9 @@ public sealed class SkiaTextMeasurer : ITextMeasurer
     [ThreadStatic]
     private static Dictionary<(string Text, RenderFont Font), float>? t_widths;
 
+    [ThreadStatic]
+    private static Dictionary<RenderFont, float>? t_xHeights;
+
     /// <inheritdoc />
     public float MeasureWidth(string text, RenderFont font)
     {
@@ -50,6 +53,33 @@ public sealed class SkiaTextMeasurer : ITextMeasurer
         width = SkiaTextShaping.MeasureTextWidth(GetPaint(font), text, font.LetterSpacing, font);
         widths[(text, font)] = width;
         return width;
+    }
+
+    /// <inheritdoc />
+    public float MeasureXHeight(RenderFont font)
+    {
+        var heights = t_xHeights ??= [];
+
+        if (!heights.TryGetValue(font, out var height))
+        {
+            using var skFont = new SKFont(GetPaint(font).Typeface, font.FontSize);
+            height = skFont.Metrics.XHeight;
+
+            // not every font states its x-height
+            if (!(height > 0f))
+            {
+                height = font.FontSize * 0.5f;
+            }
+
+            if (heights.Count >= MaxCachedPaints)
+            {
+                heights.Clear();
+            }
+
+            heights[font] = height;
+        }
+
+        return height;
     }
 
     /// <inheritdoc />

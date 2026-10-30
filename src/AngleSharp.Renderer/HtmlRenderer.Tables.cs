@@ -611,8 +611,15 @@ public sealed partial class HtmlRenderer
         return (width, color);
     }
 
+    /// <summary>
+    /// Marks a style map whose border widths are halves of collapsed grid lines, which were
+    /// snapped to device pixels as whole lines already (see SnapBorderWidth).
+    /// </summary>
+    private const string CollapsedBordersMarker = "-anglesharp-collapsed-borders";
+
     private static void OverrideCollapsedBorder(Dictionary<string, string> styleMap, string side, float width)
     {
+        styleMap[CollapsedBordersMarker] = "1";
         OverrideStyleLength(styleMap, $"border-{side}-width", width);
         styleMap[$"border-{side}-style"] = width > 0f ? "solid" : "none";
         styleMap[$"border-{side}-color"] = "transparent";

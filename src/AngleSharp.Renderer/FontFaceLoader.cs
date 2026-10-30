@@ -3,6 +3,7 @@ namespace AngleSharp.Renderer;
 using System.Globalization;
 using System.IO;
 using System.Linq;
+using System.Runtime.CompilerServices;
 using System.Text;
 
 using AngleSharp.Css.Dom;
@@ -19,6 +20,10 @@ internal static class FontFaceLoader
     // EOT are not supported, so those sources are skipped and the next one is tried.
     private static readonly HashSet<string> UnsupportedFormats =
         new(StringComparer.OrdinalIgnoreCase) { "svg", "embedded-opentype" };
+
+    // The fonts of a document are fetched and decoded once, not for every frame painted. The
+    // stable payloads also let the backend keep the typefaces it creates from them.
+    private static readonly ConditionalWeakTable<IDocument, Dictionary<string, byte[]?>> s_fontDataByDocument = new();
 
     public static FontFaceSet Load(IDocument document)
     {
@@ -85,6 +90,24 @@ internal static class FontFaceLoader
     }
 
     private static bool TryLoadFontData(IDocument document, string url, out byte[] data)
+    {
+        var cache = s_fontDataByDocument.GetValue(document, static _ => new Dictionary<string, byte[]?>(StringComparer.Ordinal));
+        byte[]? cached;
+
+        lock (cache)
+        {
+            if (!cache.TryGetValue(url, out cached))
+            {
+                cached = FetchFontData(document, url, out var fetched) ? fetched : null;
+                cache[url] = cached;
+            }
+        }
+
+        data = cached ?? [];
+        return cached is not null;
+    }
+
+    private static bool FetchFontData(IDocument document, string url, out byte[] data)
     {
         data = [];
 

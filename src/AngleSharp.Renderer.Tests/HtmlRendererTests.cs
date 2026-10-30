@@ -32,6 +32,25 @@ public sealed class HtmlRendererTests
         Assert.Contains(displayList.Commands, command => command is DrawTextCommand);
     }
 
+    [Theory]
+    [InlineData("display:block", 15f)]
+    [InlineData("display:inline-block", 15f)]
+    [InlineData("display:flex", 0f)]
+    public async Task BuildDisplayList_CentersTheContentOfATallerButton(string display, float expectedOffset)
+    {
+        var document = await ParseAsync($$"""
+            <html><body style="margin:0">
+              <button style="{{display}}; height:40px; padding:0; border:0; margin:0"><div style="width:20px; height:10px; background:red"></div></button>
+            </body></html>
+            """);
+        var renderer = new HtmlRenderer();
+
+        var commands = renderer.BuildDisplayList(document, new DefaultRenderDevice { ViewPortWidth = 200, ViewPortHeight = 100, FontSize = 16f }).Commands;
+
+        var offset = commands.OfType<PushTransformCommand>().Select(m => m.Transform).FirstOrDefault(m => m == RenderTransform2D.Translate(0f, m.F)).F;
+        Assert.Equal(expectedOffset, offset);
+    }
+
     [Fact]
     public async Task BuildDisplayList_PaintsImageElementsFromCurrentDownload()
     {

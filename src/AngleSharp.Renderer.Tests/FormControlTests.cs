@@ -160,6 +160,17 @@ public sealed class FormControlTests
         Assert.Equal(20f, text.FontSize, precision: 2);
     }
 
+    [Theory]
+    [InlineData("checkbox")]
+    [InlineData("radio")]
+    public async Task AppearanceNone_PaintsNoNativeCheck(string type)
+    {
+        // dev.to draws the check mark of `appearance: none` checkboxes as a background image
+        var displayList = await LayoutAsync($"<input type=\"{type}\" checked style=\"appearance: none; accent-color: rgb(200, 0, 100)\">");
+
+        Assert.DoesNotContain(displayList.Commands.OfType<FillRectCommand>(), command => command.Color.Equals(new RenderColor(200, 0, 100)));
+    }
+
     private static async Task<DisplayList> LayoutAsync(string body)
     {
         var context = BrowsingContext.New(Configuration.Default.WithCss());
