@@ -65,7 +65,7 @@ jobs:
           - name: windows
             os: windows-2022
           - name: macos
-            os: macos-14
+            os: macos-15
 
     steps:
     - uses: actions/checkout@v5
