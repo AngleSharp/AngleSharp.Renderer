@@ -76,6 +76,9 @@ public sealed class RenderedFrame
     /// </summary>
     public bool IsAnimating { get; internal set; }
 
+    /// <summary>Gets the commands of the frame, as laid out (before any shift).</summary>
+    internal DisplayList DisplayList => _displayList;
+
     /// <summary>
     /// Gets what is painted where, in viewport coordinates of this frame.
     /// </summary>

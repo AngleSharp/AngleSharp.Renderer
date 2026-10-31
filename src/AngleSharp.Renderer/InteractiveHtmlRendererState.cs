@@ -24,7 +24,13 @@ internal sealed class InteractiveHtmlRendererState : IDomHarness
     private (double X, double Y) _mousePosition;
     private IDocument? _metricsDocument;
     private MutationObserver? _metricsObserver;
-    private IReadOnlyDictionary<IElement, HtmlRenderer.ElementLayoutMetrics>? _metrics;
+    private HtmlRenderer.LayoutSnapshot? _metrics;
+    // the last frame and its layout (see UpdateFrame)
+    private RenderedFrame? _lastFrame;
+    private HtmlRenderer.LayoutSnapshot? _lastFrameLayout;
+    // the changes the observer delivered on its own, which the metrics have not seen yet
+    private readonly List<IMutationRecord> _pendingMutations = [];
+    private const int MaxPendingMutations = 256;
     private (int Width, int Height) _metricsViewport;
 
     private sealed class ElementInteractionState
@@ -75,9 +81,10 @@ internal sealed class InteractiveHtmlRendererState : IDomHarness
             _mousePosition = value;
             var hoverChanged = UpdateHoveredElementFromMousePosition();
 
+            // the hover state is what styles (and so the layout) depend on
             if (!hoverChanged)
             {
-                OnPaintInvalidated();
+                OnPaintInvalidated(keepsMetrics: true);
             }
         }
     }
@@ -109,7 +116,7 @@ internal sealed class InteractiveHtmlRendererState : IDomHarness
         }
 
         state.ScrollLeft = next;
-        OnPaintInvalidated();
+        OnPaintInvalidated(keepsMetrics: IsPage(element));
     }
 
     /// <summary>
@@ -139,7 +146,7 @@ internal sealed class InteractiveHtmlRendererState : IDomHarness
         }
 
         state.ScrollTop = next;
-        OnPaintInvalidated();
+        OnPaintInvalidated(keepsMetrics: IsPage(element));
     }
 
     public void SetHoveredElement(IElement? element)
@@ -296,13 +303,21 @@ internal sealed class InteractiveHtmlRendererState : IDomHarness
 
         using (_animationTracker.BeginFrame())
         {
-            var frame = _renderer.PrepareFrame(targetDocument, RenderDevice, scrollTop, _isFrameScrollShiftable ? overscan : 0);
+            var frame = _renderer.PrepareFrame(targetDocument, RenderDevice, scrollTop, _isFrameScrollShiftable ? overscan : 0, out var snapshot);
 
             if (frame.OverscanTop > 0 && !frame.IsScrollShiftable)
             {
-                frame = _renderer.PrepareFrame(targetDocument, RenderDevice, scrollTop, 0);
+                frame = _renderer.PrepareFrame(targetDocument, RenderDevice, scrollTop, 0, out snapshot);
             }
 
+            // the frame's layout answers the geometry reads until something changes it
+            WatchMutations(targetDocument);
+            _metricsObserver!.Flush();
+            _pendingMutations.Clear();
+            _metrics = snapshot;
+            _metricsViewport = (RenderDevice.ViewPortWidth, RenderDevice.ViewPortHeight);
+            _lastFrame = frame;
+            _lastFrameLayout = snapshot;
             _isFrameScrollShiftable = frame.IsScrollShiftable;
             frame.IsAnimating = _animationTracker.IsAnimating || _transitionTracker.HasRunningTransitions;
             return frame;
@@ -315,46 +330,119 @@ internal sealed class InteractiveHtmlRendererState : IDomHarness
     /// over and over, often for many elements in a row, and every capture is a full layout.
     /// </summary>
     /// <remarks>
-    /// The metrics are dropped by a mutation of the document (taken synchronously, so a script
-    /// changing a class and reading geometry right after sees the change), by anything that
-    /// invalidates the paint here (scrolling, hovering, time), by a frame being prepared (which
-    /// happens after resources such as style sheets, images, or fonts arrived), and by a
-    /// changed viewport.
+    /// The metrics follow the mutations of the document (taken synchronously, so a script
+    /// changing a class and reading geometry right after sees the change): a change confined to
+    /// an out-of-flow box lays out only that box again (see <see cref="HtmlRenderer.LayoutSnapshot"/>),
+    /// anything else all of the page. They are dropped by anything that invalidates the paint
+    /// here (hovering, time; not scrolling or moving the pointer) and by a changed viewport. A
+    /// frame being prepared (which happens after resources such as style sheets, images, or
+    /// fonts arrived) replaces them with its own layout.
     /// </remarks>
-    internal IReadOnlyDictionary<IElement, HtmlRenderer.ElementLayoutMetrics> GetLayoutMetrics(IDocument document)
+    internal IReadOnlyDictionary<IElement, HtmlRenderer.ElementLayoutMetrics> GetLayoutMetrics(IDocument document) =>
+        GetLayoutSnapshot(document).Metrics;
+
+    /// <summary>
+    /// Gets the layout of the given document (see <see cref="GetLayoutMetrics"/>), which also
+    /// maps its boxes into the viewport.
+    /// </summary>
+    internal HtmlRenderer.LayoutSnapshot GetLayoutSnapshot(IDocument document)
     {
         ArgumentNullException.ThrowIfNull(document);
 
         var viewport = (RenderDevice.ViewPortWidth, RenderDevice.ViewPortHeight);
 
-        if (!ReferenceEquals(_metricsDocument, document))
-        {
-            _metricsObserver?.Disconnect();
-            _metricsObserver = new MutationObserver((_, _) => _metrics = null);
-            _metricsObserver.Connect(document, childList: true, subtree: true, attributes: true, characterData: true);
-            _metricsDocument = document;
-            _metrics = null;
-        }
-        else if (_metricsObserver!.Flush().ToArray().Length > 0)
-        {
-            _metrics = null;
-        }
-
+        WatchMutations(document);
+        KeepMutations(_metricsObserver!.Flush());
         var metrics = _metrics;
+
+        if (_pendingMutations.Count > 0 && metrics is not null && (_metricsViewport != viewport || !metrics.TryUpdate(_pendingMutations)))
+        {
+            metrics = null;
+        }
 
         if (metrics is null || _metricsViewport != viewport)
         {
-            metrics = HtmlRenderer.CaptureLayoutMetrics(document, RenderDevice);
-            _metrics = metrics;
+            metrics = _renderer.CaptureLayout(document, RenderDevice);
             _metricsViewport = viewport;
         }
 
+        // the changes the layout made itself (see PrepareDocumentForRendering) are in already
+        _metricsObserver.Flush();
+        _pendingMutations.Clear();
+        _metrics = metrics;
         return metrics;
     }
 
-    private void OnPaintInvalidated()
+    public RenderedFrame? UpdateFrame()
     {
-        _metrics = null;
+        var document = Context.Active;
+
+        if (document is null || _lastFrame is null || !ReferenceEquals(document, _metricsDocument) || _metricsObserver is null ||
+            _metricsViewport != (RenderDevice.ViewPortWidth, RenderDevice.ViewPortHeight))
+        {
+            return null;
+        }
+
+        KeepMutations(_metricsObserver.Flush());
+
+        // only the frame's own layout (kept up to date since) knows where its boxes are painted
+        if (_metrics is not { } metrics || !ReferenceEquals(metrics, _lastFrameLayout))
+        {
+            return null;
+        }
+
+        if (_pendingMutations.Count > 0 && !metrics.TryUpdate(_pendingMutations))
+        {
+            _metrics = null;
+            _pendingMutations.Clear();
+            return null;
+        }
+
+        _pendingMutations.Clear();
+        _lastFrame = _renderer.UpdateFrame(document, _lastFrame, metrics);
+        return _lastFrame;
+    }
+
+    private void WatchMutations(IDocument document)
+    {
+        if (!ReferenceEquals(_metricsDocument, document))
+        {
+            _metricsObserver?.Disconnect();
+            _metricsObserver = new MutationObserver((records, _) => KeepMutations(records));
+            _metricsObserver.Connect(document, childList: true, subtree: true, attributes: true, characterData: true, attributeOldValue: true);
+            _metricsDocument = document;
+            _metrics = null;
+        }
+    }
+
+    // Many changes before the next read are cheaper laid out all at once, and kept around
+    // without one they would only pile up.
+    private void KeepMutations(IEnumerable<IMutationRecord> records)
+    {
+        if (_metrics is not null)
+        {
+            _pendingMutations.AddRange(records);
+
+            if (_pendingMutations.Count > MaxPendingMutations)
+            {
+                _metrics = null;
+                _pendingMutations.Clear();
+            }
+        }
+    }
+
+    // the page scrolls in the viewport, other scroll containers move their content in the layout
+    private static bool IsPage(IElement element) => ReferenceEquals(element, element.Owner?.DocumentElement);
+
+    // the metrics are laid out unscrolled and only depend on the hovered element, not on where
+    // the pointer is (see GetLayoutMetrics), so scrolling the page and moving the pointer keep them
+    private void OnPaintInvalidated(bool keepsMetrics = false)
+    {
+        if (!keepsMetrics)
+        {
+            _metrics = null;
+        }
+
         PaintInvalidated?.Invoke(this, EventArgs.Empty);
     }
 

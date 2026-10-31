@@ -19,8 +19,7 @@ public static class ElementCssomViewExtensions
     {
         ArgumentNullException.ThrowIfNull(element);
 
-        var metricsMap = GetMetricsMap(element);
-        if (metricsMap is null || !metricsMap.TryGetValue(element, out var metrics))
+        if (GetViewportMetrics(element) is not { } metrics)
         {
             return new DomRect();
         }
@@ -36,8 +35,7 @@ public static class ElementCssomViewExtensions
     {
         ArgumentNullException.ThrowIfNull(element);
 
-        var metricsMap = GetMetricsMap(element);
-        if (metricsMap is null || !metricsMap.TryGetValue(element, out var metrics))
+        if (GetViewportMetrics(element) is not { } metrics)
         {
             return new DomRectList();
         }
@@ -122,9 +120,9 @@ public static class ElementCssomViewExtensions
     {
         ArgumentNullException.ThrowIfNull(element);
 
-        var maxLeft = GetMaxScrollLeft(element);
+        // clamped when it was set, so reading it (scripts do, e.g. on every scroll) needs no layout
         var state = GetInteractiveState(element);
-        return state is null ? 0d : state.GetScrollLeft(element, maxLeft);
+        return state is null ? 0d : state.GetScrollLeft(element, double.MaxValue);
     }
 
     /// <summary>
@@ -154,9 +152,9 @@ public static class ElementCssomViewExtensions
     {
         ArgumentNullException.ThrowIfNull(element);
 
-        var maxTop = GetMaxScrollTop(element);
+        // clamped when it was set, so reading it (scripts do, e.g. on every scroll) needs no layout
         var state = GetInteractiveState(element);
-        return state is null ? 0d : state.GetScrollTop(element, maxTop);
+        return state is null ? 0d : state.GetScrollTop(element, double.MaxValue);
     }
 
     /// <summary>
@@ -406,6 +404,33 @@ public static class ElementCssomViewExtensions
             : HtmlRenderer.CaptureLayoutMetrics(owner, harness.RenderDevice);
     }
 
+    // The box of the element in the viewport: the metrics are laid out unscrolled, so this is
+    // where the page's scroll position (and sticky boxes sticking for it) come in.
+    private static HtmlRenderer.ElementLayoutMetrics? GetViewportMetrics(IElement element)
+    {
+        var owner = element.Owner;
+
+        if (owner is null)
+        {
+            return null;
+        }
+
+        if (owner.Context.GetDomHarness() is InteractiveHtmlRendererState state)
+        {
+            var snapshot = state.GetLayoutSnapshot(owner);
+
+            if (!snapshot.Metrics.TryGetValue(element, out var metrics))
+            {
+                return null;
+            }
+
+            var root = owner.DocumentElement;
+            return root is null ? metrics : snapshot.ToViewport(metrics, state.GetScrollLeft(root, double.MaxValue), state.GetScrollTop(root, double.MaxValue));
+        }
+
+        return GetMetricsMap(element) is { } metricsMap && metricsMap.TryGetValue(element, out var unscrolled) ? unscrolled : null;
+    }
+
     private static IDomHarness? GetInteractiveState(IElement element)
     {
         var owner = element.Owner;
@@ -428,16 +453,23 @@ public static class ElementCssomViewExtensions
         var paddingBoxTop = elementMetrics.BorderBoxY + elementMetrics.BorderTop;
         var rightExtent = paddingBoxLeft + clientWidth;
         var bottomExtent = paddingBoxTop + clientHeight;
+        // the content of a scroll container is laid out where its scroll position moved it
+        var isPage = ReferenceEquals(element, element.Owner?.DocumentElement);
+        var state = isPage ? null : GetInteractiveState(element);
+        var scrollLeft = state is null ? 0d : state.GetScrollLeft(element, double.MaxValue);
+        var scrollTop = state is null ? 0d : state.GetScrollTop(element, double.MaxValue);
 
         foreach (var (candidate, candidateMetrics) in metricsMap)
         {
-            if (ReferenceEquals(candidate, element) || !IsDescendantOf(candidate, element))
+            // content clipped by a scroll container (or any clipping box) inside is no overflow of
+            // this one, nor is anything in a fixed box
+            if (ReferenceEquals(candidate, element) || candidateMetrics.IsViewportAnchored || !IsUnclippedDescendantOf(candidate, element, metricsMap))
             {
                 continue;
             }
 
-            rightExtent = Math.Max(rightExtent, candidateMetrics.BorderBoxX + candidateMetrics.BorderBoxWidth);
-            bottomExtent = Math.Max(bottomExtent, candidateMetrics.BorderBoxY + candidateMetrics.BorderBoxHeight);
+            rightExtent = Math.Max(rightExtent, candidateMetrics.BorderBoxX + candidateMetrics.BorderBoxWidth + scrollLeft);
+            bottomExtent = Math.Max(bottomExtent, candidateMetrics.BorderBoxY + candidateMetrics.BorderBoxHeight + scrollTop);
         }
 
         var scrollWidth = (int)Math.Round(Math.Max(clientWidth, rightExtent - paddingBoxLeft));
@@ -460,18 +492,18 @@ public static class ElementCssomViewExtensions
         return Math.Max(0d, maxTop);
     }
 
-    private static bool IsDescendantOf(IElement candidate, IElement ancestor)
+    private static bool IsUnclippedDescendantOf(IElement candidate, IElement ancestor, IReadOnlyDictionary<IElement, HtmlRenderer.ElementLayoutMetrics> metricsMap)
     {
-        var current = candidate.ParentElement;
+        var isClipped = false;
 
-        while (current is not null)
+        for (var current = candidate.ParentElement; current is not null; current = current.ParentElement)
         {
             if (ReferenceEquals(current, ancestor))
             {
-                return true;
+                return !isClipped;
             }
 
-            current = current.ParentElement;
+            isClipped |= metricsMap.TryGetValue(current, out var metrics) && metrics.Layer.ClipsOverflow;
         }
 
         return false;
@@ -526,6 +558,16 @@ public static class ElementCssomViewExtensions
 
             var currentLeft = ancestor.GetScrollLeft();
             var currentTop = ancestor.GetScrollTop();
+
+            // the content of a scroll container is laid out where its scroll position moved it,
+            // the page is laid out unscrolled
+            if (!ReferenceEquals(ancestor, element.Owner?.DocumentElement))
+            {
+                elementLeft += (float)currentLeft;
+                elementRight += (float)currentLeft;
+                elementTop += (float)currentTop;
+                elementBottom += (float)currentTop;
+            }
             var targetLeft = ResolveScrollOffset(currentLeft, elementLeft, elementRight, clientWidth, inline);
             var targetTop = ResolveScrollOffset(currentTop, elementTop, elementBottom, clientHeight, block);
 

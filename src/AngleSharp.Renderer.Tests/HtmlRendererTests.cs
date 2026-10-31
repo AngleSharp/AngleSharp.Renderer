@@ -646,6 +646,66 @@ public sealed class HtmlRendererTests
     }
 
     [Fact]
+    public async Task BuildDisplayList_AbsolutelyPositionedGridChildrenTakeNoCellAndArePlacedInThePaddingBox()
+    {
+        var displayList = await LayoutAsync("""
+            <html><body style="margin:0">
+                <div style="position:relative; display:grid; grid-template-columns:100px 100px; width:300px; padding:10px; border:5px solid #000000">
+                    <div style="position:absolute; top:5px; right:5px; width:20px; height:20px; background-color:#aa0000"></div>
+                    <div style="height:30px; background-color:#00aa00"></div>
+                    <div style="height:40px; background-color:#0000aa"></div>
+                    <div style="position:absolute; width:20px; height:20px; background-color:#aaaa00"></div>
+                </div>
+                <div style="height:10px; background-color:#333333"></div>
+            </body></html>
+            """);
+
+        Assert.Equal(new RenderRect(15, 15, 100, 30), FillOf(displayList, new RenderColor(0x00, 0xaa, 0x00)));
+        Assert.Equal(new RenderRect(115, 15, 100, 40), FillOf(displayList, new RenderColor(0x00, 0x00, 0xaa)));
+        Assert.Equal(new RenderRect(300, 10, 20, 20), FillOf(displayList, new RenderColor(0xaa, 0x00, 0x00)));
+        // without insets, at the start of the content box
+        Assert.Equal(new RenderRect(15, 15, 20, 20), FillOf(displayList, new RenderColor(0xaa, 0xaa, 0x00)));
+        Assert.Equal(70f, FillOf(displayList, new RenderColor(0x33, 0x33, 0x33)).Y);
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_AbsolutelyPositionedGridChildrenArePlacedInTheirGridArea()
+    {
+        var displayList = await LayoutAsync("""
+            <html><body style="margin:0">
+                <div style="position:relative; display:grid; grid-template-columns:100px 100px; grid-template-rows:50px 50px; grid-template-areas:'a b' 'c d'">
+                    <div style="position:absolute; grid-column:2; grid-row:2; left:10px; top:5px; width:20px; height:20px; background-color:#aa0000"></div>
+                    <div style="position:absolute; grid-column:1 / 2; right:0; top:0; width:20px; height:20px; background-color:#00aa00"></div>
+                    <div style="position:absolute; grid-column:1; right:0; top:0; width:20px; height:20px; background-color:#aaaa00"></div>
+                    <div style="position:absolute; grid-area:c; left:0; bottom:0; width:20px; height:20px; background-color:#0000aa"></div>
+                </div>
+            </body></html>
+            """);
+
+        Assert.Equal(new RenderRect(110, 55, 20, 20), FillOf(displayList, new RenderColor(0xaa, 0x00, 0x00)));
+        // the lines left out are the padding edges
+        Assert.Equal(new RenderRect(80, 0, 20, 20), FillOf(displayList, new RenderColor(0x00, 0xaa, 0x00)));
+        Assert.Equal(new RenderRect(480, 0, 20, 20), FillOf(displayList, new RenderColor(0xaa, 0xaa, 0x00)));
+        Assert.Equal(new RenderRect(0, 80, 20, 20), FillOf(displayList, new RenderColor(0x00, 0x00, 0xaa)));
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_GridItemsPaintInTheOrderOfTheirZIndex()
+    {
+        var displayList = await LayoutAsync("""
+            <html><body style="margin:0">
+                <div style="display:grid; grid-template-columns:100px">
+                    <div style="grid-column:1; grid-row:1; z-index:1; height:20px; background-color:#aa0000"></div>
+                    <div style="grid-column:1; grid-row:1; height:20px; background-color:#00aa00"></div>
+                </div>
+            </body></html>
+            """);
+
+        var fills = displayList.Commands.OfType<FillRectCommand>().Select(command => command.Color).ToList();
+        Assert.True(fills.IndexOf(new RenderColor(0xaa, 0x00, 0x00)) > fills.IndexOf(new RenderColor(0x00, 0xaa, 0x00)));
+    }
+
+    [Fact]
     public async Task BuildDisplayList_GridTrackListFromACustomPropertyIsUsed()
     {
         // the cascaded (not computed) value would still be the unresolved var()

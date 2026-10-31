@@ -16,6 +16,8 @@ public sealed partial class HtmlRenderer
     {
         private readonly List<PlacedFloat> _floats = [];
 
+        public bool IsEmpty => _floats.Count == 0;
+
         private readonly record struct PlacedFloat(float Left, float Top, float Right, float Bottom, bool IsLeft);
 
         /// <summary>

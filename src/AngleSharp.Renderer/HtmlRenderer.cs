@@ -70,6 +70,10 @@ public sealed partial class HtmlRenderer
     /// </summary>
     private static readonly ConditionalWeakTable<IElement, string> s_generatedContentImages = new();
     private static readonly AsyncLocal<LayoutCapture?> s_layoutCapture = new();
+
+    // the boxes placed by their bottom whose auto height is being measured (see LayoutElement)
+    [ThreadStatic]
+    private static HashSet<IElement>? s_measuringPositioned;
     private static readonly AsyncLocal<LayoutPass?> s_layoutPass = new();
     private static readonly ITextMeasurer s_defaultTextMeasurer = new SkiaTextMeasurer();
 
@@ -84,6 +88,11 @@ public sealed partial class HtmlRenderer
 
     private sealed record CachedImageResource(byte[] Bytes, string MimeType, int NaturalWidth, int NaturalHeight);
 
+    /// <remarks>
+    /// The box is in page coordinates (unscrolled), except for one inside a fixed box
+    /// (<paramref name="IsViewportAnchored"/>), which is in the viewport; <paramref name="Sticky"/>
+    /// is the innermost sticky box it moves with (see LayoutSnapshot.ToViewport).
+    /// </remarks>
     internal readonly record struct ElementLayoutMetrics(
         float BorderBoxX,
         float BorderBoxY,
@@ -97,7 +106,9 @@ public sealed partial class HtmlRenderer
         float PaddingRight,
         float PaddingTop,
         float PaddingBottom,
-        HitTestLayer Layer = default);
+        HitTestLayer Layer = default,
+        bool IsViewportAnchored = false,
+        IElement? Sticky = null);
 
     /// <summary>
     /// What hit testing needs to know about an element beyond its box: where it paints relative
@@ -163,10 +174,36 @@ public sealed partial class HtmlRenderer
         /// <summary>The baseline of the first line of text laid out while this capture was active.</summary>
         public float? FirstBaselineY { get; set; }
 
+        /// <summary>Where the layouts of out-of-flow boxes started, for laying them out again on their own (see <see cref="LayoutSnapshot"/>); none for trial layouts.</summary>
+        public Dictionary<IElement, LayoutEntry>? Entries { get; init; }
+
+        /// <summary>Where the not rendered children of a flow would paint, for showing them in a frame (see <see cref="LayoutSnapshot"/>).</summary>
+        public Dictionary<IElement, PaintLayer>? Layers { get; init; }
+
+        /// <summary>The commands of the boxes with <see cref="Entries"/>, for replacing them in a frame (see <see cref="LayoutSnapshot"/>).</summary>
+        public Dictionary<IElement, (RenderCommand First, int Count)>? Ranges { get; init; }
+
+        /// <summary>What blocks gave their children to start their layouts from (see <see cref="LayoutSnapshot"/>); none for trial layouts.</summary>
+        public Dictionary<IElement, ContainerEntry>? Containers { get; init; }
+
+        /// <summary>The flex and grid items passing on the in-flow entries of their container to their content (see <see cref="IsInFlowEntry"/>).</summary>
+        public HashSet<IElement>? Links { get; init; }
+
+        /// <summary>The elements in the order their metrics were recorded (see RecordStickyMetrics).</summary>
+        public List<IElement> RecordOrder { get; } = [];
+
+        /// <summary>The sticky boxes resolved against the viewport, for scrolling them later (see <see cref="LayoutSnapshot"/>); none for trial layouts.</summary>
+        public Dictionary<IElement, StickyRecord>? Stickies { get; init; }
+
         public void Record(IElement element, ElementLayoutMetrics metrics)
         {
             _metricsByElement[element] = metrics;
+            RecordOrder.Add(element);
         }
+
+        public bool TryGet(IElement element, out ElementLayoutMetrics metrics) => _metricsByElement.TryGetValue(element, out metrics);
+
+        public void Replace(IElement element, ElementLayoutMetrics metrics) => _metricsByElement[element] = metrics;
 
         public IReadOnlyDictionary<IElement, ElementLayoutMetrics> Snapshot()
         {
@@ -179,21 +216,7 @@ public sealed partial class HtmlRenderer
         ArgumentNullException.ThrowIfNull(document);
         ArgumentNullException.ThrowIfNull(renderDevice);
 
-        var context = CreateLayoutContext(document, renderDevice, s_defaultTextMeasurer);
-        var viewport = new RenderViewport(context.Width, context.Height);
-        var capture = new LayoutCapture();
-        var previous = s_layoutCapture.Value;
-        s_layoutCapture.Value = capture;
-
-        try
-        {
-            _ = BuildDisplayList(document, viewport, context, renderDevice, measureFullExtent: true);
-            return AddHitTestLayers(capture.Snapshot(), context);
-        }
-        finally
-        {
-            s_layoutCapture.Value = previous;
-        }
+        return LayoutSnapshot.Capture(document, renderDevice).Metrics;
     }
 
     private static float ZeroIfNaN(float value) => float.IsNaN(value) ? 0f : value;
@@ -259,18 +282,7 @@ public sealed partial class HtmlRenderer
         float paddingTop,
         float paddingBottom)
     {
-        if (s_stickyProbe is { } probe && ReferenceEquals(probe.Element, element))
-        {
-            probe.Metrics = new ElementLayoutMetrics(borderBoxX, borderBoxY, borderBoxWidth, borderBoxHeight, borderLeft, borderRight, borderTop, borderBottom, paddingLeft, paddingRight, paddingTop, paddingBottom);
-        }
-
-        var capture = s_layoutCapture.Value;
-        if (capture is null)
-        {
-            return;
-        }
-
-        capture.Record(element, new ElementLayoutMetrics(
+        var metrics = new ElementLayoutMetrics(
             borderBoxX,
             borderBoxY,
             borderBoxWidth,
@@ -282,7 +294,16 @@ public sealed partial class HtmlRenderer
             paddingLeft,
             paddingRight,
             paddingTop,
-            paddingBottom));
+            paddingBottom,
+            IsViewportAnchored: s_viewportAnchorDepth > 0,
+            Sticky: s_stickyElement);
+
+        if (s_stickyProbe is { } probe && ReferenceEquals(probe.Element, element))
+        {
+            probe.Metrics = metrics;
+        }
+
+        s_layoutCapture.Value?.Record(element, metrics);
     }
 
     /// <summary>
@@ -515,6 +536,45 @@ public sealed partial class HtmlRenderer
     /// newly-set scroll position depends on exactly that), so metrics capture always lays out at
     /// scroll offset 0 regardless of whatever is currently scrolled into view for painting.
     /// </summary>
+    /// <summary>
+    /// The scroll position of a scroll container, which moves its content within its padding
+    /// box; the page's is the viewport's (see <see cref="ResolveRootScrollOffsetY"/>).
+    /// </summary>
+    private static (float X, float Y) GetContentScrollOffset(IElement element)
+    {
+        if (element.Owner is not { } document || ReferenceEquals(element, document.DocumentElement) ||
+            !document.Context.TryGetDomHarness(out var harness) || harness is null)
+        {
+            return default;
+        }
+
+        return ((float)harness.GetScrollLeft(element, double.MaxValue), (float)harness.GetScrollTop(element, double.MaxValue));
+    }
+
+    /// <summary>
+    /// Moves the metrics the content of a scroll container recorded by its scroll position, as
+    /// its commands are; boxes in fixed boxes stay.
+    /// </summary>
+    private static void MoveScrolledContent(LayoutCapture? capture, int recordStart, IElement container, (float X, float Y) scroll)
+    {
+        if (capture is null || !ReferenceEquals(capture, s_layoutCapture.Value))
+        {
+            return;
+        }
+
+        var moved = new HashSet<IElement>(ReferenceEqualityComparer.Instance) { container };
+
+        for (var index = recordStart; index < capture.RecordOrder.Count; index++)
+        {
+            var element = capture.RecordOrder[index];
+
+            if (moved.Add(element) && capture.TryGet(element, out var recorded) && !recorded.IsViewportAnchored)
+            {
+                capture.Replace(element, recorded with { BorderBoxX = recorded.BorderBoxX - scroll.X, BorderBoxY = recorded.BorderBoxY - scroll.Y });
+            }
+        }
+    }
+
     private static float ResolveRootScrollOffsetY(IDocument document)
     {
         var scrollingElement = document.DocumentElement;
@@ -531,10 +591,10 @@ public sealed partial class HtmlRenderer
         return (float)harness.GetScrollTop(scrollingElement, double.MaxValue);
     }
 
-    private static DisplayList BuildDisplayList(IDocument document, RenderViewport viewport, LayoutContext context, IRenderDevice renderDevice, float scrollOffsetY = 0f, bool measureFullExtent = false, float surfaceExtraHeight = 0f)
+    private static DisplayList BuildDisplayList(IDocument document, RenderViewport viewport, LayoutContext context, IRenderDevice renderDevice, float scrollOffsetY = 0f, bool measureFullExtent = false, float surfaceExtraHeight = 0f, LayoutPass? pass = null)
     {
         var previous = s_layoutPass.Value;
-        var pass = new LayoutPass();
+        pass ??= new LayoutPass();
         s_layoutPass.Value = pass;
 
         // the render's style collection serves the pass as well, instead of gathering and
@@ -847,11 +907,21 @@ public sealed partial class HtmlRenderer
         var computedStyle = node.ComputedStyle;
         var styleMap = GetOrCreateStyleMap(context, node.Ref, node.ComputedStyle);
 
+        if (s_layoutCapture.Value is { Entries: not null } capture)
+        {
+            var isPlain = !isFlexItem && !isAtomicInline && !mainAxisMarginsPlaced && contentOffsetY == 0f &&
+                float.IsNaN(forcedBorderBoxWidth) && float.IsNaN(forcedBorderBoxHeight);
+            RecordLayoutEntry(capture, node, styleMap, containingX, containingY, containingWidth, cursorY, previousBlockMarginBottom, suppressNextBlockTopMargin, floats,
+                textIndentConsumed, inheritedTextStyle, context, maxY, isPlain,
+                containingHeight, positionedContainingX, positionedContainingY, positionedContainingWidth, positionedContainingHeight);
+        }
+
         if (!GeneratesBoxes(node))
         {
             return;
         }
 
+        using var baselines = IsOutOfFlowPositioned(styleMap) ? BaselineScope.Begin() : default;
         var tagName = element.LocalName;
 
         if (string.Equals(tagName, "br", StringComparison.OrdinalIgnoreCase))
@@ -1191,8 +1261,8 @@ public sealed partial class HtmlRenderer
             : flowContainingWidth;
         var leftOffset = ParseLength(styleMap, "left", flowContainingWidth, 0f, allowAuto: true);
         var topOffset = ParseLength(styleMap, "top", offsetHeightReference, 0f, allowAuto: true);
-        var rightOffset = ParseLength(styleMap, "right", flowContainingWidth, float.NaN, allowAuto: true);
-        var bottomOffset = ParseLength(styleMap, "bottom", float.IsNaN(positionedContainingHeight) ? flowContainingWidth : positionedContainingHeight, float.NaN, allowAuto: true);
+        var rightOffset = ParseLength(styleMap, "right", isFixed ? context.Width : flowContainingWidth, float.NaN, allowAuto: true);
+        var bottomOffset = ParseLength(styleMap, "bottom", isFixed ? context.Height : float.IsNaN(positionedContainingHeight) ? flowContainingWidth : positionedContainingHeight, float.NaN, allowAuto: true);
 
         if (float.IsNaN(leftOffset))
         {
@@ -1291,9 +1361,40 @@ public sealed partial class HtmlRenderer
             borderBoxX = absoluteContainingX + absoluteContainingWidth - rightOffset - positionedMargins.Right - positionedBorderBoxWidth;
         }
 
-        if (isAbsolute && !styleMap.ContainsKey("top") && !float.IsNaN(bottomOffset) && !float.IsNaN(positionedContainingHeight) && !float.IsNaN(positionedBorderBoxHeight))
+        // a box placed by its bottom needs its height first, which an auto one only has once laid out
+        var placementHeight = positionedBorderBoxHeight;
+
+        if ((isAbsolute || isFixed) && float.IsNaN(placementHeight) && !styleMap.ContainsKey("top") && !float.IsNaN(bottomOffset) &&
+            (isFixed || !float.IsNaN(positionedContainingHeight)) && (s_measuringPositioned ??= new(ReferenceEqualityComparer.Instance)).Add(element))
         {
-            borderBoxY = absoluteContainingY + positionedContainingHeight - bottomOffset - positionedMargins.Bottom - positionedBorderBoxHeight;
+            // its own scope, so the trial is not held back for the height of the container
+            context.PositionedScopes.Push(new PositionedScope(node));
+
+            try
+            {
+                placementHeight = TrialLayout(node, flowContainingWidth, inheritedTextStyle, context, positionedBorderBoxWidth, isAtomicInline: false).Metrics?.BorderBoxHeight ?? float.NaN;
+            }
+            finally
+            {
+                context.PositionedScopes.Pop();
+                s_measuringPositioned.Remove(element);
+            }
+        }
+
+        if (isAbsolute && !styleMap.ContainsKey("top") && !float.IsNaN(bottomOffset) && !float.IsNaN(positionedContainingHeight) && !float.IsNaN(placementHeight))
+        {
+            borderBoxY = absoluteContainingY + positionedContainingHeight - bottomOffset - positionedMargins.Bottom - placementHeight;
+        }
+
+        // a fixed box is placed in the viewport (e.g. a button at the bottom right)
+        if (isFixed && !styleMap.ContainsKey("left") && !float.IsNaN(rightOffset))
+        {
+            borderBoxX = context.Width - context.Padding - rightOffset - positionedMargins.Right - positionedBorderBoxWidth;
+        }
+
+        if (isFixed && !styleMap.ContainsKey("top") && !float.IsNaN(bottomOffset) && !float.IsNaN(placementHeight))
+        {
+            borderBoxY = context.Height - context.Padding - bottomOffset - positionedMargins.Bottom - placementHeight;
         }
 
         contentX = borderBoxX + borderLeft + paddingLeft;
@@ -1311,6 +1412,9 @@ public sealed partial class HtmlRenderer
         // and spliced in before this index once the box's final size is known, rather than simply
         // appended (which would paint them on top of - and hide - the children).
         var boxPaintInsertIndex = displayList.Commands.Count;
+        // what the children record, which moves with the scroll position of a scroll container
+        var scrolledCapture = s_layoutCapture.Value;
+        var scrolledRecordStart = scrolledCapture?.RecordOrder.Count ?? 0;
         List<DeferredPositionedBox>? deferredPositionedBoxes = null;
 
         if (string.Equals(display, "list-item", StringComparison.OrdinalIgnoreCase))
@@ -1521,6 +1625,13 @@ public sealed partial class HtmlRenderer
         else
         {
             var flowStart = displayList.Commands.Count;
+
+            if (s_layoutCapture.Value is { Containers: { } containers })
+            {
+                containers[element] = new ContainerEntry(node, contentX, contentY + contentOffsetY, contentWidth, currentTextStyle, maxY, resolvedContentHeight,
+                    childPositionedContainingX, childPositionedContainingY, childPositionedContainingWidth, childPositionedContainingHeight, IsFlow: true);
+            }
+
             context.PositionedScopes.Push(new PositionedScope(node));
 
             LayoutFlowChildren(
@@ -1584,6 +1695,12 @@ public sealed partial class HtmlRenderer
 
         var borderBoxWidth = borderLeft + paddingLeft + contentWidth + paddingRight + borderRight;
         var borderBoxHeight = borderTop + paddingTop + contentHeight + paddingBottom + borderBottom;
+
+        // the height its held back boxes are laid out with (see below)
+        if (s_layoutCapture.Value is { Containers: { } heldBackContainers } && heldBackContainers.TryGetValue(element, out var containerEntry) && ReferenceEquals(containerEntry.Node, node))
+        {
+            heldBackContainers[element] = containerEntry with { PaddingBoxHeight = borderBoxHeight - borderTop - borderBottom };
+        }
 
         // A box with its own formatting context never collapses margins with its children.
         var canCollapseWithLastChild = borderBottom <= 0f &&
@@ -1657,6 +1774,13 @@ public sealed partial class HtmlRenderer
             boxPaintBuffer.PushClip(clipRect, box.BorderRadius.ClampToBox(borderBoxWidth, borderBoxHeight));
         }
 
+        var contentScroll = clipsOverflow ? GetContentScrollOffset(node.Ref) : default;
+
+        if (contentScroll != default)
+        {
+            boxPaintBuffer.PushTransform(RenderTransform2D.Translate(-contentScroll.X, -contentScroll.Y));
+        }
+
         var paintInsertionIndex = boxPaintInsertIndex;
 
         if (!createsStackingContext && negativeZIndexRanges.Count > 0)
@@ -1665,6 +1789,20 @@ public sealed partial class HtmlRenderer
         }
 
         displayList.InsertRange(paintInsertionIndex, boxPaintBuffer.Commands);
+
+        // the content painted below the box (negative z-index) is still clipped and scrolled by it
+        if (clipsOverflow && paintInsertionIndex != boxPaintInsertIndex)
+        {
+            var clipRect = new RenderRect(borderBoxX + borderLeft, borderBoxY + borderTop, Math.Max(0f, borderBoxWidth - borderLeft - borderRight), Math.Max(0f, borderBoxHeight - borderTop - borderBottom));
+
+            foreach (var (start, count) in negativeZIndexRanges.OrderByDescending(range => range.StartIndex))
+            {
+                var clip = new PushClipCommand(clipRect, box.BorderRadius.ClampToBox(borderBoxWidth, borderBoxHeight));
+                displayList.InsertRange(start + count, contentScroll != default ? [new PopTransformCommand(), new PopClipCommand()] : [new PopClipCommand()]);
+                displayList.InsertRange(start, contentScroll != default ? [clip, new PushTransformCommand(RenderTransform2D.Translate(-contentScroll.X, -contentScroll.Y))] : [clip]);
+            }
+        }
+
         ResolveStickyBoxes(displayList, context.StickyScopes.Peek(), new RenderRect(contentX, contentY, contentWidth, contentHeight), context);
 
         if (TryResolveReplacedElementImage(node, styleMap, flowContainingWidth, borderBoxX + borderLeft + paddingLeft, borderBoxY + borderTop + paddingTop, out var image, out var imageRect, out var objectFitClipRect))
@@ -1724,6 +1862,12 @@ public sealed partial class HtmlRenderer
                     positionedContainingWidth: deferred.PositionedContainingWidth,
                     positionedContainingHeight: borderBoxHeight - borderTop - borderBottom);
             }
+        }
+
+        if (contentScroll != default)
+        {
+            displayList.PopTransform();
+            MoveScrolledContent(scrolledCapture, scrolledRecordStart, node.Ref, contentScroll);
         }
 
         if (clipsOverflow)
@@ -2051,6 +2195,9 @@ public sealed partial class HtmlRenderer
         // paint behind its items, but its auto-sized height is only known after they are laid out
         // (and appended), so their paint commands are spliced in before this index instead.
         var boxPaintInsertIndex = displayList.Commands.Count;
+        // what the children record, which moves with the scroll position of a scroll container
+        var scrolledCapture = s_layoutCapture.Value;
+        var scrolledRecordStart = scrolledCapture?.RecordOrder.Count ?? 0;
 
         var flexDirection = GetFlexDirection(styleMap);
         var isRowDirection = !string.Equals(flexDirection, "column", StringComparison.OrdinalIgnoreCase) && !string.Equals(flexDirection, "column-reverse", StringComparison.OrdinalIgnoreCase);
@@ -2450,6 +2597,7 @@ public sealed partial class HtmlRenderer
                         var childTextIndent = false;
                         var itemFloats = new FloatArea();
                         var itemRangeStart = displayList.Commands.Count;
+                        RecordLink(node, elementChild, styleMap, item.Style, context);
 
                         LayoutNode(
                             node: elementChild,
@@ -2534,8 +2682,17 @@ public sealed partial class HtmlRenderer
             contentHeight = Math.Min(contentHeight, maximumContentHeight);
         }
 
+        if (s_layoutCapture.Value is { Containers: { } containers })
+        {
+            // what LayoutOutOfFlowChildren gives a child shown later (see FindLayoutRoot)
+            containers[node.Ref] = new ContainerEntry(node, containingX, borderBoxY + borderTop + paddingTop, containingWidth, inheritedTextStyle, maxY, float.NaN,
+                borderBoxX + borderLeft, borderBoxY + borderTop, paddingLeft + containingWidth + paddingRight, paddingTop + contentHeight + paddingBottom);
+        }
+
         LayoutOutOfFlowChildren(contentHeight);
         paintOrder.Apply(displayList);
+        // the hidden children, which the flattened ones leave out
+        RecordPaintLayer(paintOrder, node.Children, displayList);
         var borderBoxWidth = borderLeft + paddingLeft + containingWidth + paddingRight + borderRight;
         var borderBoxHeight = borderTop + paddingTop + contentHeight + paddingBottom + borderBottom;
         var canCollapseWithLastChild = borderBottom <= 0f && paddingBottom <= 0f && float.IsNaN(specifiedContentHeight);
@@ -2606,6 +2763,13 @@ public sealed partial class HtmlRenderer
             boxPaintBuffer.PushClip(clipRect, box.BorderRadius.ClampToBox(borderBoxWidth, borderBoxHeight));
         }
 
+        var contentScroll = clipsOverflow ? GetContentScrollOffset(node.Ref) : default;
+
+        if (contentScroll != default)
+        {
+            boxPaintBuffer.PushTransform(RenderTransform2D.Translate(-contentScroll.X, -contentScroll.Y));
+        }
+
         displayList.InsertRange(boxPaintInsertIndex, boxPaintBuffer.Commands);
         ResolveStickyBoxes(
             displayList,
@@ -2642,6 +2806,12 @@ public sealed partial class HtmlRenderer
             {
                 displayList.PopClip();
             }
+        }
+
+        if (contentScroll != default)
+        {
+            displayList.PopTransform();
+            MoveScrolledContent(scrolledCapture, scrolledRecordStart, node.Ref, contentScroll);
         }
 
         if (clipsOverflow)
@@ -2764,6 +2934,9 @@ public sealed partial class HtmlRenderer
         // paint behind its items, but its auto-sized height is only known after they are laid out
         // (and appended), so their paint commands are spliced in before this index instead.
         var boxPaintInsertIndex = displayList.Commands.Count;
+        // what the children record, which moves with the scroll position of a scroll container
+        var scrolledCapture = s_layoutCapture.Value;
+        var scrolledRecordStart = scrolledCapture?.RecordOrder.Count ?? 0;
 
         var columnGap = ResolveColumnGap(styleMap, containingWidth);
         var rowGap = ResolveRowGap(styleMap, ResolveGapHeightReference(styleMap, containingWidth, paddingTop + paddingBottom + borderTop + borderBottom));
@@ -2772,6 +2945,13 @@ public sealed partial class HtmlRenderer
         var gridItems = FlattenDisplayContents(node.Children, context)
             .Where(child => child is ElementRenderNode || (child is TextRenderNode textNode && NormalizeWhitespace(textNode.Ref.Data).Length > 0))
             .ToList();
+        // absolutely positioned children take no cell; they are laid out once the grid's size is known
+        var outOfFlowChildren = gridItems
+            .OfType<ElementRenderNode>()
+            .Where(child => IsOutOfFlowPositioned(GetOrCreateStyleMap(context, child.Ref, child.ComputedStyle)))
+            .ToList();
+        gridItems.RemoveAll(child => child is ElementRenderNode element && outOfFlowChildren.Contains(element));
+        var paintOrder = new PaintOrder();
 
         var explicitGridTemplateColumns = styleMap.GetValueOrDefault("grid-template-columns") ?? string.Empty;
         var columnLineNames = new Dictionary<string, List<int>>(StringComparer.Ordinal);
@@ -3186,6 +3366,8 @@ public sealed partial class HtmlRenderer
             var childSuppressNextBlockTopMargin = false;
             var childFloats = new FloatArea();
             var childTextIndentConsumed = false;
+            var itemRangeStart = displayList.Commands.Count;
+            RecordLink(node, elementChild, styleMap, childStyleMap, context);
 
             LayoutNode(
                 node: elementChild,
@@ -3206,6 +3388,7 @@ public sealed partial class HtmlRenderer
                 flexMainSize: resolvedChildContentWidth,
                 flexCrossSize: resolvedChildContentHeight,
                 mainAxisMarginsPlaced: true);
+            paintOrder.Track(elementChild, displayList, itemRangeStart, context);
         }
 
         var gridContentWidth = GetGridContentSize(columnSizes, resolvedColumnGap, containingWidth);
@@ -3222,6 +3405,10 @@ public sealed partial class HtmlRenderer
             resolvedGridContentHeight = Math.Min(resolvedGridContentHeight, maximumGridContentHeight);
         }
         var borderBoxHeight = borderTop + paddingTop + resolvedGridContentHeight + paddingBottom + borderBottom;
+        LayoutOutOfFlowChildren();
+        paintOrder.Apply(displayList);
+        // the hidden children, which the flattened ones leave out
+        RecordPaintLayer(paintOrder, node.Children, displayList);
         // The margins of grid items never collapse with the grid's own (CSS Grid 1 §6.1).
         var effectiveMarginBottom = ParseLength(styleMap, "margin-bottom", containingWidth, box.Margin.Bottom, allowAuto: false);
 
@@ -3285,6 +3472,13 @@ public sealed partial class HtmlRenderer
             boxPaintBuffer.PushClip(clipRect, box.BorderRadius.ClampToBox(borderBoxWidth, borderBoxHeight));
         }
 
+        var contentScroll = clipsOverflow ? GetContentScrollOffset(node.Ref) : default;
+
+        if (contentScroll != default)
+        {
+            boxPaintBuffer.PushTransform(RenderTransform2D.Translate(-contentScroll.X, -contentScroll.Y));
+        }
+
         displayList.InsertRange(boxPaintInsertIndex, boxPaintBuffer.Commands);
         ResolveStickyBoxes(
             displayList,
@@ -3296,6 +3490,12 @@ public sealed partial class HtmlRenderer
                 Math.Max(0f, borderBoxHeight - borderTop - borderBottom - paddingTop - paddingBottom)),
             context);
 
+        if (contentScroll != default)
+        {
+            displayList.PopTransform();
+            MoveScrolledContent(scrolledCapture, scrolledRecordStart, node.Ref, contentScroll);
+        }
+
         if (clipsOverflow)
         {
             displayList.PopClip();
@@ -3305,6 +3505,109 @@ public sealed partial class HtmlRenderer
         cursorY = flowBorderBoxY + borderBoxHeight;
         previousBlockMarginBottom = effectiveMarginBottom + context.ParagraphSpacing;
         suppressNextBlockTopMargin = false;
+
+        // Laid out against the grid area of their lines (CSS Grid 1 §9.1): a line left out (or
+        // not in the grid) is the padding edge. Their static position is the start of the content box.
+        void LayoutOutOfFlowChildren()
+        {
+            var contentX = borderBoxX + borderLeft + paddingLeft;
+            var contentY = borderBoxY + borderTop + paddingTop;
+            var paddingBoxX = borderBoxX + borderLeft;
+            var paddingBoxY = borderBoxY + borderTop;
+            var paddingBoxWidth = borderBoxWidth - borderLeft - borderRight;
+            var paddingBoxHeight = paddingTop + resolvedGridContentHeight + paddingBottom;
+
+            if (s_layoutCapture.Value is { Containers: { } containers })
+            {
+                // what a child shown later is laid out from (see FindLayoutRoot)
+                containers[node.Ref] = new ContainerEntry(node, contentX, contentY, containingWidth, inheritedTextStyle, maxY, float.NaN,
+                    paddingBoxX, paddingBoxY, paddingBoxWidth, paddingBoxHeight);
+            }
+
+            foreach (var child in outOfFlowChildren)
+            {
+                var childStyleMap = GetOrCreateStyleMap(context, child.Ref, child.ComputedStyle);
+                var (columnStart, columnEnd, rowStart, rowEnd) = childStyleMap.TryGetValue("grid-area", out var areaName) &&
+                    namedAreas.TryGetValue(areaName.Trim().Trim('"', '\''), out var area)
+                    ? (area.Column, area.Column + area.ColumnSpan, area.Row, area.Row + area.RowSpan)
+                    : ParseAbsoluteGridLines(childStyleMap.GetValueOrDefault("grid-column"), columnLines) is var (startColumn, endColumn) &&
+                      ParseAbsoluteGridLines(childStyleMap.GetValueOrDefault("grid-row"), rowLines) is var (startRow, endRow)
+                        ? (startColumn, endColumn, startRow, endRow)
+                        : default((int?, int?, int?, int?));
+                var areaLeft = GetLinePosition(columnStart, columnSizes, contentX + columnAlignment.Offset, resolvedColumnGap + columnAlignment.Spacing) ?? paddingBoxX;
+                var areaRight = GetLinePosition(columnEnd, columnSizes, contentX + columnAlignment.Offset, resolvedColumnGap + columnAlignment.Spacing) ?? paddingBoxX + paddingBoxWidth;
+                var areaTop = GetLinePosition(rowStart, rowSizes, contentY + rowAlignment.Offset, resolvedRowGap + rowAlignment.Spacing) ?? paddingBoxY;
+                var areaBottom = GetLinePosition(rowEnd, rowSizes, contentY + rowAlignment.Offset, resolvedRowGap + rowAlignment.Spacing) ?? paddingBoxY + paddingBoxHeight;
+                var childCursorY = contentY;
+                var childPreviousBottom = 0f;
+                var childSuppressMargin = false;
+                var childTextIndent = false;
+                var childRangeStart = displayList.Commands.Count;
+
+                LayoutNode(
+                    child,
+                    contentX,
+                    contentY,
+                    containingWidth,
+                    ref childCursorY,
+                    ref childPreviousBottom,
+                    ref childSuppressMargin,
+                    new FloatArea(),
+                    ref childTextIndent,
+                    inheritedTextStyle,
+                    context,
+                    displayList,
+                    maxY,
+                    positionedContainingX: areaLeft,
+                    positionedContainingY: areaTop,
+                    positionedContainingWidth: Math.Max(0f, areaRight - areaLeft),
+                    positionedContainingHeight: Math.Max(0f, areaBottom - areaTop));
+                paintOrder.Track(child, displayList, childRangeStart, context);
+            }
+        }
+
+        // where a line of the grid is, if it is one
+        static float? GetLinePosition(int? line, IReadOnlyList<float> tracks, float start, float gap) =>
+            line is { } index && index >= 0 && index <= tracks.Count
+                ? start + (index == 0 ? 0f : GetGridTrackOffset(tracks, index - 1, gap) + tracks[index - 1])
+                : null;
+    }
+
+    /// <summary>
+    /// The lines of a <c>grid-column</c>/<c>grid-row</c> value of an absolutely positioned box
+    /// (0-based, null for <c>auto</c>): a span counts from the other line, and a lone name
+    /// stands for both edges of its area.
+    /// </summary>
+    private static (int? Start, int? End) ParseAbsoluteGridLines(string? rawValue, GridLines lines)
+    {
+        if (string.IsNullOrWhiteSpace(rawValue))
+        {
+            return (null, null);
+        }
+
+        var parts = rawValue.Split('/', 2);
+        var startTokens = SplitGridLineTokens(parts[0]);
+        var endTokens = parts.Length > 1 ? SplitGridLineTokens(parts[1]) : null;
+
+        if (endTokens is null && startTokens.Length == 1 && !int.TryParse(startTokens[0], NumberStyles.Integer, CultureInfo.InvariantCulture, out _) &&
+            !string.Equals(startTokens[0], "auto", StringComparison.OrdinalIgnoreCase))
+        {
+            endTokens = startTokens;
+        }
+
+        var start = ResolveGridLine(startTokens, lines, "-start");
+        var end = endTokens is null ? null : ResolveGridLine(endTokens, lines, "-end");
+
+        if (start is null && end is { } onlyEnd && ResolveGridSpan(startTokens) is { } startSpan)
+        {
+            start = onlyEnd - startSpan;
+        }
+        else if (end is null && start is { } onlyStart && endTokens is not null && ResolveGridSpan(endTokens) is { } endSpan)
+        {
+            end = onlyStart + endSpan;
+        }
+
+        return start is { } first && end is { } last && last < first ? (last, first) : (start, end);
     }
 
     /// <summary>
@@ -5519,8 +5822,12 @@ public sealed partial class HtmlRenderer
     private static void PrepareDocumentForRendering(IDocument document)
     {
         ArgumentNullException.ThrowIfNull(document);
+        PrepareElementsForRendering(document.All.OfType<IElement>());
+    }
 
-        foreach (var element in document.All.OfType<IElement>())
+    private static void PrepareElementsForRendering(IEnumerable<IElement> elements)
+    {
+        foreach (var element in elements)
         {
             var styleAttribute = element.GetAttribute("style");
 
@@ -6600,7 +6907,10 @@ public sealed partial class HtmlRenderer
     /// </summary>
     private sealed class PaintOrder
     {
-        private readonly List<(int Z, int Order, RenderCommand First, int Count)> _raised = [];
+        private readonly List<(int Z, int Order, RenderCommand First, int Count, IElement Element)> _raised = [];
+
+        /// <summary>Gets the children moved to the end, in the order they paint (once applied).</summary>
+        public IReadOnlyList<RaisedChild> Applied { get; private set; } = [];
 
         public void Track(IRenderNode child, DisplayList displayList, int start, LayoutContext context)
         {
@@ -6612,14 +6922,17 @@ public sealed partial class HtmlRenderer
 
                 if ((IsOutOfFlowPositioned(styleMap) || HasExplicitZIndex(styleMap)) && ParseZIndex(styleMap) >= 0)
                 {
-                    _raised.Add((ParseZIndex(styleMap), _raised.Count, displayList.Commands[start], count));
+                    _raised.Add((ParseZIndex(styleMap), _raised.Count, displayList.Commands[start], count, element.Ref));
                 }
             }
         }
 
         public void Apply(DisplayList displayList)
         {
-            foreach (var (_, _, first, count) in _raised.OrderBy(m => m.Z).ThenBy(m => m.Order))
+            var ordered = _raised.OrderBy(m => m.Z).ThenBy(m => m.Order).ToList();
+            Applied = ordered.Select(m => new RaisedChild(m.Element, m.Z, m.First, m.Count)).ToList();
+
+            foreach (var (_, _, first, count, _) in ordered)
             {
                 var commands = displayList.Commands;
 
