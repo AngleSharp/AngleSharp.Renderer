@@ -22,6 +22,7 @@ Released on Sunday, November 1 2026.
 - Fixed grid items with a `z-index` painting in document order
 - Fixed `scrollHeight` and `scrollWidth` counting the content clipped by scroll containers inside, and boxes in fixed boxes
 - Fixed the text of an absolutely positioned box moving the baseline of its inline-block (e.g. a dropdown inside an inline-block pushing the following lines down)
+- Fixed checkboxes, radios and other form controls as flex items in a row (e.g. a checkbox beside its label in a `display: flex` label) getting no width, so they were not painted
 - Added `IDomHarness.UpdateFrame`, bringing the last frame up to date without a layout of the whole document when the changes since were confined to boxes out of the flow: their commands are replaced, removed, or inserted where a box shown since paints (e.g. on dev.to showing a profile dropdown or changing the fixed header takes about 50 ms instead of 1.1 s, with the same pixels), and a frame stays as it is when they were not rendered then and are not now (e.g. a dropdown shown, measured and hidden again)
 
 # 0.9.1

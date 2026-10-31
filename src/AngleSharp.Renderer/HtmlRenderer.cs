@@ -5039,6 +5039,17 @@ public sealed partial class HtmlRenderer
         }
 
         var childStyle = GetOrCreateStyleMap(context, elementChild.Ref, elementChild.ComputedStyle);
+        var childTextStyle = ResolveTextStyle(childStyle, inheritedTextStyle);
+        var formControlKind = ResolveFormControlKind(elementChild);
+
+        // A form control's intrinsic size (e.g. a checkbox's box) is its default width/height,
+        // which LayoutElement only fills in when it lays the item out - too late for its flex
+        // base size, which would come from its (empty) content and squeeze it to nothing.
+        if (formControlKind != FormControlKind.None)
+        {
+            ApplyFormControlDefaults(formControlKind, elementChild.Ref, childStyle, childTextStyle, context);
+        }
+
         // Needed so ResolveFlexBaseSize/ResolveFlexCrossSize can convert an authored border-box
         // width/height/flex-basis into this renderer's content-box convention using *this item's*
         // own border/padding - not the container's - before flex-grow/shrink ever runs, the same
@@ -5062,7 +5073,6 @@ public sealed partial class HtmlRenderer
 
         // The content size along the main axis: max-content (or the image's width) for rows, the
         // laid-out height for columns; the min-content width feeds the automatic minimum.
-        var childTextStyle = ResolveTextStyle(childStyle, inheritedTextStyle);
         float contentMainSize;
         float contentMinimum;
         var hasDeferredMainSize = false;

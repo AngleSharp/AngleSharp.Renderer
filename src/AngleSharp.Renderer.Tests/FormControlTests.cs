@@ -110,6 +110,23 @@ public sealed class FormControlTests
     }
 
     [Theory]
+    [InlineData("<div style=\"display:flex\">{0}<span>Label</span></div>")]
+    [InlineData("<label style=\"display:flex; align-items:center\">{0}<span>Label</span></label>")]
+    [InlineData("<div style=\"display:flex\">{0}Label</div>")]
+    [InlineData("<div style=\"display:inline-flex\">{0}</div>")]
+    [InlineData("<div style=\"display:flex; flex-direction:column\">{0}<span>Label</span></div>")]
+    public async Task CheckedControls_ArePaintedAsFlexItems(string container)
+    {
+        // found in the browser's settings page: checkboxes beside their label in a flex row vanished
+        foreach (var type in new[] { "checkbox", "radio" })
+        {
+            var displayList = await LayoutAsync(string.Format(container, $"<input type=\"{type}\" checked style=\"margin:0 12px 0 0\">"));
+
+            Assert.Contains(displayList.Commands.OfType<FillRectCommand>(), command => command.Color.Equals(DefaultAccent));
+        }
+    }
+
+    [Theory]
     [InlineData("checkbox", "checked")]
     [InlineData("radio", "checked")]
     [InlineData("range", "")]
