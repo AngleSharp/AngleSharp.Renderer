@@ -220,8 +220,8 @@ class Build : FalloutBuild
         .DependsOn(RunUnitTests)
         .Executes(() =>
         {
+            // In CI this is the short-lived key issued by NuGet trusted publishing (NuGet/login).
             var apiKey = Environment.GetEnvironmentVariable("NUGET_API_KEY");
-
 
             if (apiKey.IsNullOrEmpty())
             {
