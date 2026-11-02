@@ -20,8 +20,11 @@ public static class DocumentCssomViewExtensions
         ArgumentNullException.ThrowIfNull(document);
 
         var harness = document.Context.GetDomHarness();
+        // the point is in the viewport, so are the boxes it is looked up in
         var metricsMap = harness is InteractiveHtmlRendererState state
-            ? state.GetLayoutMetrics(document)
+            ? document.DocumentElement is { } root
+                ? state.GetLayoutSnapshot(document).ToViewport(state.GetScrollLeft(root, double.MaxValue), state.GetScrollTop(root, double.MaxValue))
+                : state.GetLayoutMetrics(document)
             : HtmlRenderer.CaptureLayoutMetrics(document, harness.RenderDevice);
         var targetElement = HitTesting.FindTopMostElementAt(metricsMap, x, y);
 

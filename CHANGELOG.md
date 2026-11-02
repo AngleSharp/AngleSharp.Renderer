@@ -1,3 +1,30 @@
+# 0.9.2
+
+Released on Sunday, November 1 2026.
+
+- Improved geometry reads after a change confined to an out-of-flow box (e.g. a script showing a hidden dropdown with `position: absolute`, measuring it, and hiding it again): only that box is laid out again, not the whole document (dev.to's scroll handler measuring its 60 dropdowns went from 64 s to under 3 s)
+- Improved geometry reads to keep the layout when the page scrolls or the pointer moves without changing the hovered element, and `scrollTop`/`scrollLeft`/`scrollY` to not lay out the document
+- Improved `IDomHarness.UpdateFrame` to show hidden absolutely positioned children of flex and grid containers without a full layout, too
+- Improved geometry reads after a frame of an interactive document, which are answered from the frame's layout instead of laying out the document again
+- Improved geometry reads and `IDomHarness.UpdateFrame` after changes of in-flow blocks (e.g. the text of a title, the color of an article): the block is laid out again on its own when it stays the same from outside (its box, its intrinsic widths where a flex or grid item is sized by them, its margins, no floats beside the boxes after it), else the next blocks around it are tried before a full layout (dev.to: 34ms instead of 1.2s for a changed title)
+- Improved laying out a box on its own to reuse what the layout resolved from the page (e.g. the page styles of inline SVG icons, which built a style collection of their own every time)
+- Improved changes of the content of an element on pages with `:has()` selectors, which needed a full layout; only a change flipping the match of a `:has()` on the element or around it does now
+- Fixed `getBoundingClientRect`, `getClientRects`, and `caretPositionFromPoint` ignoring the scroll position of the page; boxes in fixed boxes stay, and sticky boxes stick for it
+- Fixed the content of a stuck sticky box (e.g. the links of a sticky header) being hit tested and measured where it would be without sticking
+- Fixed geometry reads measuring text with another measurer than painting (e.g. images in a line off by a tenth of a pixel)
+- Fixed `right` and `bottom` of fixed boxes being ignored (e.g. a button fixed at the bottom right was placed at the top left)
+- Fixed absolutely positioned and fixed boxes of an auto height placed by `bottom` staying at the top; they are measured first
+- Fixed scroll containers other than the page (`overflow: auto`, `scroll`, `hidden`) not moving their content when scrolled, in painting, hit testing, and geometry (`getBoundingClientRect`, `scrollIntoView`)
+- Fixed a box laid out on its own inside a scrolled container (other than the page) being measured where it would be unscrolled
+- Fixed changes of style sheets (the text of a `style` element, adding or removing `style` and `link` elements) inside a box out of the flow being taken for changes of that box only
+- Fixed content with a negative `z-index` inside a scroll container (or any box clipping its overflow) being neither clipped nor scrolled by it
+- Fixed absolutely positioned children of grid containers being laid out as grid items (taking a cell and sizing the tracks); they are placed against the grid's padding box, or the grid area of their `grid-column`/`grid-row`/`grid-area` lines (CSS Grid 1 §9.1)
+- Fixed grid items with a `z-index` painting in document order
+- Fixed `scrollHeight` and `scrollWidth` counting the content clipped by scroll containers inside, and boxes in fixed boxes
+- Fixed the text of an absolutely positioned box moving the baseline of its inline-block (e.g. a dropdown inside an inline-block pushing the following lines down)
+- Fixed checkboxes, radios and other form controls as flex items in a row (e.g. a checkbox beside its label in a `display: flex` label) getting no width, so they were not painted
+- Added `IDomHarness.UpdateFrame`, bringing the last frame up to date without a layout of the whole document when the changes since were confined to boxes out of the flow: their commands are replaced, removed, or inserted where a box shown since paints (e.g. on dev.to showing a profile dropdown or changing the fixed header takes about 50 ms instead of 1.1 s, with the same pixels), and a frame stays as it is when they were not rendered then and are not now (e.g. a dropdown shown, measured and hidden again)
+
 # 0.9.1
 
 Released on Friday, October 30 2026.

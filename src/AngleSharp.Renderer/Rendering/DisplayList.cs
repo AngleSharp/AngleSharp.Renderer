@@ -45,6 +45,15 @@ public sealed class DisplayList
     }
 
     /// <summary>
+    /// Replaces the commands of a range with others (e.g. a box laid out again).
+    /// </summary>
+    internal void ReplaceRange(int index, int count, IEnumerable<RenderCommand> commands)
+    {
+        _commands.RemoveRange(index, count);
+        _commands.InsertRange(index, commands);
+    }
+
+    /// <summary>
     /// Removes the commands from the given index on, e.g. the ones of a layout to be redone.
     /// </summary>
     /// <param name="index">The position of the first command to remove.</param>

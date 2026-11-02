@@ -24,10 +24,19 @@ public sealed partial class HtmlRenderer
     [ThreadStatic]
     private static StickyProbe? s_stickyProbe;
 
+    // what the boxes laid out now move with: fixed boxes (any depth), the innermost sticky box
+    [ThreadStatic]
+    private static int s_viewportAnchorDepth;
+
+    [ThreadStatic]
+    private static IElement? s_stickyElement;
+
     /// <summary>
     /// A sticky box waiting for its container: the display list it was emitted into, its first
     /// command (found again by identity, since later insertions shift indices) and command count,
-    /// and its natural border box.
+    /// and its natural border box. The metrics recorded while it was laid out (its own and those
+    /// of its content) are <paramref name="Records"/> of <paramref name="Capture"/>, and
+    /// <paramref name="EnclosingSticky"/> is the sticky box it is in, if any.
     /// </summary>
     private sealed record StickyBox(
         DisplayList DisplayList,
@@ -35,7 +44,16 @@ public sealed partial class HtmlRenderer
         int Count,
         IElement Element,
         Dictionary<string, string> Style,
-        ElementLayoutMetrics Metrics);
+        ElementLayoutMetrics Metrics,
+        LayoutCapture? Capture = null,
+        Range Records = default,
+        IElement? EnclosingSticky = null);
+
+    /// <summary>
+    /// A sticky box as resolved against the viewport at the scroll position the layout was made
+    /// for: with its containing block it sticks anew for another one (see LayoutSnapshot.ToViewport).
+    /// </summary>
+    private sealed record StickyRecord(StickyBox Box, RenderRect ContainingBlock, float OffsetX, float OffsetY);
 
     /// <summary>
     /// A sticky box inside a writing-mode system, whose offset waits until the system is placed:
@@ -120,15 +138,22 @@ public sealed partial class HtmlRenderer
         var previousProbe = s_stickyProbe;
         var probe = isSticky ? new StickyProbe(node.Ref) : null;
         var isViewportAnchored = string.Equals(GetPosition(styleMap), "fixed", StringComparison.Ordinal);
+        var enclosingSticky = s_stickyElement;
+        var capture = s_layoutCapture.Value;
+        var recordStart = capture?.RecordOrder.Count ?? 0;
 
         if (probe is not null)
         {
             s_stickyProbe = probe;
+            s_stickyElement = node.Ref;
         }
 
         if (isViewportAnchored)
         {
             displayList.Add(new PushViewportAnchorCommand());
+            // a fixed box does not move with the sticky boxes around it
+            s_viewportAnchorDepth++;
+            s_stickyElement = null;
         }
 
         context.StickyScopes.Push([]);
@@ -141,16 +166,40 @@ public sealed partial class HtmlRenderer
         {
             context.StickyScopes.Pop();
             s_stickyProbe = previousProbe;
+            s_stickyElement = enclosingSticky;
 
             if (isViewportAnchored)
             {
                 displayList.Add(new PopViewportAnchorCommand());
+                s_viewportAnchorDepth--;
+            }
+        }
+
+        // what a block of a block flow leaves for the boxes after it
+        if (capture is { Entries: { } entries } && ReferenceEquals(capture, s_layoutCapture.Value) &&
+            entries.TryGetValue(node.Ref, out var entry) && entry.IsInFlow && ReferenceEquals(entry.Node, node))
+        {
+            entries[node.Ref] = entry with { Result = new FlowResult(cursorY, previousBlockMarginBottom, suppressNextBlockTopMargin, textIndentConsumed, floats.IsEmpty) };
+        }
+
+        // where the box that may be laid out on its own is in the display list
+        if (capture is { Ranges: { } ranges } && ReferenceEquals(capture, s_layoutCapture.Value) && capture.Entries!.ContainsKey(node.Ref))
+        {
+
+            if (displayList.Commands.Count > start)
+            {
+                ranges[node.Ref] = (displayList.Commands[start], displayList.Commands.Count - start);
+            }
+            else
+            {
+                ranges.Remove(node.Ref);
             }
         }
 
         if (probe?.Metrics is { } metrics && displayList.Commands.Count > start && context.StickyScopes.TryPeek(out var scope))
         {
-            scope.Add(new StickyBox(displayList, displayList.Commands[start], displayList.Commands.Count - start, node.Ref, styleMap, metrics));
+            var records = ReferenceEquals(capture, s_layoutCapture.Value) && capture is not null ? recordStart..capture.RecordOrder.Count : default;
+            scope.Add(new StickyBox(displayList, displayList.Commands[start], displayList.Commands.Count - start, node.Ref, styleMap, metrics, capture, records, enclosingSticky));
         }
     }
 
@@ -201,6 +250,11 @@ public sealed partial class HtmlRenderer
             }
 
             var (offsetX, offsetY) = ComputeStickyOffset(sticky, containingBlock, GetStickyViewport(context));
+
+            if (s_layoutCapture.Value is { Stickies: { } stickies })
+            {
+                stickies[sticky.Element] = new StickyRecord(sticky, containingBlock, offsetX, offsetY);
+            }
 
             if (offsetX == 0f && offsetY == 0f)
             {
@@ -276,6 +330,24 @@ public sealed partial class HtmlRenderer
 
     private static void RecordStickyMetrics(StickyBox sticky, float offsetX, float offsetY)
     {
+        // the box moves with its content
+        if (sticky.Capture is { } capture && ReferenceEquals(capture, s_layoutCapture.Value) && sticky.Records.End.Value > sticky.Records.Start.Value)
+        {
+            var moved = new HashSet<IElement>(ReferenceEqualityComparer.Instance);
+
+            for (var index = sticky.Records.Start.Value; index < sticky.Records.End.Value; index++)
+            {
+                var element = capture.RecordOrder[index];
+
+                if (moved.Add(element) && capture.TryGet(element, out var recorded) && !recorded.IsViewportAnchored)
+                {
+                    capture.Replace(element, recorded with { BorderBoxX = recorded.BorderBoxX + offsetX, BorderBoxY = recorded.BorderBoxY + offsetY });
+                }
+            }
+
+            return;
+        }
+
         var metrics = sticky.Metrics;
         RecordLayoutMetrics(
             sticky.Element,

@@ -170,12 +170,36 @@ public sealed partial class HtmlRenderer
             if (cursorY > maxY && !ContainsBottomStickyBox(children.Skip(index + 1), context))
             {
                 paintOrder.Apply(displayList);
+                RecordPaintLayer(paintOrder, children, displayList);
                 return;
             }
         }
 
         FlushRun(ref cursorY, ref previousBlockMarginBottom, ref suppressNextBlockTopMargin, floats, ref textIndentConsumed);
         paintOrder.Apply(displayList);
+        RecordPaintLayer(paintOrder, children, displayList);
+    }
+
+    /// <summary>
+    /// Notes where the not rendered children of a flow would paint once shown: among the
+    /// children moved to the end (by z-index, then document order), else after the flow.
+    /// </summary>
+    private static void RecordPaintLayer(PaintOrder paintOrder, IEnumerable<IRenderNode> children, DisplayList displayList)
+    {
+        if (s_layoutCapture.Value is not { Layers: { } layers } || displayList.Commands.Count == 0)
+        {
+            return;
+        }
+
+        PaintLayer? layer = null;
+
+        foreach (var child in children)
+        {
+            if (child is ElementRenderNode element && !GeneratesBoxes(element))
+            {
+                layers[element.Ref] = layer ??= new PaintLayer(paintOrder.Applied, displayList.Commands[^1]);
+            }
+        }
     }
 
     private enum FlowChildKind
@@ -2101,6 +2125,36 @@ public sealed partial class HtmlRenderer
         {
             capture.LastBaselineY = baselineY;
             capture.FirstBaselineY ??= baselineY;
+        }
+    }
+
+    /// <summary>
+    /// Keeps the baselines noted so far while an out-of-flow box is laid out: its lines are no
+    /// part of the lines its container aligns by (an inline-block's baseline is that of its last
+    /// in-flow line box, CSS 2.1 §10.8.1).
+    /// </summary>
+    private readonly struct BaselineScope : IDisposable
+    {
+        private readonly LayoutCapture? _capture;
+        private readonly float? _firstBaselineY;
+        private readonly float? _lastBaselineY;
+
+        private BaselineScope(LayoutCapture capture)
+        {
+            _capture = capture;
+            _firstBaselineY = capture.FirstBaselineY;
+            _lastBaselineY = capture.LastBaselineY;
+        }
+
+        public static BaselineScope Begin() => s_layoutCapture.Value is { } capture ? new BaselineScope(capture) : default;
+
+        public void Dispose()
+        {
+            if (_capture is not null)
+            {
+                _capture.FirstBaselineY = _firstBaselineY;
+                _capture.LastBaselineY = _lastBaselineY;
+            }
         }
     }
 

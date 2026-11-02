@@ -11,36 +11,66 @@ using AngleSharp.Renderer.Rendering;
 public sealed partial class HtmlRenderer
 {
     /// <summary>
+    /// Lays out the document unscrolled for geometry reads, measuring text like the frames do.
+    /// </summary>
+    internal LayoutSnapshot CaptureLayout(IDocument document, IRenderDevice renderDevice) =>
+        LayoutSnapshot.LayOut(document, renderDevice, _textMeasurer, 0f, 0, isFrame: false, out _);
+
+    /// <summary>
     /// Lays out the document for a frame scrolled to <paramref name="scrollTop"/>. The frame's
     /// surface extends <paramref name="overscan"/> rows above and below the viewport, so a host
     /// can scroll it (see <see cref="RenderedFrame.IsScrollShiftable"/>) until the next frame.
     /// </summary>
-    internal RenderedFrame PrepareFrame(IDocument document, IRenderDevice renderDevice, double scrollTop, int overscan)
+    internal RenderedFrame PrepareFrame(IDocument document, IRenderDevice renderDevice, double scrollTop, int overscan) =>
+        PrepareFrame(document, renderDevice, scrollTop, overscan, out _);
+
+    /// <summary>
+    /// Lays out the document for a frame (see above), which also gives the layout to answer
+    /// geometry reads from until the document changes.
+    /// </summary>
+    internal RenderedFrame PrepareFrame(IDocument document, IRenderDevice renderDevice, double scrollTop, int overscan, out LayoutSnapshot snapshot)
     {
         ArgumentNullException.ThrowIfNull(document);
         ArgumentNullException.ThrowIfNull(renderDevice);
 
         overscan = Math.Max(0, overscan);
-        var context = CreateLayoutContext(document, renderDevice, _textMeasurer);
-        var viewport = new RenderViewport(context.Width, context.Height);
-        var surface = new RenderViewport(context.Width, context.Height + (2 * overscan));
         var scrollOffsetY = (float)scrollTop - overscan;
-        var capture = new LayoutCapture();
-        var previous = s_layoutCapture.Value;
-        s_layoutCapture.Value = capture;
-        DisplayList displayList;
-        IReadOnlyDictionary<IElement, ElementLayoutMetrics> metrics;
+        // the whole page is laid out: hit testing below the viewport and the scroll extent need it
+        snapshot = LayoutSnapshot.LayOut(document, renderDevice, _textMeasurer, scrollOffsetY, 2 * overscan, isFrame: true, out var displayList);
+        return CreateFrame(document, snapshot, displayList, scrollTop, overscan);
+    }
 
-        try
+    /// <summary>
+    /// The last frame with the boxes laid out on their own since (see
+    /// <see cref="LayoutSnapshot.TryPatch"/>), or null if it needs a new layout.
+    /// </summary>
+    internal RenderedFrame? UpdateFrame(IDocument document, RenderedFrame frame, LayoutSnapshot snapshot)
+    {
+        if (snapshot.IsUnchangedSinceFrame)
         {
-            // the whole page is laid out: hit testing below the viewport and the scroll extent need it
-            displayList = BuildDisplayList(document, viewport, context, renderDevice, scrollOffsetY, measureFullExtent: true, surfaceExtraHeight: 2 * overscan);
-            metrics = AddHitTestLayers(capture.Snapshot(), context);
+            return frame;
         }
-        finally
+
+        var displayList = new DisplayList { Fonts = frame.DisplayList.Fonts };
+        displayList.InsertRange(0, frame.DisplayList.Commands);
+
+        if (!snapshot.TryPatch(displayList))
         {
-            s_layoutCapture.Value = previous;
+            return null;
         }
+
+        var updated = CreateFrame(document, snapshot, displayList, frame.ScrollTop, frame.OverscanTop);
+        updated.IsAnimating = frame.IsAnimating;
+        return updated;
+    }
+
+    private RenderedFrame CreateFrame(IDocument document, LayoutSnapshot snapshot, DisplayList displayList, double scrollTop, int overscan)
+    {
+        var scrollOffsetY = (float)scrollTop - overscan;
+        var (width, height) = snapshot.Viewport;
+        var styleMaps = snapshot.StyleMaps;
+        var surface = new RenderViewport(width, height + (2 * overscan));
+        var metrics = snapshot.LayoutMetrics;
 
         var isScrollShiftable = true;
         var hasStickyBoxes = false;
@@ -48,7 +78,7 @@ public sealed partial class HtmlRenderer
 
         foreach (var (element, elementMetrics) in metrics)
         {
-            var position = context.StyleMapCache.TryGetValue(element, out var styleMap)
+            var position = styleMaps.TryGetValue(element, out var styleMap)
                 ? styleMap.GetValueOrDefault("position")?.Trim()
                 : null;
 
@@ -65,9 +95,9 @@ public sealed partial class HtmlRenderer
             }
         }
 
-        var hitTestMap = HitTestMap.Create(document, metrics, context.StyleMapCache, -overscan);
-        var contentHeight = Math.Max(context.Height, (double)contentBottom);
+        var hitTestMap = HitTestMap.Create(document, metrics, styleMaps, -overscan);
+        var contentHeight = Math.Max(height, (double)contentBottom);
         // fixed boxes are marked in the display list, sticky ones would have to stick anew
-        return new RenderedFrame(displayList, _backend, surface, context.Height, scrollTop, overscan, contentHeight, isScrollShiftable, !hasStickyBoxes, hitTestMap);
+        return new RenderedFrame(displayList, _backend, surface, height, scrollTop, overscan, contentHeight, isScrollShiftable, !hasStickyBoxes, hitTestMap);
     }
 }

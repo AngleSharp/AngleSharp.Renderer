@@ -109,4 +109,14 @@ public interface IDomHarness
     /// </param>
     /// <returns>The prepared frame.</returns>
     RenderedFrame PrepareFrame(int overscan = 0);
+
+    /// <summary>
+    /// Brings the last frame (<see cref="PrepareFrame"/>) up to date with the changes of the
+    /// active document since, without laying out all of it: when they were confined to boxes
+    /// out of the flow, those are laid out again and replace their commands (e.g. a menu changing
+    /// its items), and when the boxes were not rendered then and are not now (e.g. a script
+    /// showing, measuring and hiding a dropdown again), the frame stays as it is.
+    /// </summary>
+    /// <returns>The frame showing the document now, or null if it needs <see cref="PrepareFrame"/>.</returns>
+    RenderedFrame? UpdateFrame() => null;
 }

@@ -49,6 +49,28 @@ public sealed class ElementCssomViewExtensionsTests
     }
 
     [Fact]
+    public async Task AbsolutelyPositionedContent_DoesNotMoveTheBaselineOfItsInlineBlock()
+    {
+        var document = await ParseAsync("""
+            <html>
+              <head><style>html, body { margin: 0; padding: 0; } p { margin: 0; }</style></head>
+              <body>
+                <p><span style="display:inline-block; position:relative">Card
+                  <span id="dropdown" style="position:absolute; top:100%; left:0; display:none; font-size:30px">One<br>Two</span></span></p>
+                <div id="after">After</div>
+              </body>
+            </html>
+            """);
+        var after = document.QuerySelector("#after")!;
+        var top = after.GetBoundingClientRect().Top;
+
+        document.QuerySelector("#dropdown")!.SetAttribute("style", "position:absolute; top:100%; left:0; font-size:30px");
+        document.Context.GetDomHarness().PaintToPng();
+
+        Assert.Equal(top, after.GetBoundingClientRect().Top, 3);
+    }
+
+    [Fact]
     public async Task GetClientRects_ReturnsEmpty_WhenElementHasNoLayoutBox()
     {
         var document = await ParseAsync("""
