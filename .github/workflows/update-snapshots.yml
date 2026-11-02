@@ -15,8 +15,8 @@ permissions:
   contents: write
 
 env:
-  ANGLESHARP_VERSION: 1.8.6
-  ANGLESHARP_CSS_VERSION: 1.2.2
+  ANGLESHARP_VERSION: 1.9.0
+  ANGLESHARP_CSS_VERSION: 1.3.1
 
 jobs:
   # Keep this matrix identical to the `test` matrix in ci.yml, images included - a baseline
