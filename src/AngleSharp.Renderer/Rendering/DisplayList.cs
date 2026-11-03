@@ -393,6 +393,16 @@ public sealed record DrawBorderImageCommand(RenderRect Area, RenderBorderImage I
 public sealed record DrawBackdropFilterCommand(RenderRect Rect, RenderCornerRadii Radii, IReadOnlyList<RenderFilterFunction> Functions) : RenderCommand;
 
 /// <summary>
+/// What an iframe shows: the frame of its document in <see cref="Viewport"/>, clipped to it. The
+/// frame is laid out once the page around it is (see <see cref="Frame"/>).
+/// </summary>
+public sealed record DrawSubframeCommand(RenderRect Viewport) : RenderCommand
+{
+    /// <summary>The frame of the nested document, if it has one yet.</summary>
+    public RenderedFrame? Frame { get; set; }
+}
+
+/// <summary>
 /// Begins a group that is masked by <see cref="Layers"/> once the matching
 /// <see cref="PopMaskCommand"/> ends it (CSS `mask`). Layers are listed topmost first.
 /// </summary>

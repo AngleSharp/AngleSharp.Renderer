@@ -50,6 +50,11 @@ internal sealed class InteractiveHtmlRendererState : IDomHarness
         _renderer = new HtmlRenderer();
     }
 
+    private readonly HashSet<InteractiveHtmlRendererState> _subframes = [];
+    private readonly HashSet<IElement> _watchedFrames = new(ReferenceEqualityComparer.Instance);
+    private bool _isPreparingFrame;
+    private bool _hasChangedSinceFrame;
+
     public event EventHandler? PaintInvalidated;
 
     public IBrowsingContext Context { get; }
@@ -241,7 +246,59 @@ internal sealed class InteractiveHtmlRendererState : IDomHarness
     {
         _clockMs += delta.TotalMilliseconds;
         _transitionTracker.AdvanceTime(delta);
+
+        foreach (var subframe in _subframes)
+        {
+            subframe.AdvanceTime(delta);
+        }
+
         OnPaintInvalidated();
+    }
+
+    /// <summary>
+    /// Makes what changes the document of an iframe in the page change the page.
+    /// </summary>
+    internal void AttachSubframe(InteractiveHtmlRendererState subframe)
+    {
+        if (_subframes.Add(subframe))
+        {
+            subframe.PaintInvalidated += (_, _) => OnPaintInvalidated();
+        }
+    }
+
+    private bool HasChangedSinceFrame()
+    {
+        if (_metricsObserver is { } observer)
+        {
+            KeepMutations(observer.Flush());
+        }
+
+        return _hasChangedSinceFrame || !ReferenceEquals(Context.Active, _frameDocument) || _subframes.Any(static subframe => subframe.HasChangedSinceFrame());
+    }
+
+    /// <summary>
+    /// Has the page painted again once an iframe without a document yet got one.
+    /// </summary>
+    internal void WatchFrameLoad(IElement element)
+    {
+        if (_watchedFrames.Add(element))
+        {
+            element.AddEventListener("load", (_, _) => OnPaintInvalidated());
+        }
+    }
+
+    /// <summary>
+    /// Sets the size of the viewport of the document of an iframe.
+    /// </summary>
+    internal void SetViewport(int width, int height)
+    {
+        if (RenderDevice is DefaultRenderDevice device && (device.ViewPortWidth != width || device.ViewPortHeight != height))
+        {
+            device.ViewPortWidth = width;
+            device.ViewPortHeight = height;
+            device.DeviceWidth = width;
+            device.DeviceHeight = height;
+        }
     }
 
     public TimeSpan CurrentTime => TimeSpan.FromMilliseconds(_clockMs);
@@ -300,7 +357,11 @@ internal sealed class InteractiveHtmlRendererState : IDomHarness
 
         var scrollTop = targetDocument.DocumentElement is { } root ? GetScrollTop(root, double.MaxValue) : 0d;
         _metrics = null;
+        _isPreparingFrame = true;
+        _hasChangedSinceFrame = false;
 
+        try
+        {
         using (_animationTracker.BeginFrame())
         {
             var frame = _renderer.PrepareFrame(targetDocument, RenderDevice, scrollTop, _isFrameScrollShiftable ? overscan : 0, out var snapshot);
@@ -319,8 +380,13 @@ internal sealed class InteractiveHtmlRendererState : IDomHarness
             _lastFrame = frame;
             _lastFrameLayout = snapshot;
             _isFrameScrollShiftable = frame.IsScrollShiftable;
-            frame.IsAnimating = _animationTracker.IsAnimating || _transitionTracker.HasRunningTransitions;
+            frame.IsAnimating = _animationTracker.IsAnimating || _transitionTracker.HasRunningTransitions || snapshot.Subframes.Values.Any(static entry => entry.Frame?.IsAnimating == true);
             return frame;
+        }
+        }
+        finally
+        {
+            _isPreparingFrame = false;
         }
     }
 
@@ -377,6 +443,12 @@ internal sealed class InteractiveHtmlRendererState : IDomHarness
     {
         var document = Context.Active;
 
+        // what an iframe shows is in the frame, and only a new one has it change
+        if (_subframes.Any(static subframe => subframe.HasChangedSinceFrame()))
+        {
+            return null;
+        }
+
         if (document is null || _lastFrame is null || !ReferenceEquals(document, _metricsDocument) || _metricsObserver is null ||
             _metricsViewport != (RenderDevice.ViewPortWidth, RenderDevice.ViewPortHeight))
         {
@@ -419,6 +491,13 @@ internal sealed class InteractiveHtmlRendererState : IDomHarness
     // without one they would only pile up.
     private void KeepMutations(IEnumerable<IMutationRecord> records)
     {
+        // the document of an iframe has nobody else watching it
+        if (Context.Parent is not null && !_isPreparingFrame && records.Any())
+        {
+            _hasChangedSinceFrame = true;
+            OnPaintInvalidated(keepsMetrics: true);
+        }
+
         if (_metrics is not null)
         {
             _pendingMutations.AddRange(records);

@@ -511,7 +511,7 @@ public sealed class TableLayoutTests
     private static async Task<DisplayList> LayoutAsync(string bodyHtml)
     {
         var context = BrowsingContext.New(Configuration.Default.WithCss());
-        var document = await context.OpenAsync(request => request.Content($"<html><body style=\"margin:0\">{bodyHtml}</body></html>"));
+        var document = await context.OpenAsync(request => request.Content($"<!doctype html><html><body style=\"margin:0\">{bodyHtml}</body></html>"));
 
         return new HtmlRenderer().BuildDisplayList(document, new DefaultRenderDevice
         {

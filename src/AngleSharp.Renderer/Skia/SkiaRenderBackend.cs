@@ -13,12 +13,23 @@ namespace AngleSharp.Renderer.Skia;
 /// The backend also measures text, so a renderer using it lays out against the same advance
 /// widths it paints with.
 /// </remarks>
-public sealed partial class SkiaRenderBackend : IPixelRenderBackend, ITextMeasurer
+public sealed partial class SkiaRenderBackend : IPixelRenderBackend, ITextMeasurer, IFontMetricsMeasurer
 {
     private readonly SkiaTextMeasurer _textMeasurer = new();
 
     /// <inheritdoc />
     public float MeasureWidth(string text, RenderFont font) => _textMeasurer.MeasureWidth(text, font);
+
+    (float Average, float Maximum) IFontMetricsMeasurer.MeasureCharacterWidths(RenderFont font) =>
+        ((IFontMetricsMeasurer)_textMeasurer).MeasureCharacterWidths(font);
+
+    (float Ascent, float Descent) IFontMetricsMeasurer.MeasureFontHeights(RenderFont font) => ((IFontMetricsMeasurer)_textMeasurer).MeasureFontHeights(font);
+
+    float IFontMetricsMeasurer.MeasureContentHeight(RenderFont font) =>
+        ((IFontMetricsMeasurer)_textMeasurer).MeasureContentHeight(font);
+
+    float IFontMetricsMeasurer.MeasureLineSpacing(RenderFont font) =>
+        ((IFontMetricsMeasurer)_textMeasurer).MeasureLineSpacing(font);
 
     /// <inheritdoc />
     public IReadOnlyList<int> GetClusterBoundaries(string text, RenderFont font) => _textMeasurer.GetClusterBoundaries(text, font);
@@ -93,6 +104,18 @@ public sealed partial class SkiaRenderBackend : IPixelRenderBackend, ITextMeasur
     {
         switch (command)
         {
+            case DrawSubframeCommand { Frame: { } subframe } drawSubframe:
+                canvas.Save();
+                canvas.ClipRect(new SKRect(drawSubframe.Viewport.X, drawSubframe.Viewport.Y, drawSubframe.Viewport.X + drawSubframe.Viewport.Width, drawSubframe.Viewport.Y + drawSubframe.Viewport.Height));
+                canvas.Translate(drawSubframe.Viewport.X, drawSubframe.Viewport.Y);
+
+                foreach (var nested in subframe.DisplayList.Commands)
+                {
+                    DrawCommand(canvas, nested, subframe.DisplayList.Fonts, state);
+                }
+
+                canvas.Restore();
+                break;
             case DrawBorderImageCommand borderImage:
                 DrawBorderImage(canvas, borderImage);
                 break;

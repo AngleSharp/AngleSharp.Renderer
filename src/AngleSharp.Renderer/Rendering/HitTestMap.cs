@@ -9,7 +9,13 @@ using AngleSharp.Dom;
 /// <param name="Element">The element painted top-most at the point.</param>
 /// <param name="Cursor">The element's computed `cursor`, e.g., "auto" or "pointer".</param>
 /// <param name="IsInScrollContainer">If an ancestor (not the viewport) scrolls its overflow, i.e., wheeling may scroll it rather than the page.</param>
-public readonly record struct HitTestResult(IElement Element, string Cursor, bool IsInScrollContainer);
+public readonly record struct HitTestResult(IElement Element, string Cursor, bool IsInScrollContainer)
+{
+    /// <summary>
+    /// Gets where the viewport of the document of the element is, for one in an iframe.
+    /// </summary>
+    public (double X, double Y) FrameOrigin { get; init; }
+}
 
 /// <summary>
 /// What a frame painted where, prepared while laying it out: the boxes that can be hit, in
@@ -27,7 +33,24 @@ public sealed class HitTestMap
     private readonly float _offsetY;
 
     // a viewport-anchored box is fixed itself or inside a fixed box, so it does not scroll
-    private readonly record struct Entry(IElement Element, RenderRect Box, RenderRect Clip, string Cursor, bool IsInScrollContainer, bool IsViewportAnchored);
+    private enum ClipEscape
+    {
+        None,
+        ToContainingBlock,
+        ToViewport,
+    }
+
+    private static ClipEscape GetEscape(IReadOnlyDictionary<IElement, Dictionary<string, string>> styleMaps, IElement element) =>
+        styleMaps.TryGetValue(element, out var style) && style.TryGetValue("position", out var position)
+            ? position.Trim().ToLowerInvariant() switch
+            {
+                "absolute" => ClipEscape.ToContainingBlock,
+                "fixed" => ClipEscape.ToViewport,
+                _ => ClipEscape.None,
+            }
+            : ClipEscape.None;
+
+    private readonly record struct Entry(IElement Element, RenderRect Box, RenderRect Clip, string Cursor, bool IsInScrollContainer, bool IsViewportAnchored, RenderedFrame? Subframe = null, RenderRect Viewport = default);
 
     private HitTestMap(Entry[] entries, float offsetY = 0f)
     {
@@ -43,7 +66,7 @@ public sealed class HitTestMap
     /// <summary>
     /// Gets the elements that can be hit, top-most first.
     /// </summary>
-    public IEnumerable<IElement> Elements => _entries.Select(m => m.Element);
+    public IEnumerable<IElement> Elements => _entries.SelectMany(static m => m.Subframe is { } frame ? frame.HitTestMap.Elements.Prepend(m.Element) : [m.Element]);
 
     /// <summary>
     /// Finds the element painted top-most at the given point.
@@ -59,6 +82,14 @@ public sealed class HitTestMap
 
             if (Contains(entry.Box, x, entryY) && Contains(entry.Clip, x, entryY))
             {
+                // what an iframe shows is hit in its document: everything there, as it scrolls of its own
+                if (entry.Subframe is { } frame &&
+                    x >= entry.Viewport.X && x < entry.Viewport.X + entry.Viewport.Width && entryY >= entry.Viewport.Y && entryY < entry.Viewport.Y + entry.Viewport.Height &&
+                    frame.HitTestMap.HitTest(x - entry.Viewport.X, entryY - entry.Viewport.Y) is { } inner)
+                {
+                    return inner with { FrameOrigin = (inner.FrameOrigin.X + entry.Viewport.X, inner.FrameOrigin.Y + entry.Viewport.Y + (y - entryY)), IsInScrollContainer = true };
+                }
+
                 return new HitTestResult(entry.Element, entry.Cursor, entry.IsInScrollContainer);
             }
         }
@@ -71,7 +102,12 @@ public sealed class HitTestMap
     /// </summary>
     internal HitTestMap Shift(float deltaY) => new(_entries, _offsetY + deltaY);
 
-    internal static HitTestMap Create(IDocument document, IReadOnlyDictionary<IElement, HtmlRenderer.ElementLayoutMetrics> metrics, IReadOnlyDictionary<IElement, Dictionary<string, string>> styleMaps, float offsetY)
+    private static RenderTransform2D? GetTransform(IReadOnlyDictionary<IElement, Dictionary<string, string>> styleMaps, IElement element, HtmlRenderer.ElementLayoutMetrics metrics, float offsetY) =>
+        styleMaps.TryGetValue(element, out var style) && HtmlRenderer.HasTransform(style)
+            ? HtmlRenderer.ResolveTransform(style, metrics with { BorderBoxY = metrics.BorderBoxY + offsetY }) is { IsIdentity: false } transform ? transform : null
+            : null;
+
+    internal static HitTestMap Create(IDocument document, IReadOnlyDictionary<IElement, HtmlRenderer.ElementLayoutMetrics> metrics, IReadOnlyDictionary<IElement, Dictionary<string, string>> styleMaps, float offsetY, IReadOnlyDictionary<IElement, HtmlRenderer.SubframeEntry>? subframes = null)
     {
         var order = GetDocumentOrder(document);
         var unordered = (double)order.Count;
@@ -86,9 +122,18 @@ public sealed class HitTestMap
 
             var box = new RenderRect(elementMetrics.BorderBoxX, elementMetrics.BorderBoxY + offsetY, elementMetrics.BorderBoxWidth, elementMetrics.BorderBoxHeight);
             var clip = new RenderRect(-Unbounded, -Unbounded, 2 * Unbounded, 2 * Unbounded);
+
+            if (GetTransform(styleMaps, element, elementMetrics, offsetY) is { } ownTransform)
+            {
+                box = ownTransform.MapBounds(box);
+            }
+
             var path = new List<(int Step, int ZIndex, double Order)> { (1, 0, GetOrder(element)) };
             var isInScrollContainer = false;
             var isViewportAnchored = IsFixed(styleMaps, element);
+
+            // what is out of the flow isn't clipped by what is below its containing block
+            var escapes = GetEscape(styleMaps, element);
 
             for (var ancestor = element.ParentElement; ancestor is not null; ancestor = ancestor.ParentElement)
             {
@@ -99,7 +144,13 @@ public sealed class HitTestMap
 
                 isViewportAnchored |= IsFixed(styleMaps, ancestor);
 
-                if (ancestorMetrics.Layer.ClipsOverflow)
+                if (escapes != ClipEscape.None && styleMaps.TryGetValue(ancestor, out var escapeStyle) &&
+                    (escapes == ClipEscape.ToViewport ? HtmlRenderer.HasTransformLikeEffect(escapeStyle) : HtmlRenderer.ActsAsContainingBlock(escapeStyle, 0f)))
+                {
+                    escapes = ClipEscape.None;
+                }
+
+                if (escapes == ClipEscape.None && ancestorMetrics.Layer.ClipsOverflow)
                 {
                     isInScrollContainer |= styleMaps.TryGetValue(ancestor, out var ancestorStyle) && IsScrolling(ancestorStyle);
                     clip = Intersect(clip, new RenderRect(
@@ -113,6 +164,18 @@ public sealed class HitTestMap
                 {
                     path.Add(GetRank(ancestor, ancestorMetrics.Layer));
                 }
+
+                // what is in a transformed box is hit where it is painted
+                if (GetTransform(styleMaps, ancestor, ancestorMetrics, offsetY) is { } ancestorTransform)
+                {
+                    box = ancestorTransform.MapBounds(box);
+                    clip = clip.Width >= Unbounded ? clip : ancestorTransform.MapBounds(clip);
+                }
+
+                if (escapes == ClipEscape.None)
+                {
+                    escapes = GetEscape(styleMaps, ancestor);
+                }
             }
 
             if (elementMetrics.Layer.IsLayerRoot)
@@ -124,7 +187,13 @@ public sealed class HitTestMap
             var cursor = styleMaps.TryGetValue(element, out var styleMap) && styleMap.TryGetValue("cursor", out var value)
                 ? value.Trim().ToLowerInvariant()
                 : "auto";
-            candidates.Add((new Entry(element, box, clip, cursor, isInScrollContainer, isViewportAnchored), path.ToArray()));
+            var subframe = subframes is not null && subframes.TryGetValue(element, out var frameEntry) ? frameEntry.Frame : null;
+            var frameViewport = new RenderRect(
+                box.X + elementMetrics.BorderLeft + elementMetrics.PaddingLeft,
+                box.Y + elementMetrics.BorderTop + elementMetrics.PaddingTop,
+                Math.Max(0f, box.Width - elementMetrics.BorderLeft - elementMetrics.BorderRight - elementMetrics.PaddingLeft - elementMetrics.PaddingRight),
+                Math.Max(0f, box.Height - elementMetrics.BorderTop - elementMetrics.BorderBottom - elementMetrics.PaddingTop - elementMetrics.PaddingBottom));
+            candidates.Add((new Entry(element, box, clip, cursor, isInScrollContainer, isViewportAnchored, subframe, frameViewport), path.ToArray()));
         }
 
         // top-most first; ties (which only unordered elements can have) keep the first one on top

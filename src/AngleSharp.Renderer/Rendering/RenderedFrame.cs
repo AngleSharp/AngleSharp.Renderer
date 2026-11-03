@@ -12,6 +12,8 @@ public sealed class RenderedFrame
     private readonly RenderViewport _surface;
     // how far the display list is moved when rasterized, see Reposition
     private readonly float _shiftY;
+    // what is shown on top of the page, see WithOverlay
+    private readonly DisplayList? _overlay;
 
     internal RenderedFrame(DisplayList displayList, IRenderBackend backend, RenderViewport surface, int viewportHeight, double scrollTop, int overscanTop, double contentHeight, bool isScrollShiftable, bool canReposition, HitTestMap hitTestMap, float shiftY = 0f)
     {
@@ -26,6 +28,13 @@ public sealed class RenderedFrame
         ContentHeight = contentHeight;
         IsScrollShiftable = isScrollShiftable;
         HitTestMap = hitTestMap;
+    }
+
+    private RenderedFrame(RenderedFrame frame, DisplayList overlay)
+        : this(frame._displayList, frame._backend, frame._surface, frame.ViewportHeight, frame.ScrollTop, frame.OverscanTop, frame.ContentHeight, frame.IsScrollShiftable, frame.CanReposition, frame.HitTestMap, frame._shiftY)
+    {
+        IsAnimating = frame.IsAnimating;
+        _overlay = overlay;
     }
 
     /// <summary>
@@ -103,6 +112,17 @@ public sealed class RenderedFrame
     }
 
     /// <summary>
+    /// The frame with something on top of it that isn't part of the page, which needs no layout.
+    /// </summary>
+    /// <param name="overlay">What to show on top, in viewport coordinates.</param>
+    /// <returns>The frame showing the overlay, which is not repositioned with it.</returns>
+    public RenderedFrame WithOverlay(DisplayList overlay)
+    {
+        ArgumentNullException.ThrowIfNull(overlay);
+        return new RenderedFrame(this, overlay);
+    }
+
+    /// <summary>
     /// Rasterizes the frame into pixels. Safe to call from any thread.
     /// </summary>
     /// <returns>The pixels of the whole surface.</returns>
@@ -123,6 +143,23 @@ public sealed class RenderedFrame
     public RenderedImage RasterizeToPng() => _backend.RenderToPng(GetDisplayList(), _surface);
 
     private DisplayList GetDisplayList()
+    {
+        var page = GetPageDisplayList();
+
+        if (_overlay is null)
+        {
+            return page;
+        }
+
+        var composed = new DisplayList { Fonts = _overlay.Fonts.IsEmpty ? page.Fonts : _overlay.Fonts };
+        composed.InsertRange(0, page.Commands);
+        composed.PushTransform(RenderTransform2D.Translate(0f, OverscanTop));
+        composed.InsertRange(composed.Commands.Count, _overlay.Commands);
+        composed.PopTransform();
+        return composed;
+    }
+
+    private DisplayList GetPageDisplayList()
     {
         if (_shiftY == 0f)
         {

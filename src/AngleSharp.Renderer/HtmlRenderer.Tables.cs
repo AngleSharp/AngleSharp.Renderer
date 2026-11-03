@@ -675,10 +675,10 @@ public sealed partial class HtmlRenderer
 
         if (row.Group is { } group)
         {
-            style = ResolveTextStyle(GetOrCreateStyleMap(context, group.Ref, group.ComputedStyle), style);
+            style = ResolveTextStyle(GetOrCreateStyleMap(context, group.Ref, group.ComputedStyle), style, context);
         }
 
-        style = ResolveTextStyle(GetOrCreateStyleMap(context, row.Node.Ref, row.Node.ComputedStyle), style);
+        style = ResolveTextStyle(GetOrCreateStyleMap(context, row.Node.Ref, row.Node.ComputedStyle), style, context);
         return style with { VerticalAlignOffset = 0f };
     }
 
@@ -689,7 +689,7 @@ public sealed partial class HtmlRenderer
     private static IntrinsicWidths ComputeCellIntrinsicWidths(TableCellInfo cell, RenderTextStyle rowTextStyle, float percentageBase, LayoutContext context)
     {
         var style = cell.Style;
-        var textStyle = ResolveTextStyle(style, rowTextStyle) with { VerticalAlignOffset = 0f };
+        var textStyle = ResolveTextStyle(style, rowTextStyle, context) with { VerticalAlignOffset = 0f };
         var box = ResolveBoxStyle(style, cell.Node.Ref);
         var extras = box.BorderWidth.Left + box.BorderWidth.Right +
                      ParseLength(style, "padding-left", percentageBase, box.Padding.Left, allowAuto: false) +
@@ -699,9 +699,9 @@ public sealed partial class HtmlRenderer
         var max = Math.Max(min, content.Max + extras);
         var authored = ResolveAuthoredDimension(style, "width", percentageBase, float.NaN, extras);
 
+        // what a cell asks for is what its column prefers: only its content can't be squeezed
         if (!float.IsNaN(authored))
         {
-            min = Math.Max(min, authored + extras);
             max = Math.Max(min, authored + extras);
         }
 
@@ -810,19 +810,23 @@ public sealed partial class HtmlRenderer
     /// gets the same fraction of its range; beyond max-content the extra goes in proportion to
     /// the max-content widths.
     /// </summary>
-    private static float[] DistributeColumnWidths(float[] min, float[] max, float space)
+    private static float[] DistributeColumnWidths(float[] min, float[] max, float space, bool[] isAuthored)
     {
         var count = min.Length;
         var widths = new float[count];
         var minSum = min.Sum();
         var maxSum = max.Sum();
+        // what is left over goes to the columns that did not ask for a width, if there are any
+        var takesExtra = isAuthored.Contains(false) ? isAuthored.Select(authored => !authored).ToArray() : isAuthored;
+        var takingCount = takesExtra.Count(takes => takes);
+        var takingSum = Enumerable.Range(0, count).Where(index => takesExtra[index]).Sum(index => max[index]);
 
         for (var index = 0; index < count; index++)
         {
             if (space >= maxSum)
             {
                 var extra = space - maxSum;
-                widths[index] = max[index] + (maxSum > 0f ? extra * max[index] / maxSum : extra / count);
+                widths[index] = max[index] + (!takesExtra[index] ? 0f : takingSum > 0f ? extra * max[index] / takingSum : extra / takingCount);
             }
             else if (space > minSum && maxSum > minSum)
             {
@@ -835,6 +839,29 @@ public sealed partial class HtmlRenderer
         }
 
         return widths;
+    }
+
+    /// <summary>
+    /// The columns that ask for a width, through a `col` or a cell of their own.
+    /// </summary>
+    private static bool[] ResolveAuthoredColumns(TableStructure structure, float percentageBase, LayoutContext context)
+    {
+        var authored = new bool[structure.ColumnCount];
+
+        foreach (var cell in structure.Cells)
+        {
+            if (cell.ColumnSpan == 1 && !float.IsNaN(ResolveAuthoredDimension(cell.Style, "width", percentageBase, float.NaN, 0f)))
+            {
+                authored[cell.Column] = true;
+            }
+        }
+
+        for (var index = 0; index < Math.Min(authored.Length, structure.Columns.Count); index++)
+        {
+            authored[index] |= !float.IsNaN(ResolveTableColumnWidth(structure.Columns[index], percentageBase, context));
+        }
+
+        return authored;
     }
 
     /// <summary>
@@ -931,22 +958,37 @@ public sealed partial class HtmlRenderer
         float positionedContainingWidth,
         float positionedContainingHeight,
         float forcedBorderBoxWidth,
-        float containingHeight = float.NaN)
+        float containingHeight = float.NaN,
+        bool isFloat = false)
     {
         var structure = GetTableStructure(tableNode, context);
         var styleMap = GetOrCreateStyleMap(context, tableNode.Ref, tableNode.ComputedStyle);
-        var textStyle = ResolveTextStyle(styleMap, inheritedTextStyle) with { VerticalAlignOffset = 0f };
+        var textStyle = ResolveTextStyle(styleMap, inheritedTextStyle, context) with { VerticalAlignOffset = 0f };
 
-        var clearance = floats.GetClearance(GetClear(styleMap));
-
-        if (!float.IsNaN(clearance) && clearance > cursorY)
+        // tables keep none of the `-webkit-*` values of `text-align`, as in browsers
+        if (styleMap.GetValueOrDefault("text-align")?.Trim().ToLowerInvariant() is { } align && align.StartsWith("-webkit-", StringComparison.Ordinal))
         {
-            cursorY = clearance;
-            previousBlockMarginBottom = 0f;
+            textStyle = textStyle with
+            {
+                TextAlign = textStyle.Direction == TextDirection.Rtl ? TextAlign.Right : TextAlign.Left,
+                BlockAlignShare = 0f,
+                WebkitAlignLeftBehind = align,
+            };
         }
 
-        // A table establishes a block formatting context, so it sits beside floats as a whole.
-        var (flowLeft, flowRight) = floats.GetBand(cursorY, textStyle.FontSize * textStyle.LineHeightMultiplier, containingX, containingX + containingWidth);
+        var clearance = floats.GetClearance(GetClear(styleMap));
+        var floatTop = Math.Max(cursorY + previousBlockMarginBottom, float.IsNaN(clearance) ? float.MinValue : clearance);
+
+        if (!isFloat)
+        {
+            ApplyClearance(clearance, ParseLength(styleMap, "margin-top", containingWidth, 0f, allowAuto: false), isSelfCollapsing: false, ref cursorY, ref previousBlockMarginBottom, ref suppressNextBlockTopMargin);
+        }
+
+        // A table establishes a block formatting context, so it sits beside floats as a whole;
+        // a float is placed by its side of the containing block once its width is known.
+        var (flowLeft, flowRight) = isFloat
+            ? (containingX, containingX + containingWidth)
+            : floats.GetBand(cursorY, textStyle.FontSize * textStyle.LineHeightMultiplier, containingX, containingX + containingWidth);
         var flowWidth = Math.Max(0f, flowRight - flowLeft);
         var box = ResolveBoxStyle(styleMap, tableNode.Ref);
         var marginTop = ParseLength(styleMap, "margin-top", flowWidth, box.Margin.Top, allowAuto: false);
@@ -954,14 +996,14 @@ public sealed partial class HtmlRenderer
         var marginLeft = ParseLength(styleMap, "margin-left", flowWidth, box.Margin.Left, allowAuto: true);
         var marginRight = ParseLength(styleMap, "margin-right", flowWidth, box.Margin.Right, allowAuto: true);
 
-        if (!float.IsNaN(forcedBorderBoxWidth))
+        if (isFloat || !float.IsNaN(forcedBorderBoxWidth))
         {
-            // An inline-table is placed by its line; auto margins are zero there.
+            // An inline-table is placed by its line and a float by its side; auto margins are zero there.
             marginLeft = float.IsNaN(marginLeft) ? 0f : marginLeft;
             marginRight = float.IsNaN(marginRight) ? 0f : marginRight;
         }
 
-        if (suppressNextBlockTopMargin)
+        if (suppressNextBlockTopMargin && !isFloat)
         {
             marginTop = 0f;
             suppressNextBlockTopMargin = false;
@@ -1026,7 +1068,7 @@ public sealed partial class HtmlRenderer
         {
             // A table is never narrower than its content needs.
             contentWidth = Math.Max(contentWidth, minContentWidth);
-            columnWidths = DistributeColumnWidths(columnMin, columnMax, Math.Max(0f, contentWidth - horizontalSpacingTotal));
+            columnWidths = DistributeColumnWidths(columnMin, columnMax, Math.Max(0f, contentWidth - horizontalSpacingTotal), ResolveAuthoredColumns(structure, available, context));
         }
 
         contentWidth = Math.Max(contentWidth, columnWidths.Sum() + horizontalSpacingTotal);
@@ -1054,11 +1096,40 @@ public sealed partial class HtmlRenderer
                 ? flowLeft + flowWidth - marginRight - borderBoxWidth
                 : flowLeft + marginLeft;
 
+        // `-webkit-center` and its kin of the parent move a table whose margins leave space over
+        if (inheritedTextStyle.BlockAlignShare > 0f && !isFloat && float.IsNaN(forcedBorderBoxWidth) && !float.IsNaN(marginLeft) && !float.IsNaN(marginRight))
+        {
+            borderBoxX += Math.Max(0f, flowWidth - marginLeft - borderBoxWidth - marginRight) * inheritedTextStyle.BlockAlignShare;
+        }
+
         var captionCursorY = cursorY + CollapseMargins(previousBlockMarginBottom, marginTop);
+
+        if (isFloat)
+        {
+            // like any float: as high as it can at its side, its margins never collapse
+            var (floatX, floatY) = floats.Place(marginLeft + borderBoxWidth + marginRight, floatTop, GetFloat(styleMap) == "left", flowLeft, flowRight);
+            borderBoxX = floatX + marginLeft;
+            captionCursorY = floatY + marginTop;
+        }
+
+        var tableMarginBoxTop = captionCursorY - marginTop;
+        var firstCaptionTop = captionCursorY;
         LayoutTableCaptions(structure.TopCaptions, borderBoxX, borderBoxWidth, ref captionCursorY, textStyle, context, displayList, maxY, positionedContainingX, positionedContainingY, positionedContainingWidth, positionedContainingHeight);
         var borderBoxY = captionCursorY;
         var contentLeft = borderBoxX + border.Left + padding.Left;
         var contentTop = borderBoxY + border.Top + padding.Top;
+
+        // what is within is placed against a positioned table, once its height is known
+        var containingBlockScope = PushContainingBlockScope(tableNode, borderBoxX + border.Left, borderBoxY + border.Top, ActsAsContainingBlock(styleMap, positionedContainingX), context);
+
+        if (containingBlockScope is not null)
+        {
+            positionedContainingX = containingBlockScope.PaddingBoxX;
+            positionedContainingY = containingBlockScope.PaddingBoxY;
+            positionedContainingWidth = borderBoxWidth - border.Left - border.Right;
+            positionedContainingHeight = float.NaN;
+        }
+
 
         var columnX = new float[columnCount];
         var nextColumnX = contentLeft + horizontalSpacing;
@@ -1099,12 +1170,13 @@ public sealed partial class HtmlRenderer
         var rowDescents = new float[rowCount];
         var cellCount = structure.Cells.Count;
         var cellHeights = new float[cellCount];
+        var cellContentHeights = new float[cellCount];
         var cellBaselines = new float[cellCount];
 
         // A percentage table height refers to the containing block's height (and is `auto` while
         // that is not definite); percentage row and cell heights refer to the table's height, and
         // count for nothing while that is not definite.
-        var definiteTableHeight = ResolveAuthoredDimension(styleMap, "height", containingHeight, float.NaN, verticalExtras);
+        var definiteTableHeight = ResolveAuthoredDimension(styleMap, "height", float.IsNaN(containingHeight) && context.IsQuirksMode ? ResolveQuirksHeightReference(tableNode, styleMap, context) : containingHeight, float.NaN, verticalExtras);
         var percentageHeightBase = float.IsNaN(definiteTableHeight) ? 0f : definiteTableHeight;
 
         for (var row = 0; row < rowCount; row++)
@@ -1126,6 +1198,16 @@ public sealed partial class HtmlRenderer
             }
 
             cellHeights[index] = metrics.BorderBoxHeight;
+            // it is aligned by what it holds, whatever height it asks for
+            cellContentHeights[index] = trial.AutoContentHeight is { } auto
+                ? auto + metrics.BorderTop + metrics.BorderBottom + metrics.PaddingTop + metrics.PaddingBottom
+                : metrics.BorderBoxHeight;
+
+            // in the quirks mode the height of a cell includes its border and padding (Quirks Mode Standard 3.8)
+            if (context.IsQuirksMode && ParseLengthValue(cell.Style.GetValueOrDefault("height") ?? string.Empty, float.NaN, allowAuto: false) is var quirkyHeight && !float.IsNaN(quirkyHeight))
+            {
+                cellHeights[index] = Math.Max(cellContentHeights[index], quirkyHeight);
+            }
 
             if (!float.IsNaN(cell.PercentHeight) && percentageHeightBase > 0f)
             {
@@ -1254,6 +1336,8 @@ public sealed partial class HtmlRenderer
         PaintOutline(decorations, styleMap, borderBoxX, borderBoxY, borderBoxWidth, borderBoxHeight);
         RecordLayoutMetrics(tableNode.Ref, borderBoxX, borderBoxY, borderBoxWidth, borderBoxHeight, border.Left, border.Right, border.Top, border.Bottom, padding.Left, padding.Right, padding.Top, padding.Bottom);
 
+        RecordTableRowMetrics(structure, rowY, rowHeights, collapsedRows, contentLeft + horizontalSpacing, Math.Max(0f, contentWidth - (2f * horizontalSpacing)));
+
         var shownCells = new HashSet<TableCellInfo>();
 
         for (var index = 0; index < cellCount; index++)
@@ -1276,7 +1360,7 @@ public sealed partial class HtmlRenderer
             }
 
             // A hidden cell keeps its place, but its collapsed grid lines are not painted.
-            if (!ResolveTextStyle(cell.Style, rowTextStyles[cell.Row]).IsHidden)
+            if (!ResolveTextStyle(cell.Style, rowTextStyles[cell.Row], context).IsHidden)
             {
                 shownCells.Add(cell);
             }
@@ -1290,8 +1374,8 @@ public sealed partial class HtmlRenderer
             var contentOffsetY = ParseCellVerticalAlign(cell.Style) switch
             {
                 CellVerticalAlign.Top => 0f,
-                CellVerticalAlign.Middle => (height - cellHeights[index]) / 2f,
-                CellVerticalAlign.Bottom => height - cellHeights[index],
+                CellVerticalAlign.Middle => (height - cellContentHeights[index]) / 2f,
+                CellVerticalAlign.Bottom => height - cellContentHeights[index],
                 _ => cell.RowSpan == 1 ? rowBaselines[cell.Row] - cellBaselines[index] : 0f,
             };
 
@@ -1330,11 +1414,99 @@ public sealed partial class HtmlRenderer
 
         ResolveStickyBoxes(displayList, context.StickyScopes.Peek(), new RenderRect(contentLeft, contentTop, contentWidth, contentHeight), context);
         CloseElementEffectScopes(displayList, effects);
+        LayoutHeldBackBoxes(containingBlockScope, borderBoxHeight - border.Top - border.Bottom, context, displayList);
 
         var tableBottom = borderBoxY + borderBoxHeight;
+        var hasCaptions = structure.TopCaptions.Count + structure.BottomCaptions.Count > 0;
         LayoutTableCaptions(structure.BottomCaptions, borderBoxX, borderBoxWidth, ref tableBottom, textStyle, context, displayList, maxY, positionedContainingX, positionedContainingY, positionedContainingWidth, positionedContainingHeight);
+
+        // what scripts see of a table holds its captions, too
+        if (hasCaptions && s_layoutCapture.Value is { } capture && capture.TryGet(tableNode.Ref, out var recorded))
+        {
+            capture.Replace(tableNode.Ref, recorded with { OwnBox = new RenderRect(0f, firstCaptionTop - borderBoxY, borderBoxWidth, tableBottom - firstCaptionTop) });
+        }
+
+        if (isFloat)
+        {
+            floats.Add(borderBoxX - marginLeft, tableMarginBoxTop, borderBoxX + borderBoxWidth + marginRight, tableBottom + marginBottom, isLeft: GetFloat(styleMap) == "left");
+            return;
+        }
+
         cursorY = tableBottom;
         previousBlockMarginBottom = marginBottom + context.ParagraphSpacing;
+    }
+
+    /// <summary>
+    /// Rows and row groups paint nothing of their own, but scripts can ask for their boxes.
+    /// </summary>
+    private static void RecordTableRowMetrics(TableStructure structure, float[] rowY, float[] rowHeights, bool[] collapsedRows, float x, float width)
+    {
+        if (s_layoutCapture.Value is null)
+        {
+            return;
+        }
+
+        var groups = new Dictionary<ElementRenderNode, (float Top, float Bottom)>();
+
+        for (var row = 0; row < structure.Rows.Count; row++)
+        {
+            if (collapsedRows[row])
+            {
+                continue;
+            }
+
+            var top = rowY[row];
+            var bottom = top + rowHeights[row];
+            RecordLayoutMetrics(structure.Rows[row].Node.Ref, x, top, width, rowHeights[row], 0f, 0f, 0f, 0f, 0f, 0f, 0f, 0f);
+
+            if (structure.Rows[row].Group is { } group)
+            {
+                groups[group] = groups.TryGetValue(group, out var known) ? (Math.Min(known.Top, top), Math.Max(known.Bottom, bottom)) : (top, bottom);
+            }
+        }
+
+        foreach (var (group, (top, bottom)) in groups)
+        {
+            RecordLayoutMetrics(group.Ref, x, top, width, bottom - top, 0f, 0f, 0f, 0f, 0f, 0f, 0f, 0f);
+        }
+    }
+
+    /// <summary>
+    /// A table out of the flow: measured first, as what places it depends on its size, then laid
+    /// out where it ends up (static position for auto offsets, auto margins are zero).
+    /// </summary>
+    private static void LayoutPositionedTable(ElementRenderNode node, Dictionary<string, string> styleMap, bool isFixed, float containingX, float containingWidth, float containingHeight, float staticY, RenderTextStyle inheritedTextStyle, LayoutContext context, DisplayList displayList, float maxY, float positionedContainingX, float positionedContainingY, float positionedContainingWidth, float positionedContainingHeight)
+    {
+        var blockX = isFixed ? context.Padding : float.IsNaN(positionedContainingX) ? containingX : positionedContainingX;
+        var blockY = isFixed ? context.Padding : float.IsNaN(positionedContainingY) ? staticY : positionedContainingY;
+        var blockWidth = isFixed ? context.Width - (2f * context.Padding) : float.IsNaN(positionedContainingWidth) ? containingWidth : positionedContainingWidth;
+        var blockHeight = isFixed ? context.Height - (2f * context.Padding) : positionedContainingHeight;
+
+        if (TrialLayout(node, blockWidth, inheritedTextStyle, context, float.NaN, isAtomicInline: true).Metrics is not { } measured)
+        {
+            return;
+        }
+
+        var box = ResolveBoxStyle(styleMap, node.Ref);
+        var marginLeft = ZeroIfNaN(ParseLength(styleMap, "margin-left", blockWidth, box.Margin.Left, allowAuto: true));
+        var marginRight = ZeroIfNaN(ParseLength(styleMap, "margin-right", blockWidth, box.Margin.Right, allowAuto: true));
+        var marginTop = ZeroIfNaN(ParseLength(styleMap, "margin-top", blockWidth, box.Margin.Top, allowAuto: true));
+        var marginBottom = ZeroIfNaN(ParseLength(styleMap, "margin-bottom", blockWidth, box.Margin.Bottom, allowAuto: true));
+        var left = ParseLength(styleMap, "left", blockWidth, float.NaN, allowAuto: true);
+        var right = ParseLength(styleMap, "right", blockWidth, float.NaN, allowAuto: true);
+        var top = ParseLength(styleMap, "top", blockHeight, float.NaN, allowAuto: true);
+        var bottom = ParseLength(styleMap, "bottom", blockHeight, float.NaN, allowAuto: true);
+        var marginBoxX = !float.IsNaN(left) ? blockX + left
+            : !float.IsNaN(right) ? blockX + blockWidth - right - marginRight - measured.BorderBoxWidth - marginLeft
+            : containingX;
+        var marginBoxY = !float.IsNaN(top) ? blockY + top
+            : !float.IsNaN(bottom) && !float.IsNaN(blockHeight) ? blockY + blockHeight - bottom - marginBottom - measured.BorderBoxHeight - marginTop
+            : staticY;
+        var cursorY = marginBoxY;
+        var previousMargin = 0f;
+        var suppressTopMargin = false;
+
+        LayoutTable(node, marginBoxX, marginLeft + measured.BorderBoxWidth + marginRight, ref cursorY, ref previousMargin, ref suppressTopMargin, new FloatArea(), inheritedTextStyle, context, displayList, maxY, positionedContainingX, positionedContainingY, positionedContainingWidth, positionedContainingHeight, measured.BorderBoxWidth, containingHeight);
     }
 
     private static void LayoutTableCaptions(

@@ -28,6 +28,24 @@ public static class InteractiveHtmlRendererStateExtensions
                 throw new InvalidOperationException("No IRenderDevice service is registered in the browsing context. Register a render device service in IConfiguration before creating the context.");
             }
 
+            // the document of an iframe has a viewport of its own
+            if (browsingContext.Parent is not null)
+            {
+                renderDevice = new DefaultRenderDevice
+                {
+                    Category = renderDevice.Category,
+                    ColorBits = renderDevice.ColorBits,
+                    Frequency = renderDevice.Frequency,
+                    IsInterlaced = renderDevice.IsInterlaced,
+                    IsScripting = renderDevice.IsScripting,
+                    Resolution = renderDevice.Resolution,
+                    ViewPortWidth = 300,
+                    ViewPortHeight = 150,
+                    DeviceWidth = 300,
+                    DeviceHeight = 150,
+                };
+            }
+
             return new InteractiveHtmlRendererState(browsingContext, renderDevice);
         });
     }

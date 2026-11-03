@@ -1,3 +1,68 @@
+# 0.10.0
+
+Released on Tuesday, November 3 2026.
+
+- Fixed absolutely positioned boxes being placed against their parent instead of the nearest positioned ancestor (positioned or transformed blocks, flex and grid containers, tables and inline boxes) or the viewport, waiting for the height of that one if it is auto
+- Fixed percentages of absolutely positioned and fixed boxes referring to their parent instead of their containing block, and auto margins not centering them between their offsets
+- Fixed the root element collapsing its margins with its first child
+- Fixed the margins of an empty block adding up instead of collapsing through it, with those of the blocks around it and of its parent
+- Fixed the margins of flex items on the cross axis: they count for the size of the line, stretching and alignment, auto ones take the free space (in rows, too), and percentages refer to the container; lines of a multi-line container share the free space of `align-content: stretch`
+- Fixed absolutely positioned boxes without offsets after text: an inline-level one is where it would be on the line, a block-level one below the line
+- Fixed boxes that are not the containing block of an absolutely positioned or fixed box clipping it, when painting and hit testing
+- Fixed `getBoundingClientRect` and `offsetHeight` of the root element reporting the viewport instead of its own box
+- Fixed boxes in columns after the first being measured and hit tested where they would be in one column, and boxes across columns having no fragments in `getClientRects`
+- Fixed the list `getClientRects` returns not being indexable from scripts
+- Fixed boxes of no width dropping what is in them, instead of wrapping its text and laying out what is out of the flow
+- Fixed absolutely positioned boxes with an explicit `top: auto` or `left: auto` (e.g. `inset: auto 0 0`) ignoring their `bottom` or `right` offset
+- Fixed the bottom margin of the last child missing from the auto height of a box that doesn't collapse with it (formatting contexts, bottom padding or border), negative margins included
+- Fixed out-of-flow boxes (e.g. `sr-only` headings) separating the margins of the blocks around them, and taking the top margin suppression from the first in-flow child
+- Fixed auto margins of column flex items with padding moving them out of the container, and made them keep the item from stretching
+- Fixed `align-self` being ignored for stretching flex items when `align-items` is `stretch`
+- Fixed form controls of auto height (or auto width in a column) not being stretched as flex items
+- Added `progress` and `meter`, list boxes (`select` with `multiple` or `size`, option groups included, scrolling to their selected option) with `ListBoxExtensions` for hosts to make them interactive, and the name of the chosen file next to the button of a file input
+- Added `SelectPopup` and `RenderedFrame.WithOverlay` for hosts to show the list of a dropdown on top of a frame, using the color scheme of the select (its `color-scheme`, or the `color-scheme` meta element, and the preference) and the colors of the select and its options
+- Added color emoji: characters presented as emoji use the color font of the host (or a declared web font) before fonts having a monochrome glyph, and stay together with their selectors, skin tones and joined characters
+- Fixed `line-height: normal` being 1.35 for every font instead of the line spacing the font states, and inheriting an explicit line height of the parent
+- Fixed `caretPositionFromPoint` guessing character widths, ignoring wrapped lines and collapsed white space, and being as tall as the line (a length made it taller than that by the font size): it now measures the text and spans the font
+- Fixed buttons having a minimum width of 20px, and empty ones a line
+- Fixed selects being as wide as the selected option instead of the widest, not showing options in groups, and `appearance: none` still reserving and painting the arrow; a native one ignores `line-height`
+- Fixed the sizes of checkboxes, radio buttons, color, range, file and date/time inputs to the ones of browsers, whatever the font
+- Fixed the baselines of controls without text
+- Fixed lengths and percentages of `vertical-align` being ignored for atomic inlines
+- Fixed text fields to be sized by their font and `size`, and text areas by `cols`, `rows` and room for their scrollbar, instead of a fixed width
+- Fixed `width: 100%` text fields contributing no width to a box sized by its content
+- Fixed `vertical-align: text-top` and `text-bottom` of atomic inlines, which were aligned with the baseline and grew the line
+- Fixed auto grid rows not filling the `min-height` of the grid container
+- Fixed grid tracks in `em`, `rem`, viewport units or `calc()` being sized as zero, and `calc()` mixing percentages and lengths in tracks and gaps
+- Fixed `column-gap` or `row-gap` alone also applying to the other axis
+- Fixed `minmax(<length>, 1fr)` adding its floor to its share of the space, and `fr` values summing to less than 1 taking all of it
+- Fixed floated tables and floated flex or grid containers not being floats: they stayed in the flow, and text did not wrap around them
+- Fixed floats resetting the margins around them, which collapse with each other as if the float was not there
+- Fixed `clear` ignoring the margin that already takes a box below the floats, adding the margin of the box below them, and moving what follows a float with `clear`
+- Fixed `vertical-align` of inline boxes: `super` and `sub` were far off and not inherited by the content of the box, lengths moved in the wrong direction, percentages, `top` and `bottom` were ignored, and lines did not grow for what is shifted out of them
+- Fixed `position: relative` being ignored on inline boxes
+- Fixed lines using the metrics of the bundled font for every font, and a line height smaller than the font moving the text down instead of letting it overflow
+- Fixed the size of inline boxes, which is the ascent and descent of their font
+- Fixed the baseline of `inline-flex` and `inline-grid` to be the one of the first item
+- Fixed background and mask images in data URLs containing quotes (`<svg xmlns="...">`) not loading
+- Fixed `Times` and `Times New Roman` not resolving to the metric-compatible fonts on Linux
+- Fixed table rows and row groups having no box for `getBoundingClientRect()`
+- Fixed `text-align: -webkit-center` and its kin not moving the block-level boxes inside (`<center>`, `<div align>`, `<td align>`), which tables don't inherit
+- Added the quirks mode of documents without a doctype: lines only get their height from text, percentage heights look past auto heights, and the height of a table cell includes its padding
+- Fixed a `width` on a table cell growing a table with a width of its own, and left over table width going to columns that ask for a width
+- Fixed cells with a height not honoring `vertical-align` (`middle`, the default, and `bottom`)
+- Fixed the bottom margin of a block in an inline (`<a><div>`) getting lost
+- Fixed `getBoundingClientRect()`, `getClientRects()` and the hit test map ignoring transforms
+- Fixed `position: absolute` and `fixed` tables staying in the flow
+- Fixed plain `fr` tracks getting narrower than their content (the automatic minimum size), and grids reporting overflowing tracks as their width
+- Fixed `min()`, `max()` and `clamp()` with percentages in grid tracks
+- Fixed `width: min-content`, `max-content` and `fit-content` being ignored
+- Fixed shrink-to-fit widths not counting a float next to inline content
+- Fixed a relatively positioned inline box painting below the rest of its line
+- Fixed the box of a table for scripts not holding its captions
+- Fixed broken images showing nothing: inline ones show their `alt` text, and ones with a size of their own are marked
+- Added iframes: their documents are laid out with a viewport of their own and painted in their box, hit testing reaches their elements, and changes in them repaint the page
+
 # 0.9.2
 
 Released on Sunday, November 1 2026.

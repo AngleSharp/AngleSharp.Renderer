@@ -49,6 +49,8 @@ internal static class SkiaTextShaping
             ["arial"] = ["Liberation Sans"],
             ["helvetica"] = ["Nimbus Sans", "Liberation Sans"],
             ["courier new"] = ["Liberation Mono", "Nimbus Mono PS"],
+            ["times"] = ["Liberation Serif", "Nimbus Roman"],
+            ["times new roman"] = ["Liberation Serif", "Nimbus Roman"],
         };
 
     // CSS family names are case insensitive, but Skia's family lookup is not on every platform:
@@ -252,7 +254,93 @@ internal static class SkiaTextShaping
         return hostFallback ?? primary;
     }
 
+    /// <summary>
+    /// The typeface drawing an emoji: a web font the page declares for it, else the color emoji
+    /// font of the host, which browsers prefer to the glyphs other fonts may have for emoji
+    /// (such as the monochrome ones of the bundled DejaVu). <see langword="null"/> without either.
+    /// </summary>
+    private static SKTypeface? ResolveEmojiTypeface(RenderFont font, int codepoint)
+    {
+        if (font.Faces is { IsEmpty: false } faces)
+        {
+            var fontStyle = CreateFontStyle(font.FontWeight, font.IsItalic, font.FontStretch);
+
+            foreach (var family in font.FontFamily.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+            {
+                if (faces.TryMatch(family.Trim('\'', '"', ' '), font.FontWeight, font.IsItalic, out var face) &&
+                    TryResolveFaceTypeface(face, fontStyle, out var declared) && HasGlyph(declared, codepoint))
+                {
+                    return declared;
+                }
+            }
+        }
+
+        return ColorEmojiTypeface.Value is { } typeface && HasGlyph(typeface, codepoint) ? typeface : null;
+    }
+
+    private static readonly string[] ColorEmojiFamilies = ["Apple Color Emoji", "Segoe UI Emoji", "Noto Color Emoji", "Twemoji Mozilla", "JoyPixels", "EmojiOne Color"];
+
+    private static readonly Lazy<SKTypeface?> ColorEmojiTypeface = new(static () =>
+    {
+        foreach (var family in ColorEmojiFamilies)
+        {
+            if (TryResolveSystemTypeface(family, SKFontStyle.Normal, out var typeface))
+            {
+                return typeface;
+            }
+        }
+
+        return null;
+    }, LazyThreadSafetyMode.ExecutionAndPublication);
+
     private static bool HasGlyph(SKTypeface typeface, int codepoint) => typeface.GetGlyph(codepoint) != 0;
+
+    private static readonly ConcurrentDictionary<SKTypeface, FontTableMetrics> TableMetrics = new();
+
+    /// <summary>
+    /// The metrics a font states, in ems (0 if it does not): read from its tables, as the font
+    /// engines of the platforms report them differently.
+    /// </summary>
+    public static FontTableMetrics GetFontTableMetrics(SKTypeface typeface) =>
+        TableMetrics.GetOrAdd(typeface, static face =>
+        {
+            static int ReadInt16(byte[] table, int offset) => (short)((table[offset] << 8) | table[offset + 1]);
+
+            var unitsPerEm = (float)face.UnitsPerEm;
+            var metrics = default(FontTableMetrics);
+
+            if (unitsPerEm <= 0f)
+            {
+                return metrics;
+            }
+
+            if (face.TryGetTableData(FontTableOs2, out var os2) && os2.Length >= 4)
+            {
+                metrics = metrics with { AverageWidth = Math.Max(0f, ReadInt16(os2, 2) / unitsPerEm) };
+            }
+
+            // the bounding box of all glyphs
+            if (face.TryGetTableData(FontTableHead, out var head) && head.Length >= 44)
+            {
+                metrics = metrics with { MaximumWidth = Math.Max(0f, (ReadInt16(head, 40) - ReadInt16(head, 36)) / unitsPerEm) };
+            }
+
+            if (face.TryGetTableData(FontTableHhea, out var hhea) && hhea.Length >= 10)
+            {
+                metrics = metrics with
+                {
+                    Ascent = Math.Max(0f, ReadInt16(hhea, 4) / unitsPerEm),
+                    Descent = Math.Max(0f, -ReadInt16(hhea, 6) / unitsPerEm),
+                    LineGap = Math.Max(0f, ReadInt16(hhea, 8) / unitsPerEm),
+                };
+            }
+
+            return metrics;
+        });
+
+    private const uint FontTableOs2 = 0x4F532F32; // 'OS/2'
+    private const uint FontTableHead = 0x68656164; // 'head'
+    private const uint FontTableHhea = 0x68686561; // 'hhea'
 
     /// <summary>
     /// Splits text into runs that each draw with one typeface: the paint's own where it has the
@@ -263,7 +351,7 @@ internal static class SkiaTextShaping
     {
         var primary = paint.Typeface;
 
-        if (font is null || primary is null || primary.ContainsGlyphs(text))
+        if (font is null || primary is null || (primary.ContainsGlyphs(text) && !EmojiPresentation.MayContainEmoji(text)))
         {
             return null;
         }
@@ -271,13 +359,35 @@ internal static class SkiaTextShaping
         var runs = new List<(string Text, SKTypeface Typeface)>();
         var builder = new StringBuilder();
         SKTypeface? current = null;
+        var runes = text.EnumerateRunes().ToArray();
+        var inEmoji = false;
 
-        foreach (var rune in text.EnumerateRunes())
+        for (var index = 0; index < runes.Length; index++)
         {
-            // Spaces and controls stay with the run they are in rather than splitting it.
-            var typeface = current is not null && (Rune.IsWhiteSpace(rune) || Rune.IsControl(rune)) ? current :
-                HasGlyph(primary, rune.Value) || Rune.IsWhiteSpace(rune) || Rune.IsControl(rune) ? primary :
-                ResolveFallbackTypeface(font.Value, primary, rune.Value);
+            var rune = runes[index];
+            var previous = index > 0 ? runes[index - 1].Value : 0;
+            var next = index + 1 < runes.Length ? runes[index + 1].Value : 0;
+            SKTypeface typeface;
+
+            if (inEmoji && EmojiPresentation.ContinuesEmoji(rune.Value, previous))
+            {
+                typeface = current!;
+            }
+            else if (EmojiPresentation.IsEmoji(rune.Value, next) && ResolveEmojiTypeface(font.Value, rune.Value) is { } emojiTypeface)
+            {
+                typeface = emojiTypeface;
+                inEmoji = true;
+            }
+            else
+            {
+                // Spaces and controls stay with the run they are in rather than splitting it, but
+                // not with an emoji: the space of a color font is as wide as its emoji.
+                var staysInRun = current is not null && !inEmoji;
+                inEmoji = false;
+                typeface = staysInRun && (Rune.IsWhiteSpace(rune) || Rune.IsControl(rune)) ? current! :
+                    HasGlyph(primary, rune.Value) || Rune.IsWhiteSpace(rune) || Rune.IsControl(rune) ? primary :
+                    ResolveFallbackTypeface(font.Value, primary, rune.Value);
+            }
 
             if (current is not null && !ReferenceEquals(typeface, current))
             {
@@ -768,6 +878,8 @@ internal static class SkiaTextShaping
     }
 
     private readonly record struct BundledFontFamily(SKTypeface Regular, SKTypeface Bold);
+
+    public readonly record struct FontTableMetrics(float AverageWidth, float MaximumWidth, float Ascent, float Descent, float LineGap);
 
     private readonly record struct SystemTypefaceKey(string Family, int Weight, int Width, SKFontStyleSlant Slant);
 }

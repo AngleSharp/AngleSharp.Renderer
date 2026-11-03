@@ -1,5 +1,7 @@
 namespace AngleSharp.Renderer;
 
+using AngleSharp.Dom;
+
 using System.Globalization;
 using System.Linq;
 using System.Threading;
@@ -359,6 +361,8 @@ public sealed partial class HtmlRenderer
         }
 
         var scratch = new DisplayList { Fonts = context.Fonts };
+        var metricsCapture = s_layoutCapture.Value;
+        var metricsStart = metricsCapture?.RecordOrder.Count ?? 0;
         var capture = new ColumnBreakCapture();
         var previousCapture = s_columnBreakCapture.Value;
         s_columnBreakCapture.Value = capture;
@@ -425,6 +429,8 @@ public sealed partial class HtmlRenderer
             }
         }
 
+        MoveMetricsIntoColumns(metricsCapture, metricsStart, segments, top, columns.Width + columns.Gap, context);
+
         for (var index = 0; index < segments.Count; index++)
         {
             var (start, end) = segments[index];
@@ -441,6 +447,96 @@ public sealed partial class HtmlRenderer
 
         PaintColumnRules(styleMap, segments.Count, columns, contentX, top, columnHeight, textStyle.IsHidden ? new DisplayList() : displayList);
         return columnHeight;
+    }
+
+    /// <summary>
+    /// Moves what was recorded when laying out the content as one column to where it is painted:
+    /// a box in the column it is in, one across columns with a fragment in each of them, where its
+    /// box is around them (CSSOM View §6).
+    /// </summary>
+    private static void MoveMetricsIntoColumns(LayoutCapture? capture, int recordStart, List<(float Start, float End)> segments, float top, float columnStep, LayoutContext context)
+    {
+        if (capture is null || segments.Count == 0)
+        {
+            return;
+        }
+
+        var moved = new HashSet<IElement>(ReferenceEqualityComparer.Instance);
+
+        for (var index = recordStart; index < capture.RecordOrder.Count; index++)
+        {
+            moved.Add(capture.RecordOrder[index]);
+        }
+
+        foreach (var element in moved)
+        {
+            if (!capture.TryGet(element, out var recorded) || recorded.IsViewportAnchored || IsPlacedOutsideOfColumns(element, moved, context))
+            {
+                continue;
+            }
+
+            var boxTop = recorded.BorderBoxY - top;
+            var boxBottom = boxTop + recorded.BorderBoxHeight;
+            var fragments = new List<RenderRect>();
+
+            for (var column = 0; column < segments.Count; column++)
+            {
+                var (start, end) = segments[column];
+                var isLast = column == segments.Count - 1;
+
+                // a box of no height is where it starts
+                if (boxBottom > boxTop ? boxTop < end && boxBottom > start : boxTop >= start && (boxTop < end || isLast))
+                {
+                    var fragmentTop = Math.Max(boxTop, start);
+                    var fragmentBottom = Math.Max(fragmentTop, Math.Min(boxBottom, end));
+                    fragments.Add(new RenderRect(recorded.BorderBoxX + (column * columnStep), top + fragmentTop - start, recorded.BorderBoxWidth, fragmentBottom - fragmentTop));
+                }
+            }
+
+            if (fragments.Count == 0)
+            {
+                continue;
+            }
+
+            var left = fragments.Min(fragment => fragment.X);
+            var boxY = fragments.Min(fragment => fragment.Y);
+            var right = fragments.Max(fragment => fragment.X + fragment.Width);
+            var bottom = fragments.Max(fragment => fragment.Y + fragment.Height);
+
+            capture.Replace(element, recorded with
+            {
+                BorderBoxX = left,
+                BorderBoxY = boxY,
+                BorderBoxWidth = right - left,
+                BorderBoxHeight = bottom - boxY,
+                Fragments = fragments.Count > 1
+                    ? fragments.Select(fragment => new RenderRect(fragment.X - left, fragment.Y - boxY, fragment.Width, fragment.Height)).ToList()
+                    : null,
+            });
+        }
+    }
+
+    // what is placed against a box outside of the column set doesn't move with its columns
+    private static bool IsPlacedOutsideOfColumns(IElement element, HashSet<IElement> moved, LayoutContext context)
+    {
+        var placed = false;
+
+        for (var current = element; current is not null && moved.Contains(current); current = current.ParentElement)
+        {
+            if (!context.StyleMapCache.TryGetValue(current, out var style))
+            {
+                continue;
+            }
+
+            if (placed && ActsAsContainingBlock(style, 0f))
+            {
+                placed = false;
+            }
+
+            placed |= GetPosition(style)?.Trim().ToLowerInvariant() is "absolute" or "fixed";
+        }
+
+        return placed;
     }
 
     /// <summary>

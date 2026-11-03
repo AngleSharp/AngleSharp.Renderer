@@ -428,7 +428,7 @@ public sealed class ElementCssomViewExtensionsTests
 
     [Theory]
     [InlineData("input", 39d)]
-    [InlineData("select", 39d)]
+    [InlineData("select", 36d)] // a native select ignores `line-height`: 19px of the font and 2px of its own
     [InlineData("textarea", 63d)]
     public async Task FormControl_KeepsItsPaddingAndBorder_UnderBorderBox(string control, double expectedHeight)
     {
@@ -456,9 +456,9 @@ public sealed class ElementCssomViewExtensionsTests
 
         var rect = document.QuerySelector("#c")!.GetBoundingClientRect();
 
-        // the 1.5px border is snapped to 1px, as in browsers
+        // the 1.5px border is snapped to 1px, as in browsers; 20 characters of the font in between
         Assert.Equal(39d, rect.Height, 1);
-        Assert.Equal(232d, rect.Width, 1);
+        Assert.Equal(282d, rect.Width, 1);
     }
 
     [Fact]
@@ -692,7 +692,7 @@ public sealed class ElementCssomViewExtensionsTests
     [InlineData("margin: 0 auto; width: 100px", 70d, 100d)]
     [InlineData("margin: 0 0 0 auto; width: 100px", 140d, 100d)]
     [InlineData("margin: 0 10px", 10d, 220d)]
-    [InlineData("margin: 0 auto", 0d, 0d)]
+    [InlineData("margin: 0 auto", 120d, 0d)] // shrunk to its content, which is nothing
     public async Task GridItemMargins_PlaceTheItemInItsArea(string style, double left, double width)
     {
         // dev.to centers its sign-in card as a grid item with `margin: 0 auto; width: 640px`
