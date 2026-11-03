@@ -449,7 +449,7 @@ public sealed class ElementCssomViewExtensionsTests
     {
         var document = await ParseAsync("""
             <html>
-              <head><style>html, body { margin: 0; } #c { font-size: 16px; line-height: 1.5; padding: 6.5px 40px; border: 1.5px solid black; }</style></head>
+              <head><style>html, body { margin: 0; } #c { font-family: sans-serif; font-size: 16px; line-height: 1.5; padding: 6.5px 40px; border: 1.5px solid black; }</style></head>
               <body><input id="c"></body>
             </html>
             """);
