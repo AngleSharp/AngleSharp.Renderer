@@ -2,6 +2,17 @@
 
 Released on Tuesday, November 3 2026.
 
+- Fixed synthesized small caps: digits, punctuation and spaces keep the full size with `small-caps` and are reduced with `all-small-caps`, `unicase` reduces everything but lowercase letters instead of acting as `small-caps`, `ß` and Latin ligatures become their capitals, letter spacing applies where the size changes, and a decoration crosses spaces in one size
+- Fixed spaces between words of a fallback font being as wide as that font's space instead of the first font's
+- Fixed the background and border of inline boxes around right-to-left text starting at the left of the page, and the left and right padding, border and margin of such boxes changing places
+- Fixed `letter-spacing` after the last character missing from the width of text, making boxes sized by their text too narrow and aligned text off by that much
+- Fixed kerning and letter spacing across spaces missing from line breaking, intrinsic widths and inline positions, so a line could wrap though it fit, or overflow, and what followed a text run could be off by a fraction of a pixel
+- Fixed `min-content`, `max-content` and `fit-content` being ignored as the `width` of flex and grid items, and as `flex-basis`, `min-width` and `max-width` of flex items in a row
+- Fixed `white-space: pre-wrap` and `break-spaces` collapsing repeated spaces and indentation of bare text, and dropping lines of only spaces
+- Added `text-decoration-line: overline` and `text-decoration-thickness`
+- Fixed text decorations taking the color of nested elements (or the style of the box around them) instead of the box declaring the lines
+- Fixed collapsed table borders of equal width using the color of the cell further down or right instead of further up or left, and vertical lines being painted over horizontal ones
+- Fixed square borders with differently colored edges not meeting on the corner diagonals (e.g. triangles from `border-color: red transparent transparent`)
 - Fixed absolutely positioned boxes being placed against their parent instead of the nearest positioned ancestor (positioned or transformed blocks, flex and grid containers, tables and inline boxes) or the viewport, waiting for the height of that one if it is auto
 - Fixed percentages of absolutely positioned and fixed boxes referring to their parent instead of their containing block, and auto margins not centering them between their offsets
 - Fixed the root element collapsing its margins with its first child

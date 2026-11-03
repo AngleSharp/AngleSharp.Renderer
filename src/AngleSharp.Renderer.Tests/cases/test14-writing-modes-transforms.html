@@ -1,0 +1,144 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Test 14 - Writing Modes and Transforms</title>
+<style>
+* { box-sizing: border-box; }
+html, body { margin: 0; padding: 0; }
+body {
+  background: #e8edf1;
+  color: #202830;
+  font: 15px/1.4 Arial, sans-serif;
+}
+h1, h2, p, div { margin: 0; padding: 0; }
+.page {
+  width: 900px;
+  margin: 0 auto;
+  padding: 24px;
+  background: white;
+}
+h1 { font-size: 28px; margin-bottom: 20px; }
+h2 { font-size: 18px; margin: 22px 0 10px; }
+.row {
+  display: flex;
+  gap: 20px;
+  align-items: flex-start;
+}
+.vertical {
+  width: 120px;
+  height: 260px;
+  padding: 12px;
+  border: 2px solid #45617b;
+  background: #dceaf5;
+  writing-mode: vertical-rl;
+}
+.vertical-lr {
+  writing-mode: vertical-lr;
+  background: #f2e1cf;
+}
+.logical {
+  width: 320px;
+  padding-block: 20px;
+  padding-inline: 30px;
+  margin-block-start: 15px;
+  margin-inline-start: 25px;
+  border-block: 4px solid #52734d;
+  border-inline: 6px solid #8c5c36;
+  background: #e2eedf;
+}
+.rtl {
+  direction: rtl;
+  unicode-bidi: isolate;
+  text-align: start;
+  width: 360px;
+  padding: 15px;
+  border: 2px solid #6a5278;
+  background: #eee4f3;
+}
+.transform-stage {
+  position: relative;
+  width: 600px;
+  height: 260px;
+  border: 2px solid #555;
+  background: #f5f5f5;
+  overflow: hidden;
+}
+.box {
+  position: absolute;
+  width: 150px;
+  height: 90px;
+  padding: 15px;
+  border: 3px solid #345c7b;
+  background: #dceaf5;
+}
+.rotate {
+  left: 70px;
+  top: 70px;
+  transform: rotate(25deg);
+}
+.origin {
+  left: 300px;
+  top: 70px;
+  transform: rotate(25deg);
+  transform-origin: top left;
+  background: #f2dfcc;
+  border-color: #8a5b34;
+}
+.nested-stage {
+  position: absolute;
+  left: 30px;
+  top: 30px;
+  width: 220px;
+  height: 150px;
+  border: 2px dashed #555;
+  transform: translate(15px, 10px) scale(0.9);
+  transform-origin: top left;
+}
+.nested-child {
+  position: absolute;
+  left: 40px;
+  top: 30px;
+  width: 100px;
+  height: 60px;
+  border: 2px solid #694c79;
+  background: #eadff0;
+  transform: rotate(-15deg);
+}
+</style>
+</head>
+<body>
+<div class="page">
+  <h1>Writing Modes and Transforms</h1>
+
+  <h2>Vertical writing modes</h2>
+  <div class="row">
+    <div class="vertical">
+      vertical-rl: text flows vertically from right to left
+    </div>
+    <div class="vertical vertical-lr">
+      vertical-lr: text flows vertically from left to right
+    </div>
+  </div>
+
+  <h2>Logical properties</h2>
+  <div class="logical">
+    This box uses block and inline logical dimensions, margins, and borders.
+  </div>
+
+  <h2>Right-to-left direction</h2>
+  <div class="rtl">
+    RTL container: English text mixed with العربية and numeric content 12345.
+  </div>
+
+  <h2>Transforms and coordinate systems</h2>
+  <div class="transform-stage">
+    <div class="box rotate">rotate(25deg)</div>
+    <div class="box origin">origin: top left</div>
+    <div class="nested-stage">
+      <div class="nested-child">Nested transform</div>
+    </div>
+  </div>
+</div>
+</body>
+</html>

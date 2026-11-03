@@ -2,6 +2,8 @@ namespace AngleSharp.Renderer.Tests;
 
 using AngleSharp;
 using AngleSharp.Css;
+using AngleSharp.Dom;
+using AngleSharp.Renderer;
 using AngleSharp.Renderer.Rendering;
 using AngleSharp.Renderer.Skia;
 
@@ -114,8 +116,8 @@ public sealed class TextMeasurementTests
         var plain = new RenderFont("sans-serif", 16f, 400f, false, 0f);
         var spaced = plain with { LetterSpacing = 4f };
 
-        // "Handgloves" has ten characters, so nine gaps of four pixels each.
-        Assert.Equal(measurer.MeasureWidth("Handgloves", plain) + 36f, measurer.MeasureWidth("Handgloves", spaced), tolerance: 0.01f);
+        // "Handgloves" has ten characters, each followed by four pixels.
+        Assert.Equal(measurer.MeasureWidth("Handgloves", plain) + 40f, measurer.MeasureWidth("Handgloves", spaced), tolerance: 0.01f);
     }
 
     [Fact]
@@ -181,6 +183,136 @@ public sealed class TextMeasurementTests
         }
 
         Assert.Equal(BoxTop(8f) - 2f, BoxTop(12f), tolerance: 0.01f);
+    }
+
+    [Theory]
+    [InlineData("L L", 26, 1)] // kerned closer: fits, though its words and space add up to 30
+    [InlineData("K K", 30, 2)] // kerned apart: does not fit, though they add up to 30
+    public async Task BareText_BreaksByItsKerningAcrossSpaces(string text, int width, int expectedLines)
+    {
+        var commands = await LayoutWithKerningAsync($$"""<div style="width: {{width}}px">{{text}}</div>""");
+
+        Assert.Equal(expectedLines, commands.OfType<DrawTextCommand>().Count());
+    }
+
+    [Theory]
+    [InlineData("L L", 26, 1)]
+    [InlineData("K K", 30, 2)]
+    public async Task InlineContent_BreaksByItsKerningAcrossSpaces(string text, int width, int expectedLines)
+    {
+        var commands = await LayoutWithKerningAsync($$"""<div style="width: {{width}}px"><span>{{text}}</span></div>""");
+
+        Assert.Equal(expectedLines, commands.OfType<DrawTextCommand>().Count());
+    }
+
+    [Theory]
+    [InlineData("L L", 26f)]
+    [InlineData("K K", 34f)]
+    [InlineData("L L L", 42f)]
+    public async Task IntrinsicWidth_IncludesKerningAcrossSpaces(string text, float expected)
+    {
+        var commands = await LayoutWithKerningAsync($$"""<div style="display: inline-block; background-color: #ff0000">{{text}}</div>""");
+
+        Assert.Equal(expected, commands.OfType<FillRectCommand>().Single(fill => fill.Color == new RenderColor(255, 0, 0)).Rect.Width);
+        Assert.Single(commands.OfType<DrawTextCommand>());
+    }
+
+    [Fact]
+    public async Task InlineContent_PlacesWhatFollowsAKernedSpaceAfterThePaintedRun()
+    {
+        var commands = await LayoutWithKerningAsync("""<div>L L<span style="color: #ff0000">x</span></div>""");
+
+        var after = commands.OfType<DrawTextCommand>().Single(text => text.Text == "x");
+
+        Assert.Equal(26f, after.X);
+    }
+
+    [Theory]
+    [InlineData("<div style=\"word-spacing: 5px\">L L</div>")]
+    [InlineData("<div style=\"word-spacing: 5px\"><span>L L</span></div>")]
+    public async Task WordSpacing_KeepsTheKerningAcrossTheSpace(string html)
+    {
+        var commands = await LayoutWithKerningAsync(html);
+
+        Assert.Equal(21f, commands.OfType<DrawTextCommand>().Single(text => text.Text == "L" && text.X > 0f).X);
+    }
+
+    [Fact]
+    public async Task JustifiedText_KeepsTheKerningAcrossTheSpace()
+    {
+        var commands = await LayoutWithKerningAsync("""<div style="width: 50px; text-align: justify">L L K K K K</div>""");
+
+        // "L L K" is 46 wide with its kerning, so 2 spaces share 4 pixels; the last word ends at the edge
+        var line = commands.OfType<DrawTextCommand>().Where(text => text.Y == commands.OfType<DrawTextCommand>().First().Y).ToList();
+
+        Assert.Equal(50f, line[^1].X + 10f, precision: 3);
+    }
+
+    [Theory]
+    [InlineData("a", 1)]
+    [InlineData("abc", 3)]
+    [InlineData("ab cd", 5)]
+    public void Measurer_LetterSpacingFollowsEveryCharacter(string text, int characters)
+    {
+        // also the last one, as in browsers
+        var measurer = new SkiaTextMeasurer();
+        var plain = new RenderFont("sans-serif", 20f, 400f, false, 0f);
+
+        Assert.Equal(measurer.MeasureWidth(text, plain) + (characters * 3f), measurer.MeasureWidth(text, plain with { LetterSpacing = 3f }), precision: 2);
+    }
+
+    [Theory]
+    [InlineData("<div id=\"box\" style=\"display: inline-block; letter-spacing: 3px\">ab cd</div>")]
+    [InlineData("<div id=\"box\" style=\"display: inline-block; letter-spacing: 3px\"><span>ab cd</span></div>")]
+    [InlineData("<span id=\"box\" style=\"letter-spacing: 3px\">ab cd</span>")]
+    public async Task LetterSpacedBox_IsAsWideAsItsTextWithTheSpacingAfterTheLastCharacter(string html)
+    {
+        var device = new DefaultRenderDevice { ViewPortWidth = 400, ViewPortHeight = 300, FontSize = 16f };
+        var context = BrowsingContext.New(Configuration.Default.WithCss().WithRenderDevice(device));
+        var document = await context.OpenAsync(request => request.Content($$"""
+            <!doctype html><html><head><style>html, body { margin: 0; font: 20px sans-serif }</style></head><body>{{html}}<br><span id="plain">ab cd</span></body></html>
+            """));
+        context.GetDomHarness();
+
+        var box = document.GetElementById("box")!.GetBoundingClientRect();
+        var plain = document.GetElementById("plain")!.GetBoundingClientRect();
+
+        Assert.Equal(plain.Width + (5 * 3), box.Width, precision: 1);
+    }
+
+    [Fact]
+    public async Task LetterSpacedLine_BreaksWithTheSpacingAfterItsLastCharacter()
+    {
+        var device = new DefaultRenderDevice { ViewPortWidth = 400, ViewPortHeight = 300, FontSize = 16f };
+        var context = BrowsingContext.New(Configuration.Default.WithCss().WithRenderDevice(device));
+        var measurer = new SkiaTextMeasurer();
+        var width = measurer.MeasureWidth("ab cd", new RenderFont("sans-serif", 20f, 400f, false, 0f)) + (5 * 3f);
+        var document = await context.OpenAsync(request => request.Content($$"""
+            <!doctype html><html><head><style>html, body { margin: 0; font: 20px sans-serif; letter-spacing: 3px }</style></head>
+            <body><div style="width: {{(width - 1f).ToString(System.Globalization.CultureInfo.InvariantCulture)}}px">ab cd</div></body></html>
+            """));
+
+        var texts = new HtmlRenderer().BuildDisplayList(document, device).Commands.OfType<DrawTextCommand>().ToList();
+
+        Assert.Equal(2, texts.Count);
+    }
+
+    private static async Task<IReadOnlyList<RenderCommand>> LayoutWithKerningAsync(string body)
+    {
+        var device = new DefaultRenderDevice { ViewPortWidth = 400, ViewPortHeight = 300, FontSize = 16f };
+        var context = BrowsingContext.New(Configuration.Default.WithCss().WithRenderDevice(device));
+        var document = await context.OpenAsync(request => request.Content($$"""
+            <!doctype html><html><head><style>html, body { margin: 0 }</style></head><body>{{body}}</body></html>
+            """));
+
+        return new HtmlRenderer(new SkiaRenderBackend(), new KerningTextMeasurer()).BuildDisplayList(document, device).Commands;
+    }
+
+    /// <summary>Ten pixels per character, with a kerning pair of "L" and of "K" with the space after it.</summary>
+    private sealed class KerningTextMeasurer : ITextMeasurer
+    {
+        public float MeasureWidth(string text, RenderFont font) =>
+            (10f * text.Length) - (4f * text.Split("L ").Length) + 4f + (4f * text.Split("K ").Length) - 4f;
     }
 
     private sealed class XHeightTextMeasurer(float xHeight) : ITextMeasurer

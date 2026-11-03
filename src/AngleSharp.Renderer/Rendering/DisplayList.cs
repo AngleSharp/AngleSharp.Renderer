@@ -316,12 +316,24 @@ public sealed class DisplayList
         string? fontFeatures = null,
         string? language = null,
         string? contextBefore = null,
-        string? contextAfter = null)
+        string? contextAfter = null,
+        bool overline = false,
+        float decorationThickness = float.NaN,
+        float decorationFontSize = float.NaN)
     {
-        ArgumentException.ThrowIfNullOrWhiteSpace(text);
+        // only a decorated run can be nothing but spaces, for the decoration to cross them
+        if (underline || overline || strikeThrough)
+        {
+            ArgumentException.ThrowIfNullOrEmpty(text);
+        }
+        else
+        {
+            ArgumentException.ThrowIfNullOrWhiteSpace(text);
+        }
+
         ArgumentException.ThrowIfNullOrWhiteSpace(fontFamily);
 
-        Add(new DrawTextCommand(text, x, y, color, fontSize, fontFamily, fontWeight, isItalic, underline, strikeThrough, decorationColor ?? color, decorationStyle, letterSpacing, fontStretch, isRightToLeft, fontFeatures, language, contextBefore, contextAfter));
+        Add(new DrawTextCommand(text, x, y, color, fontSize, fontFamily, fontWeight, isItalic, underline, strikeThrough, decorationColor ?? color, decorationStyle, letterSpacing, fontStretch, isRightToLeft, fontFeatures, language, contextBefore, contextAfter, overline, decorationThickness, decorationFontSize));
     }
 
     /// <summary>
@@ -523,7 +535,10 @@ public sealed record DrawTextCommand(
     string? FontFeatures = null,
     string? Language = null,
     string? ContextBefore = null,
-    string? ContextAfter = null) : RenderCommand
+    string? ContextAfter = null,
+    bool Overline = false,
+    float DecorationThickness = float.NaN,
+    float DecorationFontSize = float.NaN) : RenderCommand
 {
     /// <summary>
     /// Indicates whether the command should be rendered with a bold typeface.

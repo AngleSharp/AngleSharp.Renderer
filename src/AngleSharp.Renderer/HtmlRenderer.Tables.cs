@@ -510,7 +510,8 @@ public sealed partial class HtmlRenderer
                 }
                 else if (grid[cell.Row - 1, column] is { } above)
                 {
-                    top.Add((boxes[above].BorderWidth.Bottom, boxes[above].BorderStyle.Bottom, boxes[above].BorderColor.Bottom));
+                    // of two equally wide borders the one further up or left wins (CSS 2.1 17.6.2.1)
+                    top.Insert(0, (boxes[above].BorderWidth.Bottom, boxes[above].BorderStyle.Bottom, boxes[above].BorderColor.Bottom));
                 }
 
                 if (lastRow == rowCount)
@@ -535,7 +536,7 @@ public sealed partial class HtmlRenderer
                 }
                 else if (grid[row, cell.Column - 1] is { } before)
                 {
-                    left.Add((boxes[before].BorderWidth.Right, boxes[before].BorderStyle.Right, boxes[before].BorderColor.Right));
+                    left.Insert(0, (boxes[before].BorderWidth.Right, boxes[before].BorderStyle.Right, boxes[before].BorderColor.Right));
                 }
 
                 if (lastColumn == columnCount)
@@ -1599,31 +1600,39 @@ public sealed partial class HtmlRenderer
     /// </summary>
     private static void PaintCollapsedBorders(DisplayList displayList, IEnumerable<TableCellInfo> cells, float[] columnX, float[] rowY, Func<TableCellInfo, float> spanWidth, Func<TableCellInfo, float> spanHeight)
     {
-        foreach (var cell in cells)
-        {
-            var x = columnX[cell.Column];
-            var y = rowY[cell.Row];
-            var width = spanWidth(cell);
-            var height = spanHeight(cell);
-            var lines = cell.LineWidths;
-            var colors = cell.LineColors;
-            var left = x - (lines.Left / 2f);
-            var top = y - (lines.Top / 2f);
-            var fullWidth = width + ((lines.Left + lines.Right) / 2f);
-            var fullHeight = height + ((lines.Top + lines.Bottom) / 2f);
+        // the horizontal lines go on top, so a line keeps its color where vertical ones meet it
+        var shown = cells as IReadOnlyCollection<TableCellInfo> ?? [.. cells];
 
-            PaintLine(new RenderRect(left, top, fullWidth, lines.Top), colors.Top);
-            PaintLine(new RenderRect(left, top, lines.Left, fullHeight), colors.Left);
+        foreach (var cell in shown)
+        {
+            var (left, top, _, fullHeight) = GetLineBox(cell);
+            PaintLine(new RenderRect(left, top, cell.LineWidths.Left, fullHeight), cell.LineColors.Left);
 
             if (cell.PaintsRightLine)
             {
-                PaintLine(new RenderRect(x + width - (lines.Right / 2f), top, lines.Right, fullHeight), colors.Right);
+                PaintLine(new RenderRect(columnX[cell.Column] + spanWidth(cell) - (cell.LineWidths.Right / 2f), top, cell.LineWidths.Right, fullHeight), cell.LineColors.Right);
             }
+        }
+
+        foreach (var cell in shown)
+        {
+            var (left, top, fullWidth, _) = GetLineBox(cell);
+            PaintLine(new RenderRect(left, top, fullWidth, cell.LineWidths.Top), cell.LineColors.Top);
 
             if (cell.PaintsBottomLine)
             {
-                PaintLine(new RenderRect(left, y + height - (lines.Bottom / 2f), fullWidth, lines.Bottom), colors.Bottom);
+                PaintLine(new RenderRect(left, rowY[cell.Row] + spanHeight(cell) - (cell.LineWidths.Bottom / 2f), fullWidth, cell.LineWidths.Bottom), cell.LineColors.Bottom);
             }
+        }
+
+        (float Left, float Top, float FullWidth, float FullHeight) GetLineBox(TableCellInfo cell)
+        {
+            var lines = cell.LineWidths;
+            return (
+                columnX[cell.Column] - (lines.Left / 2f),
+                rowY[cell.Row] - (lines.Top / 2f),
+                spanWidth(cell) + ((lines.Left + lines.Right) / 2f),
+                spanHeight(cell) + ((lines.Top + lines.Bottom) / 2f));
         }
 
         void PaintLine(RenderRect rect, RenderColor color)

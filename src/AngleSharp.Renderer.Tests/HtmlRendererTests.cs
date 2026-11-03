@@ -9422,8 +9422,8 @@ public sealed class HtmlRendererTests
 
         var displayList = BuildDisplayList(document);
 
-        // the spacing goes between all of the five characters
-        Assert.Equal(SingleFill(displayList, Red).Rect.Width + 16f, SingleFill(displayList, Green).Rect.Width, precision: 1);
+        // the spacing goes after each of the five characters
+        Assert.Equal(SingleFill(displayList, Red).Rect.Width + 20f, SingleFill(displayList, Green).Rect.Width, precision: 1);
     }
 
     [Theory]

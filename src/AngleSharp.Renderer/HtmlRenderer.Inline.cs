@@ -316,6 +316,9 @@ public sealed partial class HtmlRenderer
 
         public bool IsDecorated { get; init; }
 
+        /// <summary>Whether its end edge is at the left on the current line, its start edge at the right.</summary>
+        public bool EdgesReversed { get; set; }
+
         public float FragmentLeft { get; set; }
 
         public float FragmentRight { get; set; }
@@ -616,6 +619,11 @@ public sealed partial class HtmlRenderer
                 IsPositioned = (parentBox?.IsPositioned ?? false) || string.Equals(GetPosition(styleMap), "relative", StringComparison.OrdinalIgnoreCase),
             };
 
+            // The first fragment of a box has its start edge: the right one of a right-to-left box.
+            var leftEdgeWidth = inlineBox.MarginLeft + box.BorderWidth.Left + box.Padding.Left;
+            var rightEdgeWidth = box.Padding.Right + box.BorderWidth.Right + inlineBox.MarginRight;
+            var isRightToLeftBox = style.Direction == TextDirection.Rtl;
+
             Boxes.Add(inlineBox);
             var (bidiStart, bidiEnd) = GetBidiControls(styleMap, style.Direction);
             Pieces.Add(new InlinePiece
@@ -624,7 +632,7 @@ public sealed partial class HtmlRenderer
                 Style = style,
                 StyleId = styleId,
                 Box = inlineBox,
-                Width = inlineBox.MarginLeft + box.BorderWidth.Left + box.Padding.Left,
+                Width = isRightToLeftBox ? rightEdgeWidth : leftEdgeWidth,
                 BidiControl = bidiStart,
             });
 
@@ -639,7 +647,7 @@ public sealed partial class HtmlRenderer
                 Style = style,
                 StyleId = styleId,
                 Box = inlineBox,
-                Width = box.Padding.Right + box.BorderWidth.Right + inlineBox.MarginRight,
+                Width = isRightToLeftBox ? leftEdgeWidth : rightEdgeWidth,
                 BidiControl = bidiEnd,
             });
         }
@@ -833,6 +841,7 @@ public sealed partial class HtmlRenderer
             return;
         }
 
+        ApplySpaceKerning(pieces, context);
         ApplyShapingContext(pieces, context);
 
         var lineStartIndex = 0;
@@ -1516,6 +1525,7 @@ public sealed partial class HtmlRenderer
         List<(int StartIndex, int Count)> negativeZIndexRanges)
     {
         var visualOrder = ReorderLine(linePieces, blockStyle.Direction == TextDirection.Rtl, context);
+        PlaceInlineBoxEdges(visualOrder);
 
         var lineWidth = 0f;
 
@@ -1643,7 +1653,7 @@ public sealed partial class HtmlRenderer
             }
         }
 
-        PaintInlineBoxFragments(linePieces, baselineY, context, displayList, positioned: false);
+        PaintInlineBoxFragments(visualOrder, baselineY, context, displayList, positioned: false);
 
         // what is positioned goes above the rest of the line
         if (boxesOnLine.Exists(static box => box.IsPositioned))
@@ -1660,7 +1670,7 @@ public sealed partial class HtmlRenderer
 
             if (index == firstPositioned)
             {
-                PaintInlineBoxFragments(linePieces, baselineY, context, displayList, positioned: true);
+                PaintInlineBoxFragments(visualOrder, baselineY, context, displayList, positioned: true);
             }
 
             if (piece.Kind is InlinePieceKind.Text or InlinePieceKind.Space)
@@ -1687,7 +1697,7 @@ public sealed partial class HtmlRenderer
                 var first = index;
                 var last = runEnd - 1;
 
-                if (!piece.Style.Underline && !piece.Style.StrikeThrough)
+                if (!piece.Style.Underline && !piece.Style.Overline && !piece.Style.StrikeThrough)
                 {
                     while (first <= last && visualOrder[first].Kind == InlinePieceKind.Space)
                     {
@@ -1917,6 +1927,26 @@ public sealed partial class HtmlRenderer
 
         result.AddRange(outOfFlow);
         return result;
+    }
+
+    /// <summary>
+    /// Gives the spaces between pieces of one style, which are painted as one run, their width in
+    /// that run, so that the widths of the pieces add up to what is painted.
+    /// </summary>
+    private static void ApplySpaceKerning(List<InlinePiece> pieces, LayoutContext context)
+    {
+        for (var index = 1; index < pieces.Count - 1; index++)
+        {
+            var piece = pieces[index];
+
+            if (piece.Kind == InlinePieceKind.Space && !piece.IsTab && IsSameRunText(pieces[index - 1], piece) && IsSameRunText(pieces[index + 1], piece))
+            {
+                piece.Width = MeasureSpaceBetween(context, pieces[index - 1].Text, pieces[index + 1].Text, piece.Style);
+            }
+        }
+
+        static bool IsSameRunText(InlinePiece neighbour, InlinePiece space) =>
+            neighbour.Kind is InlinePieceKind.Text or InlinePieceKind.Space && !neighbour.IsTab && neighbour.StyleId == space.StyleId && neighbour.Text.Length > 0;
     }
 
     /// <summary>
@@ -2157,6 +2187,41 @@ public sealed partial class HtmlRenderer
     /// A box broken across lines only gets its left edge on its first fragment and its right edge
     /// on its last one.
     /// </summary>
+    /// <summary>
+    /// Decides for every inline box on a line which of its edges is at the left. With just one of
+    /// them on the line that follows from the box's <c>direction</c>; with both it is how they
+    /// were reordered, which <c>direction</c> alone does not do, so their widths may have to change places.
+    /// </summary>
+    private static void PlaceInlineBoxEdges(List<InlinePiece> visualOrder)
+    {
+        Dictionary<InlineBox, InlinePiece>? firstEdges = null;
+
+        foreach (var piece in visualOrder)
+        {
+            if (piece.Kind is not (InlinePieceKind.BoxStart or InlinePieceKind.BoxEnd) || piece.Box is not { } box)
+            {
+                continue;
+            }
+
+            firstEdges ??= [];
+
+            if (!firstEdges.TryGetValue(box, out var first))
+            {
+                firstEdges[box] = piece;
+                box.EdgesReversed = box.TextStyle.Direction == TextDirection.Rtl;
+                continue;
+            }
+
+            var reversed = first.Kind == InlinePieceKind.BoxEnd;
+
+            if (reversed != box.EdgesReversed)
+            {
+                (first.Width, piece.Width) = (piece.Width, first.Width);
+                box.EdgesReversed = reversed;
+            }
+        }
+    }
+
     private static void PaintInlineBoxFragments(List<InlinePiece> linePieces, float baselineY, LayoutContext context, DisplayList displayList, bool positioned)
     {
         var boxes = new List<InlineBox>();
@@ -2178,16 +2243,21 @@ public sealed partial class HtmlRenderer
                 var left = piece.X;
                 var right = piece.X + (piece.Kind == InlinePieceKind.OutOfFlow ? 0f : piece.Width);
 
-                if (ReferenceEquals(piece.Box, box) && piece.Kind == InlinePieceKind.BoxStart)
+                if (ReferenceEquals(piece.Box, box) && piece.Kind is InlinePieceKind.BoxStart or InlinePieceKind.BoxEnd)
                 {
-                    left += box.MarginLeft;
-                    box.StartsOnLine = true;
-                }
+                    var isStart = piece.Kind == InlinePieceKind.BoxStart;
 
-                if (ReferenceEquals(piece.Box, box) && piece.Kind == InlinePieceKind.BoxEnd)
-                {
-                    right -= box.MarginRight;
-                    box.EndsOnLine = true;
+                    if (isStart != box.EdgesReversed)
+                    {
+                        left += box.MarginLeft;
+                    }
+                    else
+                    {
+                        right -= box.MarginRight;
+                    }
+
+                    box.StartsOnLine |= isStart;
+                    box.EndsOnLine |= !isStart;
                 }
 
                 box.FragmentLeft = Math.Min(box.FragmentLeft, Math.Min(left, right));
@@ -2228,9 +2298,9 @@ public sealed partial class HtmlRenderer
             var radii = isWhole ? box.Box.BorderRadius : RenderCornerRadii.Zero;
             var borderWidths = new EdgeSizes(
                 box.Box.BorderWidth.Top,
-                box.EndsOnLine ? box.Box.BorderWidth.Right : 0f,
+                (box.EdgesReversed ? box.StartsOnLine : box.EndsOnLine) ? box.Box.BorderWidth.Right : 0f,
                 box.Box.BorderWidth.Bottom,
-                box.StartsOnLine ? box.Box.BorderWidth.Left : 0f);
+                (box.EdgesReversed ? box.EndsOnLine : box.StartsOnLine) ? box.Box.BorderWidth.Left : 0f);
 
             PaintBackground(displayList, box.Box.BackgroundPaint, left, top, width, height, radii);
             PaintBorder(displayList, box.Box.BorderColor, left, top, width, height, borderWidths, radii, box.Box.BorderStyle);
@@ -3104,20 +3174,28 @@ public sealed partial class HtmlRenderer
         var min = 0f;
         var max = 0f;
         var paragraphs = text.Split('\n');
-        // a measured run has letter spacing between its characters only, so joining two words
-        // (measured on their own) also adds the spacing before and after the space between them
-        var joinWidth = spaceWidth + (2f * style.LetterSpacing);
 
         for (var paragraphIndex = 0; paragraphIndex < paragraphs.Length; paragraphIndex++)
         {
             var paragraph = paragraphs[paragraphIndex];
             var words = paragraph.Split(' ');
             var paragraphWidth = 0f;
+            // spaces at the edges and in a row have no words on both sides to measure them with
+            var keepsSpaces = Array.IndexOf(words, string.Empty) >= 0;
+
+            if (keepsSpaces)
+            {
+                paragraphWidth = MeasureTextWidth(context, paragraph, style) + (CountSpaces(paragraph) * style.WordSpacing);
+            }
 
             for (var index = 0; index < words.Length; index++)
             {
                 var wordWidth = words[index].Length > 0 ? MeasureTextWidth(context, words[index], style) : 0f;
-                paragraphWidth += wordWidth + (index > 0 ? joinWidth : 0f);
+
+                if (!keepsSpaces)
+                {
+                    paragraphWidth += wordWidth + (index > 0 ? MeasureSpaceBetween(context, StripSoftHyphens(words[index - 1]), StripSoftHyphens(words[index]), style) : 0f);
+                }
 
                 if (style.WordBreak == WordBreakMode.BreakAll || style.OverflowWrap == OverflowWrapMode.BreakWord)
                 {

@@ -171,6 +171,20 @@ public sealed class FontFallbackTests
         Assert.Equal(Width("ab", "serif") + Width(SerifLacks, "sans-serif") + Width("cd", "serif"), mixed, tolerance: 0.05f);
     }
 
+    [Theory]
+    [InlineData("serif")]
+    [InlineData("sans-serif")]
+    public void SpaceBetweenFallbackWords_ComesFromThePrimaryFont(string fontFamily)
+    {
+        // as in browsers; the bundled Devanagari font is fallback-only, with a space of its own
+        const string Word = "\u0928\u092E";
+
+        Assert.Equal(
+            (2f * Width(Word, fontFamily)) + Width(" ", fontFamily),
+            Width(Word + " " + Word, fontFamily),
+            tolerance: 0.01f);
+    }
+
     private static float Width(string text, string fontFamily) =>
         Measurer.MeasureWidth(text, new RenderFont(fontFamily, 20f, 400f, false, 0f));
 

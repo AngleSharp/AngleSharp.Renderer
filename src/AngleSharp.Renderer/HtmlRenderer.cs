@@ -3736,6 +3736,13 @@ public sealed partial class HtmlRenderer
             var justifySelf = ResolveGridSelfAlignment(childStyleMap, "justify-self", styleMap, "justify-items");
             var alignSelf = ResolveGridSelfAlignment(childStyleMap, "align-self", styleMap, "align-items");
 
+            // A content-sized width is not stretched, and may overflow the grid area.
+            if (GetContentSizeKeyword(childStyleMap, "width") is not null && !IsReplacedElement(elementChild.Ref))
+            {
+                childContentWidth = Math.Max(0f, ResolveShrinkToFitBorderBoxWidth(elementChild, availableWidth, inheritedTextStyle, context, out _, out _) - childHorizontalExtras);
+                resolvedChildContentWidth = childContentWidth;
+            }
+
             // An item that is not stretched (auto margins prevent stretching) is as wide as its
             // content (shrink-to-fit) and as tall.
             if (float.IsNaN(childContentWidth) && (justifySelf != GridSelfAlignment.Stretch || hasAutoInlineMargin))
@@ -5320,16 +5327,21 @@ public sealed partial class HtmlRenderer
                 // A text run cannot express word spacing, so each word is painted on its own.
                 var spaceAdvance = MeasureTextWidth(context, " ", textStyle) + textStyle.WordSpacing + justifyExtra;
                 var wordX = lineX;
+                var words = line.Split(' ');
 
-                foreach (var word in line.Split(' '))
+                for (var wordIndex = 0; wordIndex < words.Length; wordIndex++)
                 {
+                    var word = words[wordIndex];
+
                     if (word.Length > 0)
                     {
                         DrawStyledText(context, displayList, word, wordX, baselineY, textStyle);
                         wordX += MeasureTextWidth(context, word, textStyle);
                     }
 
-                    wordX += spaceAdvance;
+                    wordX += word.Length > 0 && wordIndex + 1 < words.Length && words[wordIndex + 1].Length > 0
+                        ? MeasureSpaceBetween(context, word, words[wordIndex + 1], textStyle) + justifyExtra
+                        : spaceAdvance;
                 }
 
                 continue;
@@ -5580,8 +5592,19 @@ public sealed partial class HtmlRenderer
         var hasDefiniteCrossSize = !float.IsNaN(ResolveAuthoredDimension(childStyle, isRowDirection ? "height" : "width", crossRelativeTo, float.NaN, crossBorderAndPadding)) &&
             (formControlKind is FormControlKind.None or FormControlKind.Checkbox or FormControlKind.Radio ||
              !IsAutoComputedSize(elementChild.ComputedStyle, isRowDirection ? "height" : "width"));
+
+        // a content-sized width is as definite as a length: the width of a column's item is known here
+        if (!isRowDirection && GetContentSizeKeyword(childStyle, "width") is not null && !IsReplacedElement(elementChild.Ref))
+        {
+            crossSize = Math.Max(0f, ResolveShrinkToFitBorderBoxWidth(elementChild, relativeTo, inheritedTextStyle, context, out _, out _) - crossBorderAndPadding);
+            hasDefiniteCrossSize = true;
+        }
+
         var mainProperty = isRowDirection ? "width" : "height";
         var specifiedMainSize = ResolveAuthoredDimension(childStyle, mainProperty, mainRelativeTo, float.NaN, mainBorderAndPadding);
+        var keywordBaseSize = float.NaN;
+        var keywordMinSize = float.NaN;
+        var keywordMaxSize = float.NaN;
 
         // The content size along the main axis: max-content (or the image's width) for rows, the
         // laid-out height for columns; the min-content width feeds the automatic minimum.
@@ -5597,6 +5620,21 @@ public sealed partial class HtmlRenderer
                 : ComputeContentIntrinsicWidths(elementChild, childTextStyle, relativeTo, context);
             contentMainSize = intrinsic.Max;
             contentMinimum = intrinsic.Min;
+
+            // a content-sized width is as definite as a length, for the item's size and its limits
+            float ResolveKeyword(string property) => GetContentSizeKeyword(childStyle, property) switch
+            {
+                "min-content" => intrinsic.Min,
+                "max-content" => intrinsic.Max,
+                "fit-content" => Math.Min(intrinsic.Max, Math.Max(intrinsic.Min, relativeTo - horizontalBorderAndPadding - childBox.Margin.Left - childBox.Margin.Right)),
+                _ => float.NaN,
+            };
+
+            var keywordWidth = ResolveKeyword("width");
+            specifiedMainSize = float.IsNaN(keywordWidth) ? specifiedMainSize : keywordWidth;
+            keywordBaseSize = ResolveKeyword("flex-basis");
+            keywordMinSize = ResolveKeyword("min-width");
+            keywordMaxSize = ResolveKeyword("max-width");
         }
         else if (deferringAlignItems is not null && CanDeferFlexItemHeight(elementChild, childStyle, specifiedMainSize, mainRelativeTo, mainBorderAndPadding, hasDefiniteCrossSize, deferringAlignItems, context))
         {
@@ -5614,7 +5652,7 @@ public sealed partial class HtmlRenderer
         }
 
         // `flex-basis` when definite, else the main size property, else the content size.
-        var baseMainSize = ResolveFlexBaseSize(childStyle, mainRelativeTo, mainBorderAndPadding);
+        var baseMainSize = float.IsNaN(keywordBaseSize) ? ResolveFlexBaseSize(childStyle, mainRelativeTo, mainBorderAndPadding) : keywordBaseSize;
 
         if (float.IsNaN(baseMainSize))
         {
@@ -5622,11 +5660,17 @@ public sealed partial class HtmlRenderer
         }
 
         var minProperty = isRowDirection ? "min-width" : "min-height";
-        var maxMainSize = ResolveAuthoredDimension(childStyle, isRowDirection ? "max-width" : "max-height", mainRelativeTo, float.NaN, mainBorderAndPadding);
+        var maxMainSize = float.IsNaN(keywordMaxSize)
+            ? ResolveAuthoredDimension(childStyle, isRowDirection ? "max-width" : "max-height", mainRelativeTo, float.NaN, mainBorderAndPadding)
+            : keywordMaxSize;
         var minRaw = childStyle.GetValueOrDefault(minProperty)?.Trim();
         float minMainSize;
 
-        if (string.IsNullOrEmpty(minRaw) || string.Equals(minRaw, "auto", StringComparison.OrdinalIgnoreCase))
+        if (!float.IsNaN(keywordMinSize))
+        {
+            minMainSize = keywordMinSize;
+        }
+        else if (string.IsNullOrEmpty(minRaw) || string.Equals(minRaw, "auto", StringComparison.OrdinalIgnoreCase))
         {
             // `min-width: auto`: a flex item does not shrink below its content (or below its
             // specified size, when that is smaller); scroll containers have no such minimum.
@@ -5975,9 +6019,19 @@ public sealed partial class HtmlRenderer
         var lineHeight = !isNormalLineHeight ? ParseLineHeight(styleMap, fontSize, inherited.LineHeightMultiplier)
             : inherited.IsNormalLineHeight && fontSize == inherited.FontSize && fontWeight == inherited.FontWeight && isItalic == inherited.IsItalic && fontStretch == inherited.FontStretch && fontFamily == inherited.FontFamily ? inherited.LineHeightMultiplier
             : ResolveNormalLineHeight(new RenderFont(fontFamily, fontSize, fontWeight, isItalic, 0f, context.Fonts, fontStretch), context);
-        var (underline, strikeThrough) = ParseTextDecoration(styleMap, inherited.Underline, inherited.StrikeThrough);
-        var decorationColor = ParseColor(styleMap.TryGetValue("text-decoration-color", out var decorationColorValue) ? decorationColorValue : null, color);
-        var decorationStyle = ParseTextDecorationStyle(styleMap, inherited.DecorationStyle);
+        var (underline, overline, strikeThrough) = ParseTextDecoration(styleMap, inherited.Underline, inherited.Overline, inherited.StrikeThrough);
+        // Decorations are painted as the box declaring the lines says, also across its descendants;
+        // the other `text-decoration-*` properties of a box without lines have nothing to apply to.
+        var declaresDecoration = HasOwnTextDecorationLines(styleMap);
+        var decorationColor = declaresDecoration
+            ? ParseColor(styleMap.TryGetValue("text-decoration-color", out var decorationColorValue) ? decorationColorValue : null, color)
+            : inherited.DecorationColor;
+        var decorationStyle = declaresDecoration
+            ? ParseTextDecorationStyle(styleMap, global::AngleSharp.Renderer.Rendering.RenderTextDecorationStyle.Solid)
+            : inherited.DecorationStyle;
+        var decorationThickness = declaresDecoration
+            ? ParseLength(styleMap, "text-decoration-thickness", fontSize, float.NaN, allowAuto: true)
+            : inherited.DecorationThickness;
         var direction = ParseTextDirection(styleMap, inherited.Direction);
         var textAlign = ParseTextAlign(styleMap, inherited.TextAlign, direction, inherited.WebkitAlignLeftBehind);
         var letterSpacing = ParseLength(styleMap, "letter-spacing", inherited.FontSize, inherited.LetterSpacing, allowAuto: false);
@@ -6010,7 +6064,9 @@ public sealed partial class HtmlRenderer
             FlowMode: inherited.FlowMode,
             FeatureProperties: featureProperties,
             FontFeatures: fontFeatures,
-            Language: language);
+            Language: language,
+            Overline: overline,
+            DecorationThickness: decorationThickness);
     }
 
     /// <summary>
@@ -6304,9 +6360,20 @@ public sealed partial class HtmlRenderer
         return normalized is "italic" or "oblique";
     }
 
-    private static (bool Underline, bool StrikeThrough) ParseTextDecoration(Dictionary<string, string> styleMap, bool defaultUnderline, bool defaultStrikeThrough)
+    private static bool HasOwnTextDecorationLines(Dictionary<string, string> styleMap)
+    {
+        if (!styleMap.TryGetValue("text-decoration-line", out var lineValue) && !styleMap.TryGetValue("text-decoration", out lineValue))
+        {
+            return false;
+        }
+
+        return lineValue.Split(' ', StringSplitOptions.RemoveEmptyEntries).Any(static token => token.ToLowerInvariant() is "underline" or "overline" or "line-through" or "strikethrough");
+    }
+
+    private static (bool Underline, bool Overline, bool StrikeThrough) ParseTextDecoration(Dictionary<string, string> styleMap, bool defaultUnderline, bool defaultOverline, bool defaultStrikeThrough)
     {
         var underline = defaultUnderline;
+        var overline = defaultOverline;
         var strikeThrough = defaultStrikeThrough;
 
         if (styleMap.TryGetValue("text-decoration-line", out var lineValue) || styleMap.TryGetValue("text-decoration", out lineValue))
@@ -6321,6 +6388,10 @@ public sealed partial class HtmlRenderer
                 {
                     underline = true;
                 }
+                else if (normalized == "overline")
+                {
+                    overline = true;
+                }
                 else if (normalized is "line-through" or "strikethrough")
                 {
                     strikeThrough = true;
@@ -6328,12 +6399,13 @@ public sealed partial class HtmlRenderer
                 else if (normalized == "none")
                 {
                     underline = false;
+                    overline = false;
                     strikeThrough = false;
                 }
             }
         }
 
-        return (underline, strikeThrough);
+        return (underline, overline, strikeThrough);
     }
 
     /// <summary>
@@ -7057,6 +7129,7 @@ public sealed partial class HtmlRenderer
         AddIfPresent(map, "text-decoration-line", style.GetPropertyValue("text-decoration-line"));
         AddIfPresent(map, "text-decoration-color", style.GetPropertyValue("text-decoration-color"));
         AddIfPresent(map, "text-decoration-style", style.GetPropertyValue("text-decoration-style"));
+        AddIfPresent(map, "text-decoration-thickness", style.GetPropertyValue("text-decoration-thickness"));
         AddIfPresent(map, "text-align", style.GetPropertyValue("text-align"));
         AddIfPresent(map, "text-align-last", style.GetPropertyValue("text-align-last"));
         AddIfPresent(map, "direction", style.GetPropertyValue("direction"));
@@ -11381,6 +11454,13 @@ public sealed partial class HtmlRenderer
             return;
         }
 
+        // The same for square corners between edges of different colors.
+        if (clampedRadii.IsZero && !HasBrokenStyle(styles) && HasCornerBetweenColors(color, border, styles))
+        {
+            PaintRoundedBorderRing(displayList, color, x, y, width, height, border, clampedRadii, styles);
+            return;
+        }
+
         var clipsRoundedBorder = !clampedRadii.IsZero;
 
         if (clipsRoundedBorder)
@@ -11399,6 +11479,19 @@ public sealed partial class HtmlRenderer
         }
     }
 
+    private static bool HasCornerBetweenColors(EdgeBorderColor color, EdgeSizes border, EdgeBorderStyle styles)
+    {
+        var top = border.Top > 0f && IsPaintedBorderStyle(styles.Top);
+        var right = border.Right > 0f && IsPaintedBorderStyle(styles.Right);
+        var bottom = border.Bottom > 0f && IsPaintedBorderStyle(styles.Bottom);
+        var left = border.Left > 0f && IsPaintedBorderStyle(styles.Left);
+
+        return (top && right && color.Top != color.Right) ||
+            (right && bottom && color.Right != color.Bottom) ||
+            (bottom && left && color.Bottom != color.Left) ||
+            (left && top && color.Left != color.Top);
+    }
+
     private static bool HasBrokenStyle(EdgeBorderStyle styles) =>
         styles.Top is BorderStyleKind.Dashed or BorderStyleKind.Dotted ||
         styles.Right is BorderStyleKind.Dashed or BorderStyleKind.Dotted ||
@@ -11414,12 +11507,29 @@ public sealed partial class HtmlRenderer
         var innerRight = right - border.Right;
         var innerBottom = bottom - border.Bottom;
 
+        // The regions of a square border reach beyond the ring along the diagonals through the
+        // corners: an edge of the clip on an edge of the ring would anti-alias a box at a fractional
+        // position twice. (Those of a rounded one must not: the curve would show up to that reach.)
+        var isSquare = radii.IsZero;
+        var topLeft = isSquare ? CornerReach(border.Left, border.Top) : default;
+        var topRight = isSquare ? CornerReach(border.Right, border.Top) : default;
+        var bottomRight = isSquare ? CornerReach(border.Right, border.Bottom) : default;
+        var bottomLeft = isSquare ? CornerReach(border.Left, border.Bottom) : default;
+        (float X, float Y) outerTopLeft = (x - topLeft.OuterX, y - topLeft.OuterY);
+        (float X, float Y) outerTopRight = (right + topRight.OuterX, y - topRight.OuterY);
+        (float X, float Y) outerBottomRight = (right + bottomRight.OuterX, bottom + bottomRight.OuterY);
+        (float X, float Y) outerBottomLeft = (x - bottomLeft.OuterX, bottom + bottomLeft.OuterY);
+        (float X, float Y) innerTopLeft = (innerLeft + topLeft.InnerX, innerTop + topLeft.InnerY);
+        (float X, float Y) innerTopRight = (innerRight - topRight.InnerX, innerTop + topRight.InnerY);
+        (float X, float Y) innerBottomRight = (innerRight - bottomRight.InnerX, innerBottom - bottomRight.InnerY);
+        (float X, float Y) innerBottomLeft = (innerLeft + bottomLeft.InnerX, innerBottom - bottomLeft.InnerY);
+
         var sides = new (float Width, BorderStyleKind Style, RenderColor Color, bool IsTopOrLeft, (float X, float Y)[] Region)[]
         {
-            (border.Top, styles.Top, color.Top, true, [(x, y), (right, y), (innerRight, innerTop), (innerLeft, innerTop)]),
-            (border.Right, styles.Right, color.Right, false, [(right, y), (right, bottom), (innerRight, innerBottom), (innerRight, innerTop)]),
-            (border.Bottom, styles.Bottom, color.Bottom, false, [(right, bottom), (x, bottom), (innerLeft, innerBottom), (innerRight, innerBottom)]),
-            (border.Left, styles.Left, color.Left, true, [(x, bottom), (x, y), (innerLeft, innerTop), (innerLeft, innerBottom)]),
+            (border.Top, styles.Top, color.Top, true, [outerTopLeft, outerTopRight, innerTopRight, innerTopLeft]),
+            (border.Right, styles.Right, color.Right, false, [outerTopRight, outerBottomRight, innerBottomRight, innerTopRight]),
+            (border.Bottom, styles.Bottom, color.Bottom, false, [outerBottomRight, outerBottomLeft, innerBottomLeft, innerBottomRight]),
+            (border.Left, styles.Left, color.Left, true, [outerBottomLeft, outerTopLeft, innerTopLeft, innerBottomLeft]),
         };
 
         foreach (var side in sides)
@@ -11445,6 +11555,23 @@ public sealed partial class HtmlRenderer
 
             displayList.PopClip();
         }
+    }
+
+    /// <summary>
+    /// How far to continue the diagonal through a corner between edges of these widths, outwards
+    /// and inwards: at least a pixel on each axis. Beside an edge without a width there is no
+    /// diagonal; the other edge just reaches outwards there, with a straight side.
+    /// </summary>
+    private static (float OuterX, float OuterY, float InnerX, float InnerY) CornerReach(float horizontalWidth, float verticalWidth)
+    {
+        if (horizontalWidth <= 0f || verticalWidth <= 0f)
+        {
+            return (1f, 1f, horizontalWidth > 0f ? 1f : -1f, verticalWidth > 0f ? 1f : -1f);
+        }
+
+        var smallest = Math.Min(horizontalWidth, verticalWidth);
+        var (reachX, reachY) = (horizontalWidth / smallest, verticalWidth / smallest);
+        return (reachX, reachY, reachX, reachY);
     }
 
     private static RenderRect InsetBox(float x, float y, float width, float height, EdgeSizes border, float fraction) => new(
@@ -13672,7 +13799,17 @@ public sealed partial class HtmlRenderer
             text = StripSoftHyphens(text);
         }
 
-        var words = text.Split(' ', StringSplitOptions.RemoveEmptyEntries);
+        var keepsSpaces = textStyle.WhiteSpace is WhiteSpaceMode.PreWrap or WhiteSpaceMode.BreakSpaces;
+
+        // spaces at the edges and in a row are measured in place, as for the intrinsic width
+        if (keepsSpaces && MeasureTextWidth(context, text, textStyle) + (CountSpaces(text) * textStyle.WordSpacing) <= maxWidth)
+        {
+            return [StripSoftHyphens(text)];
+        }
+
+        var words = keepsSpaces
+            ? SplitWordsKeepingSpaces(text)
+            : text.Split(' ', StringSplitOptions.RemoveEmptyEntries);
 
         if (words.Length == 0)
         {
@@ -13693,9 +13830,13 @@ public sealed partial class HtmlRenderer
             }
         }
 
+        float MeasureSeparator(string token) => current.Length == 0 || token.Length == 0
+            ? 0f
+            : MeasureSpaceBetween(context, current.ToString(current.Length - Math.Min(2, current.Length), Math.Min(2, current.Length)), token, textStyle);
+
         void AppendToken(string token, float tokenWidth)
         {
-            var separatorWidth = current.Length == 0 ? 0f : MeasureTextWidth(context, " ", textStyle) + textStyle.WordSpacing;
+            var separatorWidth = MeasureSeparator(token);
 
             if (current.Length > 0 && currentWidth + separatorWidth + tokenWidth > maxWidth)
             {
@@ -13722,7 +13863,7 @@ public sealed partial class HtmlRenderer
             // one that leaves room for the visible hyphen.
             if (!ReferenceEquals(word, rawWord))
             {
-                var separatorWidth = current.Length == 0 ? 0f : MeasureTextWidth(context, " ", textStyle) + textStyle.WordSpacing;
+                var separatorWidth = MeasureSeparator(word);
 
                 if (currentWidth + separatorWidth + wordWidth > maxWidth)
                 {
@@ -13789,6 +13930,43 @@ public sealed partial class HtmlRenderer
         FlushCurrentLine();
 
         return lines;
+    }
+
+    /// <summary>
+    /// The wrappable units of a text with preserved spaces: one space between two units is the
+    /// separator <see cref="WrapText"/> puts back, any others stay in the front of the next unit
+    /// (or the end of the last one), so a line of only spaces is a unit as well.
+    /// </summary>
+    private static string[] SplitWordsKeepingSpaces(string text)
+    {
+        var words = new List<string>();
+        var spaces = 0;
+
+        foreach (var part in text.Split(' '))
+        {
+            if (part.Length == 0)
+            {
+                spaces++;
+            }
+            else
+            {
+                words.Add(new string(' ', spaces) + part);
+                spaces = 0;
+            }
+        }
+
+        // the split yields one empty part less than there are spaces at the end of the text
+        if (spaces > 0)
+        {
+            if (words.Count == 0)
+            {
+                return [text];
+            }
+
+            words[^1] += new string(' ', spaces);
+        }
+
+        return [.. words];
     }
 
     /// <summary>
@@ -13988,6 +14166,27 @@ public sealed partial class HtmlRenderer
     /// Measures text the way <see cref="DrawStyledText"/> paints it: soft hyphens are invisible
     /// and small capitals are measured run by run.
     /// </summary>
+    /// <summary>
+    /// The width a space takes between two pieces of text measured on their own: with its kerning
+    /// against the characters on both sides, which those measures do not have, its letter spacing
+    /// and the word spacing. It is measured from just these characters, as far
+    /// as glyphs can interact across a space, so that it is shared by the many spaces of a text.
+    /// </summary>
+    private static float MeasureSpaceBetween(LayoutContext context, ReadOnlySpan<char> before, ReadOnlySpan<char> after, RenderTextStyle textStyle)
+    {
+        var style = textStyle with { ShapingContextBefore = null, ShapingContextAfter = null };
+        var left = LastCharacter(before);
+        var right = FirstCharacter(after);
+        var width = MeasureTextWidth(context, string.Concat(left, " ", right), style) - MeasureTextWidth(context, left, style) - MeasureTextWidth(context, right, style);
+        return Math.Max(0f, width) + textStyle.WordSpacing;
+
+        static string LastCharacter(ReadOnlySpan<char> text) =>
+            (text.Length > 1 && char.IsLowSurrogate(text[^1]) ? text[^2..] : text[^1..]).ToString();
+
+        static string FirstCharacter(ReadOnlySpan<char> text) =>
+            (text.Length > 1 && char.IsHighSurrogate(text[0]) ? text[..2] : text[..1]).ToString();
+    }
+
     private static float MeasureTextWidth(LayoutContext context, string text, RenderTextStyle textStyle)
     {
         text = StripSoftHyphens(text);
@@ -14165,7 +14364,10 @@ public sealed partial class HtmlRenderer
         string? ShapingContextAfter = null,
         bool IsNormalLineHeight = false,
         float BlockAlignShare = 0f,
-        string? WebkitAlignLeftBehind = null);
+        string? WebkitAlignLeftBehind = null,
+        bool Overline = false,
+        float DecorationThickness = float.NaN,
+        float DecorationFontSize = float.NaN);
 
     private enum TextAlign
     {

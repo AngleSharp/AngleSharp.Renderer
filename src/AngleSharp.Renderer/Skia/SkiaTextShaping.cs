@@ -380,12 +380,15 @@ internal static class SkiaTextShaping
             }
             else
             {
-                // Spaces and controls stay with the run they are in rather than splitting it, but
-                // not with an emoji: the space of a color font is as wide as its emoji.
+                // A space comes from the primary font, also between words of a fallback, as in
+                // browsers; so does anything else the primary font has. Spaces it does not have
+                // and controls stay with the run they are in rather than splitting it, but not
+                // with an emoji: the space of a color font is as wide as its emoji.
                 var staysInRun = current is not null && !inEmoji;
                 inEmoji = false;
-                typeface = staysInRun && (Rune.IsWhiteSpace(rune) || Rune.IsControl(rune)) ? current! :
-                    HasGlyph(primary, rune.Value) || Rune.IsWhiteSpace(rune) || Rune.IsControl(rune) ? primary :
+                var hasPrimaryGlyph = HasGlyph(primary, rune.Value);
+                typeface = staysInRun && (Rune.IsControl(rune) || (Rune.IsWhiteSpace(rune) && !hasPrimaryGlyph)) ? current! :
+                    hasPrimaryGlyph || Rune.IsWhiteSpace(rune) || Rune.IsControl(rune) ? primary :
                     ResolveFallbackTypeface(font.Value, primary, rune.Value);
             }
 
@@ -686,7 +689,6 @@ internal static class SkiaTextShaping
         }
 
         var penX = 0f;
-        var spacingCount = 0;
 
         foreach (var (start, length, typeface, script) in segments)
         {
@@ -720,19 +722,17 @@ internal static class SkiaTextShaping
                 points[index] = new SKPoint(penX + (positions[index].XOffset * scale), -positions[index].YOffset * scale);
                 penX += positions[index].XAdvance * scale;
 
-                // spacing follows the last glyph of every cluster
+                // spacing follows the last glyph of every cluster, also of the last one
                 if (letterSpacing != 0f && (index + 1 == infos.Length || infos[index + 1].Cluster != infos[index].Cluster))
                 {
                     penX += letterSpacing;
-                    spacingCount++;
                 }
             }
 
             runs.Add(new GlyphRun(typeface, glyphs, points, clusters));
         }
 
-        // no spacing after the last cluster
-        return new ShapedText(runs, spacingCount > 0 ? penX - letterSpacing : penX);
+        return new ShapedText(runs, penX);
     }
 
     // Without a `lang` the language is fixed rather than HarfBuzz's default (the host locale), so

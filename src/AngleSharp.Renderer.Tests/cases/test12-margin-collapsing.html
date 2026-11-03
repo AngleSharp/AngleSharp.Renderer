@@ -1,0 +1,130 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Test 12 - Margin Collapsing</title>
+<style>
+* { box-sizing: border-box; }
+html, body { margin: 0; padding: 0; }
+body {
+  background: #e8e8e8;
+  color: #202020;
+  font: 15px/1.4 Arial, sans-serif;
+}
+h1, h2, p, div { margin: 0; padding: 0; }
+.page {
+  width: 850px;
+  margin: 0 auto;
+  padding: 24px;
+  background: white;
+}
+h1 { font-size: 28px; margin-bottom: 20px; }
+h2 { font-size: 18px; margin: 22px 0 10px; }
+.section {
+  border: 1px solid #999;
+  background: #f7f7f7;
+}
+.block {
+  height: 50px;
+  padding: 12px;
+  border: 2px solid #42617c;
+  background: #dceaf5;
+}
+.sibling-a { margin-bottom: 35px; }
+.sibling-b { margin-top: 20px; }
+.parent {
+  margin-top: 40px;
+  background: #f4e4d2;
+}
+.child {
+  height: 50px;
+  margin-top: 30px;
+  padding: 12px;
+  border: 2px solid #8c5b32;
+  background: #fff;
+}
+.bordered-parent {
+  margin-top: 30px;
+  border-top: 5px solid #333;
+  padding-top: 10px;
+  background: #e6e6e6;
+}
+.empty {
+  height: 0;
+  margin-top: 25px;
+  margin-bottom: 40px;
+  border: 0;
+}
+.bfc {
+  display: flow-root;
+  margin-top: 20px;
+  padding: 10px;
+  border: 2px solid #53744d;
+  background: #e3efdf;
+}
+.float {
+  float: left;
+  width: 120px;
+  height: 90px;
+  margin: 0 15px 10px 0;
+  border: 2px solid #315d83;
+  background: #dceaf6;
+}
+.clear {
+  clear: both;
+  padding: 10px;
+  border: 2px solid #805b36;
+  background: #f3e2cf;
+}
+</style>
+</head>
+<body>
+<div class="page">
+  <h1>Margin Collapsing</h1>
+
+  <h2>Adjacent sibling margins</h2>
+  <div class="section">
+    <div class="block sibling-a">margin-bottom: 35px</div>
+    <div class="block sibling-b">margin-top: 20px</div>
+  </div>
+
+  <h2>Parent and first-child margins</h2>
+  <div class="section">
+    <div class="parent">
+      <div class="child">Child margin-top: 30px</div>
+    </div>
+  </div>
+
+  <h2>Border prevents parent-child collapse</h2>
+  <div class="section">
+    <div class="bordered-parent">
+      <div class="child">Parent has border and padding</div>
+    </div>
+  </div>
+
+  <h2>Empty block margins</h2>
+  <div class="section">
+    <div class="block">Before empty block</div>
+    <div class="empty"></div>
+    <div class="block">After empty block</div>
+  </div>
+
+  <h2>Block formatting context</h2>
+  <div class="section">
+    <div class="bfc">
+      <div class="float"></div>
+      This parent establishes a new block formatting context.
+      Its height must contain the floated child.
+      Additional text makes the interaction easier to inspect.
+    </div>
+  </div>
+
+  <h2>Float clearance</h2>
+  <div class="section">
+    <div class="float"></div>
+    Text flows beside the float. The following block clears both sides.
+    <div class="clear">clear: both</div>
+  </div>
+</div>
+</body>
+</html>

@@ -1,0 +1,122 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Test 10 - Intrinsic Sizing</title>
+<style>
+* { box-sizing: border-box; }
+html, body { margin: 0; padding: 0; }
+body {
+  background: #e8edf2;
+  color: #202832;
+  font: 15px/1.4 Arial, sans-serif;
+}
+h1, h2, p, div { margin: 0; padding: 0; }
+h1 { font-size: 28px; margin-bottom: 20px; }
+h2 { font-size: 18px; margin: 22px 0 10px; }
+.page {
+  width: 900px;
+  margin: 0 auto;
+  padding: 24px;
+  background: white;
+}
+.demo {
+  display: flex;
+  gap: 12px;
+  align-items: flex-start;
+}
+.box {
+  padding: 12px;
+  border: 2px solid #45617b;
+  background: #dceaf5;
+}
+.min-content { width: min-content; }
+.max-content { width: max-content; }
+.fit-content { width: fit-content(220px); }
+.fixed { width: 220px; }
+.long {
+  overflow-wrap: normal;
+  white-space: normal;
+}
+.intrinsic-grid {
+  display: grid;
+  grid-template-columns: min-content max-content minmax(0, 1fr);
+  gap: 10px;
+}
+.intrinsic-grid > div {
+  padding: 10px;
+  border: 2px solid #6a5278;
+  background: #eee4f3;
+}
+.flex-container {
+  display: flex;
+  width: 600px;
+  gap: 10px;
+  border: 2px solid #555;
+  padding: 10px;
+}
+.flex-item {
+  flex: 1 1 0;
+  padding: 10px;
+  border: 2px solid #53744d;
+  background: #e1eddc;
+}
+.flex-item.no-min {
+  min-width: 0;
+}
+.aspect {
+  width: 240px;
+  aspect-ratio: 2 / 1;
+  border: 4px solid #995c36;
+  background: #f5dfcc;
+}
+.aspect-child {
+  width: 50%;
+  height: 50%;
+  border: 2px solid #333;
+  background: white;
+}
+</style>
+</head>
+<body>
+<div class="page">
+  <h1>Intrinsic Sizing and Constraints</h1>
+
+  <h2>Intrinsic width keywords</h2>
+  <div class="demo">
+    <div class="box min-content">
+      MIN-CONTENT: supercalifragilisticexpialidocious
+    </div>
+    <div class="box max-content">
+      MAX-CONTENT: several words
+    </div>
+    <div class="box fixed">
+      Fixed width: 220px
+    </div>
+  </div>
+
+  <h2>Grid intrinsic tracks</h2>
+  <div class="intrinsic-grid">
+    <div>min-content track: ABCDEFGHIJKLMNOPQRSTUVWXYZ</div>
+    <div>max-content track: Several words in one track</div>
+    <div>minmax(0, 1fr): flexible remaining space</div>
+  </div>
+
+  <h2>Flex automatic minimum size</h2>
+  <div class="flex-container">
+    <div class="flex-item">
+      Long unbreakable token:
+      ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789
+    </div>
+    <div class="flex-item no-min">
+      min-width: 0 allows this item to shrink.
+    </div>
+  </div>
+
+  <h2>Aspect ratio and percentage descendants</h2>
+  <div class="aspect">
+    <div class="aspect-child"></div>
+  </div>
+</div>
+</body>
+</html>
