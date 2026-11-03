@@ -9414,6 +9414,12 @@ public sealed partial class HtmlRenderer
     /// <summary>The space a select leaves for its arrow, whatever the font size.</summary>
     private const float FormControlSelectArrowSpace = 20f;
 
+    /// <summary>
+    /// Where a native select's label starts in its content box. Part of the control, not its
+    /// padding, which browsers set to 0 (Blink's PopupInternalPaddingStart).
+    /// </summary>
+    private const float FormControlSelectLabelInset = 4f;
+
     /// <summary>What a select adds to the height of its line.</summary>
     private const float FormControlSelectVerticalSpace = 2f;
 
@@ -9934,6 +9940,7 @@ public sealed partial class HtmlRenderer
                 var baselineY = contentY + verticalCenteringOffset + (textStyle.FontSize * FormControlTextAscentRatio) + textStyle.VerticalAlignOffset;
                 RecordTextBaseline(baselineY - textStyle.VerticalAlignOffset);
                 var labelWidth = label.Length > 0 ? MeasureTextWidth(context, label, textStyle) : 0f;
+                var labelInset = kind == FormControlKind.Select ? FormControlSelectLabelInset : 0f;
 
                 if (label.Length > 0)
                 {
@@ -9942,7 +9949,7 @@ public sealed partial class HtmlRenderer
                     // centered in its box instead.
                     var labelX = kind == FormControlKind.Button
                         ? contentX + Math.Max(0f, (contentWidth - labelWidth) / 2f)
-                        : contentX;
+                        : contentX + labelInset;
 
                     DrawStyledText(context, displayList, label, labelX, baselineY, textStyle, decorate: false);
                 }
@@ -9954,7 +9961,7 @@ public sealed partial class HtmlRenderer
                 if (kind == FormControlKind.Select)
                 {
                     var arrowWidth = MeasureTextWidth(context, FormControlSelectArrowGlyph, textStyle);
-                    var arrowX = contentX + Math.Max(labelWidth, contentWidth - arrowWidth);
+                    var arrowX = contentX + Math.Max(labelInset + labelWidth, contentWidth - arrowWidth);
                     var arrowBaselineY = baselineY + (textStyle.FontSize * FormControlSelectArrowVerticalOffsetRatio);
                     DrawStyledText(context, displayList, FormControlSelectArrowGlyph, arrowX, arrowBaselineY, textStyle, decorate: false);
                 }

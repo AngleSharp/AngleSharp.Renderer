@@ -2,6 +2,8 @@
 
 Released on Wednesday, November 4 2026.
 
+- Updated to AngleSharp.Css 1.3.2, whose default style gives form controls the font, padding, margins and `box-sizing` of browsers
+- Fixed the label of a native select touching its border now that its default padding is 0
 - Fixed synthesized small caps: digits, punctuation and spaces keep the full size with `small-caps` and are reduced with `all-small-caps`, `unicase` reduces everything but lowercase letters instead of acting as `small-caps`, `ß` and Latin ligatures become their capitals, letter spacing applies where the size changes, and a decoration crosses spaces in one size
 - Fixed spaces between words of a fallback font being as wide as that font's space instead of the first font's
 - Fixed the background and border of inline boxes around right-to-left text starting at the left of the page, and the left and right padding, border and margin of such boxes changing places

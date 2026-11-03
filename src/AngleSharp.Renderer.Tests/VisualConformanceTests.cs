@@ -2267,6 +2267,7 @@ public sealed class VisualConformanceTests
               <head><style>
                 html, body { margin: 0; padding: 0; }
                 div.row { margin-bottom: 6px; }
+                input, select, textarea, button { font-family: sans-serif; }
               </style></head>
               <body>
                 <div class="row"><input type="text" value="Hello" /></div>
@@ -2311,7 +2312,7 @@ public sealed class VisualConformanceTests
         // "somewhat overridable" native chrome without needing a `appearance: none` escape hatch.
         var document = await ParseAsync("""
             <html>
-              <head><style>html, body { margin: 0; padding: 0; }</style></head>
+              <head><style>html, body { margin: 0; padding: 0; } input, select, textarea, button { font-family: sans-serif; }</style></head>
               <body>
                 <input type="text" value="Default" style="display:block; margin-bottom:8px;" />
                 <input type="text" value="Custom" style="display:block; width:100px; background-color:#fff6d5; border:3px solid #cc6600; border-radius:8px;" />
@@ -2578,7 +2579,7 @@ public sealed class VisualConformanceTests
         var document = await ParseAsync("""
             <html>
               <head>
-                <style>html, body { margin: 0; padding: 0; background-color: white; }</style>
+                <style>html, body { margin: 0; padding: 0; background-color: white; } input, select, textarea, button { font-family: sans-serif; }</style>
               </head>
               <body>
                 <input id="target" type="text" value="Hi" style="margin:10px;" />

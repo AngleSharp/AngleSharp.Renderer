@@ -871,7 +871,7 @@ public sealed class SiteRegressionTests
     public async Task TableCell_IsAlignedByWhatItHoldsWhateverItsHeight(string align, double top)
     {
         var document = await OpenAsync($$"""
-            <style>body { margin: 0; font: 16px/20px sans-serif } table { border-spacing: 0 } td { padding: 0 }</style>
+            <style>body { margin: 0 } table { border-spacing: 0; font: 16px/20px sans-serif } td { padding: 0 }</style>
             <table><tr><td style="height: 60px; vertical-align: {{align}}"><div id="content">x</div></td></tr></table>
             """);
 
