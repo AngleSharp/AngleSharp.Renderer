@@ -154,6 +154,23 @@ public sealed class InteractiveFrameTests
         Assert.False(harness.PrepareFrame().IsAnimating);
     }
 
+    [Fact]
+    public async Task HitTestMap_FindsTransformedBoxesWhereTheyArePainted()
+    {
+        var (_, harness) = await OpenAsync("""
+            <div id="moved" style="width: 40px; height: 40px; transform: translate(50px, 50px)"><div id="inner" style="width: 10px; height: 10px; transform: translate(20px, 0)"></div></div>
+            <div style="height: 60px"></div>
+            <div id="scaled" style="width: 40px; height: 40px; transform: scale(3); transform-origin: 0 0"></div>
+            """);
+
+        var frame = harness.PrepareFrame(0);
+
+        Assert.Equal("moved", frame.HitTestMap.HitTest(60, 80)?.Element.Id);
+        Assert.Equal("inner", frame.HitTestMap.HitTest(75, 55)?.Element.Id);
+        Assert.NotEqual("moved", frame.HitTestMap.HitTest(10, 10)?.Element.Id);
+        Assert.Equal("scaled", frame.HitTestMap.HitTest(100, 150)?.Element.Id);
+    }
+
     private static async Task<(IDocument Document, IDomHarness Harness)> OpenAsync(string body)
     {
         var configuration = Configuration.Default.WithCss().WithRenderDevice(Device);

@@ -1,3 +1,5 @@
+using System.Linq;
+
 namespace AngleSharp.Renderer.Rendering;
 
 /// <summary>
@@ -25,6 +27,19 @@ namespace AngleSharp.Renderer.Rendering;
 /// </summary>
 public readonly record struct RenderTransform2D(float A, float B, float C, float D, float E, float F)
 {
+    /// <summary>The smallest upright rectangle holding <paramref name="rect"/> under this transform.</summary>
+    internal RenderRect MapBounds(RenderRect rect)
+    {
+        if (IsIdentity)
+        {
+            return rect;
+        }
+
+        var xs = new[] { (A * rect.X) + (C * rect.Y) + E, (A * (rect.X + rect.Width)) + (C * rect.Y) + E, (A * rect.X) + (C * (rect.Y + rect.Height)) + E, (A * (rect.X + rect.Width)) + (C * (rect.Y + rect.Height)) + E };
+        var ys = new[] { (B * rect.X) + (D * rect.Y) + F, (B * (rect.X + rect.Width)) + (D * rect.Y) + F, (B * rect.X) + (D * (rect.Y + rect.Height)) + F, (B * (rect.X + rect.Width)) + (D * (rect.Y + rect.Height)) + F };
+        return new RenderRect(xs.Min(), ys.Min(), xs.Max() - xs.Min(), ys.Max() - ys.Min());
+    }
+
     /// <summary>The identity transform - painting under it looks exactly as if it were not applied.</summary>
     public static readonly RenderTransform2D Identity = new(1f, 0f, 0f, 1f, 0f, 0f);
 

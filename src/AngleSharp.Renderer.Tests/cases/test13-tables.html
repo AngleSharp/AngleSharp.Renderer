@@ -1,0 +1,145 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Test 13 - Table Layout</title>
+<style>
+* { box-sizing: border-box; }
+html, body { margin: 0; padding: 0; }
+body {
+  background: #e9edf0;
+  color: #202830;
+  font: 15px/1.4 Arial, sans-serif;
+}
+h1, h2, p, div { margin: 0; padding: 0; }
+.page {
+  width: 900px;
+  margin: 0 auto;
+  padding: 24px;
+  background: white;
+}
+h1 { font-size: 28px; margin-bottom: 20px; }
+h2 { font-size: 18px; margin: 22px 0 10px; }
+table {
+  width: 100%;
+  border-collapse: separate;
+  border-spacing: 0;
+  table-layout: auto;
+  color: #202020;
+}
+td, th {
+  padding: 10px;
+  border: 2px solid #45617b;
+  text-align: left;
+  vertical-align: top;
+  font-weight: 400;
+}
+th {
+  background: #dceaf5;
+  font-weight: 700;
+}
+.fixed {
+  table-layout: fixed;
+}
+.fixed td, .fixed th {
+  overflow-wrap: anywhere;
+}
+.collapsed {
+  border-collapse: collapse;
+  border-spacing: 0;
+}
+.collapsed td, .collapsed th {
+  border: 3px solid #555;
+}
+.collapsed th {
+  border-color: #9b5738;
+  background: #f3dfcf;
+}
+.rowspan {
+  vertical-align: middle;
+  background: #e1eddc;
+}
+.small {
+  height: 40px;
+}
+.tall {
+  height: 100px;
+}
+.long {
+  overflow-wrap: anywhere;
+}
+</style>
+</head>
+<body>
+<div class="page">
+  <h1>Table Layout and Borders</h1>
+
+  <h2>Automatic table layout</h2>
+  <table>
+    <tr>
+      <th>Short</th>
+      <th>Medium-length heading</th>
+      <th>Long content</th>
+    </tr>
+    <tr>
+      <td>One</td>
+      <td>Several words in this cell</td>
+      <td class="long">ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789</td>
+    </tr>
+    <tr>
+      <td>Two</td>
+      <td>Content with wrapping</td>
+      <td>Another row with more text than the first</td>
+    </tr>
+  </table>
+
+  <h2>Fixed table layout</h2>
+  <table class="fixed">
+    <colgroup>
+      <col style="width: 20%">
+      <col style="width: 30%">
+      <col style="width: 50%">
+    </colgroup>
+    <tr>
+      <th>20%</th>
+      <th>30%</th>
+      <th>50%</th>
+    </tr>
+    <tr>
+      <td>Small column</td>
+      <td>Medium column</td>
+      <td>Long unbreakable token: ABCDEFGHIJKLMNOPQRSTUVWXYZ</td>
+    </tr>
+  </table>
+
+  <h2>Collapsed borders and spanning</h2>
+  <table class="collapsed">
+    <tr>
+      <th colspan="3">Three-column heading</th>
+    </tr>
+    <tr>
+      <td rowspan="2" class="rowspan">Two-row cell</td>
+      <td class="small">Short row</td>
+      <td>Content</td>
+    </tr>
+    <tr>
+      <td class="tall">Tall cell with multiple lines of text to increase row height.</td>
+      <td>Another cell</td>
+    </tr>
+    <tr>
+      <td>Final row</td>
+      <td colspan="2">Cell spanning two columns</td>
+    </tr>
+  </table>
+
+  <h2>Vertical alignment</h2>
+  <table>
+    <tr style="height: 120px">
+      <td style="vertical-align: top">Top</td>
+      <td style="vertical-align: middle">Middle</td>
+      <td style="vertical-align: bottom">Bottom</td>
+    </tr>
+  </table>
+</div>
+</body>
+</html>

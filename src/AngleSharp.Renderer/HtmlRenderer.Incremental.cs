@@ -142,9 +142,9 @@ public sealed partial class HtmlRenderer
             return;
         }
 
-        var deferContainer = float.IsNaN(positionedContainingHeight) &&
-            context.PositionedScopes.TryPeek(out var scope) &&
-            scope.Container.Children.Contains(node) ? scope.Container.Ref : null;
+        var deferContainer = float.IsNaN(positionedContainingHeight)
+            ? FindContainingBlockScope(positionedContainingX, positionedContainingY, context)?.Container?.Ref
+            : null;
 
         capture.Entries![node.Ref] = new LayoutEntry(
             node,
@@ -415,6 +415,10 @@ public sealed partial class HtmlRenderer
 
         /// <summary>Gets the style maps of the laid out elements.</summary>
         public IReadOnlyDictionary<IElement, Dictionary<string, string>> StyleMaps => _context.StyleMapCache;
+
+        internal IReadOnlyDictionary<IElement, SubframeEntry> Subframes => _context.Subframes;
+
+        internal void ResolveSubframes() => HtmlRenderer.ResolveSubframes(_document, _context);
 
         public static LayoutSnapshot Capture(IDocument document, IRenderDevice renderDevice) =>
             LayOut(document, renderDevice, s_defaultTextMeasurer, 0f, 0, isFrame: false, out _);
@@ -919,13 +923,23 @@ public sealed partial class HtmlRenderer
         }
 
         // What a subtree lays out beyond itself: sticky boxes (stuck by an ancestor), content with
-        // a negative z-index (painted below the in-flow content of its stacking context), and
-        // counters (counted through the whole document).
-        private bool ReachesOutOfItsSubtree(IRenderNode node)
+        // a negative z-index (painted below the in-flow content of its stacking context), counters
+        // (counted through the whole document), and absolutely positioned boxes placed against an
+        // ancestor outside of it (which may wait for the height of that one).
+        private bool ReachesOutOfItsSubtree(IRenderNode node) => ReachesOutOfItsSubtree(node, hasContainingBlock: false);
+
+        private bool ReachesOutOfItsSubtree(IRenderNode node, bool hasContainingBlock)
         {
             if (node is ElementRenderNode element)
             {
                 var styleMap = GetOrCreateStyleMap(_context, element.Ref, element.ComputedStyle);
+
+                if (!hasContainingBlock && string.Equals(GetPosition(styleMap), "absolute", StringComparison.OrdinalIgnoreCase) && DependsOnContainingBlockHeight(styleMap))
+                {
+                    return true;
+                }
+
+                hasContainingBlock |= ActsAsContainingBlock(styleMap, 0f);
 
                 if (IsStickyPositioned(styleMap) || (HasExplicitZIndex(styleMap) && ParseZIndex(styleMap) < 0) ||
                     IsCounting("counter-increment") || IsCounting("counter-reset") || IsCounting("counter-set") ||
@@ -938,7 +952,15 @@ public sealed partial class HtmlRenderer
                     !string.Equals(value.Trim(), "none", StringComparison.OrdinalIgnoreCase);
             }
 
-            return node.Children.Any(ReachesOutOfItsSubtree);
+            foreach (var child in node.Children)
+            {
+                if (ReachesOutOfItsSubtree(child, hasContainingBlock))
+                {
+                    return true;
+                }
+            }
+
+            return false;
         }
 
         private static bool IsPlacedByInsets(Dictionary<string, string> styleMap)

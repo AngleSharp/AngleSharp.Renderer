@@ -7,6 +7,7 @@ using System.Text;
 using AngleSharp.Css.Dom;
 using AngleSharp.Css.RenderTree;
 using AngleSharp.Dom;
+using AngleSharp.Html.Dom;
 using AngleSharp.Renderer.Rendering;
 
 /// <summary>
@@ -315,6 +316,9 @@ public sealed partial class HtmlRenderer
 
         public bool IsDecorated { get; init; }
 
+        /// <summary>Whether its end edge is at the left on the current line, its start edge at the right.</summary>
+        public bool EdgesReversed { get; set; }
+
         public float FragmentLeft { get; set; }
 
         public float FragmentRight { get; set; }
@@ -332,6 +336,33 @@ public sealed partial class HtmlRenderer
         public float BoundsRight { get; set; } = float.MinValue;
 
         public float BoundsBottom { get; set; } = float.MinValue;
+
+        /// <summary>How far its baseline is below that of its parent (`vertical-align`).</summary>
+        public float BaselineShift { get; init; }
+
+        /// <summary>`top` or `bottom`: placed at that edge of the line once its height is known.</summary>
+        public string? LineEdge { get; init; }
+
+        /// <summary>Its `position: relative` offset and those of the boxes around it.</summary>
+        public float RelativeX { get; init; }
+
+        /// <inheritdoc cref="RelativeX"/>
+        public float RelativeY { get; init; }
+
+        public bool IsOnLine { get; set; }
+
+        public bool IsBrokenImage { get; init; }
+
+        /// <summary>Positioned, itself or by a box around it: painted above what else is on the line.</summary>
+        public bool IsPositioned { get; init; }
+
+        /// <summary>What a box at a line edge and all within it need of the line, around its baseline.</summary>
+        public float EdgeAbove { get; set; }
+
+        /// <inheritdoc cref="EdgeAbove"/>
+        public float EdgeBelow { get; set; }
+
+        public float EdgeBaselineY { get; set; }
     }
 
     private sealed class InlinePiece
@@ -419,7 +450,8 @@ public sealed partial class HtmlRenderer
         float BorderBoxOffsetY,
         float MarginBottom,
         float Baseline,
-        string VerticalAlign)
+        string VerticalAlign,
+        float RaisedBy = 0f)
     {
         public float OuterWidth => MarginLeft + BorderBoxWidth + MarginRight;
 
@@ -502,6 +534,28 @@ public sealed partial class HtmlRenderer
                 return;
             }
 
+            // a broken image is its alternative text, next to an icon
+            if (ResolveBrokenImageText(element, styleMap) is { } brokenImageText)
+            {
+                var brokenStyle = ResolveTextStyle(styleMap, parentStyle, _context);
+                var brokenBox = new InlineBox
+                {
+                    Node = element,
+                    Box = ResolveBoxStyle(styleMap, element.Ref),
+                    TextStyle = brokenStyle,
+                    Parent = parentBox,
+                    IsBrokenImage = true,
+                    RelativeX = parentBox?.RelativeX ?? 0f,
+                    RelativeY = parentBox?.RelativeY ?? 0f,
+                    IsPositioned = parentBox?.IsPositioned ?? false,
+                };
+                Boxes.Add(brokenBox);
+                Pieces.Add(new InlinePiece { Kind = InlinePieceKind.BoxStart, Style = brokenStyle, StyleId = GetStyleId(element), Box = brokenBox, Width = BrokenImageIconSize });
+                CollectText(brokenImageText, brokenStyle, GetStyleId(element), brokenBox);
+                Pieces.Add(new InlinePiece { Kind = InlinePieceKind.BoxEnd, Style = brokenStyle, StyleId = GetStyleId(element), Box = brokenBox });
+                return;
+            }
+
             if (IsAtomicInlineElement(element, styleMap))
             {
                 var measurement = MeasureAtomicInline(element, _containingWidth, parentStyle, _context);
@@ -528,7 +582,7 @@ public sealed partial class HtmlRenderer
                 return;
             }
 
-            var style = ResolveTextStyle(styleMap, parentStyle);
+            var style = ResolveTextStyle(styleMap, parentStyle, _context);
             var styleId = GetStyleId(element);
             var children = OrderChildrenForPainting(element.Children, _context);
 
@@ -548,6 +602,7 @@ public sealed partial class HtmlRenderer
             var isDecorated = box.BorderWidth.Top > 0f || box.BorderWidth.Right > 0f || box.BorderWidth.Bottom > 0f || box.BorderWidth.Left > 0f ||
                               box.Padding.Top > 0f || box.Padding.Right > 0f || box.Padding.Bottom > 0f || box.Padding.Left > 0f ||
                               box.BackgroundPaint is not RenderColorPaint { Color.A: 0 };
+            var (relativeX, relativeY) = ResolveInlineRelativeOffset(styleMap, _containingWidth);
             var inlineBox = new InlineBox
             {
                 Node = element,
@@ -557,7 +612,17 @@ public sealed partial class HtmlRenderer
                 MarginLeft = float.IsNaN(marginLeft) ? 0f : marginLeft,
                 MarginRight = float.IsNaN(marginRight) ? 0f : marginRight,
                 IsDecorated = isDecorated,
+                BaselineShift = ResolveInlineBaselineShift(styleMap, style, parentStyle, _context, out var lineEdge),
+                LineEdge = lineEdge,
+                RelativeX = (parentBox?.RelativeX ?? 0f) + relativeX,
+                RelativeY = (parentBox?.RelativeY ?? 0f) + relativeY,
+                IsPositioned = (parentBox?.IsPositioned ?? false) || string.Equals(GetPosition(styleMap), "relative", StringComparison.OrdinalIgnoreCase),
             };
+
+            // The first fragment of a box has its start edge: the right one of a right-to-left box.
+            var leftEdgeWidth = inlineBox.MarginLeft + box.BorderWidth.Left + box.Padding.Left;
+            var rightEdgeWidth = box.Padding.Right + box.BorderWidth.Right + inlineBox.MarginRight;
+            var isRightToLeftBox = style.Direction == TextDirection.Rtl;
 
             Boxes.Add(inlineBox);
             var (bidiStart, bidiEnd) = GetBidiControls(styleMap, style.Direction);
@@ -567,7 +632,7 @@ public sealed partial class HtmlRenderer
                 Style = style,
                 StyleId = styleId,
                 Box = inlineBox,
-                Width = inlineBox.MarginLeft + box.BorderWidth.Left + box.Padding.Left,
+                Width = isRightToLeftBox ? rightEdgeWidth : leftEdgeWidth,
                 BidiControl = bidiStart,
             });
 
@@ -582,7 +647,7 @@ public sealed partial class HtmlRenderer
                 Style = style,
                 StyleId = styleId,
                 Box = inlineBox,
-                Width = box.Padding.Right + box.BorderWidth.Right + inlineBox.MarginRight,
+                Width = isRightToLeftBox ? leftEdgeWidth : rightEdgeWidth,
                 BidiControl = bidiEnd,
             });
         }
@@ -769,12 +834,14 @@ public sealed partial class HtmlRenderer
         }
 
         var pieces = collector.Pieces;
+        var pendingBlockMargin = 0f;
 
         if (pieces.Count == 0)
         {
             return;
         }
 
+        ApplySpaceKerning(pieces, context);
         ApplyShapingContext(pieces, context);
 
         var lineStartIndex = 0;
@@ -810,7 +877,7 @@ public sealed partial class HtmlRenderer
             {
                 var piece = pieces[lineStartIndex];
                 var blockCursorY = lineTop;
-                var blockPreviousMarginBottom = 0f;
+                var blockPreviousMarginBottom = pendingBlockMargin;
                 var blockSuppressTopMargin = false;
                 var blockTextIndentConsumed = false;
 
@@ -835,6 +902,8 @@ public sealed partial class HtmlRenderer
                     positionedContainingHeight: positionedContainingHeight);
 
                 lineTop = blockCursorY;
+                // its bottom margin is still to come, and collapses with the next one
+                pendingBlockMargin = blockPreviousMarginBottom;
                 lineStartIndex++;
                 emittedAnyLine = true;
                 textIndentConsumed = true;
@@ -876,9 +945,12 @@ public sealed partial class HtmlRenderer
 
             if (!hasLineBox)
             {
-                LayoutOutOfFlowPieces(linePieces, contentX, lineTop, contentWidth, context, displayList, maxY, containingHeight, positionedContainingX, positionedContainingY, positionedContainingWidth, positionedContainingHeight, paintOrder);
+                LayoutOutOfFlowPieces(linePieces, false, 0f, contentX, lineTop, contentWidth, context, displayList, maxY, containingHeight, positionedContainingX, positionedContainingY, positionedContainingWidth, positionedContainingHeight, paintOrder);
                 continue;
             }
+
+            lineTop += pendingBlockMargin;
+            pendingBlockMargin = 0f;
 
             var lineHeight = EmitLine(
                 linePieces,
@@ -887,6 +959,7 @@ public sealed partial class HtmlRenderer
                 lineTop,
                 textStyle,
                 isLastLine,
+                forcedBreak,
                 context,
                 displayList,
                 contentWidth,
@@ -897,7 +970,7 @@ public sealed partial class HtmlRenderer
                 positionedContainingHeight,
                 negativeZIndexRanges);
 
-            LayoutOutOfFlowPieces(linePieces, contentX, lineTop, contentWidth, context, displayList, maxY, containingHeight, positionedContainingX, positionedContainingY, positionedContainingWidth, positionedContainingHeight, paintOrder);
+            LayoutOutOfFlowPieces(linePieces, true, lineHeight, contentX, lineTop, contentWidth, context, displayList, maxY, containingHeight, positionedContainingX, positionedContainingY, positionedContainingWidth, positionedContainingHeight, paintOrder);
 
             lineTop += lineHeight;
             emittedAnyLine = true;
@@ -944,7 +1017,7 @@ public sealed partial class HtmlRenderer
         if (emittedAnyLine)
         {
             cursorY = Math.Max(cursorY, lineTop);
-            previousBlockMarginBottom = 0f;
+            previousBlockMarginBottom = pendingBlockMargin;
             suppressNextBlockTopMargin = false;
         }
     }
@@ -1440,6 +1513,7 @@ public sealed partial class HtmlRenderer
         float lineTop,
         RenderTextStyle blockStyle,
         bool isLastLine,
+        bool endsWithForcedBreak,
         LayoutContext context,
         DisplayList displayList,
         float contentWidth,
@@ -1451,6 +1525,7 @@ public sealed partial class HtmlRenderer
         List<(int StartIndex, int Count)> negativeZIndexRanges)
     {
         var visualOrder = ReorderLine(linePieces, blockStyle.Direction == TextDirection.Rtl, context);
+        PlaceInlineBoxEdges(visualOrder);
 
         var lineWidth = 0f;
 
@@ -1476,24 +1551,67 @@ public sealed partial class HtmlRenderer
             }
         }
 
-        // Vertical metrics: the block's own strut, every text piece's half-leading box, and every
-        // atomic inline's margin box, all aligned on one baseline.
-        var strutLineHeight = blockStyle.FontSize * blockStyle.LineHeightMultiplier;
-        var maxAbove = ResolveTextBaselineOffset(strutLineHeight, blockStyle.FontSize);
-        var maxBelow = strutLineHeight - maxAbove;
+        // Vertical metrics: the block's own strut, the line-height box of every inline box and of
+        // its text, and every atomic inline's margin box, all aligned on one baseline, each shifted
+        // by its `vertical-align`. Boxes at the top or bottom edge of the line are aligned among
+        // themselves, and placed once the height of the line is known (CSS 2.1 §10.8).
+        // In the quirks mode only what has text in it gives a line its height (Quirks Mode Standard 3.6).
+        var isQuirky = context.IsQuirksMode;
+        var (maxAbove, maxBelow) = isQuirky && !linePieces.Exists(piece => piece.Box is null && piece.Kind == InlinePieceKind.Text) &&
+            !(endsWithForcedBreak && !linePieces.Exists(piece => piece.Kind is InlinePieceKind.Text or InlinePieceKind.Atomic))
+            ? (0f, 0f)
+            : ResolveLineHeightBox(blockStyle, context);
         var edgeAlignedHeight = 0f;
+        var boxesOnLine = new List<InlineBox>();
+        var lastStyleId = -1;
+
+        void AddExtent(InlineBox? box, float above, float below)
+        {
+            var shift = ResolveLineShift(box, out var edgeBox);
+
+            if (edgeBox is null)
+            {
+                maxAbove = Math.Max(maxAbove, above - shift);
+                maxBelow = Math.Max(maxBelow, below + shift);
+            }
+            else
+            {
+                edgeBox.EdgeAbove = Math.Max(edgeBox.EdgeAbove, above - shift);
+                edgeBox.EdgeBelow = Math.Max(edgeBox.EdgeBelow, below + shift);
+            }
+        }
 
         foreach (var piece in linePieces)
         {
+            if (piece.Kind != InlinePieceKind.OutOfFlow)
+            {
+                for (var box = piece.Box; box is not null && !box.IsOnLine; box = box.Parent)
+                {
+                    box.IsOnLine = true;
+                    box.EdgeAbove = 0f;
+                    box.EdgeBelow = 0f;
+                    boxesOnLine.Add(box);
+
+                    if (!isQuirky || box.IsDecorated || box.MarginLeft != 0f || box.MarginRight != 0f)
+                    {
+                        var (above, below) = ResolveLineHeightBox(box.TextStyle, context);
+                        AddExtent(box, above, below);
+                    }
+                }
+            }
+
             switch (piece.Kind)
             {
                 case InlinePieceKind.Text:
                 case InlinePieceKind.Space:
                 {
-                    var pieceLineHeight = piece.Style.FontSize * piece.Style.LineHeightMultiplier;
-                    var above = ResolveTextBaselineOffset(pieceLineHeight, piece.Style.FontSize);
-                    maxAbove = Math.Max(maxAbove, above);
-                    maxBelow = Math.Max(maxBelow, pieceLineHeight - above);
+                    if (piece.StyleId != lastStyleId && (!isQuirky || piece.Kind == InlinePieceKind.Text))
+                    {
+                        lastStyleId = piece.StyleId;
+                        var (above, below) = ResolveLineHeightBox(piece.Style, context);
+                        AddExtent(piece.Box, above, below);
+                    }
+
                     break;
                 }
                 case InlinePieceKind.Atomic:
@@ -1506,11 +1624,20 @@ public sealed partial class HtmlRenderer
                         break;
                     }
 
-                    var above = ResolveAtomicAscent(measurement, blockStyle, context);
-                    maxAbove = Math.Max(maxAbove, above);
-                    maxBelow = Math.Max(maxBelow, measurement.OuterHeight - above);
+                    var above = ResolveAtomicAscent(measurement, piece.Style, context);
+                    AddExtent(piece.Box, above, measurement.OuterHeight - above);
                     break;
                 }
+            }
+        }
+
+        foreach (var box in boxesOnLine)
+        {
+            box.IsOnLine = false;
+
+            if (box.LineEdge is not null)
+            {
+                edgeAlignedHeight = Math.Max(edgeAlignedHeight, box.EdgeAbove + box.EdgeBelow);
             }
         }
 
@@ -1518,13 +1645,33 @@ public sealed partial class HtmlRenderer
         var baselineY = lineTop + maxAbove;
         RecordColumnLine(lineTop, lineTop + lineHeight);
 
-        PaintInlineBoxFragments(linePieces, baselineY, displayList);
+        foreach (var box in boxesOnLine)
+        {
+            if (box.LineEdge is not null)
+            {
+                box.EdgeBaselineY = box.LineEdge == "top" ? lineTop + box.EdgeAbove : lineTop + lineHeight - box.EdgeBelow;
+            }
+        }
 
+        PaintInlineBoxFragments(visualOrder, baselineY, context, displayList, positioned: false);
+
+        // what is positioned goes above the rest of the line
+        if (boxesOnLine.Exists(static box => box.IsPositioned))
+        {
+            visualOrder = visualOrder.OrderBy(static piece => piece.Box?.IsPositioned == true ? 1 : 0).ToList();
+        }
+
+        var firstPositioned = visualOrder.FindIndex(static piece => piece.Box?.IsPositioned == true);
         var index = 0;
 
         while (index < visualOrder.Count)
         {
             var piece = visualOrder[index];
+
+            if (index == firstPositioned)
+            {
+                PaintInlineBoxFragments(visualOrder, baselineY, context, displayList, positioned: true);
+            }
 
             if (piece.Kind is InlinePieceKind.Text or InlinePieceKind.Space)
             {
@@ -1550,7 +1697,7 @@ public sealed partial class HtmlRenderer
                 var first = index;
                 var last = runEnd - 1;
 
-                if (!piece.Style.Underline && !piece.Style.StrikeThrough)
+                if (!piece.Style.Underline && !piece.Style.Overline && !piece.Style.StrikeThrough)
                 {
                     while (first <= last && visualOrder[first].Kind == InlinePieceKind.Space)
                     {
@@ -1576,8 +1723,8 @@ public sealed partial class HtmlRenderer
                 // A run that is nothing but a space has no glyphs to paint (DrawText rejects it).
                 if (!string.IsNullOrWhiteSpace(text))
                 {
-                    var runX = visualOrder[first].X;
-                    var textBaseline = baselineY + piece.Style.VerticalAlignOffset;
+                    var runX = visualOrder[first].X + (piece.Box?.RelativeX ?? 0f);
+                    var textBaseline = ResolveBoxBaseline(piece.Box, baselineY) + (piece.Box?.RelativeY ?? 0f);
 
                     // shaped with the context of its logically first and last pieces
                     var logicalFirst = visualOrder[piece.Style.IsRightToLeftRun ? last : first];
@@ -1602,8 +1749,8 @@ public sealed partial class HtmlRenderer
                 {
                     "top" => lineTop,
                     "bottom" => lineTop + lineHeight - measurement.OuterHeight,
-                    _ => baselineY - ResolveAtomicAscent(measurement, blockStyle, context),
-                };
+                    _ => ResolveBoxBaseline(piece.Box, baselineY) - ResolveAtomicAscent(measurement, piece.Style, context),
+                } + (piece.Box?.RelativeY ?? 0f);
 
                 var atomicCursorY = marginBoxTop;
                 var atomicPreviousMarginBottom = 0f;
@@ -1614,7 +1761,7 @@ public sealed partial class HtmlRenderer
 
                 LayoutNode(
                     node: piece.Element!,
-                    containingX: piece.X,
+                    containingX: piece.X + (piece.Box?.RelativeX ?? 0f),
                     containingY: marginBoxTop,
                     containingWidth: contentWidth,
                     cursorY: ref atomicCursorY,
@@ -1783,6 +1930,26 @@ public sealed partial class HtmlRenderer
     }
 
     /// <summary>
+    /// Gives the spaces between pieces of one style, which are painted as one run, their width in
+    /// that run, so that the widths of the pieces add up to what is painted.
+    /// </summary>
+    private static void ApplySpaceKerning(List<InlinePiece> pieces, LayoutContext context)
+    {
+        for (var index = 1; index < pieces.Count - 1; index++)
+        {
+            var piece = pieces[index];
+
+            if (piece.Kind == InlinePieceKind.Space && !piece.IsTab && IsSameRunText(pieces[index - 1], piece) && IsSameRunText(pieces[index + 1], piece))
+            {
+                piece.Width = MeasureSpaceBetween(context, pieces[index - 1].Text, pieces[index + 1].Text, piece.Style);
+            }
+        }
+
+        static bool IsSameRunText(InlinePiece neighbour, InlinePiece space) =>
+            neighbour.Kind is InlinePieceKind.Text or InlinePieceKind.Space && !neighbour.IsTab && neighbour.StyleId == space.StyleId && neighbour.Text.Length > 0;
+    }
+
+    /// <summary>
     /// Gives every text piece that touches another one across an inline box edge (no space or
     /// anything else between them, e.g. <c>ab&lt;b&gt;cd&lt;/b&gt;</c>) a few characters of its
     /// neighbours as shaping context, so contextual forms such as Arabic joining continue across
@@ -1842,23 +2009,220 @@ public sealed partial class HtmlRenderer
     }
 
     /// <summary>
-    /// Distance from the top of an atomic inline's margin box to the line's baseline.
+    /// Distance from the top of an atomic inline's margin box to the baseline of its parent.
     /// </summary>
     /// <remarks>
-    /// `middle` centers the box on the baseline raised by half the x-height of the font the
-    /// line's text is drawn with.
+    /// `middle` centers the box on that baseline raised by half the x-height of the parent's font;
+    /// `text-top` and `text-bottom` align it with the edges of that font's content area.
     /// </remarks>
-    private static float ResolveAtomicAscent(AtomicInlineMeasurement measurement, RenderTextStyle blockStyle, LayoutContext context) =>
-        measurement.VerticalAlign == "middle"
-            ? (measurement.OuterHeight / 2f) + (context.TextMeasurer.MeasureXHeight(ToRenderFont(blockStyle, context.Fonts)) / 2f)
-            : measurement.Baseline;
+    private static float ResolveAtomicAscent(AtomicInlineMeasurement measurement, RenderTextStyle parentStyle, LayoutContext context) =>
+        measurement.VerticalAlign switch
+        {
+            "-webkit-baseline-middle" => measurement.OuterHeight / 2f,
+            "middle" => (measurement.OuterHeight / 2f) + (context.TextMeasurer.MeasureXHeight(ToRenderFont(parentStyle, context.Fonts)) / 2f),
+            "text-top" => ResolveFontHeights(parentStyle, context).Ascent,
+            "text-bottom" => measurement.OuterHeight - ResolveFontHeights(parentStyle, context).Descent,
+            _ => measurement.Baseline + measurement.RaisedBy,
+        };
+
+    private const float BrokenImageIconSize = 16f;
+
+    /// <summary>
+    /// The alternative text an image shows as it could not be loaded, as inline content (HTML
+    /// 15.4.3); empty without an `alt`, as there is only an icon. Null for an image that has
+    /// something else to show: its pixels, a size of its own box, or nothing at all (`alt=""`).
+    /// </summary>
+    private static string? ResolveBrokenImageText(ElementRenderNode element, Dictionary<string, string> styleMap)
+    {
+        if (!IsBrokenImage(element.Ref) || !IsInlineLevelElement(element, styleMap))
+        {
+            return null;
+        }
+
+        if (element.Ref.GetAttribute("alt") is { } alt)
+        {
+            return alt.Length > 0 ? alt : null;
+        }
+
+        return string.IsNullOrWhiteSpace(styleMap.GetValueOrDefault("width")) || styleMap.GetValueOrDefault("width")!.Trim() == "auto" ? string.Empty : null;
+    }
+
+    private static bool IsBrokenImage(IElement element) =>
+        element is IHtmlImageElement image && element is not IPseudoElement &&
+        (string.IsNullOrEmpty(element.GetAttribute("src")) || image.IsCompleted) && !HasLoadableImageSource(element);
+
+    // a plain outline where browsers show their icon of a broken image
+    private static void PaintBrokenImageMark(DisplayList displayList, float x, float y, float width, float height)
+    {
+        var color = new RenderColor(0xC0, 0xC0, 0xC0);
+        displayList.FillRect(new RenderRect(x, y, width, 1f), color);
+        displayList.FillRect(new RenderRect(x, y + height - 1f, width, 1f), color);
+        displayList.FillRect(new RenderRect(x, y, 1f, height), color);
+        displayList.FillRect(new RenderRect(x + width - 1f, y, 1f, height), color);
+    }
+
+    /// <summary>
+    /// The ascent and descent of the font of some text, which is what its content area spans.
+    /// </summary>
+    private static (float Ascent, float Descent) ResolveFontHeights(RenderTextStyle style, LayoutContext context) =>
+        context.TextMeasurer is IFontMetricsMeasurer measurer && style.FontSize > 0f
+            ? measurer.MeasureFontHeights(ToRenderFont(style, context.Fonts))
+            : (style.FontSize * FormControlTextAscentRatio, style.FontSize * FormControlTextDescentRatio);
+
+    /// <summary>
+    /// The line-height box of some text around its baseline: its content area with half the
+    /// leading on either side, which is negative for a line height smaller than the font. As in
+    /// Blink, the half above the baseline is a whole number of pixels.
+    /// </summary>
+    private static (float Above, float Below) ResolveLineHeightBox(RenderTextStyle style, LayoutContext context)
+    {
+        var lineHeight = style.FontSize * style.LineHeightMultiplier;
+        var (ascent, descent) = ResolveFontHeights(style, context);
+        var above = ascent + MathF.Floor((lineHeight - ascent - descent) / 2f);
+        return (above, lineHeight - above);
+    }
+
+    /// <summary>
+    /// How far the baseline of an inline box is below that of its parent. As in Blink, `sub` and
+    /// `super` depend on the size of the parent's font only.
+    /// </summary>
+    private static float ResolveInlineBaselineShift(Dictionary<string, string> styleMap, RenderTextStyle style, RenderTextStyle parentStyle, LayoutContext context, out string? lineEdge)
+    {
+        lineEdge = null;
+        var value = styleMap.GetValueOrDefault("vertical-align")?.Trim().ToLowerInvariant();
+
+        switch (value)
+        {
+            case null or "" or "baseline":
+                return 0f;
+            case "sub":
+                return (parentStyle.FontSize / 5f) + 1f;
+            case "super":
+                return -((parentStyle.FontSize / 3f) + 1f);
+            case "top" or "bottom":
+                lineEdge = value;
+                return 0f;
+            case "middle":
+            {
+                var (above, below) = ResolveLineHeightBox(style, context);
+                return ((above - below) / 2f) - (context.TextMeasurer.MeasureXHeight(ToRenderFont(parentStyle, context.Fonts)) / 2f);
+            }
+            case "-webkit-baseline-middle":
+            {
+                var (above, below) = ResolveLineHeightBox(style, context);
+                return (above - below) / 2f;
+            }
+            case "text-top":
+                return ResolveLineHeightBox(style, context).Above - ResolveFontHeights(parentStyle, context).Ascent;
+            case "text-bottom":
+                return ResolveFontHeights(parentStyle, context).Descent - ResolveLineHeightBox(style, context).Below;
+        }
+
+        if (value.EndsWith('%') && float.TryParse(value[..^1], NumberStyles.Float, CultureInfo.InvariantCulture, out var percent))
+        {
+            return -(percent / 100f * style.FontSize * style.LineHeightMultiplier);
+        }
+
+        var length = ParseLengthValue(value, float.NaN, allowAuto: false);
+        return float.IsNaN(length) ? 0f : -length;
+    }
+
+    /// <summary>
+    /// The `position: relative` offset of an inline box, which moves what it holds and nothing
+    /// else. A percentage of `top` or `bottom` has no definite height to refer to and is auto.
+    /// </summary>
+    private static (float X, float Y) ResolveInlineRelativeOffset(Dictionary<string, string> styleMap, float containingWidth)
+    {
+        if (!string.Equals(GetPosition(styleMap), "relative", StringComparison.OrdinalIgnoreCase))
+        {
+            return (0f, 0f);
+        }
+
+        var left = ParseLength(styleMap, "left", containingWidth, float.NaN, allowAuto: true);
+        var right = ParseLength(styleMap, "right", containingWidth, float.NaN, allowAuto: true);
+        var top = ParseVertical("top");
+        var bottom = ParseVertical("bottom");
+        return (!float.IsNaN(left) ? left : float.IsNaN(right) ? 0f : -right, !float.IsNaN(top) ? top : float.IsNaN(bottom) ? 0f : -bottom);
+
+        float ParseVertical(string property) =>
+            styleMap.GetValueOrDefault(property)?.TrimEnd().EndsWith('%') == true
+                ? float.NaN
+                : ParseLength(styleMap, property, 0f, float.NaN, allowAuto: true);
+    }
+
+    /// <summary>
+    /// How far the baseline of an inline box is below that of the line, or of the box at a line
+    /// edge it is in.
+    /// </summary>
+    private static float ResolveLineShift(InlineBox? box, out InlineBox? edgeBox)
+    {
+        var shift = 0f;
+
+        for (; box is not null; box = box.Parent)
+        {
+            if (box.LineEdge is not null)
+            {
+                edgeBox = box;
+                return shift;
+            }
+
+            shift += box.BaselineShift;
+        }
+
+        edgeBox = null;
+        return shift;
+    }
+
+    /// <summary>
+    /// Where the baseline of an inline box is on its line.
+    /// </summary>
+    private static float ResolveBoxBaseline(InlineBox? box, float lineBaselineY)
+    {
+        var shift = ResolveLineShift(box, out var edgeBox);
+        return (edgeBox?.EdgeBaselineY ?? lineBaselineY) + shift;
+    }
 
     /// <summary>
     /// Paints the background and border of every inline box on the current line, outermost first.
     /// A box broken across lines only gets its left edge on its first fragment and its right edge
     /// on its last one.
     /// </summary>
-    private static void PaintInlineBoxFragments(List<InlinePiece> linePieces, float baselineY, DisplayList displayList)
+    /// <summary>
+    /// Decides for every inline box on a line which of its edges is at the left. With just one of
+    /// them on the line that follows from the box's <c>direction</c>; with both it is how they
+    /// were reordered, which <c>direction</c> alone does not do, so their widths may have to change places.
+    /// </summary>
+    private static void PlaceInlineBoxEdges(List<InlinePiece> visualOrder)
+    {
+        Dictionary<InlineBox, InlinePiece>? firstEdges = null;
+
+        foreach (var piece in visualOrder)
+        {
+            if (piece.Kind is not (InlinePieceKind.BoxStart or InlinePieceKind.BoxEnd) || piece.Box is not { } box)
+            {
+                continue;
+            }
+
+            firstEdges ??= [];
+
+            if (!firstEdges.TryGetValue(box, out var first))
+            {
+                firstEdges[box] = piece;
+                box.EdgesReversed = box.TextStyle.Direction == TextDirection.Rtl;
+                continue;
+            }
+
+            var reversed = first.Kind == InlinePieceKind.BoxEnd;
+
+            if (reversed != box.EdgesReversed)
+            {
+                (first.Width, piece.Width) = (piece.Width, first.Width);
+                box.EdgesReversed = reversed;
+            }
+        }
+    }
+
+    private static void PaintInlineBoxFragments(List<InlinePiece> linePieces, float baselineY, LayoutContext context, DisplayList displayList, bool positioned)
     {
         var boxes = new List<InlineBox>();
 
@@ -1879,16 +2243,21 @@ public sealed partial class HtmlRenderer
                 var left = piece.X;
                 var right = piece.X + (piece.Kind == InlinePieceKind.OutOfFlow ? 0f : piece.Width);
 
-                if (ReferenceEquals(piece.Box, box) && piece.Kind == InlinePieceKind.BoxStart)
+                if (ReferenceEquals(piece.Box, box) && piece.Kind is InlinePieceKind.BoxStart or InlinePieceKind.BoxEnd)
                 {
-                    left += box.MarginLeft;
-                    box.StartsOnLine = true;
-                }
+                    var isStart = piece.Kind == InlinePieceKind.BoxStart;
 
-                if (ReferenceEquals(piece.Box, box) && piece.Kind == InlinePieceKind.BoxEnd)
-                {
-                    right -= box.MarginRight;
-                    box.EndsOnLine = true;
+                    if (isStart != box.EdgesReversed)
+                    {
+                        left += box.MarginLeft;
+                    }
+                    else
+                    {
+                        right -= box.MarginRight;
+                    }
+
+                    box.StartsOnLine |= isStart;
+                    box.EndsOnLine |= !isStart;
                 }
 
                 box.FragmentLeft = Math.Min(box.FragmentLeft, Math.Min(left, right));
@@ -1902,18 +2271,25 @@ public sealed partial class HtmlRenderer
         foreach (var box in boxes)
         {
             box.HasFragment = false;
-            var style = box.TextStyle;
-            var top = baselineY - (style.FontSize * FormControlTextAscentRatio) - box.Box.Padding.Top - box.Box.BorderWidth.Top;
-            var bottom = baselineY + (style.FontSize * FormControlTextDescentRatio) + box.Box.Padding.Bottom + box.Box.BorderWidth.Bottom;
+            var (ascent, descent) = ResolveFontHeights(box.TextStyle, context);
+            var boxBaseline = ResolveBoxBaseline(box, baselineY) + box.RelativeY;
+            var top = boxBaseline - ascent - box.Box.Padding.Top - box.Box.BorderWidth.Top;
+            var bottom = boxBaseline + descent + box.Box.Padding.Bottom + box.Box.BorderWidth.Bottom;
             var width = Math.Max(0f, box.FragmentRight - box.FragmentLeft);
             var height = bottom - top;
+            var left = box.FragmentLeft + box.RelativeX;
 
-            box.BoundsLeft = Math.Min(box.BoundsLeft, box.FragmentLeft);
-            box.BoundsRight = Math.Max(box.BoundsRight, box.FragmentLeft + width);
+            box.BoundsLeft = Math.Min(box.BoundsLeft, left);
+            box.BoundsRight = Math.Max(box.BoundsRight, left + width);
             box.BoundsTop = Math.Min(box.BoundsTop, top);
             box.BoundsBottom = Math.Max(box.BoundsBottom, bottom);
 
-            if (!box.IsDecorated || width <= 0f || box.TextStyle.IsHidden)
+            if (box.IsBrokenImage && box.StartsOnLine && !box.TextStyle.IsHidden && box.IsPositioned == positioned)
+            {
+                PaintBrokenImageMark(displayList, left, boxBaseline - ascent + ((height - BrokenImageIconSize) / 2f), BrokenImageIconSize, BrokenImageIconSize);
+            }
+
+            if (!box.IsDecorated || width <= 0f || box.TextStyle.IsHidden || box.IsPositioned != positioned)
             {
                 continue;
             }
@@ -1922,12 +2298,12 @@ public sealed partial class HtmlRenderer
             var radii = isWhole ? box.Box.BorderRadius : RenderCornerRadii.Zero;
             var borderWidths = new EdgeSizes(
                 box.Box.BorderWidth.Top,
-                box.EndsOnLine ? box.Box.BorderWidth.Right : 0f,
+                (box.EdgesReversed ? box.StartsOnLine : box.EndsOnLine) ? box.Box.BorderWidth.Right : 0f,
                 box.Box.BorderWidth.Bottom,
-                box.StartsOnLine ? box.Box.BorderWidth.Left : 0f);
+                (box.EdgesReversed ? box.EndsOnLine : box.StartsOnLine) ? box.Box.BorderWidth.Left : 0f);
 
-            PaintBackground(displayList, box.Box.BackgroundPaint, box.FragmentLeft, top, width, height, radii);
-            PaintBorder(displayList, box.Box.BorderColor, box.FragmentLeft, top, width, height, borderWidths, radii, box.Box.BorderStyle);
+            PaintBackground(displayList, box.Box.BackgroundPaint, left, top, width, height, radii);
+            PaintBorder(displayList, box.Box.BorderColor, left, top, width, height, borderWidths, radii, box.Box.BorderStyle);
         }
 
         static int Depth(InlineBox box)
@@ -1943,8 +2319,17 @@ public sealed partial class HtmlRenderer
         }
     }
 
+    // an out-of-flow box computes to a block, but in the flow it would be what it was declared as
+    private static bool IsBlockLevelOutOfFlow(ElementRenderNode element, LayoutContext context)
+    {
+        var display = GetExplicitDeclarations(context, element.Ref)?.GetPropertyValue("display")?.Trim().ToLowerInvariant();
+        return !string.IsNullOrEmpty(display) && !display.StartsWith("inline", StringComparison.Ordinal);
+    }
+
     private static void LayoutOutOfFlowPieces(
         List<InlinePiece> linePieces,
+        bool hasLineBox,
+        float lineHeight,
         float contentX,
         float lineTop,
         float contentWidth,
@@ -1971,10 +2356,26 @@ public sealed partial class HtmlRenderer
             var suppressTopMargin = false;
             var localFloats = new FloatArea();
             var textIndentConsumed = false;
+            // Where it would be in the flow: inline-level, where it is on the line; block-level, on
+            // its own below what is on the line before it (CSS 2.1 §10.3.7, §10.6.4).
+            var staticX = contentX;
+            var isBlockLevel = IsBlockLevelOutOfFlow(piece.Element!, context);
+
+            if (!isBlockLevel && hasLineBox)
+            {
+                staticX = piece.X;
+            }
+            else if (isBlockLevel && hasLineBox && linePieces.TakeWhile(other => !ReferenceEquals(other, piece)).Any(other => other.Kind is InlinePieceKind.Text or InlinePieceKind.Atomic && !other.Trimmed))
+            {
+                staticCursorY = lineTop + lineHeight;
+            }
+
+            var (blockX, blockY, blockWidth, blockHeight) = ResolveInlineContainingBlock(piece.Box, context) ??
+                (positionedContainingX, positionedContainingY, positionedContainingWidth, positionedContainingHeight);
 
             LayoutNode(
                 node: piece.Element!,
-                containingX: contentX,
+                containingX: staticX,
                 containingY: lineTop,
                 containingWidth: contentWidth,
                 cursorY: ref staticCursorY,
@@ -1987,12 +2388,33 @@ public sealed partial class HtmlRenderer
                 displayList: displayList,
                 maxY: maxY,
                 containingHeight: containingHeight,
-                positionedContainingX: positionedContainingX,
-                positionedContainingY: positionedContainingY,
-                positionedContainingWidth: positionedContainingWidth,
-                positionedContainingHeight: positionedContainingHeight);
+                positionedContainingX: blockX,
+                positionedContainingY: blockY,
+                positionedContainingWidth: blockWidth,
+                positionedContainingHeight: blockHeight);
             paintOrder.Track(piece.Element!, displayList, rangeStart, context);
         }
+    }
+
+    /// <summary>
+    /// The padding box of the nearest positioned inline box around a piece, as far as its lines
+    /// are laid out already, if there is one.
+    /// </summary>
+    private static (float X, float Y, float Width, float Height)? ResolveInlineContainingBlock(InlineBox? inlineBox, LayoutContext context)
+    {
+        for (var box = inlineBox; box is not null; box = box.Parent)
+        {
+            if (box.BoundsRight >= box.BoundsLeft && box.BoundsBottom >= box.BoundsTop &&
+                ActsAsContainingBlock(GetOrCreateStyleMap(context, box.Node.Ref, box.Node.ComputedStyle), 0f))
+            {
+                var border = box.Box.BorderWidth;
+                return (box.BoundsLeft + border.Left, box.BoundsTop + border.Top,
+                    Math.Max(0f, box.BoundsRight - box.BoundsLeft - border.Left - border.Right),
+                    Math.Max(0f, box.BoundsBottom - box.BoundsTop - border.Top - border.Bottom));
+            }
+        }
+
+        return null;
     }
 
     /// <summary>
@@ -2025,6 +2447,20 @@ public sealed partial class HtmlRenderer
             ? Math.Clamp(lastBaseline, 0f, outerHeight)
             : outerHeight;
 
+        // That of a flex or grid container comes from its first item.
+        if (GetDisplay(styleMap)?.Trim().ToLowerInvariant() is "inline-flex" or "inline-grid" && ResolveFormControlKind(element) == FormControlKind.None)
+        {
+            baseline = ResolveItemsBaseline(element, trial, context) ?? outerHeight;
+        }
+
+        // A control without any text has its baseline where browsers define it, in its border box.
+        if (ResolveControlBaseline(element, metrics.BorderBoxHeight) is { } controlBaseline)
+        {
+            baseline = borderBoxOffsetY + controlBaseline;
+        }
+
+        var fontSize = ParseLength(styleMap, "font-size", inheritedStyle.FontSize, inheritedStyle.FontSize, allowAuto: false);
+
         return new AtomicInlineMeasurement(
             metrics.BorderBoxWidth,
             metrics.BorderBoxHeight,
@@ -2033,7 +2469,75 @@ public sealed partial class HtmlRenderer
             borderBoxOffsetY,
             marginBottom,
             baseline,
-            verticalAlign);
+            verticalAlign,
+            ParseVerticalAlignLength(verticalAlign, fontSize, fontSize * inheritedStyle.LineHeightMultiplier));
+    }
+
+    /// <summary>
+    /// The baseline of a flex or grid container that was laid out for a trial: that of its first
+    /// item, or the bottom edge of that item's border box when it has no line of text (CSS Flexbox
+    /// 1 §8.5, CSS Grid 1 §10.7). Null without any item.
+    /// </summary>
+    private static float? ResolveItemsBaseline(ElementRenderNode element, (ElementLayoutMetrics? Metrics, float? LastBaselineY, float? FirstBaselineY, IReadOnlyDictionary<IElement, ElementLayoutMetrics> Laidout, float? AutoContentHeight) trial, LayoutContext context)
+    {
+        foreach (var child in OrderChildrenForLayout(element.Children, context))
+        {
+            switch (child)
+            {
+                case TextRenderNode text when !string.IsNullOrWhiteSpace(text.Ref.Data):
+                    return trial.FirstBaselineY;
+                case ElementRenderNode item when GeneratesBoxes(item) && !IsOutOfFlowPositioned(GetOrCreateStyleMap(context, item.Ref, item.ComputedStyle)):
+                    if (!IsReplacedElement(item.Ref) && HoldsLineContent(item, context) && trial.FirstBaselineY is { } first)
+                    {
+                        return first;
+                    }
+
+                    return trial.Laidout.TryGetValue(item.Ref, out var metrics) ? metrics.BorderBoxY + metrics.BorderBoxHeight : null;
+            }
+        }
+
+        return null;
+    }
+
+    // whether a line box will be somewhere in it
+    private static bool HoldsLineContent(ElementRenderNode element, LayoutContext context) =>
+        element.Children.Any(child => child switch
+        {
+            TextRenderNode text => !string.IsNullOrWhiteSpace(text.Ref.Data),
+            ElementRenderNode inner when GeneratesBoxes(inner) && !IsOutOfFlowPositioned(GetOrCreateStyleMap(context, inner.Ref, inner.ComputedStyle)) =>
+                IsReplacedElement(inner.Ref) || ResolveFormControlKind(inner) != FormControlKind.None || HoldsLineContent(inner, context),
+            _ => false,
+        });
+
+    /// <summary>
+    /// The baseline of a control that has no line of text giving it one, from the top of its
+    /// border box, else null.
+    /// </summary>
+    private static float? ResolveControlBaseline(ElementRenderNode element, float borderBoxHeight) =>
+        ResolveFormControlKind(element) switch
+        {
+            FormControlKind.Checkbox or FormControlKind.Radio or FormControlKind.Range or FormControlKind.Progress or FormControlKind.Meter => borderBoxHeight,
+            FormControlKind.Color => Math.Max(0f, borderBoxHeight - 6f),
+            FormControlKind.ListBox => Math.Max(0f, borderBoxHeight - 3f),
+            FormControlKind.Button when string.Equals(element.Ref.LocalName, "button", StringComparison.OrdinalIgnoreCase) && ResolveFormControlLabel(FormControlKind.Button, element.Ref).Length == 0 => borderBoxHeight / 2f,
+            _ => null,
+        };
+
+    /// <summary>
+    /// How far a length or percentage of `vertical-align` raises an atomic inline (0 for a keyword).
+    /// </summary>
+    private static float ParseVerticalAlignLength(string value, float fontSize, float lineHeight)
+    {
+        float Parse(string number) => float.TryParse(number, NumberStyles.Float, CultureInfo.InvariantCulture, out var parsed) ? parsed : 0f;
+
+        return value switch
+        {
+            _ when value.EndsWith("rem", StringComparison.Ordinal) => 0f,
+            _ when value.EndsWith("px", StringComparison.Ordinal) => Parse(value[..^2]),
+            _ when value.EndsWith("em", StringComparison.Ordinal) => Parse(value[..^2]) * fontSize,
+            _ when value.EndsWith('%') => Parse(value[..^1]) / 100f * lineHeight,
+            _ => 0f,
+        };
     }
 
     /// <summary>
@@ -2043,7 +2547,7 @@ public sealed partial class HtmlRenderer
     /// grid item is blockified and lays out its contents as a block of its own (e.g. a
     /// <c>&lt;span&gt;</c> item gets the height of its line boxes, not of its inline box).
     /// </summary>
-    private static (ElementLayoutMetrics? Metrics, float? LastBaselineY, float? FirstBaselineY) TrialLayout(
+    private static (ElementLayoutMetrics? Metrics, float? LastBaselineY, float? FirstBaselineY, IReadOnlyDictionary<IElement, ElementLayoutMetrics> Laidout, float? AutoContentHeight) TrialLayout(
         ElementRenderNode element,
         float containingWidth,
         RenderTextStyle inheritedStyle,
@@ -2056,6 +2560,8 @@ public sealed partial class HtmlRenderer
         var capture = new LayoutCapture();
         var previous = s_layoutCapture.Value;
         s_layoutCapture.Value = capture;
+
+        s_trialDepth++;
 
         // a trial is laid out elsewhere, so its lines are no column break candidates
         var previousColumnBreaks = s_columnBreakCapture.Value;
@@ -2071,6 +2577,8 @@ public sealed partial class HtmlRenderer
 
         // the sticky boxes of a trial are never placed
         context.StickyFlows.Push([]);
+        // nor is anything of it held back by what is around it, which is laid out for real
+        context.PositionedScopes.Push(new PositionedScope(element, IsBarrier: true));
 
         try
         {
@@ -2099,10 +2607,12 @@ public sealed partial class HtmlRenderer
                 isFlexItem: isFlexOrGridItem);
 
             var snapshot = capture.Snapshot();
-            return (snapshot.TryGetValue(element.Ref, out var metrics) ? metrics : null, capture.LastBaselineY, capture.FirstBaselineY);
+            return (snapshot.TryGetValue(element.Ref, out var metrics) ? metrics : null, capture.LastBaselineY, capture.FirstBaselineY, snapshot, capture.AutoContentHeights.TryGetValue(element.Ref, out var autoHeight) ? autoHeight : null);
         }
         finally
         {
+            s_trialDepth--;
+            context.PositionedScopes.Pop();
             s_layoutCapture.Value = previous;
             s_columnBreakCapture.Value = previousColumnBreaks;
 
@@ -2167,7 +2677,7 @@ public sealed partial class HtmlRenderer
     {
         var styleMap = GetOrCreateStyleMap(context, element.Ref, element.ComputedStyle);
         var formControlKind = ResolveFormControlKind(element);
-        var textStyle = ResolveTextStyle(styleMap, inheritedStyle);
+        var textStyle = ResolveTextStyle(styleMap, inheritedStyle, context);
 
         if (formControlKind != FormControlKind.None)
         {
@@ -2194,6 +2704,11 @@ public sealed partial class HtmlRenderer
         if (!float.IsNaN(authored))
         {
             contentWidth = authored;
+        }
+        else if (GetContentSizeKeyword(styleMap, "width") is "min-content" or "max-content" && !IsReplacedElement(element.Ref))
+        {
+            var contentWidths = ComputeContentIntrinsicWidths(element, textStyle, containingWidth, context);
+            contentWidth = GetContentSizeKeyword(styleMap, "width") == "min-content" ? contentWidths.Min : contentWidths.Max;
         }
         else if (TryResolveReplacedContentWidth(element, styleMap, containingWidth, out var replacedWidth))
         {
@@ -2285,7 +2800,7 @@ public sealed partial class HtmlRenderer
             return IntrinsicWidths.Zero;
         }
 
-        var textStyle = ResolveTextStyle(styleMap, inheritedStyle);
+        var textStyle = ResolveTextStyle(styleMap, inheritedStyle, context);
 
         if (formControlKind != FormControlKind.None)
         {
@@ -2320,9 +2835,23 @@ public sealed partial class HtmlRenderer
         {
             content = new IntrinsicWidths(replacedWidth, replacedWidth);
         }
+        else if (formControlKind is FormControlKind.TextLike or FormControlKind.TextArea)
+        {
+            // a percentage width: a text field can shrink to nothing, but it still prefers its
+            // default size (compressible replaced elements, CSS Sizing 3 §5.2.2)
+            content = new IntrinsicWidths(0f, ResolveTextControlWidth(formControlKind, element.Ref, styleMap, textStyle, context));
+        }
         else
         {
             content = ComputeContentIntrinsicWidths(element, textStyle, percentageBase, context);
+
+            // a keyword settles which of its intrinsic widths it has
+            content = GetContentSizeKeyword(styleMap, "width") switch
+            {
+                "min-content" => new IntrinsicWidths(content.Min, content.Min),
+                "max-content" => new IntrinsicWidths(content.Max, content.Max),
+                _ => content,
+            };
         }
 
         var min = ClampToMinMaxWidth(styleMap, content.Min, percentageBase, horizontalExtras);
@@ -2342,7 +2871,7 @@ public sealed partial class HtmlRenderer
 
         if (element.Ref is not IPseudoElement &&
             (string.Equals(element.Ref.LocalName, "svg", StringComparison.OrdinalIgnoreCase) ||
-             formControlKind is FormControlKind.Select or FormControlKind.Button))
+             PaintsOwnContent(formControlKind)))
         {
             children = [];
         }
@@ -2363,7 +2892,7 @@ public sealed partial class HtmlRenderer
         if (formControlKind == FormControlKind.Button)
         {
             // A button's label is painted by PaintFormControl rather than laid out as children.
-            var label = NormalizeWhitespace(element.Ref.TextContent ?? string.Empty);
+            var label = ResolveFormControlLabel(formControlKind, element.Ref);
             var labelWidth = label.Length > 0 ? MeasureTextWidth(context, label, textStyle) : 0f;
             return new IntrinsicWidths(labelWidth, labelWidth);
         }
@@ -2498,9 +3027,15 @@ public sealed partial class HtmlRenderer
 
                     var isInline = IsInlineLevelElement(child, childStyleMap);
 
+                    if (ResolveBrokenImageText(child, childStyleMap) is { } brokenImageText)
+                    {
+                        AddContent(BrokenImageIconSize + MeasureTextWidth(context, brokenImageText, style));
+                        break;
+                    }
+
                     if (isInline && !IsAtomicInlineElement(child, childStyleMap))
                     {
-                        var childStyle = ResolveTextStyle(childStyleMap, style);
+                        var childStyle = ResolveTextStyle(childStyleMap, style, context);
                         var childBox = ResolveBoxStyle(childStyleMap, child.Ref);
                         lineMax += childBox.BorderWidth.Left + childBox.BorderWidth.Right + childBox.Padding.Left + childBox.Padding.Right;
 
@@ -2518,9 +3053,15 @@ public sealed partial class HtmlRenderer
                     {
                         AddContent(outer.Max);
                     }
+                    else if (IsFloated(childStyleMap))
+                    {
+                        // a float has its place on the line next to what is around it
+                        AddContent(outer.Max);
+                        resultMin = Math.Max(resultMin, outer.Min);
+                    }
                     else
                     {
-                        // Block-level (and floated) children sit on lines of their own.
+                        // Block-level children sit on lines of their own.
                         FlushLine();
                         resultMax = Math.Max(resultMax, outer.Max);
                     }
@@ -2633,20 +3174,28 @@ public sealed partial class HtmlRenderer
         var min = 0f;
         var max = 0f;
         var paragraphs = text.Split('\n');
-        // a measured run has letter spacing between its characters only, so joining two words
-        // (measured on their own) also adds the spacing before and after the space between them
-        var joinWidth = spaceWidth + (2f * style.LetterSpacing);
 
         for (var paragraphIndex = 0; paragraphIndex < paragraphs.Length; paragraphIndex++)
         {
             var paragraph = paragraphs[paragraphIndex];
             var words = paragraph.Split(' ');
             var paragraphWidth = 0f;
+            // spaces at the edges and in a row have no words on both sides to measure them with
+            var keepsSpaces = Array.IndexOf(words, string.Empty) >= 0;
+
+            if (keepsSpaces)
+            {
+                paragraphWidth = MeasureTextWidth(context, paragraph, style) + (CountSpaces(paragraph) * style.WordSpacing);
+            }
 
             for (var index = 0; index < words.Length; index++)
             {
                 var wordWidth = words[index].Length > 0 ? MeasureTextWidth(context, words[index], style) : 0f;
-                paragraphWidth += wordWidth + (index > 0 ? joinWidth : 0f);
+
+                if (!keepsSpaces)
+                {
+                    paragraphWidth += wordWidth + (index > 0 ? MeasureSpaceBetween(context, StripSoftHyphens(words[index - 1]), StripSoftHyphens(words[index]), style) : 0f);
+                }
 
                 if (style.WordBreak == WordBreakMode.BreakAll || style.OverflowWrap == OverflowWrapMode.BreakWord)
                 {

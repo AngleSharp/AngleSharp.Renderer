@@ -525,7 +525,7 @@ public sealed class HtmlRendererTests
     {
         // CSS 2.1, 10.5: without a definite containing block height, a percentage height is auto
         var displayList = await LayoutAsync("""
-            <html><body style="margin:0">
+            <!doctype html><html><body style="margin:0">
                 <div><div style="height:50%; background-color:#112233"><div style="height:20px"></div></div></div>
             </body></html>
             """);
@@ -549,7 +549,7 @@ public sealed class HtmlRendererTests
     public async Task BuildDisplayList_FlexContainerWithPercentageHeightInAnAutoHeightParentIsSizedByItsContent()
     {
         var displayList = await LayoutAsync("""
-            <html><body style="margin:0">
+            <!doctype html><html><body style="margin:0">
                 <header><div style="display:flex; align-items:center; height:100%; background-color:#112233"><div style="height:30px; width:40px"></div></div></header>
             </body></html>
             """);
@@ -612,6 +612,26 @@ public sealed class HtmlRendererTests
             """);
 
         Assert.Equal(20f, FillOf(displayList, new RenderColor(0x11, 0x22, 0x33)).Height);
+    }
+
+    [Theory]
+    [InlineData(50f, 50f)]
+    [InlineData(30f, 40f)]
+    public async Task BuildDisplayList_ShrunkFlexItemsThatWrapStretchToTheLineOfTheirFinalSize(float minHeight, float expectedHeight)
+    {
+        // at their flex-basis the items hold one 20px line, shrunk to 50px they hold two
+        const string Blocks = """<i style="display:inline-block; vertical-align:top; width:40px; height:20px"></i><i style="display:inline-block; vertical-align:top; width:40px; height:20px"></i>""";
+        var displayList = await LayoutAsync($"""
+            <html><body style="margin:0">
+                <div style="display:flex; width:100px; min-height:{minHeight}px; background-color:#445566">
+                    <div style="flex:1 1 100px; min-width:0; font-size:0; line-height:0; background-color:#112233">{Blocks}</div>
+                    <div style="flex:1 1 100px; min-width:0; font-size:0; line-height:0">{Blocks}</div>
+                </div>
+            </body></html>
+            """);
+
+        Assert.Equal(expectedHeight, FillOf(displayList, new RenderColor(0x11, 0x22, 0x33)).Height);
+        Assert.Equal(expectedHeight, FillOf(displayList, new RenderColor(0x44, 0x55, 0x66)).Height);
     }
 
     [Fact]
@@ -1408,9 +1428,9 @@ public sealed class HtmlRendererTests
             .ToArray();
 
         // Each item is as tall as it is as an ordinary block: one 13px line (line-height normal,
-        // 1.35) plus 18px padding and 2px border.
+        // the 15px line spacing of the font) plus 18px padding and 2px border.
         Assert.Equal(6, items.Length);
-        Assert.All(items, item => Assert.Equal(37.55f, item.Rect.Height, tolerance: 0.01f));
+        Assert.All(items, item => Assert.Equal(35f, item.Rect.Height, tolerance: 0.01f));
         Assert.Equal(8f, items[1].Rect.Y - (items[0].Rect.Y + items[0].Rect.Height), precision: 2);
     }
 
@@ -2461,7 +2481,7 @@ public sealed class HtmlRendererTests
         Assert.Equal("c", lines[1].Text);
         // The forced break lands on the very next line, not merely wherever the wrap algorithm
         // would otherwise have broken - confirmed by the line-height gap between the two baselines.
-        Assert.Equal(16f * 1.35f, lines[1].Y - lines[0].Y, precision: 2);
+        Assert.Equal(19f, lines[1].Y - lines[0].Y, precision: 2); // the line spacing of the 16px font
     }
 
     [Fact]
@@ -5395,12 +5415,12 @@ public sealed class HtmlRendererTests
             FontSize = 16f,
         });
 
-        // Default UA-like chrome: a white background box, sized to the built-in default content
-        // width (150px) plus the default 4px*2 padding and 1px*2 border (border-box width 160),
-        // since none was authored, and a plain 1px gray border (four straight edges, no
-        // border-radius, so PaintBorder falls back to four separate FillRectCommands). Filtered to
-        // width 160 because the page's own default background is also a full-viewport white fill.
-        var background = Assert.Single(displayList.Commands.OfType<FillRectCommand>().Where(f => f.Color.Equals(new RenderColor(255, 255, 255)) && f.Rect.Width == 160f));
+        // Default UA-like chrome: a white background box, sized to the default number of characters
+        // plus the default padding and border, since none was authored, and a plain 1px gray border
+        // (four straight edges, no border-radius, so PaintBorder falls back to four separate
+        // FillRectCommands). Filtered by width because the page's own default background is also a
+        // full-viewport white fill.
+        var background = Assert.Single(displayList.Commands.OfType<FillRectCommand>().Where(f => f.Color.Equals(new RenderColor(255, 255, 255)) && f.Rect.Width is > 100f and < 299f));
 
         var borderEdges = displayList.Commands.OfType<FillRectCommand>().Where(f => f.Color.Equals(new RenderColor(118, 118, 118))).ToList();
         Assert.NotEmpty(borderEdges);
@@ -5408,7 +5428,7 @@ public sealed class HtmlRendererTests
         var valueText = Assert.Single(displayList.Commands.OfType<DrawTextCommand>().Where(t => t.Text == "Hello"));
         // Left-aligned at the content box's own left edge (border + padding in from the box), not
         // centered - matching how a browser shows typed input text.
-        Assert.Equal(background.Rect.X + 1f + 4f, valueText.X, precision: 3);
+        Assert.Equal(background.Rect.X + 1f + 2f, valueText.X, precision: 3);
     }
 
     [Fact]
@@ -5438,13 +5458,15 @@ public sealed class HtmlRendererTests
         var background = Assert.Single(displayList.Commands.OfType<FillRectCommand>().Where(f => f.Color.Equals(new RenderColor(255, 255, 255)) && f.Rect.Width < 300f));
         var valueText = Assert.Single(displayList.Commands.OfType<DrawTextCommand>().Where(t => t.Text == "Hi"));
 
-        // border-top-width 1px + default padding-top 2px, and content height is the authored 60px.
-        var contentTop = background.Rect.Y + 1f + 2f;
+        // border-top-width 1px + default padding-top 1px. Without a doctype an input is border-box
+        // (the quirks mode sheet), so the authored 60px include the border and padding.
+        var contentTop = background.Rect.Y + 1f + 1f;
+        var contentHeight = background.Rect.Height - (2f * (1f + 1f));
         // Mirrors FormControlTextAscentRatio/DescentRatio in HtmlRenderer.cs.
         const float AscentRatio = 0.928f;
         const float DescentRatio = 0.236f;
-        var topGap = (valueText.Y - (20f * AscentRatio)) - contentTop;
-        var bottomGap = (contentTop + 60f) - (valueText.Y + (20f * DescentRatio));
+        var topGap = (valueText.Y - (valueText.FontSize * AscentRatio)) - contentTop;
+        var bottomGap = (contentTop + contentHeight) - (valueText.Y + (valueText.FontSize * DescentRatio));
         Assert.Equal(topGap, bottomGap, precision: 3);
     }
 
@@ -5473,7 +5495,7 @@ public sealed class HtmlRendererTests
         // authored equivalent here, and each authored value must win exactly like it does for any
         // other element, proving the defaults are only gap-fillers and not a fixed native look.
         var document = await ParseAsync("""
-            <html><body>
+            <!doctype html><html><body>
                 <input type="text" value="Hi" style="width:80px; background-color:#ff0000; border: 3px solid #0000ff;" />
             </body></html>
             """);
@@ -5488,10 +5510,11 @@ public sealed class HtmlRendererTests
 
         var background = Assert.Single(displayList.Commands.OfType<FillRectCommand>().Where(f => f.Color.Equals(new RenderColor(255, 0, 0))));
         // Border-box width, not the authored content-width in isolation: default content-box
-        // sizing (unchanged here) adds the border (3px * 2) and the still-default padding (4px * 2,
-        // since only border/background/width were overridden) on top of the authored 80px content
-        // width - 80 + 6 + 8 = 94, the same box-model arithmetic a real browser would apply.
-        Assert.Equal(94f, background.Rect.Width);
+        // sizing (unchanged here, and only in the no-quirks mode, hence the doctype) adds the border
+        // (3px * 2) and the still-default padding (2px * 2, since only border/background/width were
+        // overridden) on top of the authored 80px content width - 80 + 6 + 4 = 90, the same box-model
+        // arithmetic a real browser would apply.
+        Assert.Equal(90f, background.Rect.Width);
 
         Assert.DoesNotContain(displayList.Commands, c => c is FillRectCommand f && f.Color.Equals(new RenderColor(255, 255, 255)) && f.Rect.Width < 300f);
         Assert.DoesNotContain(displayList.Commands, c => c is FillRectCommand f && f.Color.Equals(new RenderColor(118, 118, 118)));
@@ -5535,7 +5558,7 @@ public sealed class HtmlRendererTests
         });
 
         var valueText = Assert.Single(displayList.Commands.OfType<DrawTextCommand>().Where(t => t.Text == "Hi"));
-        var background = Assert.Single(displayList.Commands.OfType<FillRectCommand>().Where(f => f.Color.Equals(new RenderColor(255, 255, 255)) && f.Rect.Width == 160f));
+        var background = Assert.Single(displayList.Commands.OfType<FillRectCommand>().Where(f => f.Color.Equals(new RenderColor(255, 255, 255)) && f.Rect.Width is > 100f and < 299f));
 
         // Without a registered IDomHarness there is no virtual clock to fade the caret against, so
         // it paints fully opaque instead of frozen mid-fade - the same fallback CSS `transition`/
@@ -5650,12 +5673,12 @@ public sealed class HtmlRendererTests
             FontSize = 16f,
         });
 
-        var background = Assert.Single(displayList.Commands.OfType<FillRectCommand>().Where(f => f.Color.Equals(new RenderColor(255, 255, 255)) && f.Rect.Width == 160f));
+        var background = Assert.Single(displayList.Commands.OfType<FillRectCommand>().Where(f => f.Color.Equals(new RenderColor(255, 255, 255)) && f.Rect.Width is > 100f and < 299f));
         var caret = Assert.Single(displayList.Commands.OfType<FillRectCommand>().Where(f => f.Rect.Width == 1.5f));
 
-        // border-left-width 1px + default padding-left 4px, the same content-edge math the value
+        // border-left-width 1px + default padding-left 2px, the same content-edge math the value
         // text itself is positioned at (see BuildDisplayList_TextLikeInputGetsDefaultChromeAndShowsItsValue).
-        Assert.Equal(background.Rect.X + 1f + 4f, caret.Rect.X, precision: 3);
+        Assert.Equal(background.Rect.X + 1f + 2f, caret.Rect.X, precision: 3);
     }
 
     [Fact]
@@ -5714,7 +5737,7 @@ public sealed class HtmlRendererTests
         var thumb = Assert.Single(displayList.Commands.OfType<FillRectCommand>()
             .Where(command => command.Rect.Width < 100f && !command.Rect.Width.Equals(track.Rect.Width)));
         var thumbCenterX = thumb.Rect.X + (thumb.Rect.Width / 2f);
-        Assert.Equal(25f, thumbCenterX, precision: 1);
+        Assert.Equal(track.Rect.X + 25f, thumbCenterX, precision: 1);
     }
 
     [Fact]
@@ -5736,7 +5759,7 @@ public sealed class HtmlRendererTests
 
         // No `value` authored - defaults to the (min+max)/2 midpoint (0-100 default range), so
         // the thumb sits at 50% along the track.
-        Assert.Equal(50f, thumbCenterX, precision: 1);
+        Assert.Equal(track.Rect.X + 50f, thumbCenterX, precision: 1);
     }
 
     [Fact]
@@ -5755,10 +5778,11 @@ public sealed class HtmlRendererTests
         var label = Assert.Single(displayList.Commands.OfType<DrawTextCommand>().Where(t => t.Text == "Choose File"));
         Assert.NotNull(label);
 
-        // Button-like default chrome: a gray background box, matching FormControlKind.Button.
-        var background = Assert.Single(displayList.Commands.OfType<FillRectCommand>()
-            .Where(command => command.Color.Equals(new RenderColor(0xe8, 0xe8, 0xe8))));
-        Assert.True(background.Rect.Width > 0f);
+        // Its button has the chrome of FormControlKind.Button, the name of the chosen file follows it.
+        var background = displayList.Commands.OfType<FillRectCommand>().Last(command => command.Color.Equals(new RenderColor(0xe8, 0xe8, 0xe8)));
+        Assert.True(background.Rect.X + background.Rect.Width <= label.X + 200f);
+        var status = Assert.Single(displayList.Commands.OfType<DrawTextCommand>().Where(t => t.Text == "No file chosen"));
+        Assert.True(status.X > background.Rect.X + background.Rect.Width);
     }
 
     [Fact]
@@ -5924,7 +5948,8 @@ public sealed class HtmlRendererTests
         });
 
         var swatch = Assert.Single(displayList.Commands.OfType<FillRectCommand>().Where(f => f.Color.Equals(new RenderColor(255, 136, 0))));
-        Assert.Equal(40f, swatch.Rect.Height, precision: 3);
+        // a color input is border-box: 40px less the border (1px * 2) and padding (1px * 2)
+        Assert.Equal(36f, swatch.Rect.Height, precision: 3);
     }
 
     [Fact]
@@ -5984,11 +6009,11 @@ public sealed class HtmlRendererTests
         var label = Assert.Single(displayList.Commands.OfType<DrawTextCommand>().Where(t => t.Text == "Second"));
         var arrow = Assert.Single(displayList.Commands.OfType<DrawTextCommand>().Where(t => t.Text == "⌄"));
 
-        // Left-aligned at the content box's own left edge (border + padding in from the box), not
-        // centered.
+        // Left-aligned at the select's own inset from the content box (border + inset in from the
+        // box; its padding is 0), not centered.
         Assert.Equal(background.Rect.X + 1f + 4f, label.X, precision: 3);
 
-        // Narrower than a text-like input's fixed 150px default width - shrunk to fit "Second" plus
+        // Narrower than a text-like input's default width - shrunk to fit "Second" plus
         // the arrow - and the arrow itself sits shortly after the label, not flush with a far-away
         // right edge of an unnecessarily wide box.
         Assert.True(background.Rect.Width < 150f);
@@ -6048,7 +6073,7 @@ public sealed class HtmlRendererTests
 
         var background = Assert.Single(displayList.Commands.OfType<FillRectCommand>().Where(f => f.Color.Equals(new RenderColor(232, 232, 232))));
         // Shrink-to-fit: the button's own box is sized to its measured label, not a fixed default
-        // width the way a text-like input is - so it must be narrower than that 150px default while
+        // width the way a text-like input is - so it must be narrower than 150px while
         // still being wide enough to actually contain the label text just drawn.
         Assert.True(background.Rect.Width < 150f);
         Assert.True(background.Rect.Width > 0f);
@@ -6068,7 +6093,7 @@ public sealed class HtmlRendererTests
             FontSize = 16f,
         });
 
-        Assert.Single(displayList.Commands.OfType<FillRectCommand>().Where(f => f.Color.Equals(new RenderColor(255, 255, 255)) && f.Rect.Width == 160f));
+        Assert.Single(displayList.Commands.OfType<FillRectCommand>().Where(f => f.Color.Equals(new RenderColor(255, 255, 255)) && f.Rect.Width is > 100f and < 299f));
         // A textarea's own child text node still flows through the ordinary block child-layout
         // path (unlike <select>/<button>, it is never excluded from it) - this is what actually
         // paints its content, not any bespoke form-control content painting.
@@ -6142,9 +6167,9 @@ public sealed class HtmlRendererTests
         });
 
         Assert.DoesNotContain(displayList.Commands, c => c is DrawTextCommand t && t.Text.Contains("secret-token"));
-        // Filtered to width 150 (the form-control default) rather than a bare "no white fill at
+        // Filtered to the width of a form control rather than a bare "no white fill at
         // all", since the page's own default background is also a full-viewport white fill.
-        Assert.DoesNotContain(displayList.Commands, c => c is FillRectCommand f && f.Color.Equals(new RenderColor(255, 255, 255)) && f.Rect.Width == 160f);
+        Assert.DoesNotContain(displayList.Commands, c => c is FillRectCommand f && f.Color.Equals(new RenderColor(255, 255, 255)) && f.Rect.Width is > 100f and < 299f);
         // The visible sibling still renders normally - the hidden input contributes no box at all
         // to disrupt the layout around it, not just an invisible one.
         Assert.Single(displayList.Commands.OfType<FillRectCommand>().Where(f => f.Color.Equals(new RenderColor(0, 255, 0))));
@@ -9401,8 +9426,8 @@ public sealed class HtmlRendererTests
 
         var displayList = BuildDisplayList(document);
 
-        // the spacing goes between all of the five characters
-        Assert.Equal(SingleFill(displayList, Red).Rect.Width + 16f, SingleFill(displayList, Green).Rect.Width, precision: 1);
+        // the spacing goes after each of the five characters
+        Assert.Equal(SingleFill(displayList, Red).Rect.Width + 20f, SingleFill(displayList, Green).Rect.Width, precision: 1);
     }
 
     [Theory]

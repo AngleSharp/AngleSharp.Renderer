@@ -91,6 +91,59 @@ public sealed class IncrementalLayoutTests
     }
 
     [Fact]
+    public async Task ChangingABlockWithABoxPlacedAgainstAnAncestorGivesTheGeometryOfAFullLayout()
+    {
+        var (document, harness) = await ParseAsync("""
+            <!doctype html><html><body style="margin: 0">
+              <div id="block" style="position: relative; width: 200px">
+                <div id="part"><span id="text">text</span><div id="placed" style="position: absolute; right: 0; bottom: 0; width: 10px; height: 50%"></div></div>
+                <div id="rest" style="height: 80px"></div>
+              </div>
+            </body></html>
+            """);
+        _ = document.GetElementById("placed")!.GetBoundingClientRect();
+
+        document.GetElementById("text")!.TextContent = "a text that is a good bit longer than the first one, so that it wraps to a further line";
+
+        AssertSameAsFullLayout(document, harness, "block", "placed", "rest");
+    }
+
+    [Fact]
+    public async Task FillingAnEmptyBlockGivesTheGeometryOfAFullLayout()
+    {
+        var (document, harness) = await ParseAsync("""
+            <!doctype html><html><body style="margin: 0">
+              <div id="before" style="height: 10px"></div>
+              <div id="empty" style="margin: 30px 0"></div>
+              <div id="after" style="height: 10px"></div>
+            </body></html>
+            """);
+        _ = document.GetElementById("after")!.GetBoundingClientRect();
+
+        document.GetElementById("empty")!.TextContent = "now it has a line, which separates its margins";
+
+        AssertSameAsFullLayout(document, harness, "before", "empty", "after");
+    }
+
+    [Fact]
+    public async Task ChangingABlockInColumnsGivesTheGeometryOfAFullLayout()
+    {
+        var (document, harness) = await ParseAsync("""
+            <!doctype html><html><body style="margin: 0">
+              <div style="columns: 2; column-gap: 20px; width: 400px">
+                <div id="first" style="height: 40px; break-inside: avoid">a</div>
+                <div id="second" style="height: 40px; break-inside: avoid"><span id="text">b</span></div>
+              </div>
+            </body></html>
+            """);
+        _ = document.GetElementById("second")!.GetBoundingClientRect();
+
+        document.GetElementById("text")!.TextContent = "c";
+
+        AssertSameAsFullLayout(document, harness, "first", "second", "text");
+    }
+
+    [Fact]
     public async Task ChangingAClassASiblingSelectorRefersToGivesTheGeometryOfAFullLayout()
     {
         var (document, harness) = await ParseAsync(Page);

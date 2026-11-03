@@ -13,12 +13,23 @@ namespace AngleSharp.Renderer.Skia;
 /// The backend also measures text, so a renderer using it lays out against the same advance
 /// widths it paints with.
 /// </remarks>
-public sealed partial class SkiaRenderBackend : IPixelRenderBackend, ITextMeasurer
+public sealed partial class SkiaRenderBackend : IPixelRenderBackend, ITextMeasurer, IFontMetricsMeasurer
 {
     private readonly SkiaTextMeasurer _textMeasurer = new();
 
     /// <inheritdoc />
     public float MeasureWidth(string text, RenderFont font) => _textMeasurer.MeasureWidth(text, font);
+
+    (float Average, float Maximum) IFontMetricsMeasurer.MeasureCharacterWidths(RenderFont font) =>
+        ((IFontMetricsMeasurer)_textMeasurer).MeasureCharacterWidths(font);
+
+    (float Ascent, float Descent) IFontMetricsMeasurer.MeasureFontHeights(RenderFont font) => ((IFontMetricsMeasurer)_textMeasurer).MeasureFontHeights(font);
+
+    float IFontMetricsMeasurer.MeasureContentHeight(RenderFont font) =>
+        ((IFontMetricsMeasurer)_textMeasurer).MeasureContentHeight(font);
+
+    float IFontMetricsMeasurer.MeasureLineSpacing(RenderFont font) =>
+        ((IFontMetricsMeasurer)_textMeasurer).MeasureLineSpacing(font);
 
     /// <inheritdoc />
     public IReadOnlyList<int> GetClusterBoundaries(string text, RenderFont font) => _textMeasurer.GetClusterBoundaries(text, font);
@@ -93,6 +104,18 @@ public sealed partial class SkiaRenderBackend : IPixelRenderBackend, ITextMeasur
     {
         switch (command)
         {
+            case DrawSubframeCommand { Frame: { } subframe } drawSubframe:
+                canvas.Save();
+                canvas.ClipRect(new SKRect(drawSubframe.Viewport.X, drawSubframe.Viewport.Y, drawSubframe.Viewport.X + drawSubframe.Viewport.Width, drawSubframe.Viewport.Y + drawSubframe.Viewport.Height));
+                canvas.Translate(drawSubframe.Viewport.X, drawSubframe.Viewport.Y);
+
+                foreach (var nested in subframe.DisplayList.Commands)
+                {
+                    DrawCommand(canvas, nested, subframe.DisplayList.Fonts, state);
+                }
+
+                canvas.Restore();
+                break;
             case DrawBorderImageCommand borderImage:
                 DrawBorderImage(canvas, borderImage);
                 break;
@@ -1060,28 +1083,57 @@ public sealed partial class SkiaRenderBackend : IPixelRenderBackend, ITextMeasur
 
         SkiaTextShaping.DrawText(canvas, paint, command.Text, command.X, command.Y, command.LetterSpacing, font);
 
-        if (command.Underline || command.StrikeThrough)
+        if (command.Underline || command.Overline || command.StrikeThrough)
         {
+            var hasThickness = !float.IsNaN(command.DecorationThickness);
+            // the size the decoration is placed by, when the run is reduced from it (small caps)
+            var decorationSize = float.IsNaN(command.DecorationFontSize) ? command.FontSize : command.DecorationFontSize;
             using var decorationPaint = new SKPaint
             {
                 Color = ToSkColor(command.DecorationColor),
                 IsAntialias = true,
                 Style = SKPaintStyle.Stroke,
-                StrokeWidth = Math.Max(1f, command.FontSize / 14f),
+                StrokeWidth = hasThickness ? command.DecorationThickness : Math.Max(1f, decorationSize / 14f),
             };
 
+            // the wave of a line of a given thickness grows with it
+            var waveScale = hasThickness ? Math.Max(1f, command.DecorationThickness) : 1f;
             var textWidth = SkiaTextShaping.MeasureTextWidth(paint, command.Text, command.LetterSpacing, font);
 
             if (command.Underline)
             {
-                var underlineY = command.Y + Math.Max(1f, command.FontSize * 0.12f);
-                DrawDecorationLine(canvas, decorationPaint, command.X, underlineY, textWidth, command.DecorationStyle);
+                var underlineY = command.Y + Math.Max(1f, decorationSize * 0.12f);
+
+                if (hasThickness)
+                {
+                    // the line grows away from the text
+                    underlineY += (command.DecorationThickness - 1f) / 2f;
+
+                    if (command.DecorationStyle == RenderTextDecorationStyle.Wavy)
+                    {
+                        underlineY += WaveAmplitude(waveScale);
+                    }
+                }
+
+                DrawDecorationLine(canvas, decorationPaint, command.X, underlineY, textWidth, command.DecorationStyle, waveScale);
+            }
+
+            if (command.Overline)
+            {
+                var overlineY = command.Y + (paint.FontMetrics.Ascent * decorationSize / command.FontSize);
+
+                if (hasThickness && command.DecorationStyle == RenderTextDecorationStyle.Wavy)
+                {
+                    overlineY -= WaveAmplitude(waveScale);
+                }
+
+                DrawDecorationLine(canvas, decorationPaint, command.X, overlineY, textWidth, command.DecorationStyle, waveScale);
             }
 
             if (command.StrikeThrough)
             {
-                var strikeY = command.Y - (command.FontSize * 0.32f);
-                DrawDecorationLine(canvas, decorationPaint, command.X, strikeY, textWidth, command.DecorationStyle);
+                var strikeY = command.Y - (decorationSize * 0.32f);
+                DrawDecorationLine(canvas, decorationPaint, command.X, strikeY, textWidth, command.DecorationStyle, waveScale);
             }
         }
     }
@@ -1114,12 +1166,12 @@ public sealed partial class SkiaRenderBackend : IPixelRenderBackend, ITextMeasur
         SkiaTextShaping.DrawText(canvas, paint, command.Text, command.X, command.Y, command.LetterSpacing, font);
     }
 
-    private static void DrawDecorationLine(SKCanvas canvas, SKPaint paint, float x, float y, float width, RenderTextDecorationStyle style)
+    private static void DrawDecorationLine(SKCanvas canvas, SKPaint paint, float x, float y, float width, RenderTextDecorationStyle style, float waveScale)
     {
         switch (style)
         {
             case RenderTextDecorationStyle.Wavy:
-                DrawWavyLine(canvas, paint, x, y, width);
+                DrawWavyLine(canvas, paint, x, y, width, waveScale);
                 break;
             case RenderTextDecorationStyle.Dashed:
                 DrawPatternedLine(canvas, paint, x, y, width, dashLength: 6f, gapLength: 4f);
@@ -1133,11 +1185,13 @@ public sealed partial class SkiaRenderBackend : IPixelRenderBackend, ITextMeasur
         }
     }
 
-    private static void DrawWavyLine(SKCanvas canvas, SKPaint paint, float x, float y, float width)
+    private static float WaveAmplitude(float scale) => 0.5f + scale;
+
+    private static void DrawWavyLine(SKCanvas canvas, SKPaint paint, float x, float y, float width, float scale)
     {
         using var path = new SKPath();
-        var wavelength = 8f;
-        var amplitude = 1.5f;
+        var wavelength = 4f * (1f + scale);
+        var amplitude = WaveAmplitude(scale);
         var steps = Math.Max(1, (int)Math.Ceiling(width / 2f));
 
         path.MoveTo(x, y);

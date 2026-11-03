@@ -4,6 +4,9 @@ using AngleSharp;
 using AngleSharp.Attributes;
 using AngleSharp.Dom.Geometry;
 using AngleSharp.Renderer;
+using AngleSharp.Renderer.Rendering;
+using System.Collections;
+using System.Linq;
 
 /// <summary>
 /// Provides CSSOM View-style geometry helpers for elements.
@@ -24,7 +27,29 @@ public static class ElementCssomViewExtensions
             return new DomRect();
         }
 
-        return new DomRect(metrics.BorderBoxX, metrics.BorderBoxY, metrics.BorderBoxWidth, metrics.BorderBoxHeight);
+        var box = ApplyTransforms(element, metrics.ReportedBox);
+        return new DomRect(box.X, box.Y, box.Width, box.Height);
+    }
+
+    // the box where it is painted: under the transforms of the element and the ones around it
+    private static RenderRect ApplyTransforms(IElement element, RenderRect box)
+    {
+        if (element.Owner is not { } owner || owner.Context.GetDomHarness() is not InteractiveHtmlRendererState state)
+        {
+            return box;
+        }
+
+        var styles = state.GetLayoutSnapshot(owner).StyleMaps;
+
+        for (var current = element; current is not null; current = current.ParentElement)
+        {
+            if (styles.TryGetValue(current, out var style) && HtmlRenderer.HasTransform(style) && GetViewportMetrics(current) is { } metrics)
+            {
+                box = HtmlRenderer.ResolveTransform(style, metrics).MapBounds(box);
+            }
+        }
+
+        return box;
     }
 
     /// <summary>
@@ -37,18 +62,19 @@ public static class ElementCssomViewExtensions
 
         if (GetViewportMetrics(element) is not { } metrics)
         {
-            return new DomRectList();
+            return new ClientRectList([]);
         }
 
-        if (metrics.BorderBoxWidth <= 0f && metrics.BorderBoxHeight <= 0f)
+        if (metrics.Fragments is { } fragments)
         {
-            return new DomRectList();
+            return new ClientRectList(fragments.Select(fragment => (IDomRect)new DomRect(metrics.BorderBoxX + fragment.X, metrics.BorderBoxY + fragment.Y, fragment.Width, fragment.Height)).ToList());
         }
 
-        return new DomRectList(new IDomRect[]
-        {
-            new DomRect(metrics.BorderBoxX, metrics.BorderBoxY, metrics.BorderBoxWidth, metrics.BorderBoxHeight),
-        });
+        var box = ApplyTransforms(element, metrics.ReportedBox);
+
+        return box.Width <= 0f && box.Height <= 0f
+            ? new ClientRectList([])
+            : new ClientRectList([new DomRect(box.X, box.Y, box.Width, box.Height)]);
     }
 
     /// <summary>
@@ -284,7 +310,7 @@ public static class ElementCssomViewExtensions
     [DomAccessor(Accessors.Getter)]
     public static int GetOffsetWidth(this IElement element)
     {
-        return GetRoundedDimension(element, static metrics => metrics.BorderBoxWidth);
+        return GetRoundedDimension(element, static metrics => metrics.ReportedBox.Width);
     }
 
     /// <summary>
@@ -294,7 +320,7 @@ public static class ElementCssomViewExtensions
     [DomAccessor(Accessors.Getter)]
     public static int GetOffsetHeight(this IElement element)
     {
-        return GetRoundedDimension(element, static metrics => metrics.BorderBoxHeight);
+        return GetRoundedDimension(element, static metrics => metrics.ReportedBox.Height);
     }
 
     /// <summary>
@@ -406,7 +432,7 @@ public static class ElementCssomViewExtensions
 
     // The box of the element in the viewport: the metrics are laid out unscrolled, so this is
     // where the page's scroll position (and sticky boxes sticking for it) come in.
-    private static HtmlRenderer.ElementLayoutMetrics? GetViewportMetrics(IElement element)
+    internal static HtmlRenderer.ElementLayoutMetrics? GetViewportMetrics(IElement element)
     {
         var owner = element.Owner;
 
@@ -445,6 +471,14 @@ public static class ElementCssomViewExtensions
         if (metricsMap is null || !metricsMap.TryGetValue(element, out var elementMetrics))
         {
             return (0, 0);
+        }
+
+        // the rows of a list box are painted, so no box tells how far they extend
+        if (HtmlRenderer.IsListBox(element) && HtmlRenderer.TryGetListBoxContentHeight(element, out var listBoxHeight))
+        {
+            var verticalInsets = elementMetrics.PaddingTop + elementMetrics.PaddingBottom;
+            var clientBoxHeight = elementMetrics.BorderBoxHeight - elementMetrics.BorderTop - elementMetrics.BorderBottom;
+            return ((int)Math.Round(elementMetrics.BorderBoxWidth - elementMetrics.BorderLeft - elementMetrics.BorderRight), (int)Math.Ceiling(Math.Max(clientBoxHeight, listBoxHeight + verticalInsets)));
         }
 
         var clientWidth = Math.Max(0d, elementMetrics.BorderBoxWidth - elementMetrics.BorderLeft - elementMetrics.BorderRight);
@@ -622,4 +656,29 @@ public static class ElementCssomViewExtensions
         var clientHeight = Math.Max(0d, metrics.BorderBoxHeight - metrics.BorderTop - metrics.BorderBottom);
         return element.GetScrollWidth() > clientWidth || element.GetScrollHeight() > clientHeight;
     }
+}
+
+/// <summary>
+/// The boxes of an element, which scripts read as a list (`getClientRects()[0]`, too).
+/// </summary>
+[DomName("DOMRectList")]
+internal sealed class ClientRectList : IDomRectList
+{
+    private readonly IReadOnlyList<IDomRect> _items;
+
+    public ClientRectList(IReadOnlyList<IDomRect> items) => _items = items;
+
+    [DomName("length")]
+    public int Length => _items.Count;
+
+    [System.Runtime.CompilerServices.IndexerName("ItemAt")]
+    [DomAccessor(Accessors.Getter)]
+    public IDomRect? this[int index] => Item(index);
+
+    [DomName("item")]
+    public IDomRect? Item(int index) => index >= 0 && index < _items.Count ? _items[index] : null;
+
+    public IEnumerator<IDomRect> GetEnumerator() => _items.GetEnumerator();
+
+    IEnumerator IEnumerable.GetEnumerator() => GetEnumerator();
 }

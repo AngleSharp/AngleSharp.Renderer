@@ -34,6 +34,7 @@ public sealed partial class HtmlRenderer
         Normal,
         SmallCaps,
         AllSmallCaps,
+        Unicase,
     }
 
     private static HyphensMode ParseHyphens(Dictionary<string, string> styleMap, HyphensMode inherited)
@@ -161,11 +162,13 @@ public sealed partial class HtmlRenderer
         {
             switch (token.ToLowerInvariant())
             {
-                // Without the font feature, petite caps and unicase fall back to small caps.
+                // Without the font feature, petite caps fall back to small caps.
                 case "small-caps":
                 case "petite-caps":
-                case "unicase":
                     mode = FontVariantCapsMode.SmallCaps;
+                    break;
+                case "unicase":
+                    mode = FontVariantCapsMode.Unicase;
                     break;
                 case "all-small-caps":
                 case "all-petite-caps":
@@ -212,39 +215,66 @@ public sealed partial class HtmlRenderer
     }
 
     /// <summary>
-    /// Splits text into runs for synthesized small capitals: lowercase letters (every letter for
-    /// <c>all-small-caps</c>) become uppercase at <see cref="SmallCapsScale"/> of the font size.
-    /// Non-letters join the run before them, so words are not cut into pieces needlessly.
+    /// Splits text into runs for synthesized small capitals, in the reduced size of
+    /// <see cref="SmallCapsScale"/> or the full one. As in browsers, <c>small-caps</c> reduces
+    /// lowercase letters to capitals and nothing else, <c>all-small-caps</c> everything, also digits
+    /// and punctuation, and <c>unicase</c> everything but lowercase letters, which stay as they are.
+    /// Marks and format characters stay with the character before them.
     /// </summary>
     private static List<(string Text, bool Reduced)> SplitSmallCaps(string text, FontVariantCapsMode mode)
     {
         var runs = new List<(string Text, bool Reduced)>();
         var current = new StringBuilder();
-        var currentReduced = false;
+        var currentIsLower = false;
+
+        // Lowercase letters and the rest are always shaped apart, also when both are reduced.
+        bool IsReduced(bool isLower) => mode switch
+        {
+            FontVariantCapsMode.AllSmallCaps => true,
+            FontVariantCapsMode.Unicase => !isLower,
+            _ => isLower,
+        };
 
         foreach (var rune in text.EnumerateRunes())
         {
-            var reduced = Rune.IsLetter(rune)
-                ? mode == FontVariantCapsMode.AllSmallCaps || Rune.IsLower(rune)
-                : current.Length > 0 && currentReduced;
+            var isLower = current.Length > 0 && StaysWithPreviousCharacter(rune) ? currentIsLower : Rune.IsLower(rune);
 
-            if (current.Length > 0 && reduced != currentReduced)
+            if (current.Length > 0 && isLower != currentIsLower)
             {
-                runs.Add((current.ToString(), currentReduced));
+                runs.Add((current.ToString(), IsReduced(currentIsLower)));
                 current.Clear();
             }
 
-            currentReduced = reduced;
-            current.Append(reduced ? Rune.ToUpperInvariant(rune).ToString() : rune.ToString());
+            currentIsLower = isLower;
+            current.Append(IsReduced(isLower) && mode != FontVariantCapsMode.Unicase ? ToSmallCapsCapital(rune) : rune.ToString());
         }
 
         if (current.Length > 0)
         {
-            runs.Add((current.ToString(), currentReduced));
+            runs.Add((current.ToString(), IsReduced(currentIsLower)));
         }
 
         return runs;
     }
+
+    private static bool StaysWithPreviousCharacter(Rune rune) =>
+        Rune.GetUnicodeCategory(rune) is UnicodeCategory.NonSpacingMark or UnicodeCategory.EnclosingMark or UnicodeCategory.SpacingCombiningMark or UnicodeCategory.Format;
+
+    /// <summary>
+    /// The capitals of a character, including the Latin ones that are several letters, which
+    /// the simple mapping of <see cref="Rune.ToUpperInvariant"/> leaves as they are.
+    /// </summary>
+    private static string ToSmallCapsCapital(Rune rune) => rune.Value switch
+    {
+        0x00DF => "SS",
+        0xFB00 => "FF",
+        0xFB01 => "FI",
+        0xFB02 => "FL",
+        0xFB03 => "FFI",
+        0xFB04 => "FFL",
+        0xFB05 or 0xFB06 => "ST",
+        _ => Rune.ToUpperInvariant(rune).ToString(),
+    };
 
     /// <summary>
     /// The inherited properties that select OpenType features, each as authored (or inherited).
@@ -395,9 +425,12 @@ public sealed partial class HtmlRenderer
         }
         else
         {
+            // the decoration runs along all of them at the place and in the thickness of the full size
+            var decorationStyle = style with { DecorationFontSize = style.FontSize };
+
             foreach (var (run, reduced) in SplitSmallCaps(text, style.VariantCaps))
             {
-                var runStyle = reduced ? WithSmallCapsSize(style) : style with { VariantCaps = FontVariantCapsMode.Normal };
+                var runStyle = reduced ? WithSmallCapsSize(decorationStyle) : decorationStyle with { VariantCaps = FontVariantCapsMode.Normal };
                 DrawPlainText(displayList, run, x, y, runStyle, decorate);
                 x += MeasureTextWidth(context, run, runStyle);
             }
@@ -411,7 +444,8 @@ public sealed partial class HtmlRenderer
 
     private static void DrawPlainText(DisplayList displayList, string text, float x, float y, RenderTextStyle style, bool decorate)
     {
-        if (string.IsNullOrWhiteSpace(text))
+        // a space has nothing to paint, unless it is a run of its own that a decoration has to cross
+        if (string.IsNullOrWhiteSpace(text) && !(decorate && float.IsFinite(style.DecorationFontSize) && text.Length > 0 && (style.Underline || style.Overline || style.StrikeThrough)))
         {
             return;
         }
@@ -440,6 +474,9 @@ public sealed partial class HtmlRenderer
             style.FontFeatures,
             style.Language,
             style.ShapingContextBefore,
-            style.ShapingContextAfter);
+            style.ShapingContextAfter,
+            decorate && style.Overline,
+            style.DecorationThickness,
+            style.DecorationFontSize);
     }
 }

@@ -128,9 +128,7 @@ public sealed class TextShapingTests
         Assert.Equal(expected, text.FontFeatures);
     }
 
-    // AngleSharp.Css parses `font-variant-east-asian` from 1.3.1 on (verified against the sibling
-    // checkout); remove the skip once AngleSharpCssVersion is raised to it.
-    [Fact(Skip = "Needs AngleSharp.Css 1.3.1, which parses font-variant-east-asian")]
+    [Fact]
     public async Task FontVariantEastAsian_SelectsOpenTypeFeatures()
     {
         var text = await LayoutSingleTextAsync("<p style='font-variant-east-asian:jis04 full-width ruby'>Text</p>");

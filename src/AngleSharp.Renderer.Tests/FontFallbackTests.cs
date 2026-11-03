@@ -32,6 +32,33 @@ public sealed class FontFallbackTests
     }
 
     [Fact]
+    public void SpaceAfterAnEmoji_KeepsTheWidthOfTheTextFont()
+    {
+        // the space of a color emoji font is as wide as its emoji (about 1.25em)
+        var font = Font("sans-serif");
+        var space = Measurer.MeasureWidth("a b", font) - Measurer.MeasureWidth("ab", font);
+        var afterEmoji = Measurer.MeasureWidth("\U0001F47C b", font) - Measurer.MeasureWidth("\U0001F47C", font) - Measurer.MeasureWidth("b", font);
+
+        Assert.Equal(space, afterEmoji, tolerance: 0.01f);
+    }
+
+    [Theory]
+    [InlineData("\U0001F47C")] // the bundled DejaVu has this one in monochrome
+    [InlineData("❤️")] // made an emoji by its selector
+    [InlineData("\U0001F468‍\U0001F469‍\U0001F467")] // joined into one glyph
+    public void Emoji_PreferTheColorFontOfTheHost(string emoji)
+    {
+        if (!SKFontManager.Default.FontFamilies.Contains("Noto Color Emoji"))
+        {
+            return;
+        }
+
+        Assert.Equal(Measurer.MeasureWidth(emoji, Font("Noto Color Emoji")), Measurer.MeasureWidth(emoji, Font("sans-serif")), tolerance: 0.01f);
+    }
+
+    private static RenderFont Font(string family) => new(family, 16f, 400f, false, 0f);
+
+    [Fact]
     public void MissingFamily_OnItsOwn_FallsBackToTheDefault()
     {
         // Nothing in the list is available, so the renderer's own default takes over. It has to be
@@ -142,6 +169,20 @@ public sealed class FontFallbackTests
         var mixed = Width("ab" + SerifLacks + "cd", "serif");
 
         Assert.Equal(Width("ab", "serif") + Width(SerifLacks, "sans-serif") + Width("cd", "serif"), mixed, tolerance: 0.05f);
+    }
+
+    [Theory]
+    [InlineData("serif")]
+    [InlineData("sans-serif")]
+    public void SpaceBetweenFallbackWords_ComesFromThePrimaryFont(string fontFamily)
+    {
+        // as in browsers; the bundled Devanagari font is fallback-only, with a space of its own
+        const string Word = "\u0928\u092E";
+
+        Assert.Equal(
+            (2f * Width(Word, fontFamily)) + Width(" ", fontFamily),
+            Width(Word + " " + Word, fontFamily),
+            tolerance: 0.01f);
     }
 
     private static float Width(string text, string fontFamily) =>

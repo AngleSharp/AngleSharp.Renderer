@@ -7,7 +7,7 @@ using SkiaSharp;
 /// <summary>
 /// Measures text with the same typefaces and paint settings <see cref="SkiaRenderBackend"/> paints with.
 /// </summary>
-public sealed class SkiaTextMeasurer : ITextMeasurer
+public sealed class SkiaTextMeasurer : ITextMeasurer, IFontMetricsMeasurer
 {
     // Layout measures once per word, so the paints are cached. They are kept per thread because
     // SKPaint is not safe to share across threads, and typeface resolution behind them is already
@@ -80,6 +80,49 @@ public sealed class SkiaTextMeasurer : ITextMeasurer
         }
 
         return height;
+    }
+
+    (float Average, float Maximum) IFontMetricsMeasurer.MeasureCharacterWidths(RenderFont font)
+    {
+        var metrics = SkiaTextShaping.GetFontTableMetrics(GetPaint(font).Typeface);
+        // not every font states its average
+        return (metrics.AverageWidth > 0f ? metrics.AverageWidth * font.FontSize : MeasureWidth("0", font), metrics.MaximumWidth * font.FontSize);
+    }
+
+    float IFontMetricsMeasurer.MeasureContentHeight(RenderFont font)
+    {
+        var (ascent, descent) = ((IFontMetricsMeasurer)this).MeasureFontHeights(font);
+        return ascent + descent;
+    }
+
+    (float Ascent, float Descent) IFontMetricsMeasurer.MeasureFontHeights(RenderFont font)
+    {
+        var metrics = SkiaTextShaping.GetFontTableMetrics(GetPaint(font).Typeface);
+
+        // not every font states them
+        if (metrics.Ascent <= 0f && metrics.Descent <= 0f)
+        {
+            using var skFont = new SKFont(GetPaint(font).Typeface, font.FontSize);
+            return (MathF.Round(-skFont.Metrics.Ascent, MidpointRounding.AwayFromZero), MathF.Round(skFont.Metrics.Descent, MidpointRounding.AwayFromZero));
+        }
+
+        // each one is rounded on its own, as in Blink
+        return (MathF.Round(metrics.Ascent * font.FontSize, MidpointRounding.AwayFromZero),
+            MathF.Round(metrics.Descent * font.FontSize, MidpointRounding.AwayFromZero));
+    }
+
+    float IFontMetricsMeasurer.MeasureLineSpacing(RenderFont font)
+    {
+        var metrics = SkiaTextShaping.GetFontTableMetrics(GetPaint(font).Typeface);
+        var content = ((IFontMetricsMeasurer)this).MeasureContentHeight(font);
+
+        if (metrics.Ascent <= 0f && metrics.Descent <= 0f)
+        {
+            using var skFont = new SKFont(GetPaint(font).Typeface, font.FontSize);
+            return content + skFont.Metrics.Leading;
+        }
+
+        return content + MathF.Round(metrics.LineGap * font.FontSize, MidpointRounding.AwayFromZero);
     }
 
     /// <inheritdoc />
