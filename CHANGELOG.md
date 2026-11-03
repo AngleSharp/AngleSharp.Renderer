@@ -1,6 +1,6 @@
 # 0.10.0
 
-Released on Tuesday, November 3 2026.
+Released on Wednesday, November 4 2026.
 
 - Fixed synthesized small caps: digits, punctuation and spaces keep the full size with `small-caps` and are reduced with `all-small-caps`, `unicase` reduces everything but lowercase letters instead of acting as `small-caps`, `ß` and Latin ligatures become their capitals, letter spacing applies where the size changes, and a decoration crosses spaces in one size
 - Fixed spaces between words of a fallback font being as wide as that font's space instead of the first font's
