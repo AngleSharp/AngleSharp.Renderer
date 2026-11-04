@@ -188,6 +188,6 @@ public sealed partial class HtmlRenderer
         var hitTestMap = HitTestMap.Create(document, metrics, styleMaps, -overscan, snapshot.Subframes);
         var contentHeight = Math.Max(height, (double)contentBottom);
         // fixed boxes are marked in the display list, sticky ones would have to stick anew
-        return new RenderedFrame(displayList, _backend, surface, height, scrollTop, overscan, contentHeight, isScrollShiftable, !hasStickyBoxes, hitTestMap);
+        return new RenderedFrame(displayList, _backend, surface, height, scrollTop, overscan, contentHeight, isScrollShiftable, !hasStickyBoxes, hitTestMap, document: document);
     }
 }

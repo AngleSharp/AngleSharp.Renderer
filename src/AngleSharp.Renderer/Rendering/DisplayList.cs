@@ -473,6 +473,17 @@ public sealed record PopTransformCommand : RenderCommand;
 public sealed record PushViewportAnchorCommand : RenderCommand;
 
 /// <summary>
+/// Starts what is painted for a run of text that can be selected (nothing, for a space), which
+/// paints nothing by itself. See <see cref="HtmlRenderer.TextMap"/>.
+/// </summary>
+internal sealed record PushTextFragmentCommand(HtmlRenderer.TextFragment Fragment) : RenderCommand;
+
+/// <summary>
+/// Ends the run started by the matching <see cref="PushTextFragmentCommand"/>.
+/// </summary>
+internal sealed record PopTextFragmentCommand : RenderCommand;
+
+/// <summary>
 /// Ends the box started by the matching <see cref="PushViewportAnchorCommand"/>.
 /// </summary>
 public sealed record PopViewportAnchorCommand : RenderCommand;

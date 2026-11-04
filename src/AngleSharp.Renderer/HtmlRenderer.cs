@@ -157,6 +157,9 @@ public sealed partial class HtmlRenderer
     {
         // only needed for what the render tree does not hold (e.g. ::placeholder), so it is built on demand
         public IStyleCollection? StyleCollection => LazyStyleCollection.Value;
+
+        /// <summary>Whether painted text says where it comes from, for selecting it (see <see cref="TextFragment"/>).</summary>
+        public bool RecordsTextFragments { get; init; }
     }
 
     /// <summary>
@@ -443,7 +446,10 @@ public sealed partial class HtmlRenderer
             // The blocks laying out their children, innermost on top (see PositionedScope).
             PositionedScopes: new Stack<PositionedScope>(),
             IsQuirksMode: document.CompatMode == "BackCompat",
-            Subframes: new Dictionary<IElement, SubframeEntry>(ReferenceEqualityComparer.Instance));
+            Subframes: new Dictionary<IElement, SubframeEntry>(ReferenceEqualityComparer.Instance))
+        {
+            RecordsTextFragments = ShouldRecordTextFragments(document),
+        };
     }
 
     /// <summary>
@@ -653,7 +659,7 @@ public sealed partial class HtmlRenderer
 
         var context = CreateLayoutContext(document, renderDevice, _textMeasurer);
         var viewport = new RenderViewport(context.Width, context.Height);
-        var displayList = BuildDisplayList(document, viewport, context, renderDevice, ResolveRootScrollOffsetY(document));
+        var displayList = WithSelectionPainted(document, context, BuildDisplayList(document, viewport, context, renderDevice, ResolveRootScrollOffsetY(document)));
 
         return _backend.RenderToPng(displayList, viewport);
     }
@@ -683,7 +689,7 @@ public sealed partial class HtmlRenderer
 
         var context = CreateLayoutContext(document, renderDevice, _textMeasurer);
         var viewport = new RenderViewport(context.Width, context.Height);
-        return BuildDisplayList(document, viewport, context, renderDevice, ResolveRootScrollOffsetY(document));
+        return WithSelectionPainted(document, context, BuildDisplayList(document, viewport, context, renderDevice, ResolveRootScrollOffsetY(document)));
     }
 
     /// <summary>
@@ -2905,7 +2911,7 @@ public sealed partial class HtmlRenderer
                         // laid out on its own in its anonymous flex item
                         var textCursorY = childY;
                         var textWidth = isRowDirection ? finalMainSize : resolvedCrossSize > 0f ? resolvedCrossSize : containingWidth;
-                        LayoutWrappedText(PrepareFlexItemText(textNode, inheritedTextStyle, context), childX, textWidth, ref textCursorY, inheritedTextStyle, context, displayList, maxY, 0f);
+                        LayoutWrappedText(PrepareFlexItemText(textNode, inheritedTextStyle, context), childX, textWidth, ref textCursorY, inheritedTextStyle, context, displayList, maxY, 0f, textSource: textNode.Ref);
                     }
                     else if (item.Node is ElementRenderNode elementChild)
                     {
@@ -5220,8 +5226,11 @@ public sealed partial class HtmlRenderer
         DisplayList displayList,
         float maxY,
         float firstLineIndent,
-        INode? source = null)
+        INode? source = null,
+        IText? textSource = null)
     {
+        textSource ??= source as IText;
+        var sourcePosition = 0;
         var lineHeight = textStyle.FontSize * textStyle.LineHeightMultiplier;
         var forcedBreakLines = new HashSet<int>();
         var lines = WrapTextRespectingWhiteSpace(context, text, maxWidth, textStyle, forcedBreakLines);
@@ -5257,6 +5266,20 @@ public sealed partial class HtmlRenderer
         for (var index = 0; index < lines.Count; index++)
         {
             var line = lines[index];
+            var lineSourceStart = sourcePosition;
+            var lineTop = cursorY;
+
+            if (textSource is not null && RecordsTextFragments(context))
+            {
+                sourcePosition = TextSourceMap.Align(textSource.Data, sourcePosition, line, default);
+            }
+
+            // the part of the line from the given character on, as far as it is painted
+            TextFragment? CreateFragment(string text, int start, float fragmentX, RenderTextStyle style, float? fixedWidth = null) =>
+                textSource is not null && RecordsTextFragments(context)
+                    ? CreateTextFragment(context, text, [new TextSegment(textSource, TextSourceMap.Align(textSource.Data, lineSourceStart, line.AsSpan(0, Math.Min(start, line.Length)), default), 0, text.Length)], fragmentX, lineTop, lineHeight, style, fixedWidth)
+                    : null;
+
             RecordColumnLine(cursorY, cursorY + lineHeight);
             cursorY += lineHeight;
 
@@ -5306,17 +5329,20 @@ public sealed partial class HtmlRenderer
             if (needsReordering)
             {
                 var runX = lineX;
+                var usedRuns = new bool[line.Length];
 
                 foreach (var (run, isRightToLeft) in BidiAlgorithm.GetVisualRuns(line, textStyle.Direction == TextDirection.Rtl))
                 {
                     var runStyle = textStyle with { IsRightToLeftRun = isRightToLeft };
+                    var runWidth = MeasureTextWidth(context, run, runStyle) + (CountSpaces(run) * textStyle.WordSpacing);
+                    var fragment = RecordsTextFragments(context) ? CreateFragment(run, FindUnusedRun(line, run, usedRuns), runX, runStyle, string.IsNullOrWhiteSpace(run) ? runWidth : null) : null;
 
-                    if (!string.IsNullOrWhiteSpace(run))
+                    if (!string.IsNullOrWhiteSpace(run) || fragment is not null)
                     {
-                        DrawStyledText(context, displayList, run, runX, baselineY, runStyle);
+                        DrawTextFragment(context, displayList, run, runX, baselineY, runStyle, fragment);
                     }
 
-                    runX += MeasureTextWidth(context, run, runStyle) + (CountSpaces(run) * textStyle.WordSpacing);
+                    runX += runWidth;
                 }
 
                 continue;
@@ -5328,6 +5354,7 @@ public sealed partial class HtmlRenderer
                 var spaceAdvance = MeasureTextWidth(context, " ", textStyle) + textStyle.WordSpacing + justifyExtra;
                 var wordX = lineX;
                 var words = line.Split(' ');
+                var wordStart = 0;
 
                 for (var wordIndex = 0; wordIndex < words.Length; wordIndex++)
                 {
@@ -5335,20 +5362,44 @@ public sealed partial class HtmlRenderer
 
                     if (word.Length > 0)
                     {
-                        DrawStyledText(context, displayList, word, wordX, baselineY, textStyle);
+                        DrawTextFragment(context, displayList, word, wordX, baselineY, textStyle, CreateFragment(word, wordStart, wordX, textStyle));
                         wordX += MeasureTextWidth(context, word, textStyle);
                     }
 
-                    wordX += word.Length > 0 && wordIndex + 1 < words.Length && words[wordIndex + 1].Length > 0
+                    var gap = word.Length > 0 && wordIndex + 1 < words.Length && words[wordIndex + 1].Length > 0
                         ? MeasureSpaceBetween(context, word, words[wordIndex + 1], textStyle) + justifyExtra
                         : spaceAdvance;
+                    wordStart += word.Length;
+
+                    if (wordIndex + 1 < words.Length && CreateFragment(" ", wordStart, wordX, textStyle, gap) is { } spaceFragment)
+                    {
+                        DrawTextFragment(context, displayList, " ", wordX, baselineY, textStyle, spaceFragment);
+                    }
+
+                    wordX += gap;
+                    wordStart++;
                 }
 
                 continue;
             }
 
-            DrawStyledText(context, displayList, line, lineX, baselineY, textStyle);
+            DrawTextFragment(context, displayList, line, lineX, baselineY, textStyle, CreateFragment(line, 0, lineX, textStyle));
         }
+    }
+
+    // where a run of a line is, the first place not yet taken by a run of the same text
+    private static int FindUnusedRun(string line, string run, bool[] used)
+    {
+        for (var start = line.IndexOf(run, StringComparison.Ordinal); start >= 0 && start < line.Length; start = line.IndexOf(run, start + 1, StringComparison.Ordinal))
+        {
+            if (!used[start])
+            {
+                Array.Fill(used, true, start, run.Length);
+                return start;
+            }
+        }
+
+        return 0;
     }
 
     private static int CountSpaces(string text)

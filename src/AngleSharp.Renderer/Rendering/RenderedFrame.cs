@@ -14,9 +14,14 @@ public sealed class RenderedFrame
     private readonly float _shiftY;
     // what is shown on top of the page, see WithOverlay
     private readonly DisplayList? _overlay;
+    // the display list with the selection painted into it, see WithSelection
+    private readonly DisplayList? _selection;
+    private HtmlRenderer.TextMap? _textMap;
+    private readonly AngleSharp.Dom.IDocument? _document;
 
-    internal RenderedFrame(DisplayList displayList, IRenderBackend backend, RenderViewport surface, int viewportHeight, double scrollTop, int overscanTop, double contentHeight, bool isScrollShiftable, bool canReposition, HitTestMap hitTestMap, float shiftY = 0f)
+    internal RenderedFrame(DisplayList displayList, IRenderBackend backend, RenderViewport surface, int viewportHeight, double scrollTop, int overscanTop, double contentHeight, bool isScrollShiftable, bool canReposition, HitTestMap hitTestMap, float shiftY = 0f, AngleSharp.Dom.IDocument? document = null)
     {
+        _document = document;
         CanReposition = canReposition;
         _displayList = displayList;
         _backend = backend;
@@ -30,11 +35,20 @@ public sealed class RenderedFrame
         HitTestMap = hitTestMap;
     }
 
-    private RenderedFrame(RenderedFrame frame, DisplayList overlay)
-        : this(frame._displayList, frame._backend, frame._surface, frame.ViewportHeight, frame.ScrollTop, frame.OverscanTop, frame.ContentHeight, frame.IsScrollShiftable, frame.CanReposition, frame.HitTestMap, frame._shiftY)
+    private RenderedFrame(RenderedFrame frame, DisplayList? overlay, DisplayList? selection)
+        : this(frame._displayList, frame._backend, frame._surface, frame.ViewportHeight, frame.ScrollTop, frame.OverscanTop, frame.ContentHeight, frame.IsScrollShiftable, frame.CanReposition, frame.HitTestMap, frame._shiftY, frame._document)
     {
         IsAnimating = frame.IsAnimating;
         _overlay = overlay;
+        _selection = selection;
+        _textMap = frame._textMap;
+    }
+
+    private RenderedFrame(DisplayList displayList, RenderedFrame frame, double scrollTop, HitTestMap hitTestMap, float shiftY)
+        : this(displayList, frame._backend, frame._surface, frame.ViewportHeight, scrollTop, frame.OverscanTop, frame.ContentHeight, frame.IsScrollShiftable, true, hitTestMap, shiftY, frame._document)
+    {
+        _selection = frame._selection;
+        _textMap = frame._textMap;
     }
 
     /// <summary>
@@ -108,7 +122,7 @@ public sealed class RenderedFrame
         }
 
         var delta = (float)(ScrollTop - scrollTop);
-        return new RenderedFrame(_displayList, _backend, _surface, ViewportHeight, scrollTop, OverscanTop, ContentHeight, IsScrollShiftable, true, HitTestMap.Shift(delta), _shiftY + delta);
+        return new RenderedFrame(_displayList, this, scrollTop, HitTestMap.Shift(delta), _shiftY + delta);
     }
 
     /// <summary>
@@ -119,8 +133,17 @@ public sealed class RenderedFrame
     public RenderedFrame WithOverlay(DisplayList overlay)
     {
         ArgumentNullException.ThrowIfNull(overlay);
-        return new RenderedFrame(this, overlay);
+        return new RenderedFrame(this, overlay, _selection);
     }
+
+    /// <summary>
+    /// The frame with the given display list (the frame's own with a selection painted into it)
+    /// painted instead, which needs no layout.
+    /// </summary>
+    internal RenderedFrame WithSelection(DisplayList selection) => new(this, _overlay, selection);
+
+    /// <summary>Gets where the text of the frame is, as laid out (before any shift).</summary>
+    internal HtmlRenderer.TextMap TextMap => _textMap ??= new HtmlRenderer.TextMap(_displayList, OverscanTop, _document!);
 
     /// <summary>
     /// Rasterizes the frame into pixels. Safe to call from any thread.
@@ -161,18 +184,20 @@ public sealed class RenderedFrame
 
     private DisplayList GetPageDisplayList()
     {
+        var displayList = _selection ?? _displayList;
+
         if (_shiftY == 0f)
         {
-            return _displayList;
+            return displayList;
         }
 
         // the surface stays white where the moved page no longer covers it
-        var shifted = new DisplayList { Fonts = _displayList.Fonts };
+        var shifted = new DisplayList { Fonts = displayList.Fonts };
         shifted.FillRect(new RenderRect(0f, 0f, _surface.Width, _surface.Height), RenderColor.White);
         shifted.PushTransform(RenderTransform2D.Translate(0f, _shiftY));
         var anchorDepth = 0;
 
-        foreach (var command in _displayList.Commands)
+        foreach (var command in displayList.Commands)
         {
             // fixed boxes take the shift back (nested ones are inside the outermost already)
             if (command is PushViewportAnchorCommand && anchorDepth++ == 0)

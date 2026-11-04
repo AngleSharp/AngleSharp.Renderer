@@ -1,3 +1,9 @@
+# 0.11.0
+
+Released on Friday, November 6 2026.
+
+- Added text selection to interactive documents: selecting with the pointer through the harness (`BeginTextSelection`, `ExtendTextSelection`, `EndTextSelection`, also by word and paragraph), `SelectAllText`, `SelectedText`, the setting `IsTextSelectionEnabled`, the DOM's `getSelection()` with `selectstart` and `selectionchange`, `user-select`, and `::selection` as soon as AngleSharp and AngleSharp.Css know it
+
 # 0.10.0
 
 Released on Wednesday, November 4 2026.

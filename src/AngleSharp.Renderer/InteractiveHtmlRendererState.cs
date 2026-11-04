@@ -10,7 +10,7 @@ namespace AngleSharp.Renderer;
 /// <summary>
 /// Stores interactive renderer state (scroll positions, hover state, and render device) per browsing context.
 /// </summary>
-internal sealed class InteractiveHtmlRendererState : IDomHarness
+internal sealed partial class InteractiveHtmlRendererState : IDomHarness
 {
     private readonly ConditionalWeakTable<IElement, ElementInteractionState> _elementStates = new();
     private readonly HtmlRenderer _renderer;
@@ -381,7 +381,7 @@ internal sealed class InteractiveHtmlRendererState : IDomHarness
             _lastFrameLayout = snapshot;
             _isFrameScrollShiftable = frame.IsScrollShiftable;
             frame.IsAnimating = _animationTracker.IsAnimating || _transitionTracker.HasRunningTransitions || snapshot.Subframes.Values.Any(static entry => entry.Frame?.IsAnimating == true);
-            return frame;
+            return ShowSelection(frame);
         }
         }
         finally
@@ -472,7 +472,7 @@ internal sealed class InteractiveHtmlRendererState : IDomHarness
 
         _pendingMutations.Clear();
         _lastFrame = _renderer.UpdateFrame(document, _lastFrame, metrics);
-        return _lastFrame;
+        return _lastFrame is { } updated ? ShowSelection(updated) : null;
     }
 
     private void WatchMutations(IDocument document)

@@ -44,6 +44,37 @@ var image = harness.PaintToPng();
 
 `harness.HoveredElement` exposes the currently hit-tested element if you need it directly.
 
+## Selecting Text
+
+Text can be selected as in a browser. A host forwards the pointer to the harness - after firing
+`mousedown`, unless that was canceled:
+
+```cs
+harness.BeginTextSelection(x, y);             // pressed; clickCount: 2 selects a word, 3 a paragraph
+harness.ExtendTextSelection(x, y);            // moved with the button held
+harness.EndTextSelection();                   // released
+
+var text = harness.SelectedText;              // as shown, e.g., for the clipboard
+```
+
+`BeginTextSelection` takes `extend: true` for a press with Shift held, and returns false when
+nothing can be selected there. `SelectAllText()` is for Ctrl+A and `ClearTextSelection()` removes
+the selection. `PaintInvalidated` is raised when the selection changes; showing it needs no layout,
+as `UpdateFrame()` returns the last frame with the selection painted.
+
+The selection also is the DOM's: `document.GetSelection()` (`getSelection()` for scripts) has the
+members of the [Selection API](https://w3c.github.io/selection-api/) except `modify`, and its changes are painted just
+the same. `selectstart` (cancelable) and `selectionchange` are fired. `user-select` is honored
+(`none`, `text`, `all`), what form controls show cannot be selected, and `::selection` gives the colors
+of the highlight and the text.
+
+Selecting is on by default. It can be turned off for a document that has no use for it, in which case
+layouts do not record where their text comes from:
+
+```cs
+harness.IsTextSelectionEnabled = false;
+```
+
 ## The Virtual Clock
 
 There is no real-time timer anywhere in this renderer. CSS `transition`s and `animation`s are both
