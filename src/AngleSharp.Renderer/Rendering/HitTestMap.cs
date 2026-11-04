@@ -90,6 +90,38 @@ public sealed class HitTestMap
         return container is null;
     }
 
+    /// <summary>
+    /// Gets the boxes clipping the element, up to the given one (not including it).
+    /// </summary>
+    internal static IEnumerable<IElement> GetClippingBoxes(IElement element, IElement? until, IReadOnlyDictionary<IElement, HtmlRenderer.ElementLayoutMetrics> metrics, IReadOnlyDictionary<IElement, Dictionary<string, string>> styleMaps)
+    {
+        var escapes = GetEscape(styleMaps, element);
+
+        for (var ancestor = element.ParentElement; ancestor is not null && !ReferenceEquals(ancestor, until); ancestor = ancestor.ParentElement)
+        {
+            if (!metrics.TryGetValue(ancestor, out var ancestorMetrics))
+            {
+                continue;
+            }
+
+            if (escapes != ClipEscape.None && styleMaps.TryGetValue(ancestor, out var escapeStyle) &&
+                (escapes == ClipEscape.ToViewport ? HtmlRenderer.HasTransformLikeEffect(escapeStyle) : HtmlRenderer.ActsAsContainingBlock(escapeStyle, 0f)))
+            {
+                escapes = ClipEscape.None;
+            }
+
+            if (escapes == ClipEscape.None)
+            {
+                if (ancestorMetrics.Layer.ClipsOverflow)
+                {
+                    yield return ancestor;
+                }
+
+                escapes = GetEscape(styleMaps, ancestor);
+            }
+        }
+    }
+
     private enum ClipEscape
     {
         None,

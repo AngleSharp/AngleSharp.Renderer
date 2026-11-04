@@ -57,6 +57,11 @@ internal sealed partial class InteractiveHtmlRendererState : IDomHarness
 
     public event EventHandler? PaintInvalidated;
 
+    /// <summary>
+    /// Raised when a frame was laid out or brought up to date, i.e., boxes may be somewhere else.
+    /// </summary>
+    internal event EventHandler? FrameUpdated;
+
     public IBrowsingContext Context { get; }
 
     /// <summary>
@@ -381,6 +386,7 @@ internal sealed partial class InteractiveHtmlRendererState : IDomHarness
             _lastFrameLayout = snapshot;
             _isFrameScrollShiftable = frame.IsScrollShiftable;
             frame.IsAnimating = _animationTracker.IsAnimating || _transitionTracker.HasRunningTransitions || snapshot.Subframes.Values.Any(static entry => entry.Frame?.IsAnimating == true);
+            FrameUpdated?.Invoke(this, EventArgs.Empty);
             return ShowSelection(frame);
         }
         }
@@ -440,6 +446,18 @@ internal sealed partial class InteractiveHtmlRendererState : IDomHarness
     }
 
     public RenderedFrame? UpdateFrame()
+    {
+        var frame = UpdateLastFrame();
+
+        if (frame is not null)
+        {
+            FrameUpdated?.Invoke(this, EventArgs.Empty);
+        }
+
+        return frame;
+    }
+
+    private RenderedFrame? UpdateLastFrame()
     {
         var document = Context.Active;
 

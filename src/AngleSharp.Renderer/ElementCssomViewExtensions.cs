@@ -463,6 +463,58 @@ public static class ElementCssomViewExtensions
         return owner?.Context.GetDomHarness();
     }
 
+    /// <summary>
+    /// Gets where the element's box is on the screen, or null if it has none.
+    /// </summary>
+    internal static RenderRect? GetRenderedBox(IElement element) =>
+        GetViewportMetrics(element) is { } metrics ? ApplyTransforms(element, metrics.ReportedBox) : null;
+
+    /// <summary>
+    /// Gets the padding box of the element on the screen, or null if it has none.
+    /// </summary>
+    internal static RenderRect? GetPaddingBox(IElement element)
+    {
+        if (GetViewportMetrics(element) is not { } metrics)
+        {
+            return null;
+        }
+
+        var box = ApplyTransforms(element, metrics.ReportedBox);
+        return new RenderRect(box.X + metrics.BorderLeft, box.Y + metrics.BorderTop, box.Width - metrics.BorderLeft - metrics.BorderRight, box.Height - metrics.BorderTop - metrics.BorderBottom);
+    }
+
+    /// <summary>
+    /// Gets what the boxes between the element and the given one (by default all around it) leave
+    /// of the screen for it, or null if none of them clips it.
+    /// </summary>
+    internal static RenderRect? GetClipTo(IElement element, IElement? root)
+    {
+        if (element.Owner is not { } owner || owner.Context.GetDomHarness() is not InteractiveHtmlRendererState state)
+        {
+            return null;
+        }
+
+        var snapshot = state.GetLayoutSnapshot(owner);
+        RenderRect? clip = null;
+
+        foreach (var ancestor in HitTestMap.GetClippingBoxes(element, root, snapshot.Metrics, snapshot.StyleMaps))
+        {
+            if (GetPaddingBox(ancestor) is { } box)
+            {
+                clip = clip is { } current ? IntersectRects(current, box) : box;
+            }
+        }
+
+        return clip;
+    }
+
+    private static RenderRect IntersectRects(RenderRect a, RenderRect b)
+    {
+        var left = Math.Max(a.X, b.X);
+        var top = Math.Max(a.Y, b.Y);
+        return new RenderRect(left, top, Math.Min(a.X + a.Width, b.X + b.Width) - left, Math.Min(a.Y + a.Height, b.Y + b.Height) - top);
+    }
+
     private static readonly IReadOnlyDictionary<IElement, Dictionary<string, string>> s_noStyleMaps = new Dictionary<IElement, Dictionary<string, string>>();
 
     private static (int Width, int Height) GetScrollExtents(IElement element)
