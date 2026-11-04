@@ -33,6 +33,63 @@ public sealed class HitTestMap
     private readonly float _offsetY;
 
     // a viewport-anchored box is fixed itself or inside a fixed box, so it does not scroll
+    /// <summary>
+    /// Gets if a box clips the element. What is out of the flow isn't clipped by what is below its
+    /// containing block.
+    /// </summary>
+    internal static bool IsClipped(IElement element, IReadOnlyDictionary<IElement, HtmlRenderer.ElementLayoutMetrics> metrics, IReadOnlyDictionary<IElement, Dictionary<string, string>> styleMaps) =>
+        !IsContentOf(element, null, metrics, styleMaps);
+
+    /// <summary>
+    /// Gets if the element counts as content of the container (null or the root: the page): it has
+    /// to be in there without a box clipping it, and out of the flow its containing block has to be
+    /// in there, too.
+    /// </summary>
+    internal static bool IsContentOf(IElement element, IElement? container, IReadOnlyDictionary<IElement, HtmlRenderer.ElementLayoutMetrics> metrics, IReadOnlyDictionary<IElement, Dictionary<string, string>> styleMaps)
+    {
+        var escapes = GetEscape(styleMaps, element);
+        var isPage = container is null || container.ParentElement is null;
+
+        for (var ancestor = element.ParentElement; ancestor is not null; ancestor = ancestor.ParentElement)
+        {
+            var isContainer = ReferenceEquals(ancestor, container);
+
+            if (!metrics.TryGetValue(ancestor, out var ancestorMetrics))
+            {
+                if (isContainer)
+                {
+                    return isPage || escapes == ClipEscape.None;
+                }
+
+                continue;
+            }
+
+            if (escapes != ClipEscape.None && styleMaps.TryGetValue(ancestor, out var escapeStyle) &&
+                (escapes == ClipEscape.ToViewport ? HtmlRenderer.HasTransformLikeEffect(escapeStyle) : HtmlRenderer.ActsAsContainingBlock(escapeStyle, 0f)))
+            {
+                escapes = ClipEscape.None;
+            }
+
+            if (isContainer)
+            {
+                return isPage || escapes == ClipEscape.None;
+            }
+
+            if (escapes == ClipEscape.None)
+            {
+                if (ancestorMetrics.Layer.ClipsOverflow)
+                {
+                    return false;
+                }
+
+                escapes = GetEscape(styleMaps, ancestor);
+            }
+        }
+
+        // nothing but the page is around everything
+        return container is null;
+    }
+
     private enum ClipEscape
     {
         None,

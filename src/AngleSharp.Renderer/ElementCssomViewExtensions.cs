@@ -463,6 +463,8 @@ public static class ElementCssomViewExtensions
         return owner?.Context.GetDomHarness();
     }
 
+    private static readonly IReadOnlyDictionary<IElement, Dictionary<string, string>> s_noStyleMaps = new Dictionary<IElement, Dictionary<string, string>>();
+
     private static (int Width, int Height) GetScrollExtents(IElement element)
     {
         ArgumentNullException.ThrowIfNull(element);
@@ -493,11 +495,15 @@ public static class ElementCssomViewExtensions
         var scrollLeft = state is null ? 0d : state.GetScrollLeft(element, double.MaxValue);
         var scrollTop = state is null ? 0d : state.GetScrollTop(element, double.MaxValue);
 
+        var styleMaps = element.Owner?.Context.GetDomHarness() is InteractiveHtmlRendererState harness
+            ? harness.GetLayoutSnapshot(element.Owner).StyleMaps
+            : s_noStyleMaps;
+
         foreach (var (candidate, candidateMetrics) in metricsMap)
         {
             // content clipped by a scroll container (or any clipping box) inside is no overflow of
-            // this one, nor is anything in a fixed box
-            if (ReferenceEquals(candidate, element) || candidateMetrics.IsViewportAnchored || !IsUnclippedDescendantOf(candidate, element, metricsMap))
+            // this one, nor is anything in a fixed box or with a containing block around this one
+            if (ReferenceEquals(candidate, element) || candidateMetrics.IsViewportAnchored || !HitTestMap.IsContentOf(candidate, element, metricsMap, styleMaps))
             {
                 continue;
             }
@@ -524,23 +530,6 @@ public static class ElementCssomViewExtensions
         var extents = GetScrollExtents(element);
         var maxTop = extents.Height - GetClientHeight(element);
         return Math.Max(0d, maxTop);
-    }
-
-    private static bool IsUnclippedDescendantOf(IElement candidate, IElement ancestor, IReadOnlyDictionary<IElement, HtmlRenderer.ElementLayoutMetrics> metricsMap)
-    {
-        var isClipped = false;
-
-        for (var current = candidate.ParentElement; current is not null; current = current.ParentElement)
-        {
-            if (ReferenceEquals(current, ancestor))
-            {
-                return !isClipped;
-            }
-
-            isClipped |= metricsMap.TryGetValue(current, out var metrics) && metrics.Layer.ClipsOverflow;
-        }
-
-        return false;
     }
 
     private static bool IsPositionFixed(IElement element)

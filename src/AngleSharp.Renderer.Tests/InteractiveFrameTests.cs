@@ -45,6 +45,70 @@ public sealed class InteractiveFrameTests
         Assert.Equal("end", second.HitTestMap.HitTest(10, 105)?.Element.Id);
     }
 
+    [Theory]
+    [InlineData("auto")]
+    [InlineData("scroll")]
+    [InlineData("hidden")]
+    public async Task Frame_ContentHeightLeavesOutWhatABoxClips(string overflow)
+    {
+        var (document, harness) = await OpenAsync($"""<div style="height: 100px; overflow: {overflow}"><div style="height: 5000px"></div></div>""");
+
+        var frame = harness.PrepareFrame();
+
+        Assert.Equal(200, frame.ContentHeight, precision: 0);
+        Assert.Equal(document.DocumentElement.GetScrollHeight(), frame.ContentHeight, precision: 0);
+    }
+
+    [Fact]
+    public async Task Frame_ContentHeightCountsAClippingBoxItself()
+    {
+        var (_, harness) = await OpenAsync("""<div style="height: 1000px; overflow: auto"><div style="height: 5000px"></div></div>""");
+
+        Assert.Equal(1000, harness.PrepareFrame().ContentHeight, precision: 0);
+    }
+
+    [Fact]
+    public async Task Frame_ContentHeightCountsAPositionedBoxEscapingAClip()
+    {
+        // the containing block of the absolute box is the page, so the auto box does not clip it
+        var (_, harness) = await OpenAsync("""<div style="height: 100px; overflow: auto"><div style="position: absolute; top: 700px; height: 300px; width: 10px"></div></div>""");
+
+        Assert.Equal(1000, harness.PrepareFrame().ContentHeight, precision: 0);
+    }
+
+    [Fact]
+    public async Task ScrollHeight_OfThePageCountsAPositionedBoxEscapingAClipLikeTheFrame()
+    {
+        var (document, harness) = await OpenAsync("""<div style="height: 100px; overflow: auto"><div style="position: absolute; top: 700px; height: 300px; width: 10px"></div></div>""");
+
+        Assert.Equal(1000, document.DocumentElement.GetScrollHeight());
+        Assert.Equal(document.DocumentElement.GetScrollHeight(), harness.PrepareFrame().ContentHeight, precision: 0);
+    }
+
+    [Fact]
+    public async Task ScrollHeight_OfABoxLeavesOutAPositionedBoxEscapingIt()
+    {
+        var (document, _) = await OpenAsync("""<div id="box" style="height: 100px; overflow: auto"><div style="position: absolute; top: 700px; height: 300px; width: 10px"></div></div>""");
+
+        Assert.Equal(100, document.GetElementById("box")!.GetScrollHeight());
+    }
+
+    [Fact]
+    public async Task ScrollHeight_OfABoxCountsAPositionedBoxItContains()
+    {
+        var (document, _) = await OpenAsync("""<div id="box" style="position: relative; height: 100px; overflow: auto"><div style="position: absolute; top: 700px; height: 300px; width: 10px"></div></div>""");
+
+        Assert.Equal(1000, document.GetElementById("box")!.GetScrollHeight());
+    }
+
+    [Fact]
+    public async Task ScrollHeight_OfABoxLeavesOutWhatABoxInsideClips()
+    {
+        var (document, _) = await OpenAsync("""<div id="box" style="height: 100px; overflow: auto"><div style="height: 50px; overflow: hidden"><div style="height: 5000px"></div></div></div>""");
+
+        Assert.Equal(100, document.GetElementById("box")!.GetScrollHeight());
+    }
+
     [Fact]
     public async Task Frame_RepositionsWithoutLayout()
     {

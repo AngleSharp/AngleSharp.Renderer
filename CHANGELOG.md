@@ -2,6 +2,8 @@
 
 Released on Friday, November 6 2026.
 
+- Fixed `scrollHeight` and `scrollWidth` not counting a positioned box escaping a clip for the page, and counting a positioned box for a box that isn't its containing block
+- Fixed `ContentHeight` of frames counting what a box clips (e.g. the content of a scroll container), making pages scroll though all of them fits the viewport
 - Added text selection to interactive documents: selecting with the pointer through the harness (`BeginTextSelection`, `ExtendTextSelection`, `EndTextSelection`, also by word and paragraph), `SelectAllText`, `SelectedText`, the setting `IsTextSelectionEnabled`, the DOM's `getSelection()` with `selectstart` and `selectionchange`, `user-select`, and `::selection` as soon as AngleSharp and AngleSharp.Css know it
 
 # 0.10.0

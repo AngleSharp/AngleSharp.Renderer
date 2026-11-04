@@ -179,7 +179,8 @@ public sealed partial class HtmlRenderer
                 isScrollShiftable = false;
                 hasStickyBoxes |= string.Equals(position, "sticky", StringComparison.OrdinalIgnoreCase);
             }
-            else
+            // what a box clips (e.g. the content of a scroll container) is no content of the page
+            else if (!HitTestMap.IsClipped(element, metrics, styleMaps))
             {
                 contentBottom = Math.Max(contentBottom, elementMetrics.BorderBoxY + elementMetrics.BorderBoxHeight + scrollOffsetY);
             }
