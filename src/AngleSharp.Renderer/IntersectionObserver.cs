@@ -1,15 +1,11 @@
 namespace AngleSharp.Dom;
 
 using AngleSharp.Attributes;
-using AngleSharp.Browser;
 using AngleSharp.Dom.Geometry;
 using AngleSharp.Renderer;
 using AngleSharp.Renderer.Rendering;
-using System.Diagnostics;
 using System.Globalization;
 using System.Linq;
-using System.Runtime.CompilerServices;
-using System.Threading;
 
 /// <summary>
 /// The callback receiving the changes an intersection observer found.
@@ -145,7 +141,7 @@ public sealed class IntersectionObserver
     private static readonly char[] Spaces = [' ', '\t', '\r', '\n', '\f'];
 
     private readonly IntersectionObserverCallback _callback;
-    private readonly IntersectionObserverScheduler _scheduler;
+    private readonly LayoutObserverScheduler _scheduler;
     private readonly (double Value, bool IsPercentage)[] _margin;
     private readonly List<IntersectionObserverEntry> _queue = [];
     private readonly Dictionary<IElement, Registration> _targets = new(ReferenceEqualityComparer.Instance);
@@ -163,7 +159,7 @@ public sealed class IntersectionObserver
         ArgumentNullException.ThrowIfNull(callback);
 
         _callback = callback;
-        _scheduler = IntersectionObserverScheduler.For(window.Document);
+        _scheduler = LayoutObserverScheduler.For(window.Document);
         _margin = ParseMargin(options?.RootMargin);
         Root = options?.Root;
         Thresholds = ParseThresholds(options?.Threshold);
@@ -274,9 +270,12 @@ public sealed class IntersectionObserver
 
     private IntersectionObserverEntry Measure(IElement target, double time)
     {
-        var rootBox = GetRootBox(target);
-        var rootBounds = rootBox is { } bounds ? ToDomRect(bounds) : null;
         var box = ElementCssomViewExtensions.GetRenderedBox(target);
+        var isNested = Root is null && target.Owner?.Context.Parent is not null;
+        var isSameOrigin = !isNested || IsSameOriginAsTop(target.Owner!);
+        // a margin isn't for a page to learn anything about what is around it
+        var rootBox = isNested ? GetTopViewport(target.Owner!, isSameOrigin) : GetRootBox(target);
+        var rootBounds = rootBox is { } bounds && isSameOrigin ? ToDomRect(bounds) : null;
 
         if (box is not { } targetBox || rootBox is not { } root || !IsInsideRoot(target))
         {
@@ -284,17 +283,107 @@ public sealed class IntersectionObserver
         }
 
         var clip = ElementCssomViewExtensions.GetClipTo(target, Root as IElement);
-        var visible = Intersect(targetBox, clip is { } inner ? Intersect(inner, root) : root);
-        var isIntersecting = visible.Width >= 0 && visible.Height >= 0;
+        var visible = clip is { } inner ? Intersect(targetBox, inner) : targetBox;
+        var offset = (X: 0f, Y: 0f);
 
-        if (!isIntersecting)
+        if (isNested)
+        {
+            // through the frames around it, in which the rest of the way is what counts
+            if (GetViewport(target.Owner!) is { } viewport)
+            {
+                visible = Intersect(visible, viewport);
+            }
+
+            for (var document = target.Owner!; visible.Width >= 0 && visible.Height >= 0 && GetFrame(document) is { } frame; document = frame.Owner!)
+            {
+                if (ElementCssomViewExtensions.GetContentBox(frame) is not { } content)
+                {
+                    return new IntersectionObserverEntry(time, rootBounds, ToDomRect(targetBox), new DomRect(), false, 0d, target);
+                }
+
+                visible = Intersect(new RenderRect(visible.X + content.X, visible.Y + content.Y, visible.Width, visible.Height), content);
+                offset = (offset.X + content.X, offset.Y + content.Y);
+
+                if (ElementCssomViewExtensions.GetClipTo(frame, null) is { } around)
+                {
+                    visible = Intersect(visible, around);
+                }
+            }
+        }
+
+        visible = Intersect(visible, root);
+
+        if (visible.Width < 0 || visible.Height < 0)
         {
             return new IntersectionObserverEntry(time, rootBounds, ToDomRect(targetBox), new DomRect(), false, 0d, target);
         }
 
         var area = (double)targetBox.Width * targetBox.Height;
         var ratio = area > 0 ? Math.Min(1d, visible.Width * (double)visible.Height / area) : 1d;
-        return new IntersectionObserverEntry(time, rootBounds, ToDomRect(targetBox), ToDomRect(visible), true, ratio, target);
+        var rect = new RenderRect(visible.X - offset.X, visible.Y - offset.Y, visible.Width, visible.Height);
+        return new IntersectionObserverEntry(time, rootBounds, ToDomRect(targetBox), ToDomRect(rect), true, ratio, target);
+    }
+
+    /// <summary>
+    /// Gets the iframe showing the document, if any.
+    /// </summary>
+    internal static IElement? GetFrame(IDocument document) =>
+        document.Context?.Parent?.Active?.QuerySelectorAll("iframe")
+            .OfType<AngleSharp.Html.Dom.IHtmlInlineFrameElement>()
+            .FirstOrDefault(frame => ReferenceEquals(frame.ContentDocument, document));
+
+    private static IDocument GetTop(IDocument document)
+    {
+        var current = document;
+
+        while (GetFrame(current) is { Owner: { } owner })
+        {
+            current = owner;
+        }
+
+        return current;
+    }
+
+    // A document without an address of its own (about:srcdoc) has the origin of what is around it,
+    // and one in a sandboxed frame an origin of its own that equals nothing.
+    private static bool IsSameOriginAsTop(IDocument document)
+    {
+        var current = document;
+        var origin = (string?)null;
+
+        while (GetFrame(current) is { Owner: { } owner } frame)
+        {
+            var sandbox = frame.GetAttribute("sandbox");
+
+            if (sandbox is not null && !sandbox.Split(Spaces, StringSplitOptions.RemoveEmptyEntries).Contains("allow-same-origin", StringComparer.OrdinalIgnoreCase))
+            {
+                return false;
+            }
+
+            origin ??= HasOwnOrigin(current) ? current.Origin : null;
+            current = owner;
+        }
+
+        return origin is null || string.Equals(origin, current.Origin, StringComparison.Ordinal);
+    }
+
+    private static bool HasOwnOrigin(IDocument document) =>
+        !document.Url.StartsWith("about:", StringComparison.OrdinalIgnoreCase);
+
+    private static RenderRect? GetViewport(IDocument document)
+    {
+        var device = document.Context.GetDomHarness().RenderDevice;
+        return new RenderRect(0f, 0f, device.ViewPortWidth, device.ViewPortHeight);
+    }
+
+    private RenderRect? GetTopViewport(IDocument document, bool withMargin)
+    {
+        if (GetViewport(GetTop(document)) is not { } box)
+        {
+            return null;
+        }
+
+        return withMargin ? Grow(box) : box;
     }
 
     private bool IsInsideRoot(IElement target)
@@ -334,6 +423,11 @@ public sealed class IntersectionObserver
             box = new RenderRect(0f, 0f, device?.ViewPortWidth ?? 0, device?.ViewPortHeight ?? 0);
         }
 
+        return Grow(box);
+    }
+
+    private RenderRect Grow(RenderRect box)
+    {
         var top = Resolve(_margin[0], box.Height);
         var right = Resolve(_margin[1], box.Width);
         var bottom = Resolve(_margin[2], box.Height);
@@ -403,99 +497,5 @@ public sealed class IntersectionObserver
         public int ThresholdIndex { get; set; } = -1;
 
         public bool IsIntersecting { get; set; }
-    }
-}
-
-/// <summary>
-/// Runs the observers of a document: after anything that may have moved a box, once per turn of the
-/// event loop, as scrolling alone may not even need a layout.
-/// </summary>
-internal sealed class IntersectionObserverScheduler
-{
-    private static readonly ConditionalWeakTable<IDocument, IntersectionObserverScheduler> Schedulers = [];
-
-    private readonly IDocument _document;
-    private readonly List<IntersectionObserver> _observers = [];
-    private readonly Stopwatch _clock = Stopwatch.StartNew();
-    private readonly EventHandler _onChanged;
-    private InteractiveHtmlRendererState? _state;
-    private int _isScheduled;
-
-    private IntersectionObserverScheduler(IDocument document)
-    {
-        _document = document;
-        _onChanged = (_, _) => Schedule();
-    }
-
-    public static IntersectionObserverScheduler For(IDocument document) =>
-        Schedulers.GetValue(document, static key => new IntersectionObserverScheduler(key));
-
-    public void Add(IntersectionObserver observer)
-    {
-        if (!_observers.Contains(observer))
-        {
-            _observers.Add(observer);
-        }
-
-        if (_state is null && _document.Context.GetDomHarness() is InteractiveHtmlRendererState state)
-        {
-            _state = state;
-            state.PaintInvalidated += _onChanged;
-            state.FrameUpdated += _onChanged;
-        }
-    }
-
-    public void Remove(IntersectionObserver observer)
-    {
-        _observers.Remove(observer);
-
-        if (_observers.Count == 0)
-        {
-            Detach();
-        }
-    }
-
-    public void Schedule()
-    {
-        if (Interlocked.Exchange(ref _isScheduled, 1) == 0)
-        {
-            if (_document.Context.GetService<IEventLoop>() is { } loop)
-            {
-                loop.Enqueue(_ => Run(), TaskPriority.Normal);
-            }
-            else
-            {
-                Run();
-            }
-        }
-    }
-
-    private void Run()
-    {
-        Volatile.Write(ref _isScheduled, 0);
-
-        // the document is gone, and with it everything it observed
-        if (!ReferenceEquals(_document.Context.Active, _document))
-        {
-            Detach();
-            return;
-        }
-
-        var time = _clock.Elapsed.TotalMilliseconds;
-
-        foreach (var observer in _observers.ToArray())
-        {
-            observer.Update(time);
-        }
-    }
-
-    private void Detach()
-    {
-        if (_state is { } state)
-        {
-            state.PaintInvalidated -= _onChanged;
-            state.FrameUpdated -= _onChanged;
-            _state = null;
-        }
     }
 }

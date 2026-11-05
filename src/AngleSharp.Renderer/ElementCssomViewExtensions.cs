@@ -483,6 +483,56 @@ public static class ElementCssomViewExtensions
         return new RenderRect(box.X + metrics.BorderLeft, box.Y + metrics.BorderTop, box.Width - metrics.BorderLeft - metrics.BorderRight, box.Height - metrics.BorderTop - metrics.BorderBottom);
     }
 
+    private static readonly HashSet<string> s_replacedElements = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "img", "video", "canvas", "iframe", "embed", "object", "audio", "input", "select", "textarea", "button", "svg",
+    };
+
+    /// <summary>
+    /// Gets the sizes of the element for a resize observer, which don't depend on any transform. An
+    /// element without a box, or inline without being replaced, has none (Resize Observer 3.4.1).
+    /// </summary>
+    internal static (RenderRect Content, double BorderWidth, double BorderHeight, bool IsVertical) GetObservedSizes(IElement element)
+    {
+        var none = (new RenderRect(0f, 0f, 0f, 0f), 0d, 0d, false);
+
+        if (GetViewportMetrics(element) is not { } metrics || element.Owner?.Context.GetDomHarness() is not InteractiveHtmlRendererState state)
+        {
+            return none;
+        }
+
+        var style = state.GetLayoutSnapshot(element.Owner).StyleMaps.GetValueOrDefault(element);
+        var display = style?.GetValueOrDefault("display")?.Trim();
+
+        if ((string.IsNullOrEmpty(display) || string.Equals(display, "inline", StringComparison.OrdinalIgnoreCase)) && !s_replacedElements.Contains(element.LocalName))
+        {
+            return none;
+        }
+
+        var box = metrics.ReportedBox;
+        var width = box.Width - metrics.BorderLeft - metrics.BorderRight - metrics.PaddingLeft - metrics.PaddingRight;
+        var height = box.Height - metrics.BorderTop - metrics.BorderBottom - metrics.PaddingTop - metrics.PaddingBottom;
+        var content = new RenderRect(metrics.PaddingLeft, metrics.PaddingTop, Math.Max(0f, width), Math.Max(0f, height));
+        var isVertical = style?.GetValueOrDefault("writing-mode")?.TrimStart().StartsWith("vertical", StringComparison.OrdinalIgnoreCase) ?? false;
+        return (content, box.Width, box.Height, isVertical);
+    }
+
+    /// <summary>
+    /// Gets the content box of the element on the screen, or null if it has none.
+    /// </summary>
+    internal static RenderRect? GetContentBox(IElement element)
+    {
+        if (GetViewportMetrics(element) is not { } metrics)
+        {
+            return null;
+        }
+
+        var box = ApplyTransforms(element, metrics.ReportedBox);
+        var left = metrics.BorderLeft + metrics.PaddingLeft;
+        var top = metrics.BorderTop + metrics.PaddingTop;
+        return new RenderRect(box.X + left, box.Y + top, box.Width - left - metrics.BorderRight - metrics.PaddingRight, box.Height - top - metrics.BorderBottom - metrics.PaddingBottom);
+    }
+
     /// <summary>
     /// Gets what the boxes between the element and the given one (by default all around it) leave
     /// of the screen for it, or null if none of them clips it.

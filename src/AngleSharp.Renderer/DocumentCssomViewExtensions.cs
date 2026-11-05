@@ -15,6 +15,50 @@ using System.Linq;
 public static class DocumentCssomViewExtensions
 {
     /// <summary>
+    /// Returns the topmost element at the given viewport coordinates.
+    /// </summary>
+    [DomName("elementFromPoint")]
+    public static IElement? ElementFromPoint(this IDocument document, double x, double y)
+    {
+        ArgumentNullException.ThrowIfNull(document);
+        return HitTesting.FindTopMostElementAt(GetViewportMetricsMap(document), x, y);
+    }
+
+    /// <summary>
+    /// Returns the elements at the given viewport coordinates, the topmost first: what was hit,
+    /// followed by the elements around it that contain the point.
+    /// </summary>
+    [DomName("elementsFromPoint")]
+    public static IElement[] ElementsFromPoint(this IDocument document, double x, double y)
+    {
+        ArgumentNullException.ThrowIfNull(document);
+        var metrics = GetViewportMetricsMap(document);
+        var result = new System.Collections.Generic.List<IElement>();
+
+        for (var element = HitTesting.FindTopMostElementAt(metrics, x, y); element is not null; element = element.ParentElement)
+        {
+            if (element.ParentElement is null || (metrics.TryGetValue(element, out var box) && x >= box.BorderBoxX && y >= box.BorderBoxY && x < box.BorderBoxX + box.BorderBoxWidth && y < box.BorderBoxY + box.BorderBoxHeight))
+            {
+                result.Add(element);
+            }
+        }
+
+        return result.ToArray();
+    }
+
+    private static System.Collections.Generic.IReadOnlyDictionary<IElement, HtmlRenderer.ElementLayoutMetrics> GetViewportMetricsMap(IDocument document)
+    {
+        var harness = document.Context.GetDomHarness();
+
+        // the point is in the viewport, so are the boxes it is looked up in
+        return harness is InteractiveHtmlRendererState state
+            ? document.DocumentElement is { } root
+                ? state.GetLayoutSnapshot(document).ToViewport(state.GetScrollLeft(root, double.MaxValue), state.GetScrollTop(root, double.MaxValue))
+                : state.GetLayoutMetrics(document)
+            : HtmlRenderer.CaptureLayoutMetrics(document, harness.RenderDevice);
+    }
+
+    /// <summary>
     /// Returns a caret position for the given viewport coordinates.
     /// </summary>
     [DomName("caretPositionFromPoint")]

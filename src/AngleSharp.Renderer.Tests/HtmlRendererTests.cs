@@ -634,6 +634,100 @@ public sealed class HtmlRendererTests
         Assert.Equal(expectedHeight, FillOf(displayList, new RenderColor(0x44, 0x55, 0x66)).Height);
     }
 
+    [Theory]
+    [InlineData("calc(50% + 10px)", 260)]
+    [InlineData("calc(100% - 20px)", 480)]
+    [InlineData("min(240px, 55%)", 240)]
+    [InlineData("min(55%, 240px)", 240)]
+    [InlineData("min(100px, 55%)", 100)]
+    [InlineData("max(100px, 55%)", 275)]
+    [InlineData("clamp(100px, 50%, 200px)", 200)]
+    [InlineData("min((100% + 24px), 480px)", 480)]
+    [InlineData("calc(100% - 6px - 2px)", 492)]
+    [InlineData("calc(100% / 2)", 250)]
+    [InlineData("calc((100% - 100px) / 2 + 5px)", 205)]
+    [InlineData("calc(2 * 50px + 10%)", 150)]
+    [InlineData("calc(-10px + 100%)", 490)]
+    [InlineData("min(max(10%, 60px), 300px)", 60)]
+    public async Task BuildDisplayList_WidthMixingPercentagesAndLengthsIsEvaluated(string width, float expected)
+    {
+        var displayList = await LayoutAsync($$"""
+            <html><body style="margin:0">
+                <div style="width:500px">
+                    <div style="width:{{width}}; height:5px; background-color:#112233"></div>
+                </div>
+            </body></html>
+            """);
+
+        Assert.Equal(expected, FillOf(displayList, new RenderColor(0x11, 0x22, 0x33)).Width);
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_MarginAndHeightMixingPercentagesAndLengthsAreEvaluated()
+    {
+        var displayList = await LayoutAsync("""
+            <html><body style="margin:0">
+                <div style="width:400px; height:200px">
+                    <div style="margin-left:calc(25% + 10px); width:50px; height:calc(50% + 5px); background-color:#112233"></div>
+                </div>
+            </body></html>
+            """);
+        var fill = FillOf(displayList, new RenderColor(0x11, 0x22, 0x33));
+
+        Assert.Equal(110, fill.X);
+        Assert.Equal(105, fill.Height);
+    }
+
+    [Theory]
+    [InlineData("max-width:100%", 250, 250)]
+    [InlineData("max-width:calc(100%)", 250, 250)]
+    [InlineData("max-width:calc(100% - 8px)", 250, 242)]
+    [InlineData("max-width:calc(100% - 6px - 2px)", 250, 242)]
+    public async Task BuildDisplayList_MaximumWithAPercentageDoesNotLimitAShrinkToFitBox(string maximum, float outer, float inner)
+    {
+        var displayList = await LayoutAsync($$"""
+            <html><body style="margin:0">
+                <div style="float:left; background-color:#445566">
+                    <div style="width:250px; {{maximum}}; height:5px; background-color:#112233"></div>
+                    <div style="height:5px"></div>
+                </div>
+            </body></html>
+            """);
+
+        Assert.Equal(outer, FillOf(displayList, new RenderColor(0x44, 0x55, 0x66)).Width);
+        Assert.Equal(inner, FillOf(displayList, new RenderColor(0x11, 0x22, 0x33)).Width);
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_WidthOfMathThatIsNotUnderstoodIsIgnored()
+    {
+        var displayList = await LayoutAsync("""
+            <html><body style="margin:0">
+                <div style="width:500px">
+                    <div style="width:calc(100% - var(--nope)); height:5px; background-color:#112233"></div>
+                </div>
+            </body></html>
+            """);
+
+        Assert.Equal(500, FillOf(displayList, new RenderColor(0x11, 0x22, 0x33)).Width);
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_FlexItemWithAMathWidthLeavesRoomForItsSibling()
+    {
+        var displayList = await LayoutAsync("""
+            <html><body style="margin:0">
+                <div style="display:flex; width:500px">
+                    <div style="flex:none; width:min(240px, 55%); height:5px; background-color:#112233"></div>
+                    <div style="flex:1; height:5px; background-color:#445566"></div>
+                </div>
+            </body></html>
+            """);
+
+        Assert.Equal(240, FillOf(displayList, new RenderColor(0x11, 0x22, 0x33)).Width);
+        Assert.Equal(260, FillOf(displayList, new RenderColor(0x44, 0x55, 0x66)).Width);
+    }
+
     [Fact]
     public async Task BuildDisplayList_StretchedColumnFlexContainerDistributesItsHeight()
     {

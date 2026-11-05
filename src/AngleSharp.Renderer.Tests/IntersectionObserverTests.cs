@@ -1,8 +1,12 @@
 namespace AngleSharp.Renderer.Tests;
 
 using AngleSharp;
+using AngleSharp.Browser;
+using AngleSharp.Common;
 using AngleSharp.Css;
 using AngleSharp.Dom;
+using AngleSharp.Html.Dom;
+using AngleSharp.Io;
 
 /// <summary>
 /// The IntersectionObserver: what it tells about boxes in the viewport or in another box.
@@ -272,6 +276,229 @@ public sealed class IntersectionObserverTests
         harness.PrepareFrame();
 
         Assert.False(probe.Last.IsIntersecting);
+    }
+
+    [Fact]
+    public async Task ChangesOfTheDocumentAreToldWithoutAFrame()
+    {
+        var (document, _, window) = await OpenAsync("""<div id="spacer" style="height: 0"></div><div id="t" style="height: 50px"></div>""");
+        var probe = new Probe();
+        new IntersectionObserver(window, probe.Callback).Observe(document.GetElementById("t")!);
+        Assert.True(probe.Last.IsIntersecting);
+
+        document.GetElementById("spacer")!.SetAttribute("style", "height: 1000px");
+        document.Body!.AppendChild(document.CreateElement("div"));
+        await Eventually(() => !probe.Last.IsIntersecting);
+
+        Assert.False(probe.Last.IsIntersecting);
+    }
+
+    private sealed class TestEventLoop : IEventLoop, IDisposable
+    {
+        private readonly System.Collections.Concurrent.BlockingCollection<Action> _tasks = [];
+        private readonly Thread _thread;
+
+        public TestEventLoop()
+        {
+            _thread = new Thread(() =>
+            {
+                foreach (var task in _tasks.GetConsumingEnumerable())
+                {
+                    task.Invoke();
+                }
+            })
+            { IsBackground = true };
+            _thread.Start();
+        }
+
+        public int ThreadId => _thread.ManagedThreadId;
+
+        public ICancellable Enqueue(Action<CancellationToken> action, TaskPriority priority)
+        {
+            _tasks.Add(() => action.Invoke(default));
+            return new Entry();
+        }
+
+        public void Spin()
+        {
+        }
+
+        public void CancelAll()
+        {
+        }
+
+        public Task RunAsync(Action action)
+        {
+            var done = new TaskCompletionSource();
+            _tasks.Add(() =>
+            {
+                action.Invoke();
+                done.SetResult();
+            });
+            return done.Task;
+        }
+
+        public void Dispose() => _tasks.CompleteAdding();
+
+        private sealed class Entry : ICancellable
+        {
+            public bool IsRunning => false;
+
+            public bool IsCompleted => true;
+
+            public void Cancel()
+            {
+            }
+        }
+    }
+
+    [Fact]
+    public async Task ManyChangesOfTheDocumentAreLookedAtTogetherOnTheEventLoop()
+    {
+        using var loop = new TestEventLoop();
+        var context = BrowsingContext.New(Configuration.Default.WithCss().WithRenderDevice(Device).With<IEventLoop>(_ => loop));
+        var document = await context.OpenAsync(request => request.Content("""
+            <!doctype html><html><head><style>html, body { margin: 0; padding: 0; }</style></head><body><div id="spacer" style="height: 0"></div><div id="t" style="height: 50px"></div></body></html>
+            """));
+        var calls = new System.Collections.Concurrent.ConcurrentBag<int>();
+        var spacer = document.GetElementById("spacer")!;
+
+        await loop.RunAsync(() => new IntersectionObserver(document.DefaultView!, (_, _) => calls.Add(Environment.CurrentManagedThreadId)).Observe(document.GetElementById("t")!));
+        await Eventually(() => !calls.IsEmpty);
+        var before = calls.Count;
+
+        // an even number of changes, so nothing is left to tell, but a look at every one would see
+        await loop.RunAsync(() =>
+        {
+            for (var i = 1; i <= 200; i++)
+            {
+                spacer.SetAttribute("style", i % 2 == 0 ? "height: 0" : "height: 1000px");
+            }
+        });
+        await Task.Delay(100);
+
+        Assert.True(calls.Count - before <= 2, $"The observer told {calls.Count - before} times.");
+        Assert.All(calls, m => Assert.Equal(loop.ThreadId, m));
+    }
+
+    private static async Task Eventually(Func<bool> condition)
+    {
+        for (var i = 0; i < 200 && !condition(); i++)
+        {
+            await Task.Delay(10);
+        }
+    }
+
+    private static async Task<(IDocument Document, IHtmlInlineFrameElement Frame, IDomHarness Harness)> OpenFrameAsync(string body, string content)
+    {
+        var context = BrowsingContext.New(Configuration.Default.WithCss().WithRenderDevice(Device).WithDefaultLoader(new LoaderOptions { IsResourceLoadingEnabled = true }));
+        var document = await context.OpenAsync(request => request.Address("https://example.com/").Content($$"""
+            <!doctype html><html><head><style>html, body { margin: 0; padding: 0; }</style></head><body>{{body}}</body></html>
+            """));
+        var frame = (IHtmlInlineFrameElement)document.QuerySelector("iframe")!;
+        frame.SetAttribute("srcdoc", $$"""<!doctype html><html><head><style>html, body { margin: 0; padding: 0; }</style></head><body>{{content}}</body></html>""");
+
+        for (var i = 0; i < 300 && frame.ContentDocument?.Body?.ChildElementCount is null or 0; i++)
+        {
+            await Task.Delay(10);
+        }
+
+        Assert.NotNull(frame.ContentDocument);
+        return (document, frame, context.GetDomHarness());
+    }
+
+    [Fact]
+    public async Task TargetInAFrameInViewIntersects()
+    {
+        var (_, frame, _) = await OpenFrameAsync("""<iframe style="border: 0; display: block; width: 100px; height: 100px"></iframe>""", """<div id="t" style="height: 50px"></div>""");
+        var probe = new Probe();
+
+        new IntersectionObserver(frame.ContentWindow!, probe.Callback).Observe(frame.ContentDocument!.GetElementById("t")!);
+        await Eventually(() => probe.Entries.Count > 0);
+
+        Assert.True(probe.Last.IsIntersecting);
+        Assert.Equal(1d, probe.Last.IntersectionRatio);
+        Assert.Equal(0d, probe.Last.IntersectionRect.Top);
+        Assert.Equal(200d, probe.Last.RootBounds!.Height);
+    }
+
+    [Fact]
+    public async Task TargetInAFrameOutOfViewOfThePageDoesNotIntersect()
+    {
+        var (_, frame, _) = await OpenFrameAsync("""<div style="height: 1000px"></div><iframe style="border: 0; display: block; width: 100px; height: 100px"></iframe>""", """<div id="t" style="height: 50px"></div>""");
+        var probe = new Probe();
+
+        new IntersectionObserver(frame.ContentWindow!, probe.Callback).Observe(frame.ContentDocument!.GetElementById("t")!);
+        await Eventually(() => probe.Entries.Count > 0);
+
+        Assert.False(probe.Last.IsIntersecting);
+    }
+
+    [Fact]
+    public async Task ScrollingThePageBringsATargetInAFrameIntoView()
+    {
+        var (document, frame, harness) = await OpenFrameAsync("""<div style="height: 1000px"></div><iframe style="border: 0; display: block; width: 100px; height: 100px"></iframe><div style="height: 1000px"></div>""", """<div id="t" style="height: 50px"></div>""");
+        var probe = new Probe();
+        new IntersectionObserver(frame.ContentWindow!, probe.Callback).Observe(frame.ContentDocument!.GetElementById("t")!);
+        await Eventually(() => probe.Entries.Count > 0);
+        Assert.False(probe.Last.IsIntersecting);
+
+        harness.SetScrollTop(document.DocumentElement, 950, 2000);
+        await Eventually(() => probe.Last.IsIntersecting);
+
+        Assert.True(probe.Last.IsIntersecting);
+        // still in the coordinates of the frame, where it is at the top
+        Assert.Equal(0d, probe.Last.IntersectionRect.Top);
+    }
+
+    [Fact]
+    public async Task PartOfATargetInAFrameCountsWhatThePageShows()
+    {
+        var (_, frame, _) = await OpenFrameAsync("""<div style="height: 175px"></div><iframe style="border: 0; display: block; width: 100px; height: 100px"></iframe>""", """<div id="t" style="height: 50px"></div>""");
+        var probe = new Probe();
+
+        new IntersectionObserver(frame.ContentWindow!, probe.Callback).Observe(frame.ContentDocument!.GetElementById("t")!);
+        await Eventually(() => probe.Entries.Count > 0);
+
+        Assert.Equal(0.5d, probe.Last.IntersectionRatio, 3);
+    }
+
+    [Fact]
+    public async Task TargetInAFrameIsClippedByABoxAroundTheFrame()
+    {
+        var (_, frame, _) = await OpenFrameAsync("""<div style="height: 10px; overflow: hidden"><div style="height: 20px"></div><iframe style="border: 0; display: block; width: 100px; height: 100px"></iframe></div>""", """<div id="t" style="height: 50px"></div>""");
+        var probe = new Probe();
+
+        new IntersectionObserver(frame.ContentWindow!, probe.Callback).Observe(frame.ContentDocument!.GetElementById("t")!);
+        await Eventually(() => probe.Entries.Count > 0);
+
+        Assert.False(probe.Last.IsIntersecting);
+    }
+
+    [Fact]
+    public async Task SandboxedFrameDoesNotLearnAboutThePage()
+    {
+        var (_, frame, _) = await OpenFrameAsync("""<iframe sandbox="allow-scripts" style="border: 0; display: block; width: 100px; height: 100px"></iframe>""", """<div id="t" style="height: 50px"></div>""");
+        var probe = new Probe();
+
+        new IntersectionObserver(frame.ContentWindow!, probe.Callback, new IntersectionObserverOptions { RootMargin = "1000px" }).Observe(frame.ContentDocument!.GetElementById("t")!);
+        await Eventually(() => probe.Entries.Count > 0);
+
+        Assert.True(probe.Last.IsIntersecting);
+        Assert.Null(probe.Last.RootBounds);
+    }
+
+    [Fact]
+    public async Task DocumentAsRootStaysTheViewportOfTheFrame()
+    {
+        var (_, frame, _) = await OpenFrameAsync("""<div style="height: 1000px"></div><iframe style="border: 0; display: block; width: 100px; height: 100px"></iframe>""", """<div id="t" style="height: 50px"></div>""");
+        var probe = new Probe();
+        var inner = frame.ContentDocument!;
+
+        new IntersectionObserver(frame.ContentWindow!, probe.Callback, new IntersectionObserverOptions { Root = inner }).Observe(inner.GetElementById("t")!);
+        await Eventually(() => probe.Entries.Count > 0);
+
+        Assert.True(probe.Last.IsIntersecting);
     }
 
     [Fact]

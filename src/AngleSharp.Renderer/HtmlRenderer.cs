@@ -625,7 +625,7 @@ public sealed partial class HtmlRenderer
     /// </summary>
     private static bool DependsOnContainingBlockHeight(Dictionary<string, string> styleMap)
     {
-        static bool IsPercentage(string? value) => value?.TrimEnd().EndsWith('%') == true;
+        static bool IsPercentage(string? value) => IsPercentageValue(value);
 
         var bottom = styleMap.GetValueOrDefault("bottom")?.Trim();
 
@@ -3211,7 +3211,7 @@ public sealed partial class HtmlRenderer
     /// </summary>
     private static float ResolveQuirksHeightReference(ElementRenderNode node, Dictionary<string, string> styleMap, LayoutContext context)
     {
-        if (styleMap.GetValueOrDefault("height")?.TrimEnd().EndsWith('%') != true)
+        if (!IsPercentageValue(styleMap.GetValueOrDefault("height")))
         {
             return float.NaN;
         }
@@ -4398,33 +4398,195 @@ public sealed partial class HtmlRenderer
     internal static float EvaluateLengthOrPercentage(string text, float relativeTo)
     {
         text = text.Trim();
-        var open = text.IndexOf('(');
 
-        if (open > 0 && text.EndsWith(')') && text[..open].ToLowerInvariant() is "min" or "max" or "clamp")
+        if (TryEvaluateMath(text, relativeTo, out var math))
         {
-            var arguments = SplitTopLevelCommaList(text[(open + 1)..^1]).Select(argument => EvaluateLengthOrPercentage(argument, relativeTo)).ToArray();
-
-            return text[..open].ToLowerInvariant() switch
-            {
-                "min" when arguments.Length > 0 => arguments.Min(),
-                "max" when arguments.Length > 0 => arguments.Max(),
-                "clamp" when arguments.Length == 3 => Math.Max(arguments[0], Math.Min(arguments[1], arguments[2])),
-                _ => 0f,
-            };
-        }
-
-        if (TryParsePercentagePlusLength(text, 0f, out var fraction, out var length))
-        {
-            return (fraction * relativeTo) + length;
-        }
-
-        if (text.EndsWith('%') && float.TryParse(text[..^1], NumberStyles.Float, CultureInfo.InvariantCulture, out var percent))
-        {
-            return relativeTo * percent / 100f;
+            return math;
         }
 
         var pixels = ParseLengthValue(text, float.NaN, allowAuto: false);
         return float.IsNaN(pixels) ? 0f : pixels;
+    }
+
+    /// <summary>
+    /// Whether a value depends on the size of the box it refers to: a percentage, or math with one
+    /// (e.g. <c>calc(100% - 8px)</c>). Such a value can't be resolved while that size is being found.
+    /// </summary>
+    internal static bool IsPercentageValue(string? value)
+    {
+        var text = value?.TrimEnd();
+        return text is not null && (text.EndsWith('%') || (IsMathFunction(text.TrimStart()) && text.Contains('%')));
+    }
+
+    /// <summary>
+    /// Evaluates a length, a percentage or math of them. A percentage of nothing (NaN) gives NaN,
+    /// as a plain one does, so that what asks can tell it is not known yet. False if it is not understood.
+    /// </summary>
+    internal static bool TryEvaluateMath(string text, float relativeTo, out float value)
+    {
+        var position = 0;
+        var result = ParseMathSum(text, ref position, relativeTo);
+        SkipMathSpaces(text, ref position);
+        value = result ?? float.NaN;
+        return result.HasValue && position == text.Length;
+    }
+
+    private static void SkipMathSpaces(string text, ref int position)
+    {
+        while (position < text.Length && char.IsWhiteSpace(text[position]))
+        {
+            position++;
+        }
+    }
+
+    private static float? ParseMathSum(string text, ref int position, float relativeTo)
+    {
+        var result = ParseMathProduct(text, ref position, relativeTo);
+
+        while (result.HasValue)
+        {
+            SkipMathSpaces(text, ref position);
+
+            if (position >= text.Length || (text[position] != '+' && text[position] != '-'))
+            {
+                break;
+            }
+
+            var isAddition = text[position++] == '+';
+            var other = ParseMathProduct(text, ref position, relativeTo);
+            result = other.HasValue ? (isAddition ? result + other : result - other) : null;
+        }
+
+        return result;
+    }
+
+    private static float? ParseMathProduct(string text, ref int position, float relativeTo)
+    {
+        var result = ParseMathOperand(text, ref position, relativeTo);
+
+        while (result.HasValue)
+        {
+            SkipMathSpaces(text, ref position);
+
+            if (position >= text.Length || (text[position] != '*' && text[position] != '/'))
+            {
+                break;
+            }
+
+            var isProduct = text[position++] == '*';
+            var other = ParseMathOperand(text, ref position, relativeTo);
+            result = other.HasValue ? (isProduct ? result * other : result / other) : null;
+        }
+
+        return result;
+    }
+
+    private static float? ParseMathOperand(string text, ref int position, float relativeTo)
+    {
+        SkipMathSpaces(text, ref position);
+        var start = position;
+
+        while (position < text.Length && char.IsLetter(text[position]))
+        {
+            position++;
+        }
+
+        var name = text[start..position].ToLowerInvariant();
+
+        if (position < text.Length && text[position] == '(')
+        {
+            position++;
+            var arguments = new List<float>();
+
+            while (true)
+            {
+                var argument = ParseMathSum(text, ref position, relativeTo);
+                SkipMathSpaces(text, ref position);
+
+                if (!argument.HasValue || position >= text.Length)
+                {
+                    return null;
+                }
+
+                arguments.Add(argument.Value);
+
+                if (text[position] != ',')
+                {
+                    break;
+                }
+
+                position++;
+            }
+
+            if (text[position] != ')')
+            {
+                return null;
+            }
+
+            position++;
+            return name switch
+            {
+                "" or "calc" when arguments.Count == 1 => arguments[0],
+                "min" => arguments.Min(),
+                "max" => arguments.Max(),
+                "clamp" when arguments.Count == 3 => Math.Max(arguments[0], Math.Min(arguments[1], arguments[2])),
+                _ => null,
+            };
+        }
+
+        if (name.Length > 0)
+        {
+            return null;
+        }
+
+        // a sign directly at a number is part of it; a number goes on with its unit
+        if (position < text.Length && (text[position] == '+' || text[position] == '-'))
+        {
+            position++;
+        }
+
+        while (position < text.Length && (char.IsDigit(text[position]) || text[position] == '.'))
+        {
+            position++;
+        }
+
+        if (position < text.Length - 1 && (text[position] == 'e' || text[position] == 'E') &&
+            (char.IsDigit(text[position + 1]) || text[position + 1] == '-' || text[position + 1] == '+'))
+        {
+            position += 2;
+
+            while (position < text.Length && char.IsDigit(text[position]))
+            {
+                position++;
+            }
+        }
+
+        var numberEnd = position;
+
+        if (numberEnd == start)
+        {
+            return null;
+        }
+
+        while (position < text.Length && (char.IsLetter(text[position]) || text[position] == '%'))
+        {
+            position++;
+        }
+
+        var token = text[start..position];
+
+        if (token.EndsWith('%'))
+        {
+            return float.TryParse(token[..^1], NumberStyles.Float, CultureInfo.InvariantCulture, out var percent) ? relativeTo * percent / 100f : null;
+        }
+
+        if (numberEnd == position)
+        {
+            return float.TryParse(token, NumberStyles.Float, CultureInfo.InvariantCulture, out var number) ? number : null;
+        }
+
+        var pixels = ParseLengthValue(token, float.NaN, allowAuto: false);
+        return float.IsNaN(pixels) ? null : pixels;
     }
 
     private static GridTrackSize ConvertGridTrackSize(ICssValue value, float relativeTo)
@@ -4784,7 +4946,7 @@ public sealed partial class HtmlRenderer
     /// base here and count as auto.
     /// </summary>
     private static float ResolveDefiniteContentHeight(Dictionary<string, string> styleMap, float containingWidth, float verticalBorderAndPadding) =>
-        styleMap.TryGetValue("height", out var rawHeight) && rawHeight.TrimEnd().EndsWith('%')
+        styleMap.TryGetValue("height", out var rawHeight) && IsPercentageValue(rawHeight)
             ? float.NaN
             : ResolveAuthoredDimension(styleMap, "height", containingWidth, float.NaN, verticalBorderAndPadding);
 
@@ -8414,7 +8576,7 @@ public sealed partial class HtmlRenderer
     {
         static float OrDefault(float value, float fallback) => float.IsNaN(value) ? fallback : value;
         static bool IsPercentage(Dictionary<string, string> styleMap, string property) =>
-            styleMap.TryGetValue(property, out var value) && value.TrimEnd().EndsWith('%');
+            styleMap.TryGetValue(property, out var value) && IsPercentageValue(value);
 
         var minWidth = OrDefault(ParseLength(styleMap, "min-width", containingWidth, float.NaN, allowAuto: true), 0f);
         var maxWidth = OrDefault(ParseLength(styleMap, "max-width", containingWidth, float.NaN, allowAuto: true), float.PositiveInfinity);
@@ -12018,6 +12180,14 @@ public sealed partial class HtmlRenderer
             float.TryParse(parsed[..^1], NumberStyles.Float, CultureInfo.InvariantCulture, out var pct))
         {
             return (pct / 100f) * relativeTo;
+        }
+
+        // only what mixes percentages and lengths is left as math in a computed value
+        if (IsMathFunction(parsed))
+        {
+            return TryEvaluateMath(parsed, relativeTo, out var math) && !float.IsNaN(math)
+                ? math
+                : allowAuto ? float.NaN : defaultValue;
         }
 
         return ParseLengthValue(parsed, defaultValue, allowAuto: false);

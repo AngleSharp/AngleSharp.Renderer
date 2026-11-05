@@ -2197,7 +2197,7 @@ public sealed partial class HtmlRenderer
         return (!float.IsNaN(left) ? left : float.IsNaN(right) ? 0f : -right, !float.IsNaN(top) ? top : float.IsNaN(bottom) ? 0f : -bottom);
 
         float ParseVertical(string property) =>
-            styleMap.GetValueOrDefault(property)?.TrimEnd().EndsWith('%') == true
+            IsPercentageValue(styleMap.GetValueOrDefault(property))
                 ? float.NaN
                 : ParseLength(styleMap, property, 0f, float.NaN, allowAuto: true);
     }
@@ -2874,7 +2874,7 @@ public sealed partial class HtmlRenderer
         var margins = (float.IsNaN(marginLeft) ? 0f : marginLeft) + (float.IsNaN(marginRight) ? 0f : marginRight);
         // A percentage width would refer to the very size being computed, so it counts as auto in
         // an intrinsic contribution.
-        var authored = styleMap.TryGetValue("width", out var rawWidth) && rawWidth.TrimEnd().EndsWith('%')
+        var authored = styleMap.TryGetValue("width", out var rawWidth) && IsPercentageValue(rawWidth)
             ? float.NaN
             : ResolveAuthoredDimension(styleMap, "width", percentageBase, float.NaN, horizontalExtras);
         IntrinsicWidths content;

@@ -1,5 +1,6 @@
 using AngleSharp;
 using AngleSharp.Css;
+using AngleSharp.Css.Dom;
 using AngleSharp.Dom;
 using AngleSharp.Html.Dom;
 using AngleSharp.Io;
@@ -49,6 +50,95 @@ public sealed class BrowserIntegrationTests
         var document = await LoadAsync(html);
 
         Assert.NotEmpty(Render(document));
+    }
+
+    private static string Used(IDocument document, string id, string property)
+    {
+        _ = document.GetElementById(id)!.GetBoundingClientRect();
+        return document.DefaultView!.GetComputedStyleOfScript(document.GetElementById(id)!).GetPropertyValue(property);
+    }
+
+    [Theory]
+    [InlineData("width", "260px")]
+    [InlineData("height", "50px")]
+    [InlineData("padding-left", "10px")]
+    [InlineData("padding-top", "4px")]
+    [InlineData("border-left-width", "2px")]
+    [InlineData("position", "static")]
+    public async Task ScriptSeesWhatLayoutFound(string property, string expected)
+    {
+        var document = await LoadAsync("<style>body { margin: 0 }</style><div style='width: 500px'><div id=d style='width: calc(50% + 10px); height: 50px; padding: 4px 10px; border: 2px solid red'></div></div>");
+
+        Assert.Equal(expected, Used(document, "d", property));
+    }
+
+    [Fact]
+    public async Task UsedSizeOfABorderBoxIncludesPaddingAndBorder()
+    {
+        var document = await LoadAsync("<style>body { margin: 0 }</style><div id=d style='box-sizing: border-box; width: 100px; padding: 10px; border: 1px solid red'></div>");
+
+        Assert.Equal("100px", Used(document, "d", "width"));
+    }
+
+    [Fact]
+    public async Task UsedSizeIsWhatTheBoxHasWithoutAWidth()
+    {
+        var document = await LoadAsync("<style>body { margin: 0 }</style><div style='width: 300px'><div id=d></div></div>");
+
+        Assert.Equal("300px", Used(document, "d", "width"));
+    }
+
+    [Fact]
+    public async Task AnInlineBoxAndWhatIsNotDisplayedKeepTheirComputedSize()
+    {
+        var document = await LoadAsync("<span id=s>x</span><div id=n style='display: none; width: 50%'></div>");
+
+        Assert.Equal("auto", Used(document, "s", "width"));
+        Assert.Equal("50%", Used(document, "n", "width"));
+    }
+
+    [Fact]
+    public async Task ScriptSeesInheritedTextProperties()
+    {
+        var document = await LoadAsync("<div style='font-size: 20px; color: red'><span id=s>x</span></div>");
+
+        Assert.Equal("20px", Used(document, "s", "font-size"));
+        Assert.NotEqual(string.Empty, Used(document, "s", "color"));
+    }
+
+    [Fact]
+    public async Task ElementFromPointFindsTheTopmostElement()
+    {
+        var document = await LoadAsync("<style>body { margin: 0 }</style><div id=a style='width: 100px; height: 100px'><div id=b style='width: 50px; height: 50px'></div></div><div id=c style='position: absolute; left: 10px; top: 10px; width: 10px; height: 10px'></div>");
+
+        Assert.Equal("c", document.ElementFromPoint(15, 15)!.Id);
+        Assert.Equal("b", document.ElementFromPoint(30, 30)!.Id);
+        Assert.Equal("a", document.ElementFromPoint(80, 80)!.Id);
+        Assert.NotEqual("a", document.ElementFromPoint(500, 500)?.Id);
+    }
+
+    [Fact]
+    public async Task ElementsFromPointGoesFromTheTopToTheRoot()
+    {
+        var document = await LoadAsync("<style>body { margin: 0 }</style><div id=a style='width: 100px; height: 100px'><div id=b style='width: 50px; height: 50px'></div></div>");
+
+        var names = document.ElementsFromPoint(30, 30).Select(m => m.Id is { Length: > 0 } id ? id : m.LocalName).ToArray();
+
+        Assert.Equal(new[] { "b", "a", "body", "html" }, names);
+    }
+
+    [Fact]
+    public async Task MouseEventKnowsItsPositionInTheTarget()
+    {
+        var document = await LoadAsync("<style>body { margin: 0 }</style><div id=d style='position: absolute; left: 10px; top: 20px; width: 100px; height: 100px; border: 1px solid red'></div>");
+        var target = document.GetElementById("d")!;
+        var ev = new AngleSharp.Html.Dom.Events.MouseEvent("click", true, true, document.DefaultView, 0, 0, 0, 40, 50);
+        target.Dispatch(ev);
+
+        Assert.Equal(29d, ev.GetOffsetX());
+        Assert.Equal(29d, ev.GetOffsetY());
+        Assert.Equal(40d, ev.GetPageX());
+        Assert.Equal(50d, ev.GetPageY());
     }
 
     [Fact]

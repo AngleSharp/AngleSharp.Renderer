@@ -1,3 +1,4 @@
+using AngleSharp.Css.Dom;
 namespace AngleSharp;
 
 using AngleSharp.Css;
@@ -21,6 +22,7 @@ public static class InteractiveHtmlRendererStateExtensions
 
         return s_harnesses.GetValue(context, static browsingContext =>
         {
+            browsingContext.SetUsedValueProvider(UsedValueProvider.Instance);
             var renderDevice = browsingContext.GetServices<IRenderDevice>().FirstOrDefault();
 
             if (renderDevice is null)
