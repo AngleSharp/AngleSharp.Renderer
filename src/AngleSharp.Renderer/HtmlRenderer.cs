@@ -110,7 +110,15 @@ public sealed partial class HtmlRenderer
         bool IsViewportAnchored = false,
         IElement? Sticky = null,
         RenderRect? OwnBox = null,
-        IReadOnlyList<RenderRect>? Fragments = null)
+        IReadOnlyList<RenderRect>? Fragments = null,
+        float MarginLeft = 0f,
+        float MarginRight = 0f,
+        float MarginTop = 0f,
+        float MarginBottom = 0f,
+        float InsetLeft = float.NaN,
+        float InsetRight = float.NaN,
+        float InsetTop = float.NaN,
+        float InsetBottom = float.NaN)
     {
         /// <summary>The box scripts see, relative to the border box here: the root element's own one (see LayoutDocument).</summary>
         public RenderRect ReportedBox => OwnBox is { } own
@@ -296,7 +304,15 @@ public sealed partial class HtmlRenderer
         float paddingLeft,
         float paddingRight,
         float paddingTop,
-        float paddingBottom)
+        float paddingBottom,
+        float marginLeft = 0f,
+        float marginRight = 0f,
+        float marginTop = 0f,
+        float marginBottom = 0f,
+        float insetLeft = float.NaN,
+        float insetRight = float.NaN,
+        float insetTop = float.NaN,
+        float insetBottom = float.NaN)
     {
         var metrics = new ElementLayoutMetrics(
             borderBoxX,
@@ -312,7 +328,15 @@ public sealed partial class HtmlRenderer
             paddingTop,
             paddingBottom,
             IsViewportAnchored: s_viewportAnchorDepth > 0,
-            Sticky: s_stickyElement);
+            Sticky: s_stickyElement,
+            MarginLeft: marginLeft,
+            MarginRight: marginRight,
+            MarginTop: marginTop,
+            MarginBottom: marginBottom,
+            InsetLeft: insetLeft,
+            InsetRight: insetRight,
+            InsetTop: insetTop,
+            InsetBottom: insetBottom);
 
         if (s_stickyProbe is { } probe && ReferenceEquals(probe.Element, element))
         {
@@ -320,6 +344,20 @@ public sealed partial class HtmlRenderer
         }
 
         s_layoutCapture.Value?.Record(element, metrics);
+    }
+
+    private static void SetUsedMargins(IElement element, EdgeSizes margins)
+    {
+        if (s_layoutCapture.Value is { } capture && capture.TryGet(element, out var metrics))
+        {
+            capture.Replace(element, metrics with
+            {
+                MarginTop = margins.Top,
+                MarginRight = margins.Right,
+                MarginBottom = margins.Bottom,
+                MarginLeft = margins.Left,
+            });
+        }
     }
 
     /// <summary>
@@ -935,7 +973,11 @@ public sealed partial class HtmlRenderer
 
         if (body is not null && (rootElementNode is null || IsVerticalMode(pageSystem)))
         {
-            RecordLayoutMetrics(body, contentX, contentY, contentWidth, clientHeight, 0f, 0f, 0f, 0f, 0f, 0f, 0f, 0f);
+            var bodyMargins = s_layoutCapture.Value?.TryGet(body, out var laidOutBody) == true ? laidOutBody : default;
+            RecordLayoutMetrics(
+                body, contentX, contentY, contentWidth, clientHeight,
+                0f, 0f, 0f, 0f, 0f, 0f, 0f, 0f,
+                bodyMargins.MarginLeft, bodyMargins.MarginRight, bodyMargins.MarginTop, bodyMargins.MarginBottom);
         }
 
         if (document.DocumentElement is not null)
@@ -945,7 +987,11 @@ public sealed partial class HtmlRenderer
             var ownBox = layoutCapture?.TryGet(document.DocumentElement, out var laidOut) == true
                 ? new RenderRect(laidOut.BorderBoxX - contentX, laidOut.BorderBoxY - contentY, laidOut.BorderBoxWidth, laidOut.BorderBoxHeight)
                 : (RenderRect?)null;
-            RecordLayoutMetrics(document.DocumentElement, contentX, contentY, contentWidth, clientHeight, 0f, 0f, 0f, 0f, 0f, 0f, 0f, 0f);
+            var rootMargins = layoutCapture?.TryGet(document.DocumentElement, out var laidOutRoot) == true ? laidOutRoot : default;
+            RecordLayoutMetrics(
+                document.DocumentElement, contentX, contentY, contentWidth, clientHeight,
+                0f, 0f, 0f, 0f, 0f, 0f, 0f, 0f,
+                rootMargins.MarginLeft, rootMargins.MarginRight, rootMargins.MarginTop, rootMargins.MarginBottom);
 
             if (ownBox is not null && layoutCapture!.TryGet(document.DocumentElement, out var viewportBox))
             {
@@ -1236,6 +1282,8 @@ public sealed partial class HtmlRenderer
         var marginBottom = ParseLength(styleMap, "margin-bottom", flowContainingWidth, box.Margin.Bottom, allowAuto: false);
         var marginLeft = ParseLength(styleMap, "margin-left", flowContainingWidth, box.Margin.Left, allowAuto: true);
         var marginRight = ParseLength(styleMap, "margin-right", flowContainingWidth, box.Margin.Right, allowAuto: true);
+        var cssMarginTop = marginTop;
+        var cssMarginBottom = marginBottom;
 
         // The parent already took this box's top margin (and those collapsing through it) as its
         // own; that margin belongs to its first in-flow child, which an out-of-flow box is not.
@@ -1502,6 +1550,10 @@ public sealed partial class HtmlRenderer
         var topOffset = ParseLength(styleMap, "top", offsetHeightReference, 0f, allowAuto: true);
         var rightOffset = ParseLength(styleMap, "right", isFixed ? context.Width : flowContainingWidth, float.NaN, allowAuto: true);
         var bottomOffset = ParseLength(styleMap, "bottom", isFixed ? context.Height : float.IsNaN(positionedContainingHeight) ? flowContainingWidth : positionedContainingHeight, float.NaN, allowAuto: true);
+        var cssLeftOffset = ParseLength(styleMap, "left", flowContainingWidth, float.NaN, allowAuto: true);
+        var cssRightOffset = ParseLength(styleMap, "right", flowContainingWidth, float.NaN, allowAuto: true);
+        var cssTopOffset = ParseLength(styleMap, "top", offsetHeightReference, float.NaN, allowAuto: true);
+        var cssBottomOffset = ParseLength(styleMap, "bottom", offsetHeightReference, float.NaN, allowAuto: true);
 
         if (float.IsNaN(leftOffset))
         {
@@ -1805,6 +1857,7 @@ public sealed partial class HtmlRenderer
                 PlaceFloatedContainer(ref cursorY, ref previousBlockMarginBottom);
             }
 
+            SetUsedMargins(node.Ref, new EdgeSizes(cssMarginTop, marginRight, cssMarginBottom, marginLeft));
             return;
         }
 
@@ -1851,6 +1904,7 @@ public sealed partial class HtmlRenderer
                 PlaceFloatedContainer(ref cursorY, ref previousBlockMarginBottom);
             }
 
+            SetUsedMargins(node.Ref, new EdgeSizes(cssMarginTop, marginRight, cssMarginBottom, marginLeft));
             return;
         }
 
@@ -2012,6 +2066,43 @@ public sealed partial class HtmlRenderer
 
         var borderBoxWidth = borderLeft + paddingLeft + contentWidth + paddingRight + borderRight;
         var borderBoxHeight = borderTop + paddingTop + contentHeight + paddingBottom + borderBottom;
+        var usedMarginLeft = marginLeft;
+        var usedMarginRight = marginRight;
+        var usedMarginTop = cssMarginTop;
+        var usedMarginBottom = cssMarginBottom;
+
+        if (isAbsolute || isFixed)
+        {
+            usedMarginLeft = positionedMargins.Left;
+            usedMarginRight = positionedMargins.Right;
+            usedMarginTop = positionedMargins.Top;
+            usedMarginBottom = positionedMargins.Bottom;
+
+            if (hasAutoHorizontalMargin && !IsAutoOffset(styleMap, "left") && !float.IsNaN(rightOffset))
+            {
+                var freeWidth = (isFixed ? context.Width - (2f * context.Padding) : absoluteContainingWidth) -
+                                leftOffset - rightOffset - positionedMargins.Left - positionedMargins.Right - positionedBorderBoxWidth;
+                usedMarginLeft = hasAutoLeftMargin
+                    ? hasAutoRightMargin ? Math.Max(0f, freeWidth) / 2f : freeWidth
+                    : positionedMargins.Left;
+                usedMarginRight = hasAutoRightMargin
+                    ? hasAutoLeftMargin ? Math.Max(0f, freeWidth) / 2f : freeWidth
+                    : positionedMargins.Right;
+            }
+
+            if ((autoTopMargin || autoBottomMargin) && !IsAutoOffset(styleMap, "top") && !float.IsNaN(bottomOffset) &&
+                !float.IsNaN(verticalContainingHeight) && !float.IsNaN(positionedBorderBoxHeight))
+            {
+                var freeHeight = verticalContainingHeight - topOffset - bottomOffset -
+                                 positionedMargins.Top - positionedMargins.Bottom - positionedBorderBoxHeight;
+                usedMarginTop = autoTopMargin
+                    ? autoBottomMargin ? freeHeight / 2f : freeHeight
+                    : positionedMargins.Top;
+                usedMarginBottom = autoBottomMargin
+                    ? autoTopMargin ? freeHeight / 2f : freeHeight
+                    : positionedMargins.Bottom;
+            }
+        }
 
         // the height its held back boxes are laid out with (see below)
         if (s_layoutCapture.Value is { Containers: { } heldBackContainers } && heldBackContainers.TryGetValue(element, out var containerEntry) && ReferenceEquals(containerEntry.Node, node))
@@ -2045,7 +2136,15 @@ public sealed partial class HtmlRenderer
             paddingLeft,
             paddingRight,
             paddingTop,
-            paddingBottom);
+            paddingBottom,
+            usedMarginLeft,
+            usedMarginRight,
+            usedMarginTop,
+            usedMarginBottom,
+            isRelative ? (float.IsNaN(cssLeftOffset) ? float.IsNaN(cssRightOffset) ? 0f : -cssRightOffset : cssLeftOffset) : float.NaN,
+            isRelative ? (float.IsNaN(cssRightOffset) ? float.IsNaN(cssLeftOffset) ? 0f : -cssLeftOffset : cssRightOffset) : float.NaN,
+            isRelative ? (float.IsNaN(cssTopOffset) ? float.IsNaN(cssBottomOffset) ? 0f : -cssBottomOffset : cssTopOffset) : float.NaN,
+            isRelative ? (float.IsNaN(cssBottomOffset) ? float.IsNaN(cssTopOffset) ? 0f : -cssTopOffset : cssBottomOffset) : float.NaN);
 
         var clipsOverflow = ShouldClipOverflow(styleMap);
 
@@ -2894,6 +2993,20 @@ public sealed partial class HtmlRenderer
                         itemCrossInLine = crossMarginStart;
                     }
 
+                    var usedCrossMarginStart = crossMarginStart;
+                    var usedCrossMarginEnd = crossMarginEnd;
+
+                    if (hasCrossAutoMargin)
+                    {
+                        var freeForMargins = Math.Max(0f, crossFreeSpace);
+                        usedCrossMarginStart = float.IsNaN(item.CrossMarginStart)
+                            ? float.IsNaN(item.CrossMarginEnd) ? freeForMargins / 2f : freeForMargins
+                            : crossMarginStart;
+                        usedCrossMarginEnd = float.IsNaN(item.CrossMarginEnd)
+                            ? float.IsNaN(item.CrossMarginStart) ? freeForMargins / 2f : freeForMargins
+                            : crossMarginEnd;
+                    }
+
                     var itemCrossPosition = lineCrossPosition + itemCrossInLine;
 
                     var marginStart = float.IsNaN(item.MainMarginStart) ? autoMarginSize : item.MainMarginStart;
@@ -2953,6 +3066,9 @@ public sealed partial class HtmlRenderer
                             positionedContainingHeight: itemContainingHeight,
                             mainAxisMarginsPlaced: true,
                             crossAxisMarginsPlaced: true);
+                        SetUsedMargins(elementChild.Ref, isRowDirection
+                            ? new EdgeSizes(usedCrossMarginStart, marginEnd, usedCrossMarginEnd, marginStart)
+                            : new EdgeSizes(marginStart, usedCrossMarginEnd, marginEnd, usedCrossMarginStart));
                         paintOrder.Track(elementChild, displayList, itemRangeStart, context);
 
                         if (item.HasDeferredMainSize)
@@ -3822,6 +3938,23 @@ public sealed partial class HtmlRenderer
                 positionedContainingWidth: itemContainingWidth,
                 positionedContainingHeight: itemContainingHeight,
                 mainAxisMarginsPlaced: true);
+            var gridBorderBoxWidth = resolvedChildContentWidth + childHorizontalExtras;
+            var gridBorderBoxHeight = resolvedChildContentHeight + childVerticalExtras;
+            var horizontalMarginSpace = Math.Max(0f, cellWidth - gridBorderBoxWidth - ZeroIfNaN(childMarginLeft) - ZeroIfNaN(childMarginRight));
+            var verticalMarginSpace = Math.Max(0f, cellHeight - gridBorderBoxHeight - ZeroIfNaN(childMarginTop) - ZeroIfNaN(childMarginBottom));
+            var usedGridMarginLeft = float.IsNaN(childMarginLeft)
+                ? float.IsNaN(childMarginRight) ? horizontalMarginSpace / 2f : horizontalMarginSpace
+                : childMarginLeft;
+            var usedGridMarginRight = float.IsNaN(childMarginRight)
+                ? float.IsNaN(childMarginLeft) ? horizontalMarginSpace / 2f : horizontalMarginSpace
+                : childMarginRight;
+            var usedGridMarginTop = float.IsNaN(childMarginTop)
+                ? float.IsNaN(childMarginBottom) ? verticalMarginSpace / 2f : verticalMarginSpace
+                : childMarginTop;
+            var usedGridMarginBottom = float.IsNaN(childMarginBottom)
+                ? float.IsNaN(childMarginTop) ? verticalMarginSpace / 2f : verticalMarginSpace
+                : childMarginBottom;
+            SetUsedMargins(elementChild.Ref, new EdgeSizes(usedGridMarginTop, usedGridMarginRight, usedGridMarginBottom, usedGridMarginLeft));
             paintOrder.Track(elementChild, displayList, itemRangeStart, context);
         }
 
@@ -7476,16 +7609,27 @@ public sealed partial class HtmlRenderer
         var isAnimated = SplitTopLevelCommaList(style.GetPropertyValue("animation-name"))
             .Any(name => !string.IsNullOrWhiteSpace(name) && !name.Trim().Equals("none", StringComparison.OrdinalIgnoreCase));
 
-        // Iterates the full interpolatable whitelist, not just map.Keys - a property that only
-        // ever appears inside a @keyframes block (never as a base/inherited declaration, e.g.
-        // `opacity` set solely by an animation) would otherwise have no key in the map at all for
-        // this loop to find and override.
+        // Script effects may animate properties outside the CSS animation whitelist.
         var styleMap = map as StyleMap;
+        var properties = CssValueInterpolation.InterpolatableProperties.Keys
+            .Concat(harness is InteractiveHtmlRendererState scriptState ? scriptState.GetScriptAnimatedProperties(element) : Enumerable.Empty<string>())
+            .Distinct(StringComparer.OrdinalIgnoreCase);
 
-        foreach (var property in CssValueInterpolation.InterpolatableProperties.Keys)
+        foreach (var property in properties)
         {
+            var scriptedValue = harness is InteractiveHtmlRendererState state
+                ? state.GetScriptAnimatedValue(element, property, style)
+                : null;
+
+            if (scriptedValue is not null)
+            {
+                map[property] = scriptedValue;
+                styleMap?.ClearRawLength(property);
+                continue;
+            }
+
             var animatedValue = !isAnimated ? null
-                : harness is InteractiveHtmlRendererState state ? state.GetAnimatedValue(element, property, style)
+                : harness is InteractiveHtmlRendererState cssState ? cssState.GetAnimatedValue(element, property, style)
                 : harness.GetAnimatedValue(element, property);
 
             if (animatedValue is not null)

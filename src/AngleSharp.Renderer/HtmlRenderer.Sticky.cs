@@ -363,7 +363,15 @@ public sealed partial class HtmlRenderer
             metrics.PaddingLeft,
             metrics.PaddingRight,
             metrics.PaddingTop,
-            metrics.PaddingBottom);
+            metrics.PaddingBottom,
+            metrics.MarginLeft,
+            metrics.MarginRight,
+            metrics.MarginTop,
+            metrics.MarginBottom,
+            metrics.InsetLeft,
+            metrics.InsetRight,
+            metrics.InsetTop,
+            metrics.InsetBottom);
     }
 
     /// <summary>

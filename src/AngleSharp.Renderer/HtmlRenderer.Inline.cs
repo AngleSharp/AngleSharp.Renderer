@@ -349,6 +349,14 @@ public sealed partial class HtmlRenderer
         /// <inheritdoc cref="RelativeX"/>
         public float RelativeY { get; init; }
 
+        public float InsetLeft { get; init; } = float.NaN;
+
+        public float InsetRight { get; init; } = float.NaN;
+
+        public float InsetTop { get; init; } = float.NaN;
+
+        public float InsetBottom { get; init; } = float.NaN;
+
         public bool IsOnLine { get; set; }
 
         public bool IsBrokenImage { get; init; }
@@ -611,6 +619,10 @@ public sealed partial class HtmlRenderer
                               box.Padding.Top > 0f || box.Padding.Right > 0f || box.Padding.Bottom > 0f || box.Padding.Left > 0f ||
                               box.BackgroundPaint is not RenderColorPaint { Color.A: 0 };
             var (relativeX, relativeY) = ResolveInlineRelativeOffset(styleMap, _containingWidth);
+            var inlineLeft = ParseLength(styleMap, "left", _containingWidth, float.NaN, allowAuto: true);
+            var inlineRight = ParseLength(styleMap, "right", _containingWidth, float.NaN, allowAuto: true);
+            var inlineTop = IsPercentageValue(styleMap.GetValueOrDefault("top")) ? float.NaN : ParseLength(styleMap, "top", 0f, float.NaN, allowAuto: true);
+            var inlineBottom = IsPercentageValue(styleMap.GetValueOrDefault("bottom")) ? float.NaN : ParseLength(styleMap, "bottom", 0f, float.NaN, allowAuto: true);
             var inlineBox = new InlineBox
             {
                 Node = element,
@@ -624,6 +636,10 @@ public sealed partial class HtmlRenderer
                 LineEdge = lineEdge,
                 RelativeX = (parentBox?.RelativeX ?? 0f) + relativeX,
                 RelativeY = (parentBox?.RelativeY ?? 0f) + relativeY,
+                InsetLeft = float.IsNaN(inlineLeft) ? float.IsNaN(inlineRight) ? 0f : -inlineRight : inlineLeft,
+                InsetRight = float.IsNaN(inlineRight) ? float.IsNaN(inlineLeft) ? 0f : -inlineLeft : inlineRight,
+                InsetTop = float.IsNaN(inlineTop) ? float.IsNaN(inlineBottom) ? 0f : -inlineBottom : inlineTop,
+                InsetBottom = float.IsNaN(inlineBottom) ? float.IsNaN(inlineTop) ? 0f : -inlineTop : inlineBottom,
                 IsPositioned = (parentBox?.IsPositioned ?? false) || string.Equals(GetPosition(styleMap), "relative", StringComparison.OrdinalIgnoreCase),
             };
 
@@ -1038,7 +1054,13 @@ public sealed partial class HtmlRenderer
                     inlineBox.Box.Padding.Left,
                     inlineBox.Box.Padding.Right,
                     inlineBox.Box.Padding.Top,
-                    inlineBox.Box.Padding.Bottom);
+                    inlineBox.Box.Padding.Bottom,
+                    inlineBox.MarginLeft,
+                    inlineBox.MarginRight,
+                    insetLeft: inlineBox.InsetLeft,
+                    insetRight: inlineBox.InsetRight,
+                    insetTop: inlineBox.InsetTop,
+                    insetBottom: inlineBox.InsetBottom);
             }
         }
 

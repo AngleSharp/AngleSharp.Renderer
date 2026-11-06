@@ -201,6 +201,42 @@ public sealed partial class HtmlRenderer
 
             return (X + Math.Min(stops[first], stops[last]), X + Math.Max(stops[first], stops[last]));
         }
+
+        /// <summary>Gets the painted character range for one source node.</summary>
+        public (int Start, int End)? GetSelectedCharacters(TextSegment segment, int nodeOrder, TextSelectionRange selection)
+        {
+            var start = -1;
+            var end = -1;
+
+            for (var index = segment.Start; index < segment.Start + segment.Length; index++)
+            {
+                if (GetSource(index) is { } source && ReferenceEquals(source.Node, segment.Node) &&
+                    (nodeOrder > selection.Start.Node || nodeOrder == selection.Start.Node && source.Offset >= selection.Start.Offset) &&
+                    (nodeOrder < selection.End.Node || nodeOrder == selection.End.Node && source.Offset < selection.End.Offset))
+                {
+                    start = start < 0 ? index : start;
+                    end = index + 1;
+                }
+            }
+
+            return start < 0 ? null : (start, end);
+        }
+
+        /// <summary>Gets the x-coordinate of a source caret in this run.</summary>
+        public float? GetCaretX(IText node, int offset)
+        {
+            var (boundaries, stops) = Carets;
+
+            for (var index = 0; index < boundaries.Length; index++)
+            {
+                if (GetCaretSource(boundaries[index]) is { } source && ReferenceEquals(source.Node, node) && source.Offset == offset)
+                {
+                    return X + stops[index];
+                }
+            }
+
+            return null;
+        }
     }
 
     private sealed class StyledTextFragment(LayoutContext context, RenderTextStyle style) : TextFragment
@@ -391,7 +427,8 @@ public sealed partial class HtmlRenderer
 
     /// <summary>Gets if layouts of the document are to record where their text comes from.</summary>
     private static bool ShouldRecordTextFragments(IDocument document) =>
-        document.Context is { } browsingContext && browsingContext.TryGetDomHarness(out var harness) && harness is { IsTextSelectionEnabled: true };
+        document.Context is { } browsingContext && browsingContext.TryGetDomHarness(out var harness) &&
+        harness is InteractiveHtmlRendererState state && (state.IsTextSelectionEnabled || state.IsRangeGeometryEnabled);
 
     /// <summary>A selection in terms of the text nodes in tree order; its end is exclusive.</summary>
     internal readonly record struct TextSelectionRange((int Node, int Offset) Start, (int Node, int Offset) End);
@@ -399,7 +436,9 @@ public sealed partial class HtmlRenderer
     /// <summary>What can be selected where in a display list.</summary>
     internal sealed class TextMap
     {
-        private readonly record struct Entry(TextFragment Fragment, RenderTransform2D Inverse, bool IsAnchored, RenderRect Bounds);
+        private readonly record struct Entry(TextFragment Fragment, RenderTransform2D Transform, RenderTransform2D Inverse, bool IsAnchored, RenderRect Bounds, RenderRect? Clip);
+
+        internal readonly record struct RangeTextRect(INode Node, int Offset, RenderRect Rect, bool IsAnchored);
 
         private readonly List<Entry> _entries = [];
         private readonly IDocument _document;
@@ -483,7 +522,7 @@ public sealed partial class HtmlRenderer
                 transform.A / determinant,
                 ((transform.C * transform.F) - (transform.D * transform.E)) / determinant,
                 ((transform.B * transform.E) - (transform.A * transform.F)) / determinant);
-            _entries.Add(new Entry(fragment, inverse, isAnchored, bounds));
+            _entries.Add(new Entry(fragment, transform, inverse, isAnchored, bounds, clip));
         }
 
         private static RenderRect Intersect(RenderRect? current, RenderRect rect)
@@ -628,6 +667,60 @@ public sealed partial class HtmlRenderer
         /// <summary>Gets the selection in terms of the text nodes.</summary>
         public TextSelectionRange Resolve(IRange range) =>
             new(ResolveBoundary(range.Head, range.Start), ResolveBoundary(range.Tail, range.End));
+
+        /// <summary>Gets the visible text rectangles intersected by a range.</summary>
+        public IReadOnlyList<RangeTextRect> GetRangeRects(IRange range)
+        {
+            var selection = Resolve(range);
+            var rects = new List<RangeTextRect>();
+
+            if (selection.Start == selection.End && range.Head is IText caretNode)
+            {
+                foreach (var entry in _entries)
+                {
+                    if (entry.Fragment.GetCaretX(caretNode, range.Start) is { } x)
+                    {
+                        var rect = entry.Transform.MapBounds(new RenderRect(x, entry.Fragment.Top, 0f, entry.Fragment.Height));
+
+                        if (Intersects(entry.Clip, rect))
+                        {
+                            rects.Add(new RangeTextRect(caretNode, range.Start, rect, entry.IsAnchored));
+                            return rects;
+                        }
+                    }
+                }
+
+                return rects;
+            }
+
+            foreach (var entry in _entries)
+            {
+                foreach (var segment in entry.Fragment.Segments)
+                {
+                    if (!GetTextOrder().TryGetValue(segment.Node, out var nodeOrder) ||
+                        entry.Fragment.GetSelectedCharacters(segment, nodeOrder, selection) is not { } characters)
+                    {
+                        continue;
+                    }
+
+                    var (left, right) = entry.Fragment.GetExtent(characters.Start, characters.End);
+                    var rect = entry.Transform.MapBounds(new RenderRect(left, entry.Fragment.Top, right - left, entry.Fragment.Height));
+                    var offset = entry.Fragment.GetSource(characters.Start)?.Offset ?? segment.RawStart;
+
+                    if (Intersects(entry.Clip, rect))
+                    {
+                        rects.Add(new RangeTextRect(segment.Node, offset, rect, entry.IsAnchored));
+                    }
+                }
+            }
+
+            return rects;
+        }
+
+        private static bool Intersects(RenderRect? clip, RenderRect rect) =>
+            clip is not { } clipped ||
+            rect.X + rect.Width >= clipped.X && rect.X <= clipped.X + clipped.Width &&
+            rect.Y + rect.Height >= clipped.Y && rect.Y <= clipped.Y + clipped.Height;
 
         private (int Node, int Offset) ResolveBoundary(INode node, int offset)
         {

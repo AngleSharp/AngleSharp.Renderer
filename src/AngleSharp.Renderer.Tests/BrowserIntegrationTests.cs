@@ -73,6 +73,109 @@ public sealed class BrowserIntegrationTests
     }
 
     [Fact]
+    public async Task ScriptSeesUsedMarginsAndMarginShorthand()
+    {
+        var document = await LoadAsync("<style>body { margin: 0 }</style><div style='width: 400px'><p id=p style='width: 100px; margin: 0 auto'></p><div id=q style='margin-left: 10%'></div><span id=i style='margin-left: 10%; margin-top: 5px'>x</span></div>");
+
+        Assert.Equal("150px", Used(document, "p", "margin-left"));
+        Assert.Equal("150px", Used(document, "p", "margin-right"));
+        Assert.Equal("0px 150px", Used(document, "p", "margin"));
+        Assert.Equal("40px", Used(document, "q", "margin-left"));
+        Assert.Equal("40px", Used(document, "i", "margin-left"));
+        Assert.Equal("5px", Used(document, "i", "margin-top"));
+        Assert.Equal("5px 0px 0px 40px", Used(document, "i", "margin"));
+    }
+
+    [Fact]
+    public async Task FlexAndGridItemsExposeTheirAutoMargins()
+    {
+        var document = await LoadAsync("<style>body { margin: 0 }</style><div style='width: 400px'><div style='display: flex; width: 400px'><div id=f style='width: 100px; height: 20px; margin-left: auto'></div></div><div style='display: grid; width: 400px; grid-template-columns: 400px'><div id=g style='width: 100px; height: 20px; margin: auto'></div></div></div>");
+
+        Assert.Equal("300px", Used(document, "f", "margin-left"));
+        Assert.Equal("150px", Used(document, "g", "margin-left"));
+        Assert.Equal("150px", Used(document, "g", "margin-right"));
+    }
+
+    [Fact]
+    public async Task CollapsedMarginsReportTheirOwnUsedValue()
+    {
+        var document = await LoadAsync("<style>body { margin: 0 }</style><div id=parent><div id=child style='margin-top: 20px'></div></div>");
+
+        Assert.Equal("20px", Used(document, "child", "margin-top"));
+    }
+
+    [Fact]
+    public async Task OverconstrainedBlockReportsItsAdjustedRightMargin()
+    {
+        var document = await LoadAsync("<style>body { margin: 0 }</style><div style='width: 100px'><div id=child style='width: 120px; margin-left: 20px; margin-right: 30px'></div></div>");
+
+        Assert.Equal("-40px", Used(document, "child", "margin-right"));
+    }
+
+    [Fact]
+    public async Task ScriptSeesUsedPositionedInsetsRelativeToThePaddingBox()
+    {
+        var document = await LoadAsync("<style>body { margin: 0 }</style><div style='position: relative; transform: translateX(50px); width: 400px; height: 300px; border: 10px solid'><div id=a style='position: absolute; left: 10%; top: 20%; width: 100px; height: 50px'></div></div>");
+
+        Assert.Equal("40px", Used(document, "a", "left"));
+        Assert.Equal("260px", Used(document, "a", "right"));
+        Assert.Equal("60px", Used(document, "a", "top"));
+        Assert.Equal("190px", Used(document, "a", "bottom"));
+        Assert.Equal("60px 260px 190px 40px", Used(document, "a", "inset"));
+    }
+
+    [Fact]
+    public async Task AbsolutelyPositionedAutoMarginsAreResolved()
+    {
+        var document = await LoadAsync("<style>body { margin: 0 }</style><div style='position: relative; width: 400px'><div id=a style='position: absolute; left: 0; right: 0; width: 100px; height: 20px; margin: 0 auto'></div></div>");
+
+        Assert.Equal("150px", Used(document, "a", "margin-left"));
+        Assert.Equal("150px", Used(document, "a", "margin-right"));
+        Assert.Equal("0px", Used(document, "a", "left"));
+        Assert.Equal("0px", Used(document, "a", "right"));
+    }
+
+    [Fact]
+    public async Task RelativeInsetAutoUsesTheOppositeSide()
+    {
+        var document = await LoadAsync("<style>body { margin: 0 }</style><div id=r style='position: relative; top: 10px'></div>");
+
+        Assert.Equal("10px", Used(document, "r", "top"));
+        Assert.Equal("-10px", Used(document, "r", "bottom"));
+    }
+
+    [Fact]
+    public async Task StaticAndStickyInsetsRemainComputedValues()
+    {
+        var document = await LoadAsync("<style>body { margin: 0 }</style><div id=s style='left: 5px'></div><div id=t style='position: sticky; top: 10%'></div>");
+
+        Assert.Equal("5px", Used(document, "s", "left"));
+        Assert.Equal("10%", Used(document, "t", "top"));
+    }
+
+    [Fact]
+    public async Task FixedInsetsDoNotChangeWhenThePageScrolls()
+    {
+        var document = await LoadAsync("<style>body { margin: 0 }</style><div style='height: 1000px'></div><div id=f style='position: fixed; left: 25px; top: 30px; width: 10px; height: 10px'></div>");
+
+        document.DocumentElement!.SetScrollTop(200);
+
+        Assert.Equal("25px", Used(document, "f", "left"));
+        Assert.Equal("30px", Used(document, "f", "top"));
+    }
+
+    [Fact]
+    public async Task AbsoluteInsetsAccountForContainingBlockScroll()
+    {
+        var document = await LoadAsync("<style>body { margin: 0 }</style><div id=cb style='position: relative; overflow: auto; width: 200px; height: 100px'><div style='height: 400px'></div><div id=a style='position: absolute; top: 25%; left: 10%; width: 10px; height: 10px'></div></div>");
+        var containingBlock = document.GetElementById("cb")!;
+        containingBlock.SetScrollTop(40);
+
+        Assert.Equal("25px", Used(document, "a", "top"));
+        Assert.Equal("20px", Used(document, "a", "left"));
+    }
+
+    [Fact]
     public async Task UsedSizeOfABorderBoxIncludesPaddingAndBorder()
     {
         var document = await LoadAsync("<style>body { margin: 0 }</style><div id=d style='box-sizing: border-box; width: 100px; padding: 10px; border: 1px solid red'></div>");
@@ -91,10 +194,12 @@ public sealed class BrowserIntegrationTests
     [Fact]
     public async Task AnInlineBoxAndWhatIsNotDisplayedKeepTheirComputedSize()
     {
-        var document = await LoadAsync("<span id=s>x</span><div id=n style='display: none; width: 50%'></div>");
+        var document = await LoadAsync("<span id=s>x</span><div id=n style='display: none; position: absolute; width: 50%; margin-left: auto; left: 10%'></div>");
 
         Assert.Equal("auto", Used(document, "s", "width"));
         Assert.Equal("50%", Used(document, "n", "width"));
+        Assert.Equal("auto", Used(document, "n", "margin-left"));
+        Assert.Equal("10%", Used(document, "n", "left"));
     }
 
     [Fact]

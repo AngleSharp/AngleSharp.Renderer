@@ -792,6 +792,138 @@ public sealed class ElementCssomViewExtensionsTests
         Assert.Equal(joined.Width, spaced.Width, 2);
     }
 
+    [Fact]
+    public async Task RangeClientRects_MeasureOnlyTheSelectedTextAndCollapsedCaret()
+    {
+        var document = await ParseAsync("""
+            <html>
+              <head><style>html, body { margin: 0; } #text { font: 20px/24px monospace; }</style></head>
+              <body><div id="text">abcdefghij</div></body>
+            </html>
+            """);
+        var text = document.GetElementById("text")!.FirstChild!;
+        var shortRange = document.CreateRange();
+        shortRange.StartWith(text, 2);
+        shortRange.EndWith(text, 3);
+        var range = document.CreateRange();
+        range.StartWith(text, 2);
+        range.EndWith(text, 7);
+
+        var shortRect = shortRange.GetBoundingClientRect();
+        var rects = range.GetClientRects();
+        var rect = range.GetBoundingClientRect();
+
+        Assert.Equal(1, rects.Length);
+        Assert.Equal(shortRect.Left, rect.Left, 3);
+        Assert.Equal(shortRect.Width * 5d, rect.Width, 2);
+        Assert.Equal(24d, rect.Height, 2);
+
+        var caret = document.CreateRange();
+        caret.StartWith(text, 2);
+        caret.EndWith(text, 2);
+        var caretRect = caret.GetBoundingClientRect();
+
+        Assert.Equal(0d, caretRect.Width);
+        Assert.Equal(shortRect.Left, caretRect.Left, 3);
+        Assert.Equal(shortRect.Height, caretRect.Height, 3);
+    }
+
+    [Fact]
+    public async Task RangeClientRects_ReturnOneRectanglePerWrappedLine()
+    {
+        var document = await ParseAsync("""
+            <html>
+              <head><style>html, body { margin: 0; } #text { width: 48px; font: 20px/24px monospace; }</style></head>
+              <body><div id="text">abc def ghi</div></body>
+            </html>
+            """);
+        var text = document.GetElementById("text")!.FirstChild!;
+        var range = document.CreateRange();
+        range.StartWith(text, 0);
+        range.EndWith(text, text.TextContent.Length);
+
+        var rects = range.GetClientRects();
+
+        Assert.True(rects.Length >= 3);
+        Assert.Equal(24d, rects.Item(0)!.Height, 2);
+        Assert.True(rects.Item(1)!.Top > rects.Item(0)!.Top);
+    }
+
+    [Fact]
+    public async Task RangeClientRects_FollowTransformsAndPageScrolling()
+    {
+        var document = await ParseAsync("""
+            <html>
+              <head>
+                <style>
+                  html, body { margin: 0; }
+                  #text { transform: translate(20px, 30px); font: 20px/24px monospace; }
+                  #tail { height: 500px; }
+                </style>
+              </head>
+              <body><div style="height:100px"></div><div id="text">abcdef</div><div id="tail"></div></body>
+            </html>
+            """);
+        var text = document.GetElementById("text")!.FirstChild!;
+        var range = document.CreateRange();
+        range.StartWith(text, 0);
+        range.EndWith(text, 3);
+
+        var before = range.GetBoundingClientRect();
+        document.DocumentElement!.SetScrollTop(40);
+        var after = range.GetBoundingClientRect();
+
+        Assert.True(before.Left >= 20d);
+        Assert.Equal(before.Left, after.Left, 3);
+        Assert.Equal(before.Top - 40d, after.Top, 3);
+    }
+
+    [Fact]
+    public async Task RangeClientRects_IncludeFullyContainedElementBoxes()
+    {
+        var document = await ParseAsync("""
+            <html>
+              <head><style>html, body { margin: 0; } span { display: inline-block; font: 16px/20px monospace; }</style></head>
+              <body><div><span id="first">one</span><span id="second">two</span></div></body>
+            </html>
+            """);
+        var first = document.GetElementById("first")!;
+        var second = document.GetElementById("second")!;
+        var range = document.CreateRange();
+        range.StartBefore(first);
+        range.EndAfter(second);
+
+        var rects = range.GetClientRects().ToArray();
+
+        Assert.Contains(rects, rect => rect.Left == first.GetBoundingClientRect().Left && rect.Width == first.GetBoundingClientRect().Width);
+        Assert.Contains(rects, rect => rect.Left == second.GetBoundingClientRect().Left && rect.Width == second.GetBoundingClientRect().Width);
+    }
+
+    [Fact]
+    public async Task RangeClientRects_AreEmptyForDetachedAndUndisplayedText()
+    {
+        var document = await ParseAsync("""
+            <html>
+              <head><style>html, body { margin: 0; } #hidden { display: none; }</style></head>
+              <body><div id="hidden">hidden</div></body>
+            </html>
+            """);
+        var hiddenText = document.GetElementById("hidden")!.FirstChild!;
+        var hiddenRange = document.CreateRange();
+        hiddenRange.StartWith(hiddenText, 0);
+        hiddenRange.EndWith(hiddenText, hiddenText.TextContent.Length);
+
+        var detached = document.CreateElement("div").AppendChild(document.CreateTextNode("detached"));
+        var detachedRange = document.CreateRange();
+        detachedRange.StartWith(detached, 0);
+        detachedRange.EndWith(detached, detached.TextContent.Length);
+
+        Assert.Equal(0, hiddenRange.GetClientRects().Length);
+        Assert.Equal(0d, hiddenRange.GetBoundingClientRect().Width);
+        Assert.Equal(0, detachedRange.GetClientRects().Length);
+        Assert.Equal(0d, detachedRange.GetBoundingClientRect().Width);
+    }
+
     private static async Task<IDocument> ParseAsync(string html)
     {
       var context = BrowsingContext.New(CreateConfiguration(240, 160));

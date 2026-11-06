@@ -145,6 +145,9 @@ public sealed class RenderedFrame
     /// <summary>Gets where the text of the frame is, as laid out (before any shift).</summary>
     internal HtmlRenderer.TextMap TextMap => _textMap ??= new HtmlRenderer.TextMap(_displayList, OverscanTop, _document!);
 
+    /// <summary>Gets how far a repositioned frame's text map moves with the page.</summary>
+    internal float TextMapShiftY => _shiftY;
+
     /// <summary>
     /// Rasterizes the frame into pixels. Safe to call from any thread.
     /// </summary>

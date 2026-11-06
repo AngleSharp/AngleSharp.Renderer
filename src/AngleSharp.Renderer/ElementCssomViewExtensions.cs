@@ -32,7 +32,7 @@ public static class ElementCssomViewExtensions
     }
 
     // the box where it is painted: under the transforms of the element and the ones around it
-    private static RenderRect ApplyTransforms(IElement element, RenderRect box)
+    internal static RenderRect ApplyTransforms(IElement element, RenderRect box)
     {
         if (element.Owner is not { } owner || owner.Context.GetDomHarness() is not InteractiveHtmlRendererState state)
         {
@@ -455,6 +455,13 @@ public static class ElementCssomViewExtensions
         }
 
         return GetMetricsMap(element) is { } metricsMap && metricsMap.TryGetValue(element, out var unscrolled) ? unscrolled : null;
+    }
+
+    internal static HtmlRenderer.ElementLayoutMetrics? GetPageMetrics(IElement element)
+    {
+        return GetMetricsMap(element) is { } metricsMap && metricsMap.TryGetValue(element, out var unscrolled)
+            ? unscrolled
+            : null;
     }
 
     private static IDomHarness? GetInteractiveState(IElement element)

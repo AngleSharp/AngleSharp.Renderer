@@ -12,6 +12,7 @@ using AngleSharp.Renderer.Rendering;
 internal sealed partial class InteractiveHtmlRendererState
 {
     private bool _isTextSelectionEnabled = true;
+    private bool _isRangeGeometryEnabled;
     private SelectionGesture? _gesture;
     // what the last frame shows, for not painting it again
     private (RenderedFrame Base, RenderedFrame Shown, HtmlRenderer.TextSelectionRange? Selection)? _shownSelection;
@@ -40,6 +41,21 @@ internal sealed partial class InteractiveHtmlRendererState
                 OnPaintInvalidated();
             }
         }
+    }
+
+    internal bool IsRangeGeometryEnabled => _isRangeGeometryEnabled;
+
+    internal RenderedFrame GetRangeGeometryFrame(IDocument document)
+    {
+        if (!_isRangeGeometryEnabled)
+        {
+            _isRangeGeometryEnabled = true;
+            _lastFrame = null;
+        }
+
+        var frame = GetTextFrame(document);
+        var scrollTop = document.DocumentElement is { } root ? GetScrollTop(root, double.MaxValue) : 0d;
+        return frame.CanReposition && scrollTop != frame.ScrollTop ? frame.Reposition(scrollTop) : frame;
     }
 
     public bool IsSelectingText => _gesture is not null;

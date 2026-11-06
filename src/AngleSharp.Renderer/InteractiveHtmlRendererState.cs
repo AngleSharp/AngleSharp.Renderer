@@ -251,6 +251,7 @@ internal sealed partial class InteractiveHtmlRendererState : IDomHarness
     {
         _clockMs += delta.TotalMilliseconds;
         _transitionTracker.AdvanceTime(delta);
+        AdvanceScriptAnimations();
 
         foreach (var subframe in _subframes)
         {
@@ -385,7 +386,7 @@ internal sealed partial class InteractiveHtmlRendererState : IDomHarness
             _lastFrame = frame;
             _lastFrameLayout = snapshot;
             _isFrameScrollShiftable = frame.IsScrollShiftable;
-            frame.IsAnimating = _animationTracker.IsAnimating || _transitionTracker.HasRunningTransitions || snapshot.Subframes.Values.Any(static entry => entry.Frame?.IsAnimating == true);
+            frame.IsAnimating = _animationTracker.IsAnimating || _transitionTracker.HasRunningTransitions || HasRunningScriptAnimations || snapshot.Subframes.Values.Any(static entry => entry.Frame?.IsAnimating == true);
             FrameUpdated?.Invoke(this, EventArgs.Empty);
             return ShowSelection(frame);
         }
@@ -542,6 +543,8 @@ internal sealed partial class InteractiveHtmlRendererState : IDomHarness
 
         PaintInvalidated?.Invoke(this, EventArgs.Empty);
     }
+
+    internal void OnFontsChanged() => OnPaintInvalidated();
 
     private static double Clamp(double value, double min, double max)
     {
