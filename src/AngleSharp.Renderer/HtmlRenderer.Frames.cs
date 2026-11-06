@@ -179,7 +179,8 @@ public sealed partial class HtmlRenderer
                 isScrollShiftable = false;
                 hasStickyBoxes |= string.Equals(position, "sticky", StringComparison.OrdinalIgnoreCase);
             }
-            else
+            // what a box clips (e.g. the content of a scroll container) is no content of the page
+            else if (!HitTestMap.IsClipped(element, metrics, styleMaps))
             {
                 contentBottom = Math.Max(contentBottom, elementMetrics.BorderBoxY + elementMetrics.BorderBoxHeight + scrollOffsetY);
             }
@@ -188,6 +189,6 @@ public sealed partial class HtmlRenderer
         var hitTestMap = HitTestMap.Create(document, metrics, styleMaps, -overscan, snapshot.Subframes);
         var contentHeight = Math.Max(height, (double)contentBottom);
         // fixed boxes are marked in the display list, sticky ones would have to stick anew
-        return new RenderedFrame(displayList, _backend, surface, height, scrollTop, overscan, contentHeight, isScrollShiftable, !hasStickyBoxes, hitTestMap);
+        return new RenderedFrame(displayList, _backend, surface, height, scrollTop, overscan, contentHeight, isScrollShiftable, !hasStickyBoxes, hitTestMap, document: document);
     }
 }

@@ -27,6 +27,13 @@ internal static class FontFaceLoader
 
     public static FontFaceSet Load(IDocument document)
     {
+        var faces = LoadCss(document).ToList();
+        faces.AddRange(DocumentFontFaceSet.TryGet(document)?.LoadedFaces ?? []);
+        return faces.Count == 0 ? FontFaceSet.Empty : new FontFaceSet(faces);
+    }
+
+    internal static IReadOnlyList<FontFace> LoadCss(IDocument document)
+    {
         var faces = new List<FontFace>();
 
         foreach (var sheet in document.StyleSheets.OfType<ICssStyleSheet>())
@@ -40,8 +47,29 @@ internal static class FontFaceLoader
             }
         }
 
-        return faces.Count == 0 ? FontFaceSet.Empty : new FontFaceSet(faces);
+        return faces;
     }
+
+    internal static bool TryLoadProgrammaticSource(IDocument document, string source, out byte[] data)
+    {
+        data = [];
+        var trimmed = source.Trim();
+
+        if (TryParseUrl(trimmed, out var url, out var format))
+        {
+            if (format is not null && UnsupportedFormats.Contains(format))
+            {
+                return false;
+            }
+
+            return TryLoadFontData(document, url, out data);
+        }
+
+        return false;
+    }
+
+    internal static bool TryDecodeProgrammaticData(byte[] bytes, out byte[] data) =>
+        WebFontDecoder.TryDecode(bytes, out data);
 
     private static bool TryCreateFace(IDocument document, ICssFontFaceRule rule, out FontFace face)
     {
@@ -85,8 +113,26 @@ internal static class FontFaceLoader
             return false;
         }
 
-        face = new FontFace(family, weight, isItalic, sources);
+        face = new FontFace(family, weight, isItalic, sources, rule.Weight, rule.Style, rule.Stretch, rule.Range, ParseFontDisplay(rule.CssText));
         return true;
+    }
+
+    private static string ParseFontDisplay(string cssText)
+    {
+        foreach (var declaration in cssText.Split(';'))
+        {
+            var colon = declaration.IndexOf(':');
+
+            if (colon < 0 || !string.Equals(declaration[..colon].Trim().TrimStart('{').Trim(), "font-display", StringComparison.OrdinalIgnoreCase))
+            {
+                continue;
+            }
+
+            var value = declaration[(colon + 1)..].Split('}')[0].Trim();
+            return value.Length > 0 ? value : "auto";
+        }
+
+        return "auto";
     }
 
     private static bool TryLoadFontData(IDocument document, string url, out byte[] data)

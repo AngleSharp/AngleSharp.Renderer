@@ -119,4 +119,54 @@ public interface IDomHarness
     /// </summary>
     /// <returns>The frame showing the document now, or null if it needs <see cref="PrepareFrame"/>.</returns>
     RenderedFrame? UpdateFrame() => null;
+
+    /// <summary>
+    /// Gets or sets if the text of the document can be selected, which is the case by default.
+    /// Without it, layouts do not record where their text comes from, nothing can be selected
+    /// with the pointer, and no selection is painted.
+    /// </summary>
+    bool IsTextSelectionEnabled { get => false; set { } }
+
+    /// <summary>
+    /// Gets if the pointer is selecting text, i.e., since <see cref="BeginTextSelection"/>.
+    /// </summary>
+    bool IsSelectingText => false;
+
+    /// <summary>
+    /// Starts selecting text as a press of the primary pointer button does, which a host calls
+    /// unless `mousedown` was canceled. Fires `selectstart`, and does not select when canceled.
+    /// </summary>
+    /// <param name="x">The horizontal position in viewport coordinates.</param>
+    /// <param name="y">The vertical position in viewport coordinates.</param>
+    /// <param name="clickCount">The number of successive presses: 1 places the caret, 2 selects a word, 3 a paragraph.</param>
+    /// <param name="extend">If the selection is to extend to the position (Shift held).</param>
+    /// <returns>True if text is being selected now, false if there is no selectable text there.</returns>
+    bool BeginTextSelection(double x, double y, int clickCount = 1, bool extend = false) => false;
+
+    /// <summary>
+    /// Extends the selection to the position, while the pointer moves with its button held.
+    /// </summary>
+    /// <param name="x">The horizontal position in viewport coordinates.</param>
+    /// <param name="y">The vertical position in viewport coordinates.</param>
+    void ExtendTextSelection(double x, double y) { }
+
+    /// <summary>
+    /// Ends selecting text, as releasing the pointer button does. The selection stays.
+    /// </summary>
+    void EndTextSelection() { }
+
+    /// <summary>
+    /// Selects all text of the active document, e.g., for Ctrl+A.
+    /// </summary>
+    void SelectAllText() { }
+
+    /// <summary>
+    /// Removes the selection of the active document.
+    /// </summary>
+    void ClearTextSelection() { }
+
+    /// <summary>
+    /// Gets the selected text as it is shown, e.g., for copying it to the clipboard.
+    /// </summary>
+    string SelectedText => string.Empty;
 }

@@ -996,6 +996,8 @@ public sealed partial class HtmlRenderer
         var marginBottom = ParseLength(styleMap, "margin-bottom", flowWidth, box.Margin.Bottom, allowAuto: false);
         var marginLeft = ParseLength(styleMap, "margin-left", flowWidth, box.Margin.Left, allowAuto: true);
         var marginRight = ParseLength(styleMap, "margin-right", flowWidth, box.Margin.Right, allowAuto: true);
+        var usedMarginTop = marginTop;
+        var usedMarginBottom = marginBottom;
 
         if (isFloat || !float.IsNaN(forcedBorderBoxWidth))
         {
@@ -1102,6 +1104,14 @@ public sealed partial class HtmlRenderer
         {
             borderBoxX += Math.Max(0f, flowWidth - marginLeft - borderBoxWidth - marginRight) * inheritedTextStyle.BlockAlignShare;
         }
+
+        var freeMarginSpace = flowWidth - borderBoxWidth - ZeroIfNaN(marginLeft) - ZeroIfNaN(marginRight);
+        var usedMarginLeft = float.IsNaN(marginLeft)
+            ? float.IsNaN(marginRight) ? Math.Max(0f, freeMarginSpace) / 2f : freeMarginSpace
+            : marginLeft;
+        var usedMarginRight = float.IsNaN(marginRight)
+            ? float.IsNaN(marginLeft) ? Math.Max(0f, freeMarginSpace) / 2f : freeMarginSpace
+            : marginRight;
 
         var captionCursorY = cursorY + CollapseMargins(previousBlockMarginBottom, marginTop);
 
@@ -1335,7 +1345,10 @@ public sealed partial class HtmlRenderer
         PaintBoxShadows(decorations, box.BoxShadows, borderBoxX, borderBoxY, borderBoxWidth, borderBoxHeight, box.BorderRadius);
         PaintBoxBorder(decorations, styleMap, tableNode.Ref, box, borderBoxX, borderBoxY, borderBoxWidth, borderBoxHeight);
         PaintOutline(decorations, styleMap, borderBoxX, borderBoxY, borderBoxWidth, borderBoxHeight);
-        RecordLayoutMetrics(tableNode.Ref, borderBoxX, borderBoxY, borderBoxWidth, borderBoxHeight, border.Left, border.Right, border.Top, border.Bottom, padding.Left, padding.Right, padding.Top, padding.Bottom);
+        RecordLayoutMetrics(
+            tableNode.Ref, borderBoxX, borderBoxY, borderBoxWidth, borderBoxHeight,
+            border.Left, border.Right, border.Top, border.Bottom, padding.Left, padding.Right, padding.Top, padding.Bottom,
+            usedMarginLeft, usedMarginRight, usedMarginTop, usedMarginBottom);
 
         RecordTableRowMetrics(structure, rowY, rowHeights, collapsedRows, contentLeft + horizontalSpacing, Math.Max(0f, contentWidth - (2f * horizontalSpacing)));
 

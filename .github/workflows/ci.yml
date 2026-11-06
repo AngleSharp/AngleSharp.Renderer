@@ -8,8 +8,8 @@ env:
   DOCS_BRANCH: ${{ secrets.DOCS_BRANCH }}
   # Snapshot baselines are per-platform and committed; a missing one is a gap, never a pass.
   ANGLESHARP_SNAPSHOT_STRICT: 1
-  ANGLESHARP_VERSION: 1.9.0
-  ANGLESHARP_CSS_VERSION: 1.3.2
+  ANGLESHARP_VERSION: 1.10.0
+  ANGLESHARP_CSS_VERSION: 1.4.0
 
 jobs:
   can_document:

@@ -38,7 +38,21 @@ public sealed class FontFace
     /// <param name="weight">The numeric weight the face provides.</param>
     /// <param name="isItalic">Whether the face is italic or oblique.</param>
     /// <param name="sources">The sources to try, in declaration order.</param>
-    public FontFace(string family, float weight, bool isItalic, IEnumerable<FontFaceSource> sources)
+    /// <param name="weightDescriptor">The authored weight descriptor.</param>
+    /// <param name="style">The authored style descriptor.</param>
+    /// <param name="stretch">The authored stretch descriptor.</param>
+    /// <param name="unicodeRange">The authored Unicode range descriptor.</param>
+    /// <param name="display">The authored display descriptor.</param>
+    public FontFace(
+        string family,
+        float weight,
+        bool isItalic,
+        IEnumerable<FontFaceSource> sources,
+        string? weightDescriptor = null,
+        string? style = null,
+        string? stretch = null,
+        string? unicodeRange = null,
+        string? display = null)
     {
         ArgumentNullException.ThrowIfNull(family);
         ArgumentNullException.ThrowIfNull(sources);
@@ -47,6 +61,11 @@ public sealed class FontFace
         Weight = weight;
         IsItalic = isItalic;
         Sources = [.. sources];
+        WeightDescriptor = weightDescriptor ?? weight.ToString(System.Globalization.CultureInfo.InvariantCulture);
+        Style = style ?? (isItalic ? "italic" : "normal");
+        Stretch = stretch ?? "normal";
+        UnicodeRange = unicodeRange ?? "U+0-10FFFF";
+        Display = display ?? "auto";
     }
 
     /// <summary>
@@ -63,6 +82,31 @@ public sealed class FontFace
     /// Gets whether the face is italic or oblique.
     /// </summary>
     public bool IsItalic { get; }
+
+    /// <summary>
+    /// Gets the authored weight descriptor.
+    /// </summary>
+    public string WeightDescriptor { get; }
+
+    /// <summary>
+    /// Gets the authored style descriptor.
+    /// </summary>
+    public string Style { get; }
+
+    /// <summary>
+    /// Gets the authored stretch descriptor.
+    /// </summary>
+    public string Stretch { get; }
+
+    /// <summary>
+    /// Gets the authored Unicode range descriptor.
+    /// </summary>
+    public string UnicodeRange { get; }
+
+    /// <summary>
+    /// Gets the font display descriptor.
+    /// </summary>
+    public string Display { get; }
 
     /// <summary>
     /// Gets the sources to try, in declaration order.

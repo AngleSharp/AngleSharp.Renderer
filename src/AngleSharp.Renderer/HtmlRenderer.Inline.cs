@@ -349,6 +349,14 @@ public sealed partial class HtmlRenderer
         /// <inheritdoc cref="RelativeX"/>
         public float RelativeY { get; init; }
 
+        public float InsetLeft { get; init; } = float.NaN;
+
+        public float InsetRight { get; init; } = float.NaN;
+
+        public float InsetTop { get; init; } = float.NaN;
+
+        public float InsetBottom { get; init; } = float.NaN;
+
         public bool IsOnLine { get; set; }
 
         public bool IsBrokenImage { get; init; }
@@ -413,8 +421,16 @@ public sealed partial class HtmlRenderer
         /// <summary>A preserved tab: a space piece whose width reaches the next tab stop.</summary>
         public bool IsTab { get; init; }
 
-        public InlinePiece WithText(string text, float width, RenderTextStyle? style = null) => new()
+        /// <summary>The text node this piece is from, when a harness wants to know for selecting it.</summary>
+        public IText? Source { get; init; }
+
+        /// <summary>Where in <see cref="Source"/> this piece starts.</summary>
+        public int SourceStart { get; init; }
+
+        public InlinePiece WithText(string text, float width, RenderTextStyle? style = null, int textOffset = 0) => new()
         {
+            Source = Source,
+            SourceStart = Source is not null && textOffset > 0 ? TextSourceMap.Align(Source.Data, SourceStart, Text.AsSpan(0, textOffset), default) : SourceStart,
             Kind = Kind,
             Text = text,
             Style = style ?? Style,
@@ -495,7 +511,7 @@ public sealed partial class HtmlRenderer
             switch (node)
             {
                 case TextRenderNode textNode:
-                    CollectText(textNode.Ref.Data, style, styleId, parentBox);
+                    CollectText(textNode.Ref.Data, style, styleId, parentBox, _context.RecordsTextFragments ? textNode.Ref : null);
                     break;
                 case ElementRenderNode element:
                     CollectElement(element, style, parentBox);
@@ -603,6 +619,10 @@ public sealed partial class HtmlRenderer
                               box.Padding.Top > 0f || box.Padding.Right > 0f || box.Padding.Bottom > 0f || box.Padding.Left > 0f ||
                               box.BackgroundPaint is not RenderColorPaint { Color.A: 0 };
             var (relativeX, relativeY) = ResolveInlineRelativeOffset(styleMap, _containingWidth);
+            var inlineLeft = ParseLength(styleMap, "left", _containingWidth, float.NaN, allowAuto: true);
+            var inlineRight = ParseLength(styleMap, "right", _containingWidth, float.NaN, allowAuto: true);
+            var inlineTop = IsPercentageValue(styleMap.GetValueOrDefault("top")) ? float.NaN : ParseLength(styleMap, "top", 0f, float.NaN, allowAuto: true);
+            var inlineBottom = IsPercentageValue(styleMap.GetValueOrDefault("bottom")) ? float.NaN : ParseLength(styleMap, "bottom", 0f, float.NaN, allowAuto: true);
             var inlineBox = new InlineBox
             {
                 Node = element,
@@ -616,6 +636,10 @@ public sealed partial class HtmlRenderer
                 LineEdge = lineEdge,
                 RelativeX = (parentBox?.RelativeX ?? 0f) + relativeX,
                 RelativeY = (parentBox?.RelativeY ?? 0f) + relativeY,
+                InsetLeft = float.IsNaN(inlineLeft) ? float.IsNaN(inlineRight) ? 0f : -inlineRight : inlineLeft,
+                InsetRight = float.IsNaN(inlineRight) ? float.IsNaN(inlineLeft) ? 0f : -inlineLeft : inlineRight,
+                InsetTop = float.IsNaN(inlineTop) ? float.IsNaN(inlineBottom) ? 0f : -inlineBottom : inlineTop,
+                InsetBottom = float.IsNaN(inlineBottom) ? float.IsNaN(inlineTop) ? 0f : -inlineTop : inlineBottom,
                 IsPositioned = (parentBox?.IsPositioned ?? false) || string.Equals(GetPosition(styleMap), "relative", StringComparison.OrdinalIgnoreCase),
             };
 
@@ -652,8 +676,23 @@ public sealed partial class HtmlRenderer
             });
         }
 
-        private void CollectText(string data, RenderTextStyle style, int styleId, InlineBox? box)
+        private void CollectText(string data, RenderTextStyle style, int styleId, InlineBox? box, IText? source = null)
         {
+            var sourcePosition = 0;
+
+            // the source of a piece, which the next piece goes on from
+            int NextSource(string pieceText)
+            {
+                var start = sourcePosition;
+
+                if (source is not null)
+                {
+                    sourcePosition = TextSourceMap.Align(source.Data, start, pieceText, default);
+                }
+
+                return start;
+            }
+
             if (data.Length == 0)
             {
                 return;
@@ -692,6 +731,8 @@ public sealed partial class HtmlRenderer
                         {
                             Kind = InlinePieceKind.Text,
                             Text = syllables[index],
+                            Source = source,
+                            SourceStart = NextSource(syllables[index]),
                             Style = style,
                             StyleId = styleId,
                             Box = box,
@@ -716,13 +757,13 @@ public sealed partial class HtmlRenderer
                     foreach (var rune in value.EnumerateRunes())
                     {
                         var piece = rune.ToString();
-                        Pieces.Add(new InlinePiece { Kind = InlinePieceKind.Text, Text = piece, Style = style, StyleId = styleId, Box = box, Width = MeasureTextWidth(_context, piece, style), BreakAfter = true });
+                        Pieces.Add(new InlinePiece { Kind = InlinePieceKind.Text, Text = piece, Source = source, SourceStart = NextSource(piece), Style = style, StyleId = styleId, Box = box, Width = MeasureTextWidth(_context, piece, style), BreakAfter = true });
                     }
 
                     return;
                 }
 
-                Pieces.Add(new InlinePiece { Kind = InlinePieceKind.Text, Text = value, Style = style, StyleId = styleId, Box = box, Width = MeasureTextWidth(_context, value, style) });
+                Pieces.Add(new InlinePiece { Kind = InlinePieceKind.Text, Text = value, Source = source, SourceStart = NextSource(value), Style = style, StyleId = styleId, Box = box, Width = MeasureTextWidth(_context, value, style) });
             }
 
             void AddSpace(string value, bool collapsible, float? tabWidth = null)
@@ -732,6 +773,8 @@ public sealed partial class HtmlRenderer
                 {
                     Kind = InlinePieceKind.Space,
                     Text = value,
+                    Source = source,
+                    SourceStart = NextSource(value),
                     Style = style,
                     StyleId = styleId,
                     Box = box,
@@ -747,6 +790,7 @@ public sealed partial class HtmlRenderer
                 if (c == '\n' && preserveNewlines)
                 {
                     FlushWord();
+                    NextSource("\n");
                     Pieces.Add(new InlinePiece { Kind = InlinePieceKind.ForcedBreak, Style = style, StyleId = styleId, Box = box });
                     _previousWasCollapsibleSpace = true;
                     _previousEndsWord = false;
@@ -1010,7 +1054,13 @@ public sealed partial class HtmlRenderer
                     inlineBox.Box.Padding.Left,
                     inlineBox.Box.Padding.Right,
                     inlineBox.Box.Padding.Top,
-                    inlineBox.Box.Padding.Bottom);
+                    inlineBox.Box.Padding.Bottom,
+                    inlineBox.MarginLeft,
+                    inlineBox.MarginRight,
+                    insetLeft: inlineBox.InsetLeft,
+                    insetRight: inlineBox.InsetRight,
+                    insetTop: inlineBox.InsetTop,
+                    insetBottom: inlineBox.InsetBottom);
             }
         }
 
@@ -1259,13 +1309,18 @@ public sealed partial class HtmlRenderer
         }
 
         var replacement = new List<InlinePiece>(chunks.Count);
+        var chunkSource = word.SourceStart;
 
         for (var index = 0; index < chunks.Count; index++)
         {
+            var chunkStart = chunkSource;
+            chunkSource = word.Source is { } wordSource ? TextSourceMap.Align(wordSource.Data, chunkStart, chunks[index], default) : chunkStart;
             replacement.Add(new InlinePiece
             {
                 Kind = InlinePieceKind.Text,
                 Text = chunks[index],
+                Source = word.Source,
+                SourceStart = chunkStart,
                 Style = word.Style,
                 StyleId = word.StyleId,
                 Box = word.Box,
@@ -1720,8 +1775,21 @@ public sealed partial class HtmlRenderer
 
                 var text = run.ToString();
 
+                // the spaces left out are not painted, but can be selected
+                for (var spaceIndex = index; spaceIndex < first; spaceIndex++)
+                {
+                    RecordSpaceFragment(context, displayList, visualOrder[spaceIndex], lineTop, lineHeight);
+                }
+
                 // A run that is nothing but a space has no glyphs to paint (DrawText rejects it).
-                if (!string.IsNullOrWhiteSpace(text))
+                if (string.IsNullOrWhiteSpace(text))
+                {
+                    for (var spaceIndex = first; spaceIndex <= last; spaceIndex++)
+                    {
+                        RecordSpaceFragment(context, displayList, visualOrder[spaceIndex], lineTop, lineHeight);
+                    }
+                }
+                else
                 {
                     var runX = visualOrder[first].X + (piece.Box?.RelativeX ?? 0f);
                     var textBaseline = ResolveBoxBaseline(piece.Box, baselineY) + (piece.Box?.RelativeY ?? 0f);
@@ -1735,7 +1803,13 @@ public sealed partial class HtmlRenderer
                         ShapingContextAfter = logicalLast.Style.ShapingContextAfter,
                     };
 
-                    DrawStyledText(context, displayList, text, runX, textBaseline, runStyle);
+                    var fragment = CreateRunFragment(context, visualOrder, first, last, text, runX, lineTop + (piece.Box?.RelativeY ?? 0f), lineHeight, runStyle);
+                    DrawTextFragment(context, displayList, text, runX, textBaseline, runStyle, fragment);
+                }
+
+                for (var spaceIndex = Math.Max(last + 1, first); spaceIndex < runEnd; spaceIndex++)
+                {
+                    RecordSpaceFragment(context, displayList, visualOrder[spaceIndex], lineTop, lineHeight);
                 }
 
                 index = runEnd;
@@ -1914,7 +1988,7 @@ public sealed partial class HtmlRenderer
                     var width = piece.Kind == InlinePieceKind.Space && fragment.Length == piece.Text.Length
                         ? piece.Width
                         : MeasureTextWidth(context, fragment, style) + (piece.Kind == InlinePieceKind.Space ? style.WordSpacing * fragment.Length : 0f);
-                    result.Add(piece.WithText(fragment, width, style));
+                    result.Add(piece.WithText(fragment, width, style, first));
                 }
             }
             else if (position == end || !result.Contains(piece))
@@ -2145,7 +2219,7 @@ public sealed partial class HtmlRenderer
         return (!float.IsNaN(left) ? left : float.IsNaN(right) ? 0f : -right, !float.IsNaN(top) ? top : float.IsNaN(bottom) ? 0f : -bottom);
 
         float ParseVertical(string property) =>
-            styleMap.GetValueOrDefault(property)?.TrimEnd().EndsWith('%') == true
+            IsPercentageValue(styleMap.GetValueOrDefault(property))
                 ? float.NaN
                 : ParseLength(styleMap, property, 0f, float.NaN, allowAuto: true);
     }
@@ -2822,7 +2896,7 @@ public sealed partial class HtmlRenderer
         var margins = (float.IsNaN(marginLeft) ? 0f : marginLeft) + (float.IsNaN(marginRight) ? 0f : marginRight);
         // A percentage width would refer to the very size being computed, so it counts as auto in
         // an intrinsic contribution.
-        var authored = styleMap.TryGetValue("width", out var rawWidth) && rawWidth.TrimEnd().EndsWith('%')
+        var authored = styleMap.TryGetValue("width", out var rawWidth) && IsPercentageValue(rawWidth)
             ? float.NaN
             : ResolveAuthoredDimension(styleMap, "width", percentageBase, float.NaN, horizontalExtras);
         IntrinsicWidths content;

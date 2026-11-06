@@ -10,7 +10,7 @@ namespace AngleSharp.Renderer;
 /// <summary>
 /// Stores interactive renderer state (scroll positions, hover state, and render device) per browsing context.
 /// </summary>
-internal sealed class InteractiveHtmlRendererState : IDomHarness
+internal sealed partial class InteractiveHtmlRendererState : IDomHarness
 {
     private readonly ConditionalWeakTable<IElement, ElementInteractionState> _elementStates = new();
     private readonly HtmlRenderer _renderer;
@@ -56,6 +56,11 @@ internal sealed class InteractiveHtmlRendererState : IDomHarness
     private bool _hasChangedSinceFrame;
 
     public event EventHandler? PaintInvalidated;
+
+    /// <summary>
+    /// Raised when a frame was laid out or brought up to date, i.e., boxes may be somewhere else.
+    /// </summary>
+    internal event EventHandler? FrameUpdated;
 
     public IBrowsingContext Context { get; }
 
@@ -246,6 +251,7 @@ internal sealed class InteractiveHtmlRendererState : IDomHarness
     {
         _clockMs += delta.TotalMilliseconds;
         _transitionTracker.AdvanceTime(delta);
+        AdvanceScriptAnimations();
 
         foreach (var subframe in _subframes)
         {
@@ -380,8 +386,9 @@ internal sealed class InteractiveHtmlRendererState : IDomHarness
             _lastFrame = frame;
             _lastFrameLayout = snapshot;
             _isFrameScrollShiftable = frame.IsScrollShiftable;
-            frame.IsAnimating = _animationTracker.IsAnimating || _transitionTracker.HasRunningTransitions || snapshot.Subframes.Values.Any(static entry => entry.Frame?.IsAnimating == true);
-            return frame;
+            frame.IsAnimating = _animationTracker.IsAnimating || _transitionTracker.HasRunningTransitions || HasRunningScriptAnimations || snapshot.Subframes.Values.Any(static entry => entry.Frame?.IsAnimating == true);
+            FrameUpdated?.Invoke(this, EventArgs.Empty);
+            return ShowSelection(frame);
         }
         }
         finally
@@ -441,6 +448,18 @@ internal sealed class InteractiveHtmlRendererState : IDomHarness
 
     public RenderedFrame? UpdateFrame()
     {
+        var frame = UpdateLastFrame();
+
+        if (frame is not null)
+        {
+            FrameUpdated?.Invoke(this, EventArgs.Empty);
+        }
+
+        return frame;
+    }
+
+    private RenderedFrame? UpdateLastFrame()
+    {
         var document = Context.Active;
 
         // what an iframe shows is in the frame, and only a new one has it change
@@ -472,7 +491,7 @@ internal sealed class InteractiveHtmlRendererState : IDomHarness
 
         _pendingMutations.Clear();
         _lastFrame = _renderer.UpdateFrame(document, _lastFrame, metrics);
-        return _lastFrame;
+        return _lastFrame is { } updated ? ShowSelection(updated) : null;
     }
 
     private void WatchMutations(IDocument document)
@@ -524,6 +543,8 @@ internal sealed class InteractiveHtmlRendererState : IDomHarness
 
         PaintInvalidated?.Invoke(this, EventArgs.Empty);
     }
+
+    internal void OnFontsChanged() => OnPaintInvalidated();
 
     private static double Clamp(double value, double min, double max)
     {

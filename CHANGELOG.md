@@ -1,3 +1,20 @@
+# 0.11.0
+
+Released on Friday, November 6 2026.
+
+- Updated resolution of used pixel values for margins and positioned insets in `getComputedStyle`.
+- Fixed `width`, margins and other lengths mixing percentages and lengths, e.g. `calc(50% + 10px)` or `min(240px, 55%)`, being ignored, and math of more than two terms being taken as 0 in grid tracks
+- Fixed `scrollHeight` and `scrollWidth` not counting a positioned box escaping a clip for the page, and counting a positioned box for a box that isn't its containing block
+- Fixed `ContentHeight` of frames counting what a box clips (e.g. the content of a scroll container), making pages scroll though all of them fits the viewport
+- Added `elementFromPoint` and `elementsFromPoint` to documents, and `pageX`, `pageY`, `offsetX` and `offsetY` to mouse events
+- Added the used values of `width`, `height`, paddings, border widths and inherited text properties to what `getComputedStyle` gives script
+- Added text selection to interactive documents: selecting with the pointer through the harness (`BeginTextSelection`, `ExtendTextSelection`, `EndTextSelection`, also by word and paragraph), `SelectAllText`, `SelectedText`, the setting `IsTextSelectionEnabled`, the DOM's `getSelection()` with `selectstart` and `selectionchange`, `user-select`, and `::selection` as soon as AngleSharp and AngleSharp.Css know it
+- Added `ResizeObserver`
+- Added `IntersectionObserver`, by default comparing with the viewport of the top-level page, also from the frames in it
+- Added `Range.getClientRects()` and `Range.getBoundingClientRect()`.
+- Added `element.animate()` and related script-facing Web Animations APIs on the renderer's virtual clock.
+- Added `document.fonts` and script-created `FontFace` objects to font matching and layout.
+
 # 0.10.0
 
 Released on Wednesday, November 4 2026.

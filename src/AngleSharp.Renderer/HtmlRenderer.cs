@@ -110,7 +110,15 @@ public sealed partial class HtmlRenderer
         bool IsViewportAnchored = false,
         IElement? Sticky = null,
         RenderRect? OwnBox = null,
-        IReadOnlyList<RenderRect>? Fragments = null)
+        IReadOnlyList<RenderRect>? Fragments = null,
+        float MarginLeft = 0f,
+        float MarginRight = 0f,
+        float MarginTop = 0f,
+        float MarginBottom = 0f,
+        float InsetLeft = float.NaN,
+        float InsetRight = float.NaN,
+        float InsetTop = float.NaN,
+        float InsetBottom = float.NaN)
     {
         /// <summary>The box scripts see, relative to the border box here: the root element's own one (see LayoutDocument).</summary>
         public RenderRect ReportedBox => OwnBox is { } own
@@ -157,6 +165,9 @@ public sealed partial class HtmlRenderer
     {
         // only needed for what the render tree does not hold (e.g. ::placeholder), so it is built on demand
         public IStyleCollection? StyleCollection => LazyStyleCollection.Value;
+
+        /// <summary>Whether painted text says where it comes from, for selecting it (see <see cref="TextFragment"/>).</summary>
+        public bool RecordsTextFragments { get; init; }
     }
 
     /// <summary>
@@ -293,7 +304,15 @@ public sealed partial class HtmlRenderer
         float paddingLeft,
         float paddingRight,
         float paddingTop,
-        float paddingBottom)
+        float paddingBottom,
+        float marginLeft = 0f,
+        float marginRight = 0f,
+        float marginTop = 0f,
+        float marginBottom = 0f,
+        float insetLeft = float.NaN,
+        float insetRight = float.NaN,
+        float insetTop = float.NaN,
+        float insetBottom = float.NaN)
     {
         var metrics = new ElementLayoutMetrics(
             borderBoxX,
@@ -309,7 +328,15 @@ public sealed partial class HtmlRenderer
             paddingTop,
             paddingBottom,
             IsViewportAnchored: s_viewportAnchorDepth > 0,
-            Sticky: s_stickyElement);
+            Sticky: s_stickyElement,
+            MarginLeft: marginLeft,
+            MarginRight: marginRight,
+            MarginTop: marginTop,
+            MarginBottom: marginBottom,
+            InsetLeft: insetLeft,
+            InsetRight: insetRight,
+            InsetTop: insetTop,
+            InsetBottom: insetBottom);
 
         if (s_stickyProbe is { } probe && ReferenceEquals(probe.Element, element))
         {
@@ -317,6 +344,20 @@ public sealed partial class HtmlRenderer
         }
 
         s_layoutCapture.Value?.Record(element, metrics);
+    }
+
+    private static void SetUsedMargins(IElement element, EdgeSizes margins)
+    {
+        if (s_layoutCapture.Value is { } capture && capture.TryGet(element, out var metrics))
+        {
+            capture.Replace(element, metrics with
+            {
+                MarginTop = margins.Top,
+                MarginRight = margins.Right,
+                MarginBottom = margins.Bottom,
+                MarginLeft = margins.Left,
+            });
+        }
     }
 
     /// <summary>
@@ -443,7 +484,10 @@ public sealed partial class HtmlRenderer
             // The blocks laying out their children, innermost on top (see PositionedScope).
             PositionedScopes: new Stack<PositionedScope>(),
             IsQuirksMode: document.CompatMode == "BackCompat",
-            Subframes: new Dictionary<IElement, SubframeEntry>(ReferenceEqualityComparer.Instance));
+            Subframes: new Dictionary<IElement, SubframeEntry>(ReferenceEqualityComparer.Instance))
+        {
+            RecordsTextFragments = ShouldRecordTextFragments(document),
+        };
     }
 
     /// <summary>
@@ -619,7 +663,7 @@ public sealed partial class HtmlRenderer
     /// </summary>
     private static bool DependsOnContainingBlockHeight(Dictionary<string, string> styleMap)
     {
-        static bool IsPercentage(string? value) => value?.TrimEnd().EndsWith('%') == true;
+        static bool IsPercentage(string? value) => IsPercentageValue(value);
 
         var bottom = styleMap.GetValueOrDefault("bottom")?.Trim();
 
@@ -653,7 +697,7 @@ public sealed partial class HtmlRenderer
 
         var context = CreateLayoutContext(document, renderDevice, _textMeasurer);
         var viewport = new RenderViewport(context.Width, context.Height);
-        var displayList = BuildDisplayList(document, viewport, context, renderDevice, ResolveRootScrollOffsetY(document));
+        var displayList = WithSelectionPainted(document, context, BuildDisplayList(document, viewport, context, renderDevice, ResolveRootScrollOffsetY(document)));
 
         return _backend.RenderToPng(displayList, viewport);
     }
@@ -683,7 +727,7 @@ public sealed partial class HtmlRenderer
 
         var context = CreateLayoutContext(document, renderDevice, _textMeasurer);
         var viewport = new RenderViewport(context.Width, context.Height);
-        return BuildDisplayList(document, viewport, context, renderDevice, ResolveRootScrollOffsetY(document));
+        return WithSelectionPainted(document, context, BuildDisplayList(document, viewport, context, renderDevice, ResolveRootScrollOffsetY(document)));
     }
 
     /// <summary>
@@ -929,7 +973,11 @@ public sealed partial class HtmlRenderer
 
         if (body is not null && (rootElementNode is null || IsVerticalMode(pageSystem)))
         {
-            RecordLayoutMetrics(body, contentX, contentY, contentWidth, clientHeight, 0f, 0f, 0f, 0f, 0f, 0f, 0f, 0f);
+            var bodyMargins = s_layoutCapture.Value?.TryGet(body, out var laidOutBody) == true ? laidOutBody : default;
+            RecordLayoutMetrics(
+                body, contentX, contentY, contentWidth, clientHeight,
+                0f, 0f, 0f, 0f, 0f, 0f, 0f, 0f,
+                bodyMargins.MarginLeft, bodyMargins.MarginRight, bodyMargins.MarginTop, bodyMargins.MarginBottom);
         }
 
         if (document.DocumentElement is not null)
@@ -939,7 +987,11 @@ public sealed partial class HtmlRenderer
             var ownBox = layoutCapture?.TryGet(document.DocumentElement, out var laidOut) == true
                 ? new RenderRect(laidOut.BorderBoxX - contentX, laidOut.BorderBoxY - contentY, laidOut.BorderBoxWidth, laidOut.BorderBoxHeight)
                 : (RenderRect?)null;
-            RecordLayoutMetrics(document.DocumentElement, contentX, contentY, contentWidth, clientHeight, 0f, 0f, 0f, 0f, 0f, 0f, 0f, 0f);
+            var rootMargins = layoutCapture?.TryGet(document.DocumentElement, out var laidOutRoot) == true ? laidOutRoot : default;
+            RecordLayoutMetrics(
+                document.DocumentElement, contentX, contentY, contentWidth, clientHeight,
+                0f, 0f, 0f, 0f, 0f, 0f, 0f, 0f,
+                rootMargins.MarginLeft, rootMargins.MarginRight, rootMargins.MarginTop, rootMargins.MarginBottom);
 
             if (ownBox is not null && layoutCapture!.TryGet(document.DocumentElement, out var viewportBox))
             {
@@ -1230,6 +1282,8 @@ public sealed partial class HtmlRenderer
         var marginBottom = ParseLength(styleMap, "margin-bottom", flowContainingWidth, box.Margin.Bottom, allowAuto: false);
         var marginLeft = ParseLength(styleMap, "margin-left", flowContainingWidth, box.Margin.Left, allowAuto: true);
         var marginRight = ParseLength(styleMap, "margin-right", flowContainingWidth, box.Margin.Right, allowAuto: true);
+        var cssMarginTop = marginTop;
+        var cssMarginBottom = marginBottom;
 
         // The parent already took this box's top margin (and those collapsing through it) as its
         // own; that margin belongs to its first in-flow child, which an out-of-flow box is not.
@@ -1496,6 +1550,10 @@ public sealed partial class HtmlRenderer
         var topOffset = ParseLength(styleMap, "top", offsetHeightReference, 0f, allowAuto: true);
         var rightOffset = ParseLength(styleMap, "right", isFixed ? context.Width : flowContainingWidth, float.NaN, allowAuto: true);
         var bottomOffset = ParseLength(styleMap, "bottom", isFixed ? context.Height : float.IsNaN(positionedContainingHeight) ? flowContainingWidth : positionedContainingHeight, float.NaN, allowAuto: true);
+        var cssLeftOffset = ParseLength(styleMap, "left", flowContainingWidth, float.NaN, allowAuto: true);
+        var cssRightOffset = ParseLength(styleMap, "right", flowContainingWidth, float.NaN, allowAuto: true);
+        var cssTopOffset = ParseLength(styleMap, "top", offsetHeightReference, float.NaN, allowAuto: true);
+        var cssBottomOffset = ParseLength(styleMap, "bottom", offsetHeightReference, float.NaN, allowAuto: true);
 
         if (float.IsNaN(leftOffset))
         {
@@ -1799,6 +1857,7 @@ public sealed partial class HtmlRenderer
                 PlaceFloatedContainer(ref cursorY, ref previousBlockMarginBottom);
             }
 
+            SetUsedMargins(node.Ref, new EdgeSizes(cssMarginTop, marginRight, cssMarginBottom, marginLeft));
             return;
         }
 
@@ -1845,6 +1904,7 @@ public sealed partial class HtmlRenderer
                 PlaceFloatedContainer(ref cursorY, ref previousBlockMarginBottom);
             }
 
+            SetUsedMargins(node.Ref, new EdgeSizes(cssMarginTop, marginRight, cssMarginBottom, marginLeft));
             return;
         }
 
@@ -2006,6 +2066,43 @@ public sealed partial class HtmlRenderer
 
         var borderBoxWidth = borderLeft + paddingLeft + contentWidth + paddingRight + borderRight;
         var borderBoxHeight = borderTop + paddingTop + contentHeight + paddingBottom + borderBottom;
+        var usedMarginLeft = marginLeft;
+        var usedMarginRight = marginRight;
+        var usedMarginTop = cssMarginTop;
+        var usedMarginBottom = cssMarginBottom;
+
+        if (isAbsolute || isFixed)
+        {
+            usedMarginLeft = positionedMargins.Left;
+            usedMarginRight = positionedMargins.Right;
+            usedMarginTop = positionedMargins.Top;
+            usedMarginBottom = positionedMargins.Bottom;
+
+            if (hasAutoHorizontalMargin && !IsAutoOffset(styleMap, "left") && !float.IsNaN(rightOffset))
+            {
+                var freeWidth = (isFixed ? context.Width - (2f * context.Padding) : absoluteContainingWidth) -
+                                leftOffset - rightOffset - positionedMargins.Left - positionedMargins.Right - positionedBorderBoxWidth;
+                usedMarginLeft = hasAutoLeftMargin
+                    ? hasAutoRightMargin ? Math.Max(0f, freeWidth) / 2f : freeWidth
+                    : positionedMargins.Left;
+                usedMarginRight = hasAutoRightMargin
+                    ? hasAutoLeftMargin ? Math.Max(0f, freeWidth) / 2f : freeWidth
+                    : positionedMargins.Right;
+            }
+
+            if ((autoTopMargin || autoBottomMargin) && !IsAutoOffset(styleMap, "top") && !float.IsNaN(bottomOffset) &&
+                !float.IsNaN(verticalContainingHeight) && !float.IsNaN(positionedBorderBoxHeight))
+            {
+                var freeHeight = verticalContainingHeight - topOffset - bottomOffset -
+                                 positionedMargins.Top - positionedMargins.Bottom - positionedBorderBoxHeight;
+                usedMarginTop = autoTopMargin
+                    ? autoBottomMargin ? freeHeight / 2f : freeHeight
+                    : positionedMargins.Top;
+                usedMarginBottom = autoBottomMargin
+                    ? autoTopMargin ? freeHeight / 2f : freeHeight
+                    : positionedMargins.Bottom;
+            }
+        }
 
         // the height its held back boxes are laid out with (see below)
         if (s_layoutCapture.Value is { Containers: { } heldBackContainers } && heldBackContainers.TryGetValue(element, out var containerEntry) && ReferenceEquals(containerEntry.Node, node))
@@ -2039,7 +2136,15 @@ public sealed partial class HtmlRenderer
             paddingLeft,
             paddingRight,
             paddingTop,
-            paddingBottom);
+            paddingBottom,
+            usedMarginLeft,
+            usedMarginRight,
+            usedMarginTop,
+            usedMarginBottom,
+            isRelative ? (float.IsNaN(cssLeftOffset) ? float.IsNaN(cssRightOffset) ? 0f : -cssRightOffset : cssLeftOffset) : float.NaN,
+            isRelative ? (float.IsNaN(cssRightOffset) ? float.IsNaN(cssLeftOffset) ? 0f : -cssLeftOffset : cssRightOffset) : float.NaN,
+            isRelative ? (float.IsNaN(cssTopOffset) ? float.IsNaN(cssBottomOffset) ? 0f : -cssBottomOffset : cssTopOffset) : float.NaN,
+            isRelative ? (float.IsNaN(cssBottomOffset) ? float.IsNaN(cssTopOffset) ? 0f : -cssTopOffset : cssBottomOffset) : float.NaN);
 
         var clipsOverflow = ShouldClipOverflow(styleMap);
 
@@ -2888,6 +2993,20 @@ public sealed partial class HtmlRenderer
                         itemCrossInLine = crossMarginStart;
                     }
 
+                    var usedCrossMarginStart = crossMarginStart;
+                    var usedCrossMarginEnd = crossMarginEnd;
+
+                    if (hasCrossAutoMargin)
+                    {
+                        var freeForMargins = Math.Max(0f, crossFreeSpace);
+                        usedCrossMarginStart = float.IsNaN(item.CrossMarginStart)
+                            ? float.IsNaN(item.CrossMarginEnd) ? freeForMargins / 2f : freeForMargins
+                            : crossMarginStart;
+                        usedCrossMarginEnd = float.IsNaN(item.CrossMarginEnd)
+                            ? float.IsNaN(item.CrossMarginStart) ? freeForMargins / 2f : freeForMargins
+                            : crossMarginEnd;
+                    }
+
                     var itemCrossPosition = lineCrossPosition + itemCrossInLine;
 
                     var marginStart = float.IsNaN(item.MainMarginStart) ? autoMarginSize : item.MainMarginStart;
@@ -2905,7 +3024,7 @@ public sealed partial class HtmlRenderer
                         // laid out on its own in its anonymous flex item
                         var textCursorY = childY;
                         var textWidth = isRowDirection ? finalMainSize : resolvedCrossSize > 0f ? resolvedCrossSize : containingWidth;
-                        LayoutWrappedText(PrepareFlexItemText(textNode, inheritedTextStyle, context), childX, textWidth, ref textCursorY, inheritedTextStyle, context, displayList, maxY, 0f);
+                        LayoutWrappedText(PrepareFlexItemText(textNode, inheritedTextStyle, context), childX, textWidth, ref textCursorY, inheritedTextStyle, context, displayList, maxY, 0f, textSource: textNode.Ref);
                     }
                     else if (item.Node is ElementRenderNode elementChild)
                     {
@@ -2947,6 +3066,9 @@ public sealed partial class HtmlRenderer
                             positionedContainingHeight: itemContainingHeight,
                             mainAxisMarginsPlaced: true,
                             crossAxisMarginsPlaced: true);
+                        SetUsedMargins(elementChild.Ref, isRowDirection
+                            ? new EdgeSizes(usedCrossMarginStart, marginEnd, usedCrossMarginEnd, marginStart)
+                            : new EdgeSizes(marginStart, usedCrossMarginEnd, marginEnd, usedCrossMarginStart));
                         paintOrder.Track(elementChild, displayList, itemRangeStart, context);
 
                         if (item.HasDeferredMainSize)
@@ -3205,7 +3327,7 @@ public sealed partial class HtmlRenderer
     /// </summary>
     private static float ResolveQuirksHeightReference(ElementRenderNode node, Dictionary<string, string> styleMap, LayoutContext context)
     {
-        if (styleMap.GetValueOrDefault("height")?.TrimEnd().EndsWith('%') != true)
+        if (!IsPercentageValue(styleMap.GetValueOrDefault("height")))
         {
             return float.NaN;
         }
@@ -3816,6 +3938,23 @@ public sealed partial class HtmlRenderer
                 positionedContainingWidth: itemContainingWidth,
                 positionedContainingHeight: itemContainingHeight,
                 mainAxisMarginsPlaced: true);
+            var gridBorderBoxWidth = resolvedChildContentWidth + childHorizontalExtras;
+            var gridBorderBoxHeight = resolvedChildContentHeight + childVerticalExtras;
+            var horizontalMarginSpace = Math.Max(0f, cellWidth - gridBorderBoxWidth - ZeroIfNaN(childMarginLeft) - ZeroIfNaN(childMarginRight));
+            var verticalMarginSpace = Math.Max(0f, cellHeight - gridBorderBoxHeight - ZeroIfNaN(childMarginTop) - ZeroIfNaN(childMarginBottom));
+            var usedGridMarginLeft = float.IsNaN(childMarginLeft)
+                ? float.IsNaN(childMarginRight) ? horizontalMarginSpace / 2f : horizontalMarginSpace
+                : childMarginLeft;
+            var usedGridMarginRight = float.IsNaN(childMarginRight)
+                ? float.IsNaN(childMarginLeft) ? horizontalMarginSpace / 2f : horizontalMarginSpace
+                : childMarginRight;
+            var usedGridMarginTop = float.IsNaN(childMarginTop)
+                ? float.IsNaN(childMarginBottom) ? verticalMarginSpace / 2f : verticalMarginSpace
+                : childMarginTop;
+            var usedGridMarginBottom = float.IsNaN(childMarginBottom)
+                ? float.IsNaN(childMarginTop) ? verticalMarginSpace / 2f : verticalMarginSpace
+                : childMarginBottom;
+            SetUsedMargins(elementChild.Ref, new EdgeSizes(usedGridMarginTop, usedGridMarginRight, usedGridMarginBottom, usedGridMarginLeft));
             paintOrder.Track(elementChild, displayList, itemRangeStart, context);
         }
 
@@ -4392,33 +4531,195 @@ public sealed partial class HtmlRenderer
     internal static float EvaluateLengthOrPercentage(string text, float relativeTo)
     {
         text = text.Trim();
-        var open = text.IndexOf('(');
 
-        if (open > 0 && text.EndsWith(')') && text[..open].ToLowerInvariant() is "min" or "max" or "clamp")
+        if (TryEvaluateMath(text, relativeTo, out var math))
         {
-            var arguments = SplitTopLevelCommaList(text[(open + 1)..^1]).Select(argument => EvaluateLengthOrPercentage(argument, relativeTo)).ToArray();
-
-            return text[..open].ToLowerInvariant() switch
-            {
-                "min" when arguments.Length > 0 => arguments.Min(),
-                "max" when arguments.Length > 0 => arguments.Max(),
-                "clamp" when arguments.Length == 3 => Math.Max(arguments[0], Math.Min(arguments[1], arguments[2])),
-                _ => 0f,
-            };
-        }
-
-        if (TryParsePercentagePlusLength(text, 0f, out var fraction, out var length))
-        {
-            return (fraction * relativeTo) + length;
-        }
-
-        if (text.EndsWith('%') && float.TryParse(text[..^1], NumberStyles.Float, CultureInfo.InvariantCulture, out var percent))
-        {
-            return relativeTo * percent / 100f;
+            return math;
         }
 
         var pixels = ParseLengthValue(text, float.NaN, allowAuto: false);
         return float.IsNaN(pixels) ? 0f : pixels;
+    }
+
+    /// <summary>
+    /// Whether a value depends on the size of the box it refers to: a percentage, or math with one
+    /// (e.g. <c>calc(100% - 8px)</c>). Such a value can't be resolved while that size is being found.
+    /// </summary>
+    internal static bool IsPercentageValue(string? value)
+    {
+        var text = value?.TrimEnd();
+        return text is not null && (text.EndsWith('%') || (IsMathFunction(text.TrimStart()) && text.Contains('%')));
+    }
+
+    /// <summary>
+    /// Evaluates a length, a percentage or math of them. A percentage of nothing (NaN) gives NaN,
+    /// as a plain one does, so that what asks can tell it is not known yet. False if it is not understood.
+    /// </summary>
+    internal static bool TryEvaluateMath(string text, float relativeTo, out float value)
+    {
+        var position = 0;
+        var result = ParseMathSum(text, ref position, relativeTo);
+        SkipMathSpaces(text, ref position);
+        value = result ?? float.NaN;
+        return result.HasValue && position == text.Length;
+    }
+
+    private static void SkipMathSpaces(string text, ref int position)
+    {
+        while (position < text.Length && char.IsWhiteSpace(text[position]))
+        {
+            position++;
+        }
+    }
+
+    private static float? ParseMathSum(string text, ref int position, float relativeTo)
+    {
+        var result = ParseMathProduct(text, ref position, relativeTo);
+
+        while (result.HasValue)
+        {
+            SkipMathSpaces(text, ref position);
+
+            if (position >= text.Length || (text[position] != '+' && text[position] != '-'))
+            {
+                break;
+            }
+
+            var isAddition = text[position++] == '+';
+            var other = ParseMathProduct(text, ref position, relativeTo);
+            result = other.HasValue ? (isAddition ? result + other : result - other) : null;
+        }
+
+        return result;
+    }
+
+    private static float? ParseMathProduct(string text, ref int position, float relativeTo)
+    {
+        var result = ParseMathOperand(text, ref position, relativeTo);
+
+        while (result.HasValue)
+        {
+            SkipMathSpaces(text, ref position);
+
+            if (position >= text.Length || (text[position] != '*' && text[position] != '/'))
+            {
+                break;
+            }
+
+            var isProduct = text[position++] == '*';
+            var other = ParseMathOperand(text, ref position, relativeTo);
+            result = other.HasValue ? (isProduct ? result * other : result / other) : null;
+        }
+
+        return result;
+    }
+
+    private static float? ParseMathOperand(string text, ref int position, float relativeTo)
+    {
+        SkipMathSpaces(text, ref position);
+        var start = position;
+
+        while (position < text.Length && char.IsLetter(text[position]))
+        {
+            position++;
+        }
+
+        var name = text[start..position].ToLowerInvariant();
+
+        if (position < text.Length && text[position] == '(')
+        {
+            position++;
+            var arguments = new List<float>();
+
+            while (true)
+            {
+                var argument = ParseMathSum(text, ref position, relativeTo);
+                SkipMathSpaces(text, ref position);
+
+                if (!argument.HasValue || position >= text.Length)
+                {
+                    return null;
+                }
+
+                arguments.Add(argument.Value);
+
+                if (text[position] != ',')
+                {
+                    break;
+                }
+
+                position++;
+            }
+
+            if (text[position] != ')')
+            {
+                return null;
+            }
+
+            position++;
+            return name switch
+            {
+                "" or "calc" when arguments.Count == 1 => arguments[0],
+                "min" => arguments.Min(),
+                "max" => arguments.Max(),
+                "clamp" when arguments.Count == 3 => Math.Max(arguments[0], Math.Min(arguments[1], arguments[2])),
+                _ => null,
+            };
+        }
+
+        if (name.Length > 0)
+        {
+            return null;
+        }
+
+        // a sign directly at a number is part of it; a number goes on with its unit
+        if (position < text.Length && (text[position] == '+' || text[position] == '-'))
+        {
+            position++;
+        }
+
+        while (position < text.Length && (char.IsDigit(text[position]) || text[position] == '.'))
+        {
+            position++;
+        }
+
+        if (position < text.Length - 1 && (text[position] == 'e' || text[position] == 'E') &&
+            (char.IsDigit(text[position + 1]) || text[position + 1] == '-' || text[position + 1] == '+'))
+        {
+            position += 2;
+
+            while (position < text.Length && char.IsDigit(text[position]))
+            {
+                position++;
+            }
+        }
+
+        var numberEnd = position;
+
+        if (numberEnd == start)
+        {
+            return null;
+        }
+
+        while (position < text.Length && (char.IsLetter(text[position]) || text[position] == '%'))
+        {
+            position++;
+        }
+
+        var token = text[start..position];
+
+        if (token.EndsWith('%'))
+        {
+            return float.TryParse(token[..^1], NumberStyles.Float, CultureInfo.InvariantCulture, out var percent) ? relativeTo * percent / 100f : null;
+        }
+
+        if (numberEnd == position)
+        {
+            return float.TryParse(token, NumberStyles.Float, CultureInfo.InvariantCulture, out var number) ? number : null;
+        }
+
+        var pixels = ParseLengthValue(token, float.NaN, allowAuto: false);
+        return float.IsNaN(pixels) ? null : pixels;
     }
 
     private static GridTrackSize ConvertGridTrackSize(ICssValue value, float relativeTo)
@@ -4778,7 +5079,7 @@ public sealed partial class HtmlRenderer
     /// base here and count as auto.
     /// </summary>
     private static float ResolveDefiniteContentHeight(Dictionary<string, string> styleMap, float containingWidth, float verticalBorderAndPadding) =>
-        styleMap.TryGetValue("height", out var rawHeight) && rawHeight.TrimEnd().EndsWith('%')
+        styleMap.TryGetValue("height", out var rawHeight) && IsPercentageValue(rawHeight)
             ? float.NaN
             : ResolveAuthoredDimension(styleMap, "height", containingWidth, float.NaN, verticalBorderAndPadding);
 
@@ -5220,8 +5521,11 @@ public sealed partial class HtmlRenderer
         DisplayList displayList,
         float maxY,
         float firstLineIndent,
-        INode? source = null)
+        INode? source = null,
+        IText? textSource = null)
     {
+        textSource ??= source as IText;
+        var sourcePosition = 0;
         var lineHeight = textStyle.FontSize * textStyle.LineHeightMultiplier;
         var forcedBreakLines = new HashSet<int>();
         var lines = WrapTextRespectingWhiteSpace(context, text, maxWidth, textStyle, forcedBreakLines);
@@ -5257,6 +5561,20 @@ public sealed partial class HtmlRenderer
         for (var index = 0; index < lines.Count; index++)
         {
             var line = lines[index];
+            var lineSourceStart = sourcePosition;
+            var lineTop = cursorY;
+
+            if (textSource is not null && RecordsTextFragments(context))
+            {
+                sourcePosition = TextSourceMap.Align(textSource.Data, sourcePosition, line, default);
+            }
+
+            // the part of the line from the given character on, as far as it is painted
+            TextFragment? CreateFragment(string text, int start, float fragmentX, RenderTextStyle style, float? fixedWidth = null) =>
+                textSource is not null && RecordsTextFragments(context)
+                    ? CreateTextFragment(context, text, [new TextSegment(textSource, TextSourceMap.Align(textSource.Data, lineSourceStart, line.AsSpan(0, Math.Min(start, line.Length)), default), 0, text.Length)], fragmentX, lineTop, lineHeight, style, fixedWidth)
+                    : null;
+
             RecordColumnLine(cursorY, cursorY + lineHeight);
             cursorY += lineHeight;
 
@@ -5306,17 +5624,20 @@ public sealed partial class HtmlRenderer
             if (needsReordering)
             {
                 var runX = lineX;
+                var usedRuns = new bool[line.Length];
 
                 foreach (var (run, isRightToLeft) in BidiAlgorithm.GetVisualRuns(line, textStyle.Direction == TextDirection.Rtl))
                 {
                     var runStyle = textStyle with { IsRightToLeftRun = isRightToLeft };
+                    var runWidth = MeasureTextWidth(context, run, runStyle) + (CountSpaces(run) * textStyle.WordSpacing);
+                    var fragment = RecordsTextFragments(context) ? CreateFragment(run, FindUnusedRun(line, run, usedRuns), runX, runStyle, string.IsNullOrWhiteSpace(run) ? runWidth : null) : null;
 
-                    if (!string.IsNullOrWhiteSpace(run))
+                    if (!string.IsNullOrWhiteSpace(run) || fragment is not null)
                     {
-                        DrawStyledText(context, displayList, run, runX, baselineY, runStyle);
+                        DrawTextFragment(context, displayList, run, runX, baselineY, runStyle, fragment);
                     }
 
-                    runX += MeasureTextWidth(context, run, runStyle) + (CountSpaces(run) * textStyle.WordSpacing);
+                    runX += runWidth;
                 }
 
                 continue;
@@ -5328,6 +5649,7 @@ public sealed partial class HtmlRenderer
                 var spaceAdvance = MeasureTextWidth(context, " ", textStyle) + textStyle.WordSpacing + justifyExtra;
                 var wordX = lineX;
                 var words = line.Split(' ');
+                var wordStart = 0;
 
                 for (var wordIndex = 0; wordIndex < words.Length; wordIndex++)
                 {
@@ -5335,20 +5657,44 @@ public sealed partial class HtmlRenderer
 
                     if (word.Length > 0)
                     {
-                        DrawStyledText(context, displayList, word, wordX, baselineY, textStyle);
+                        DrawTextFragment(context, displayList, word, wordX, baselineY, textStyle, CreateFragment(word, wordStart, wordX, textStyle));
                         wordX += MeasureTextWidth(context, word, textStyle);
                     }
 
-                    wordX += word.Length > 0 && wordIndex + 1 < words.Length && words[wordIndex + 1].Length > 0
+                    var gap = word.Length > 0 && wordIndex + 1 < words.Length && words[wordIndex + 1].Length > 0
                         ? MeasureSpaceBetween(context, word, words[wordIndex + 1], textStyle) + justifyExtra
                         : spaceAdvance;
+                    wordStart += word.Length;
+
+                    if (wordIndex + 1 < words.Length && CreateFragment(" ", wordStart, wordX, textStyle, gap) is { } spaceFragment)
+                    {
+                        DrawTextFragment(context, displayList, " ", wordX, baselineY, textStyle, spaceFragment);
+                    }
+
+                    wordX += gap;
+                    wordStart++;
                 }
 
                 continue;
             }
 
-            DrawStyledText(context, displayList, line, lineX, baselineY, textStyle);
+            DrawTextFragment(context, displayList, line, lineX, baselineY, textStyle, CreateFragment(line, 0, lineX, textStyle));
         }
+    }
+
+    // where a run of a line is, the first place not yet taken by a run of the same text
+    private static int FindUnusedRun(string line, string run, bool[] used)
+    {
+        for (var start = line.IndexOf(run, StringComparison.Ordinal); start >= 0 && start < line.Length; start = line.IndexOf(run, start + 1, StringComparison.Ordinal))
+        {
+            if (!used[start])
+            {
+                Array.Fill(used, true, start, run.Length);
+                return start;
+            }
+        }
+
+        return 0;
     }
 
     private static int CountSpaces(string text)
@@ -7263,16 +7609,27 @@ public sealed partial class HtmlRenderer
         var isAnimated = SplitTopLevelCommaList(style.GetPropertyValue("animation-name"))
             .Any(name => !string.IsNullOrWhiteSpace(name) && !name.Trim().Equals("none", StringComparison.OrdinalIgnoreCase));
 
-        // Iterates the full interpolatable whitelist, not just map.Keys - a property that only
-        // ever appears inside a @keyframes block (never as a base/inherited declaration, e.g.
-        // `opacity` set solely by an animation) would otherwise have no key in the map at all for
-        // this loop to find and override.
+        // Script effects may animate properties outside the CSS animation whitelist.
         var styleMap = map as StyleMap;
+        var properties = CssValueInterpolation.InterpolatableProperties.Keys
+            .Concat(harness is InteractiveHtmlRendererState scriptState ? scriptState.GetScriptAnimatedProperties(element) : Enumerable.Empty<string>())
+            .Distinct(StringComparer.OrdinalIgnoreCase);
 
-        foreach (var property in CssValueInterpolation.InterpolatableProperties.Keys)
+        foreach (var property in properties)
         {
+            var scriptedValue = harness is InteractiveHtmlRendererState state
+                ? state.GetScriptAnimatedValue(element, property, style)
+                : null;
+
+            if (scriptedValue is not null)
+            {
+                map[property] = scriptedValue;
+                styleMap?.ClearRawLength(property);
+                continue;
+            }
+
             var animatedValue = !isAnimated ? null
-                : harness is InteractiveHtmlRendererState state ? state.GetAnimatedValue(element, property, style)
+                : harness is InteractiveHtmlRendererState cssState ? cssState.GetAnimatedValue(element, property, style)
                 : harness.GetAnimatedValue(element, property);
 
             if (animatedValue is not null)
@@ -8363,7 +8720,7 @@ public sealed partial class HtmlRenderer
     {
         static float OrDefault(float value, float fallback) => float.IsNaN(value) ? fallback : value;
         static bool IsPercentage(Dictionary<string, string> styleMap, string property) =>
-            styleMap.TryGetValue(property, out var value) && value.TrimEnd().EndsWith('%');
+            styleMap.TryGetValue(property, out var value) && IsPercentageValue(value);
 
         var minWidth = OrDefault(ParseLength(styleMap, "min-width", containingWidth, float.NaN, allowAuto: true), 0f);
         var maxWidth = OrDefault(ParseLength(styleMap, "max-width", containingWidth, float.NaN, allowAuto: true), float.PositiveInfinity);
@@ -11967,6 +12324,14 @@ public sealed partial class HtmlRenderer
             float.TryParse(parsed[..^1], NumberStyles.Float, CultureInfo.InvariantCulture, out var pct))
         {
             return (pct / 100f) * relativeTo;
+        }
+
+        // only what mixes percentages and lengths is left as math in a computed value
+        if (IsMathFunction(parsed))
+        {
+            return TryEvaluateMath(parsed, relativeTo, out var math) && !float.IsNaN(math)
+                ? math
+                : allowAuto ? float.NaN : defaultValue;
         }
 
         return ParseLengthValue(parsed, defaultValue, allowAuto: false);
