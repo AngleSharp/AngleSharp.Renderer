@@ -235,6 +235,39 @@ public sealed class InteractiveFrameTests
         Assert.Equal("scaled", frame.HitTestMap.HitTest(100, 150)?.Element.Id);
     }
 
+    [Fact]
+    public async Task Frame_TellsWhatItsLayoutTook()
+    {
+        var (_, harness) = await OpenAsync("""<div style="display: flex"><p style="flex: 1">A text</p><input placeholder="Search"></div><div style="width: 10px; height: 10px"></div>""");
+
+        var metrics = harness.PrepareFrame().Metrics;
+
+        Assert.False(metrics.IsIncremental);
+        Assert.True(metrics.Style > TimeSpan.Zero);
+        Assert.True(metrics.Layout > TimeSpan.Zero);
+        Assert.Equal(metrics.Setup + metrics.Style + metrics.Layout + metrics.HitTesting + metrics.Subframes, metrics.Total);
+        // html, head, style, body, the flex container with its two items, and the box
+        Assert.Equal(8, metrics.Elements);
+        Assert.True(metrics.Boxes >= 6);
+        Assert.True(metrics.TrialLayouts > 0);
+        Assert.True(metrics.StyleMaps >= metrics.Boxes);
+        Assert.True(metrics.TextMeasurements > 0);
+        Assert.True(metrics.Commands > 0);
+        Assert.True(metrics.HitTestEntries > 0);
+        Assert.True(metrics.AllocatedBytes > 0);
+    }
+
+    [Fact]
+    public async Task Frame_MovedToAnotherScrollPositionNeededNoLayout()
+    {
+        var (_, harness) = await OpenAsync("""<div style="height: 1000px"></div>""");
+
+        var frame = harness.PrepareFrame(100).Reposition(50);
+
+        Assert.Same(Rendering.RenderMetrics.None, frame.Metrics);
+        Assert.Equal(TimeSpan.Zero, frame.Metrics.Total);
+    }
+
     private static async Task<(IDocument Document, IDomHarness Harness)> OpenAsync(string body)
     {
         var configuration = Configuration.Default.WithCss().WithRenderDevice(Device);

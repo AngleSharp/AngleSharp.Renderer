@@ -552,6 +552,51 @@ public sealed class CaseRegressionTests
         Assert.Equal(20f, displayList.Commands.OfType<DrawTextCommand>().Single().X - SingleBox(displayList).X, precision: 2);
     }
 
+    [Fact]
+    public async Task FlexItem_WidthInAColumnIsLimitedByItsMaxWidth()
+    {
+        // the card wraps its boxes at 100px, which makes the nested column (and its minimum) taller
+        var document = await OpenAsync("""
+            <div style="display: flex; flex-direction: column; min-height: 20px">
+              <div style="display: flex; flex-direction: column; flex: 1 1 0%">
+                <div id="card" style="width: 100%; max-width: 100px; font-size: 0"><span style="display: inline-block; width: 60px; height: 30px"></span><span style="display: inline-block; width: 60px; height: 30px"></span></div>
+              </div>
+              <div id="foot" style="height: 10px"></div>
+            </div>
+            """);
+
+        Assert.Equal(100f, Rect(document, "card").Width, precision: 1);
+        Assert.Equal(60f, Rect(document, "card").Height, precision: 1);
+        Assert.Equal(60f, Rect(document, "foot").Y, precision: 1);
+    }
+
+    [Fact]
+    public async Task AbsoluteBoxAtTheBottom_OfABlockTallerThanItsMinHeight_IsAtItsBottom()
+    {
+        // the Back button of the Microsoft account picker: `bottom: 0` in a view with a min-height
+        var document = await OpenAsync("""
+            <div id="view" style="position: relative; min-height: 50px">
+              <div style="height: 120px"></div>
+              <div id="buttons" style="position: absolute; bottom: 0; right: 0; height: 20px; width: 40px"></div>
+            </div>
+            """);
+
+        Assert.Equal(100f, Rect(document, "buttons").Y, precision: 1);
+    }
+
+    [Fact]
+    public async Task AbsoluteBoxOfAutomaticHeightAndAMinHeight_IsPlacedByItsBottomWithItsHeight()
+    {
+        var document = await OpenAsync("""
+            <div style="position: relative; height: 120px">
+              <div id="buttons" style="position: absolute; bottom: 0; right: 0; min-height: 1px"><div style="height: 20px; width: 40px"></div></div>
+            </div>
+            """);
+
+        Assert.Equal(100f, Rect(document, "buttons").Y, precision: 1);
+        Assert.Equal(20f, Rect(document, "buttons").Height, precision: 1);
+    }
+
     private static RenderRect SingleBox(DisplayList displayList) =>
         displayList.Commands.OfType<FillRectCommand>().Single(fill => fill.Paint is RenderColorPaint paint && paint.Color == BoxColor).Rect;
 

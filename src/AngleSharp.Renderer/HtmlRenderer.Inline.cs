@@ -2629,13 +2629,23 @@ public sealed partial class HtmlRenderer
         float forcedBorderBoxWidth,
         bool isAtomicInline,
         bool isFlexOrGridItem = false,
-        float maxY = float.MaxValue)
+        float maxY = float.MaxValue,
+        bool isHeightOnly = false)
     {
+        var pass = s_layoutPass.Value;
+        // a trial asking for more (e.g., the baseline of an inline-block) needs all of its boxes
+        var wasHeightOnly = s_measuringHeightOnly;
+        s_measuringHeightOnly = isHeightOnly;
         var capture = new LayoutCapture();
         var previous = s_layoutCapture.Value;
         s_layoutCapture.Value = capture;
 
         s_trialDepth++;
+
+        if (pass is not null)
+        {
+            pass.Metrics.TrialLayouts++;
+        }
 
         // a trial is laid out elsewhere, so its lines are no column break candidates
         var previousColumnBreaks = s_columnBreakCapture.Value;
@@ -2686,6 +2696,7 @@ public sealed partial class HtmlRenderer
         finally
         {
             s_trialDepth--;
+            s_measuringHeightOnly = wasHeightOnly;
             context.PositionedScopes.Pop();
             s_layoutCapture.Value = previous;
             s_columnBreakCapture.Value = previousColumnBreaks;

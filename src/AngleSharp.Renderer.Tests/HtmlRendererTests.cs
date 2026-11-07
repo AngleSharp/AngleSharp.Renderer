@@ -1071,6 +1071,31 @@ public sealed class HtmlRendererTests
     }
 
     [Fact]
+    public async Task BuildDisplayList_AdjacentTextNodesOfFlexContainerAreOneItem()
+    {
+        var context = BrowsingContext.New(Configuration.Default.WithCss());
+        var document = await context.OpenAsync(req => req.Content("""
+            <html><body style="margin:0"><button id="b" style="display:inline-flex; align-items:center; gap: 8px"><span style="width:10px; height:10px"></span></button></body></html>
+            """));
+        var button = document.GetElementById("b")!;
+        // e.g. what a template gives for `Sign in with {provider}`: text nodes next to each other
+        button.AppendChild(document.CreateTextNode("Mit "));
+        button.AppendChild(document.CreateComment(""));
+        button.AppendChild(document.CreateTextNode("Microsoft"));
+        button.AppendChild(document.CreateTextNode(" einloggen"));
+
+        var displayList = new HtmlRenderer().BuildDisplayList(document, new DefaultRenderDevice
+        {
+            ViewPortWidth = 360,
+            ViewPortHeight = 240,
+            FontSize = 16f,
+        });
+
+        var text = string.Join("|", displayList.Commands.OfType<DrawTextCommand>().Select(command => command.Text));
+        Assert.Equal("Mit Microsoft einloggen", text);
+    }
+
+    [Fact]
     public async Task BuildDisplayList_CodeElementFlowsInlineWithSurroundingText()
     {
         var document = await ParseAsync("""

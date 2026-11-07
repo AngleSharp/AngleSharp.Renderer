@@ -39,9 +39,21 @@ public sealed class RenderedFrame
         : this(frame._displayList, frame._backend, frame._surface, frame.ViewportHeight, frame.ScrollTop, frame.OverscanTop, frame.ContentHeight, frame.IsScrollShiftable, frame.CanReposition, frame.HitTestMap, frame._shiftY, frame._document)
     {
         IsAnimating = frame.IsAnimating;
+        Metrics = frame.Metrics;
         _overlay = overlay;
         _selection = selection;
         _textMap = frame._textMap;
+    }
+
+    /// <summary>
+    /// Creates the frame showing the given display list (the frame's own with some boxes painted
+    /// again), whose boxes are where the frame has them.
+    /// </summary>
+    internal RenderedFrame(DisplayList displayList, RenderedFrame frame, RenderMetrics metrics)
+        : this(displayList, frame._backend, frame._surface, frame.ViewportHeight, frame.ScrollTop, frame.OverscanTop, frame.ContentHeight, frame.IsScrollShiftable, frame.CanReposition, frame.HitTestMap, frame._shiftY, frame._document)
+    {
+        IsAnimating = frame.IsAnimating;
+        Metrics = metrics;
     }
 
     private RenderedFrame(DisplayList displayList, RenderedFrame frame, double scrollTop, HitTestMap hitTestMap, float shiftY)
@@ -98,6 +110,12 @@ public sealed class RenderedFrame
     /// even if nothing else changes.
     /// </summary>
     public bool IsAnimating { get; internal set; }
+
+    /// <summary>
+    /// Gets what it took to lay out the frame. A frame moved to another scroll position (see
+    /// <see cref="Reposition"/>) needed no layout: it has <see cref="RenderMetrics.None"/>.
+    /// </summary>
+    public RenderMetrics Metrics { get; internal init; } = RenderMetrics.None;
 
     /// <summary>Gets the commands of the frame, as laid out (before any shift).</summary>
     internal DisplayList DisplayList => _displayList;

@@ -235,7 +235,10 @@ public sealed class IncrementalLayoutTests
 
         var patched = harness.UpdateFrame();
         Assert.NotNull(patched);
+        Assert.True(patched!.Metrics.IsIncremental);
+        Assert.True(patched.Metrics.Layout > TimeSpan.Zero);
         var expected = harness.PrepareFrame();
+        Assert.False(expected.Metrics.IsIncremental);
 
         Assert.Equal(expected.Rasterize().Data, patched!.Rasterize().Data);
         Assert.Equal(expected.HitTestMap.HitTest(330, 250)?.Element, patched.HitTestMap.HitTest(330, 250)?.Element);

@@ -329,7 +329,7 @@ public sealed class ElementCssomViewExtensionsTests
         var context = BrowsingContext.New(CreateConfiguration(160, 100));
         var document = await context.OpenAsync(request => request.Content("""
             <html>
-              <head><style>html, body { margin: 0; padding: 0; }</style></head>
+              <head><style>html, body { margin: 0; padding: 0; } #viewport:hover { border-color: red; }</style></head>
               <body>
                 <div id="viewport" style="position:relative; width:40px; height:20px; border:1px solid black;">
                   <div style="position:absolute; left:80px; top:60px; width:30px; height:40px;"></div>
