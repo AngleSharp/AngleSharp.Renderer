@@ -1,6 +1,6 @@
 # 0.11.1
 
-Released on Saturday, November 7 2026.
+Released on Sunday, November 8 2026.
 
 - Updated to use a minimum of AngleSharp.Css 1.4.1
 - Improved the performance of layouts, e.g., text fields with a placeholder computed the styles of all their ancestors whenever they were painted
