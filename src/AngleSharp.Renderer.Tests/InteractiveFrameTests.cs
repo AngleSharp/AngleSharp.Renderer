@@ -268,6 +268,28 @@ public sealed class InteractiveFrameTests
         Assert.Equal(TimeSpan.Zero, frame.Metrics.Total);
     }
 
+    [Fact]
+    public async Task Frame_HitsAnInlineBoxOnSeveralLinesOnlyOnItsLines()
+    {
+        var (document, harness) = await OpenAsync("""<div id="box" style="width: 200px">Some words ahead of <a id="wrapped" href="#">a link over lines</a> <a id="next" href="#">next</a></div>""");
+
+        var frame = harness.PrepareFrame();
+        var wrapped = document.GetElementById("wrapped")!;
+        var next = document.GetElementById("next")!.GetBoundingClientRect();
+        var rects = wrapped.GetClientRects();
+
+        Assert.Equal(2, rects.Length);
+        var (first, second) = (rects.Item(0)!, rects.Item(1)!);
+        Assert.True(second.Top >= first.Bottom - 1);
+        Assert.True(next.Left > second.Right);
+        // left of where the link starts on its first line and right of where it ends on the second
+        Assert.Equal("box", frame.HitTestMap.HitTest(first.Left / 2, (first.Top + first.Bottom) / 2)?.Element.Id);
+        Assert.Equal("next", frame.HitTestMap.HitTest((next.Left + next.Right) / 2, (next.Top + next.Bottom) / 2)?.Element.Id);
+        Assert.Equal("wrapped", frame.HitTestMap.HitTest((first.Left + first.Right) / 2, (first.Top + first.Bottom) / 2)?.Element.Id);
+        Assert.Equal("wrapped", frame.HitTestMap.HitTest((second.Left + second.Right) / 2, (second.Top + second.Bottom) / 2)?.Element.Id);
+        Assert.Equal("box", document.ElementFromPoint(first.Left / 2, (first.Top + first.Bottom) / 2)?.Id);
+    }
+
     private static async Task<(IDocument Document, IDomHarness Harness)> OpenAsync(string body)
     {
         var configuration = Configuration.Default.WithCss().WithRenderDevice(Device);

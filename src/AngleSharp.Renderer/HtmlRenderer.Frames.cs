@@ -116,16 +116,19 @@ public sealed partial class HtmlRenderer
     /// Lays out the document for a frame (see above), which also gives the layout to answer
     /// geometry reads from until the document changes.
     /// </summary>
-    internal RenderedFrame PrepareFrame(IDocument document, IRenderDevice renderDevice, double scrollTop, int overscan, out LayoutSnapshot snapshot)
+    internal RenderedFrame PrepareFrame(IDocument document, IRenderDevice renderDevice, double scrollTop, int overscan, out LayoutSnapshot snapshot, bool viewportOnly = false)
     {
         ArgumentNullException.ThrowIfNull(document);
         ArgumentNullException.ThrowIfNull(renderDevice);
 
         overscan = Math.Max(0, overscan);
         var scrollOffsetY = (float)scrollTop - overscan;
-        // the whole page is laid out: hit testing below the viewport and the scroll extent need it
-        snapshot = LayoutSnapshot.LayOut(document, renderDevice, _textMeasurer, scrollOffsetY, 2 * overscan, isFrame: true, out var displayList);
-        return CreateFrame(document, snapshot, displayList, scrollTop, overscan);
+        // the whole page is laid out: hit testing below the viewport and the scroll extent need
+        // it, unless the frame is to show the viewport only
+        snapshot = LayoutSnapshot.LayOut(document, renderDevice, _textMeasurer, scrollOffsetY, 2 * overscan, isFrame: true, out var displayList, viewportOnly);
+        var frame = CreateFrame(document, snapshot, displayList, scrollTop, overscan);
+        frame.IsPartial = snapshot.IsPartial;
+        return frame;
     }
 
     /// <summary>

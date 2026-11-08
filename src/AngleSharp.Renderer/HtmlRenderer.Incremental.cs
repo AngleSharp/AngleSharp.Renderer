@@ -303,7 +303,8 @@ public sealed partial class HtmlRenderer
             _layoutScrollY = layoutScrollY;
             _metrics = new Dictionary<IElement, ElementLayoutMetrics>(metrics, ReferenceEqualityComparer.Instance);
             _pageMetrics = layoutScrollY == 0f ? _metrics : new Dictionary<IElement, ElementLayoutMetrics>(_metrics.Count, ReferenceEqualityComparer.Instance);
-            _relationalMatches = GetSiblingSelectors().RelationalCompounds
+            // a partial layout is never updated (see TryUpdate), which compares them
+            _relationalMatches = pass.IsCutOff || pass.BuiltNodes is not null ? [] : GetSiblingSelectors().RelationalCompounds
                 .Select(compound => (compound, TryQuerySelectorAll(document, compound)))
                 .ToList();
 
@@ -327,6 +328,9 @@ public sealed partial class HtmlRenderer
 
         /// <summary>Gets if this is a frame's layout (see <see cref="TryPatch"/>).</summary>
         public bool IsFrameLayout => _isFrameLayout;
+
+        /// <summary>Gets if the layout ends below the viewport, leaving out the rest of the page.</summary>
+        public bool IsPartial => _pass.IsCutOff || _pass.BuiltNodes is not null;
 
         /// <summary>
         /// Takes the boxes laid out again since the frame into its display list, layout by
@@ -814,9 +818,10 @@ public sealed partial class HtmlRenderer
         /// <summary>
         /// Lays out the whole document scrolled by <paramref name="scrollOffsetY"/> (unculled, as
         /// geometry reads and hit testing need all of it), on a surface that many rows taller
-        /// than the viewport.
+        /// than the viewport, or, for <paramref name="viewportOnly"/>, just as much of it as
+        /// the surface shows (see <see cref="IsPartial"/>).
         /// </summary>
-        public static LayoutSnapshot LayOut(IDocument document, IRenderDevice renderDevice, ITextMeasurer textMeasurer, float scrollOffsetY, int surfaceExtraHeight, bool isFrame, out DisplayList displayList)
+        public static LayoutSnapshot LayOut(IDocument document, IRenderDevice renderDevice, ITextMeasurer textMeasurer, float scrollOffsetY, int surfaceExtraHeight, bool isFrame, out DisplayList displayList, bool viewportOnly = false)
         {
             var pass = new LayoutPass();
             var setupStart = RenderMetricsRecorder.Now;
@@ -837,7 +842,7 @@ public sealed partial class HtmlRenderer
 
             try
             {
-                displayList = BuildDisplayList(document, viewport, context, renderDevice, scrollOffsetY, measureFullExtent: true, surfaceExtraHeight: surfaceExtraHeight, pass: pass);
+                displayList = BuildDisplayList(document, viewport, context, renderDevice, scrollOffsetY, measureFullExtent: !viewportOnly, surfaceExtraHeight: surfaceExtraHeight, pass: pass);
                 var hitTestingStart = RenderMetricsRecorder.Now;
                 var metrics = AddHitTestLayers(capture.Snapshot(), context);
                 pass.Metrics.HitTesting += RenderMetricsRecorder.Since(hitTestingStart);
@@ -920,7 +925,8 @@ public sealed partial class HtmlRenderer
             // how many enclosing roots a change may be laid out with, before a full layout is cheaper
             const int MaxEscalations = 3;
 
-            if (_document.DefaultView is not { } window)
+            // what is below the viewport was never laid out
+            if (IsPartial || _document.DefaultView is not { } window)
             {
                 return false;
             }

@@ -519,7 +519,13 @@ internal sealed partial class InteractiveHtmlRendererState : IDomHarness
         }
     }
 
-    public RenderedFrame PrepareFrame(int overscan = 0)
+    public RenderedFrame PrepareFrame(int overscan = 0) => PrepareFrame(overscan, viewportOnly: false);
+
+    /// <summary>
+    /// Prepares the next frame (see <see cref="PrepareFrame(int)"/>), for <paramref name="viewportOnly"/>
+    /// laying out just what the viewport shows (see <see cref="RenderedFrame.IsPartial"/>).
+    /// </summary>
+    internal RenderedFrame PrepareFrame(int overscan, bool viewportOnly)
     {
         var targetDocument = Context.Active
             ?? throw new InvalidOperationException("No active document is available for painting.");
@@ -543,11 +549,11 @@ internal sealed partial class InteractiveHtmlRendererState : IDomHarness
         using (_animationTracker.BeginFrame(targetDocument))
         {
             _transitionTracker.BeginFrame();
-            var frame = _renderer.PrepareFrame(targetDocument, RenderDevice, scrollTop, _isFrameScrollShiftable ? overscan : 0, out var snapshot);
+            var frame = _renderer.PrepareFrame(targetDocument, RenderDevice, scrollTop, _isFrameScrollShiftable ? overscan : 0, out var snapshot, viewportOnly);
 
             if (frame.OverscanTop > 0 && !frame.IsScrollShiftable)
             {
-                frame = _renderer.PrepareFrame(targetDocument, RenderDevice, scrollTop, 0, out snapshot);
+                frame = _renderer.PrepareFrame(targetDocument, RenderDevice, scrollTop, 0, out snapshot, viewportOnly);
             }
 
             _transitionTracker.EndFrame();
@@ -557,13 +563,20 @@ internal sealed partial class InteractiveHtmlRendererState : IDomHarness
             _metricsObserver!.Flush();
             _pendingMutations.Clear();
             _pendingRestyles.Clear();
-            _metrics = snapshot;
+            // a frame of the viewport only answers no geometry reads and is not patched (the
+            // next one lays out the whole page), and the observers wait for that one
+            _metrics = frame.IsPartial ? null : snapshot;
             _metricsViewport = (RenderDevice.ViewPortWidth, RenderDevice.ViewPortHeight);
             _lastFrame = frame;
             _lastFrameLayout = snapshot;
             _isFrameScrollShiftable = frame.IsScrollShiftable;
-            frame.IsAnimating = _animationTracker.IsAnimating || _transitionTracker.HasRunningTransitions || HasRunningScriptAnimations || snapshot.Subframes.Values.Any(static entry => entry.Frame?.IsAnimating == true);
-            FrameUpdated?.Invoke(this, EventArgs.Empty);
+            frame.IsAnimating = frame.IsPartial || _animationTracker.IsAnimating || _transitionTracker.HasRunningTransitions || HasRunningScriptAnimations || snapshot.Subframes.Values.Any(static entry => entry.Frame?.IsAnimating == true);
+
+            if (!frame.IsPartial)
+            {
+                FrameUpdated?.Invoke(this, EventArgs.Empty);
+            }
+
             return ShowSelection(frame);
         }
         }

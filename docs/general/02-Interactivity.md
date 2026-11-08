@@ -110,6 +110,22 @@ harness.NotifyStateChanged(field);
 var frame = harness.UpdateFrame() ?? harness.PrepareFrame();
 ```
 
+A page that was just loaded can be shown early on: `PrepareViewportFrame()` styles and lays out
+only what is in the viewport (with the overscan). If the page goes on below, the frame is
+`IsPartial`: its `ContentHeight` and hit-test map end there, and it is animating, as the next
+frame lays out the whole page. Reading the geometry (e.g., `getBoundingClientRect`) lays it out as
+well, and `UpdateFrame()` doesn't patch a partial frame:
+
+```cs
+var first = harness.PrepareViewportFrame();
+// show it, then
+var frame = first.IsPartial ? harness.PrepareFrame() : first;
+```
+
+Images of a page (e.g., `RenderToPng`) are rendered the same way. A document whose generated
+content uses CSS counters or quotes (with elements they apply to) is styled as a whole, as these
+depend on all elements before.
+
 For a large document, the computed styles of its elements are read on all cores (as AngleSharp.Css
 matches their selectors), while the DOM is not changed. A host without cores to spare turns this off:
 

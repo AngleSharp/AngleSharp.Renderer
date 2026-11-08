@@ -91,29 +91,35 @@ public sealed partial class HtmlRenderer
     /// </summary>
     private static void ResolveWritingModeSystems(IRenderNode node, WritingModeKind boxSystem, LayoutContext context)
     {
-        var contentSystem = boxSystem;
-
-        if (node is ElementRenderNode element)
-        {
-            var ownMode = ParseWritingMode(element.ComputedStyle.GetPropertyValue("writing-mode"), WritingModeKind.HorizontalTb);
-            contentSystem = StartsWritingModeSystem(ownMode, boxSystem) ? ownMode : boxSystem;
-
-            if (IsVerticalMode(boxSystem))
-            {
-                context.BoxSystems[element.Ref] = boxSystem;
-                context.StyleMapCache.Remove(element.Ref);
-            }
-
-            if (IsVerticalMode(contentSystem))
-            {
-                context.ContentSystems[element.Ref] = contentSystem;
-            }
-        }
+        var contentSystem = node is ElementRenderNode element ? ResolveWritingModeSystem(element, boxSystem, context) : boxSystem;
 
         foreach (var child in node.Children)
         {
             ResolveWritingModeSystems(child, contentSystem, context);
         }
+    }
+
+    /// <summary>
+    /// Records the writing mode the element's box is laid out in (see above), giving the one of
+    /// its content.
+    /// </summary>
+    private static WritingModeKind ResolveWritingModeSystem(ElementRenderNode element, WritingModeKind boxSystem, LayoutContext context)
+    {
+        var ownMode = ParseWritingMode(element.ComputedStyle.GetPropertyValue("writing-mode"), WritingModeKind.HorizontalTb);
+        var contentSystem = StartsWritingModeSystem(ownMode, boxSystem) ? ownMode : boxSystem;
+
+        if (IsVerticalMode(boxSystem))
+        {
+            context.BoxSystems[element.Ref] = boxSystem;
+            context.StyleMapCache.Remove(element.Ref);
+        }
+
+        if (IsVerticalMode(contentSystem))
+        {
+            context.ContentSystems[element.Ref] = contentSystem;
+        }
+
+        return contentSystem;
     }
 
     private static WritingModeKind GetContentSystem(IElement element, LayoutContext context) =>

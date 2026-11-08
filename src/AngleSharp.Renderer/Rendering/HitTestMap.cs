@@ -151,7 +151,8 @@ public sealed class HitTestMap
         (int Step, int ZIndex, double Order) Rank,
         RenderTransform2D? Transform);
 
-    private readonly record struct Entry(IElement Element, RenderRect Box, RenderRect Clip, string Cursor, bool IsInScrollContainer, bool IsViewportAnchored, RenderedFrame? Subframe = null, RenderRect Viewport = default);
+    // Fragments: where an inline box on several lines is (within Box), if it isn't transformed
+    private readonly record struct Entry(IElement Element, RenderRect Box, RenderRect Clip, string Cursor, bool IsInScrollContainer, bool IsViewportAnchored, RenderedFrame? Subframe = null, RenderRect Viewport = default, RenderRect[]? Fragments = null);
 
     private HitTestMap(Entry[] entries, float offsetY = 0f)
     {
@@ -181,7 +182,7 @@ public sealed class HitTestMap
         {
             var entryY = entry.IsViewportAnchored ? y : y - _offsetY;
 
-            if (Contains(entry.Box, x, entryY) && Contains(entry.Clip, x, entryY))
+            if (Contains(entry.Box, x, entryY) && Contains(entry.Clip, x, entryY) && (entry.Fragments is null || ContainsAny(entry.Fragments, x, entryY)))
             {
                 // what an iframe shows is hit in its document: everything there, as it scrolls of its own
                 if (entry.Subframe is { } frame &&
@@ -228,10 +229,12 @@ public sealed class HitTestMap
 
             var box = new RenderRect(elementMetrics.BorderBoxX, elementMetrics.BorderBoxY + offsetY, elementMetrics.BorderBoxWidth, elementMetrics.BorderBoxHeight);
             var clip = new RenderRect(-Unbounded, -Unbounded, 2 * Unbounded, 2 * Unbounded);
+            var fragments = elementMetrics.Fragments?.Select(fragment => new RenderRect(box.X + fragment.X, box.Y + fragment.Y, fragment.Width, fragment.Height)).ToArray();
 
             if (GetTransform(styleMaps, element, elementMetrics, offsetY) is { } ownTransform)
             {
                 box = ownTransform.MapBounds(box);
+                fragments = null;
             }
 
             var path = new List<(int Step, int ZIndex, double Order)> { (1, 0, GetOrder(element)) };
@@ -271,6 +274,7 @@ public sealed class HitTestMap
                 if (info.Transform is { } ancestorTransform)
                 {
                     box = ancestorTransform.MapBounds(box);
+                    fragments = null;
                     clip = clip.Width >= Unbounded ? clip : ancestorTransform.MapBounds(clip);
                 }
 
@@ -295,7 +299,7 @@ public sealed class HitTestMap
                 box.Y + elementMetrics.BorderTop + elementMetrics.PaddingTop,
                 Math.Max(0f, box.Width - elementMetrics.BorderLeft - elementMetrics.BorderRight - elementMetrics.PaddingLeft - elementMetrics.PaddingRight),
                 Math.Max(0f, box.Height - elementMetrics.BorderTop - elementMetrics.BorderBottom - elementMetrics.PaddingTop - elementMetrics.PaddingBottom));
-            candidates.Add((new Entry(element, box, clip, cursor, isInScrollContainer, isViewportAnchored, subframe, frameViewport), path.ToArray()));
+            candidates.Add((new Entry(element, box, clip, cursor, isInScrollContainer, isViewportAnchored, subframe, frameViewport, fragments), path.ToArray()));
         }
 
         // top-most first; ties (which only unordered elements can have) keep the first one on top
@@ -432,6 +436,19 @@ public sealed class HitTestMap
 
     private static bool Contains(RenderRect rect, double x, double y) =>
         x >= rect.X && x <= rect.X + rect.Width && y >= rect.Y && y <= rect.Y + rect.Height;
+
+    private static bool ContainsAny(RenderRect[] rects, double x, double y)
+    {
+        foreach (var rect in rects)
+        {
+            if (Contains(rect, x, y))
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
 
     private static RenderRect Intersect(RenderRect a, RenderRect b)
     {

@@ -68,6 +68,30 @@ public sealed partial class HtmlRenderer
 
         /// <summary>What the pass took, see <see cref="RenderedFrame.Metrics"/>.</summary>
         public RenderMetricsRecorder Metrics { get; set; } = new();
+
+        /// <summary>Where a layout of the viewport only stops (see BuildDisplayListCore), if it does.</summary>
+        public float ViewportCutoff { get; set; } = float.NaN;
+
+        /// <summary>Whether content below <see cref="ViewportCutoff"/> was left out.</summary>
+        public bool IsCutOff { get; set; }
+
+        /// <summary>
+        /// The nodes whose children were built, if the render tree is built on demand (see
+        /// RenderOnDemand): the others' were never read.
+        /// </summary>
+        public HashSet<ElementRenderNode>? BuiltNodes { get; set; }
+    }
+
+    /// <summary>
+    /// Notes that what comes after <paramref name="maxY"/> is not laid out: if it is the
+    /// viewport's bottom (not a measurement's own bound), the layout is not complete.
+    /// </summary>
+    private static void NoteCutOff(float maxY)
+    {
+        if (s_layoutPass.Value is { } pass && maxY == pass.ViewportCutoff)
+        {
+            pass.IsCutOff = true;
+        }
     }
 
     /// <summary>A rule of a `style` element declaring a property (see ResolveRawAuthoredPropertyValue).</summary>
@@ -344,7 +368,8 @@ public sealed partial class HtmlRenderer
         float insetLeft = float.NaN,
         float insetRight = float.NaN,
         float insetTop = float.NaN,
-        float insetBottom = float.NaN)
+        float insetBottom = float.NaN,
+        IReadOnlyList<RenderRect>? fragments = null)
     {
         var metrics = new ElementLayoutMetrics(
             borderBoxX,
@@ -368,7 +393,10 @@ public sealed partial class HtmlRenderer
             InsetLeft: insetLeft,
             InsetRight: insetRight,
             InsetTop: insetTop,
-            InsetBottom: insetBottom);
+            InsetBottom: insetBottom)
+        {
+            Fragments = fragments,
+        };
 
         if (s_stickyProbe is { } probe && ReferenceEquals(probe.Element, element))
         {
@@ -881,11 +909,23 @@ public sealed partial class HtmlRenderer
         var styleStart = RenderMetricsRecorder.Now;
         PrepareDocumentForRendering(document);
 
-        var renderTree = window.Render(renderDevice);
-        BuildAnonymousTableBoxes(renderTree);
-        CollectSpecifiedStyles(renderTree, context);
-        ResolveWritingModeSystems(renderTree, WritingModeKind.HorizontalTb, context);
-        CreateStyleMapsInParallel(renderTree, context);
+        // with the rules the context has gathered and indexed already; a layout of the viewport
+        // only styles what it reaches
+        var isRenderedOnDemand = !measureFullExtent && document.DocumentElement is not null && context.StyleCollection is { } lazyStyles && CanRenderOnDemand(document, lazyStyles);
+        IRenderNode renderTree;
+
+        if (isRenderedOnDemand)
+        {
+            renderTree = RenderOnDemand(window, context.StyleCollection!, context);
+        }
+        else
+        {
+            renderTree = context.StyleCollection is { } styles ? window.RenderDocument(styles) : window.Render(renderDevice);
+            BuildAnonymousTableBoxes(renderTree);
+            CollectSpecifiedStyles(renderTree, context);
+            ResolveWritingModeSystems(renderTree, WritingModeKind.HorizontalTb, context);
+            CreateStyleMapsInParallel(renderTree, context);
+        }
 
         if (metrics is not null)
         {
@@ -901,7 +941,10 @@ public sealed partial class HtmlRenderer
         // counter-reset's own new instance is naturally "popped" back to whatever the enclosing
         // scope had once this call returns), which the layout pass itself cannot offer cheaply
         // given how many early-return paths LayoutElement has. See ProcessCounters' own remarks.
-        ProcessCounters(renderTree, context);
+        if (!isRenderedOnDemand)
+        {
+            ProcessCounters(renderTree, context);
+        }
 
         var body = document.Body;
         var root = body is null ? renderTree : renderTree.Find(body) ?? renderTree;
@@ -935,7 +978,12 @@ public sealed partial class HtmlRenderer
         // there is no need to spend time measuring what will never be rasterized. Measuring the
         // page's true scrollable extent (for scrollTop/scrollHeight/max-scroll purposes) needs the
         // opposite: the full page, regardless of how tall it is relative to the viewport.
-        var maxY = measureFullExtent ? float.MaxValue : viewport.Height - context.Padding;
+        var maxY = measureFullExtent ? float.MaxValue : viewport.Height + surfaceExtraHeight - context.Padding;
+
+        if (!measureFullExtent && s_layoutPass.Value is { } cutoffPass)
+        {
+            cutoffPass.ViewportCutoff = maxY;
+        }
 
         // A `position: sticky` page child is laid out right here, in plain document order, like
         // any other page child - its own cursorY/margin-collapse threading must stay in sequence
@@ -5630,6 +5678,13 @@ public sealed partial class HtmlRenderer
             var lineSourceStart = sourcePosition;
             var lineTop = cursorY;
 
+            // the lines below the viewport are not laid out, the one reaching into it is
+            if (lineTop > maxY)
+            {
+                NoteCutOff(maxY);
+                return;
+            }
+
             if (textSource is not null && RecordsTextFragments(context))
             {
                 sourcePosition = TextSourceMap.Align(sourceData, sourcePosition, line, default);
@@ -5646,11 +5701,6 @@ public sealed partial class HtmlRenderer
 
             RecordColumnLine(cursorY, cursorY + lineHeight);
             cursorY += lineHeight;
-
-            if (cursorY > maxY)
-            {
-                return;
-            }
 
             // An empty line (a blank `pre`/`pre-wrap`/`pre-line` row from a run of consecutive
             // forced breaks) still needs to advance cursorY above, but has nothing to measure/paint
@@ -7198,14 +7248,7 @@ public sealed partial class HtmlRenderer
     {
         if (node is ElementRenderNode element)
         {
-            context.SpecifiedStyles[element.Ref] = element.SpecifiedStyle;
-
-            if (s_layoutPass.Value is { } pass)
-            {
-                pass.ComputedStyles[element.Ref] = element.ComputedStyle;
-                pass.Nodes[element.Ref] = element;
-                pass.Metrics.Elements++;
-            }
+            CollectSpecifiedStyle(element, context);
         }
 
         foreach (var child in node.Children)
@@ -7214,13 +7257,146 @@ public sealed partial class HtmlRenderer
         }
     }
 
+    private static void CollectSpecifiedStyle(ElementRenderNode element, LayoutContext context)
+    {
+        context.SpecifiedStyles[element.Ref] = element.SpecifiedStyle;
+
+        if (s_layoutPass.Value is { } pass)
+        {
+            pass.ComputedStyles[element.Ref] = element.ComputedStyle;
+            pass.Nodes[element.Ref] = element;
+            pass.Metrics.Elements++;
+        }
+    }
+
+    /// <summary>
+    /// Renders the document into a render tree whose nodes get their children when the layout
+    /// reads them, so what it does not reach (e.g. the page below the viewport, see
+    /// BuildDisplayListCore) is never styled. The children of a node are prepared for the layout
+    /// like the passes over a whole render tree do (anonymous table boxes, specified styles,
+    /// writing modes, generated content) once they are built.
+    /// </summary>
+    private static IRenderNode RenderOnDemand(IWindow window, IStyleCollection styles, LayoutContext context)
+    {
+        var pass = s_layoutPass.Value;
+
+        if (pass is not null)
+        {
+            pass.BuiltNodes = new HashSet<ElementRenderNode>(ReferenceEqualityComparer.Instance);
+        }
+
+        var root = window.RenderPartial(styles, (node, children) => PrepareChildren(node, (List<IRenderNode>)children, context));
+        PrepareNode(root, null, WritingModeKind.HorizontalTb, context);
+        return root;
+    }
+
+    private static void PrepareChildren(ElementRenderNode node, List<IRenderNode> children, LayoutContext context)
+    {
+        s_layoutPass.Value?.BuiltNodes?.Add(node);
+        BuildAnonymousTableBoxes(node, children);
+        var contentSystem = GetContentSystem(node.Ref, context);
+
+        foreach (var child in children)
+        {
+            PrepareNode(child, node.Ref, contentSystem, context);
+        }
+    }
+
+    // the anonymous boxes of a table are no nodes of the tree: their children are prepared with them
+    private static void PrepareNode(IRenderNode node, IElement? host, WritingModeKind boxSystem, LayoutContext context)
+    {
+        if (node is not ElementRenderNode element)
+        {
+            return;
+        }
+
+        CollectSpecifiedStyle(element, context);
+        var contentSystem = ResolveWritingModeSystem(element, boxSystem, context);
+
+        if (element.Ref is IPseudoElement)
+        {
+            ProcessCounters(element, context, host: host);
+        }
+        else if (IsAnonymousTableBox(element.Ref) && element.Children is List<IRenderNode> children)
+        {
+            BuildAnonymousTableBoxes(element, children);
+
+            foreach (var child in children)
+            {
+                PrepareNode(child, host, contentSystem, context);
+            }
+        }
+    }
+
+    /// <summary>
+    /// Whether the generated content of the document needs no counters or quotes, which need the
+    /// elements before in document order (see ProcessCounters), so that its render tree can be
+    /// built on demand (see RenderOnDemand): no element is styled by a rule using them (e.g.
+    /// the `q::before` of the default style sheet, if there is no `q`).
+    /// </summary>
+    private static bool CanRenderOnDemand(IDocument document, IStyleCollection styles)
+    {
+        foreach (var rule in styles)
+        {
+            foreach (var property in rule.Style)
+            {
+                if (property.Name.StartsWith("counter-", StringComparison.OrdinalIgnoreCase) ||
+                    (property.Name.Equals("content", StringComparison.OrdinalIgnoreCase) && property.Value is { } value &&
+                     (value.Contains("counter", StringComparison.OrdinalIgnoreCase) || value.Contains("quote", StringComparison.OrdinalIgnoreCase))))
+                {
+                    // the elements the pseudo-elements of the rule belong to
+                    var selector = s_generatingPseudoElement.Replace(rule.SelectorText, string.Empty);
+
+                    try
+                    {
+                        if (string.IsNullOrWhiteSpace(selector) || document.QuerySelector(selector) is not null)
+                        {
+                            return false;
+                        }
+                    }
+                    catch (DomException)
+                    {
+                        return false;
+                    }
+
+                    break;
+                }
+            }
+        }
+
+        return true;
+    }
+
+    private static readonly System.Text.RegularExpressions.Regex s_generatingPseudoElement = new("::?(before|after|marker)\\b", System.Text.RegularExpressions.RegexOptions.IgnoreCase | System.Text.RegularExpressions.RegexOptions.Compiled);
+
     /// <summary>
     /// The computed style of the element, taken from the render tree of the current layout pass.
     /// </summary>
     private static ICssStyleDeclaration ComputeStyle(IStyleCollection styleCollection, IElement element) =>
-        s_layoutPass.Value is { } pass && pass.ComputedStyles.TryGetValue(element, out var computed)
+        s_layoutPass.Value is { } pass && FindComputedStyle(pass, element) is { } computed
             ? computed
             : styleCollection.ComputeDeclarations(element);
+
+    // a render tree built on demand (see RenderOnDemand) builds the children of the parent for it
+    private static ICssStyleDeclaration? FindComputedStyle(LayoutPass pass, IElement element)
+    {
+        if (pass.ComputedStyles.TryGetValue(element, out var computed))
+        {
+            return computed;
+        }
+
+        if (pass.BuiltNodes is not { } built || element.ParentElement is not { } parent || FindComputedStyle(pass, parent) is null ||
+            !pass.Nodes.TryGetValue(parent, out var parentNode) || built.Contains(parentNode))
+        {
+            return null;
+        }
+
+        foreach (var _ in parentNode.Children)
+        {
+        }
+
+        return pass.ComputedStyles.GetValueOrDefault(element);
+    }
 
     /// <summary>
     /// Gaps and grid tracks are only parsed as px or %, so an authored one takes the computed
@@ -7836,7 +8012,8 @@ public sealed partial class HtmlRenderer
         if (harness is InteractiveHtmlRendererState observer)
         {
             observer.ObserveAnimations(element, style, isAnimated);
-            observer.ObserveTransitions(element, style);
+            // the map has the authored transform, without running the cascade again
+            observer.ObserveTransitions(element, style, map.GetValueOrDefault("transform"));
         }
 
         // nothing to look up for each property of every element, which most frames have
@@ -13336,8 +13513,8 @@ public sealed partial class HtmlRenderer
             return null;
         }
 
-        var device = window.Document.Context.GetService<IRenderDevice>() ?? new DefaultRenderDevice();
-        var styleCollection = window.GetStyleCollection(device);
+        // the one of the layout pass, if any (a new one collects all the rules again)
+        var styleCollection = GetSvgStyleCollection(window);
         var cascaded = styleCollection.GetDeclarations(element).GetPropertyValue("transform");
 
         // custom properties are only substituted in the computed value

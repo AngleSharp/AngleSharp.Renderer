@@ -27,13 +27,13 @@ internal sealed partial class InteractiveHtmlRendererState
     /// Follows the CSS transitions of an element whose style was computed for painting, to
     /// start the ones of properties whose values changed (e.g. by a script changing a class).
     /// </summary>
-    internal void ObserveTransitions(IElement element, ICssStyleDeclaration computedStyle)
+    internal void ObserveTransitions(IElement element, ICssStyleDeclaration computedStyle, string? authoredTransform)
     {
         // what is not rendered has no transition, before or after (its values are forgotten)
         if (element is not IPseudoElement && CssTransitionTracker.HasTransition(computedStyle) && !IsNotRendered(computedStyle))
         {
             var previousStyle = _lastFrameLayout?.GetComputedStyle(element);
-            _transitionTracker.Observe(element, computedStyle, previousStyle is not null && !IsNotRendered(previousStyle) ? previousStyle : null);
+            _transitionTracker.Observe(element, computedStyle, previousStyle is not null && !IsNotRendered(previousStyle) ? previousStyle : null, authoredTransform);
         }
 
         static bool IsNotRendered(ICssStyleDeclaration style) => style.GetPropertyValue("display") is "none";

@@ -2879,6 +2879,25 @@ public sealed class HtmlRendererTests
     }
 
     [Fact]
+    public async Task RenderToPng_PaintsTheLineOfTextReachingIntoTheBottomOfTheViewport()
+    {
+        var document = await ParseAsync("""
+            <html><body style="margin: 0">
+                <div style="width: 60px; font-size: 16px; line-height: 20px">wrapping words here</div>
+            </body></html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var image = renderer.RenderToPng(document, new DefaultRenderDevice { ViewPortWidth = 100, ViewPortHeight = 30 });
+
+        using var bitmap = SkiaSharp.SKBitmap.Decode(image.Data);
+        var hasText = Enumerable.Range(21, 9).Any(y => Enumerable.Range(0, 60).Any(x => bitmap.GetPixel(x, y).Red < 128));
+
+        // the second line starts at 20px and goes on below the viewport
+        Assert.True(hasText);
+    }
+
+    [Fact]
     public async Task RenderToPng_SvgFeFloodFillsTheShapeWithTheFloodColor()
     {
         var document = await ParseAsync("""

@@ -86,8 +86,9 @@ public sealed partial class HtmlRenderer
 
             var styleMap = GetOrCreateStyleMap(context, element.Ref, element.ComputedStyle);
 
+            // a tree built on demand is not built for this (what is below a viewport is left out)
             if ((IsStickyPositioned(styleMap) && !float.IsNaN(ParseLength(styleMap, "bottom", 0f, float.NaN, allowAuto: true))) ||
-                ContainsBottomStickyBox(element.Children, context))
+                (s_layoutPass.Value?.BuiltNodes is not { } built || built.Contains(element)) && ContainsBottomStickyBox(element.Children, context))
             {
                 return true;
             }

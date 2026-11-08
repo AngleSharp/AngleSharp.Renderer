@@ -1,6 +1,7 @@
 namespace AngleSharp.Renderer;
 
 using AngleSharp.Dom;
+using AngleSharp.Renderer.Rendering;
 
 /// <summary>
 /// Extensions for <see cref="IDomHarness"/>.
@@ -24,5 +25,24 @@ public static class DomHarnessExtensions
         {
             state.OnStateChanged(element);
         }
+    }
+
+    /// <summary>
+    /// Prepares the next frame like <see cref="IDomHarness.PrepareFrame"/>, but lays out just as
+    /// much of the page as the viewport (with the overscan) shows, e.g., to show a page that was
+    /// just loaded early on. If the page goes on below, the frame is partial (see
+    /// <see cref="RenderedFrame.IsPartial"/>): it is animating, and the next frame lays out the
+    /// whole page; until then, reading the geometry lays it out as well.
+    /// </summary>
+    /// <param name="harness">The harness of the document.</param>
+    /// <param name="overscan">The rows to paint above and below the viewport.</param>
+    /// <returns>The frame.</returns>
+    public static RenderedFrame PrepareViewportFrame(this IDomHarness harness, int overscan = 0)
+    {
+        ArgumentNullException.ThrowIfNull(harness);
+
+        return harness is InteractiveHtmlRendererState state
+            ? state.PrepareFrame(overscan, viewportOnly: true)
+            : harness.PrepareFrame(overscan);
     }
 }

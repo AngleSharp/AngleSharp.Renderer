@@ -260,16 +260,19 @@ internal sealed class CssTransitionTracker
     /// Follows the transitioned properties of an element whose style was computed for painting,
     /// starting a transition for each one having another value than the last time it was seen, or
     /// in the given style before (the one of the last frame), e.g., after a script changed a
-    /// class of the element. An element seen the first time has no transition.
+    /// class of the element. An element seen the first time has no transition. Its authored
+    /// `transform` is the one its style map has, read from the cascade already.
     /// </summary>
-    public void Observe(IElement element, ICssStyleDeclaration style, ICssStyleDeclaration? previousStyle)
+    public void Observe(IElement element, ICssStyleDeclaration style, ICssStyleDeclaration? previousStyle, string? authoredTransform)
     {
         _observedElements.Add(element);
 
         foreach (var (property, spec) in ParseTransitionSpecs(style, withEventOnlyProperties: true))
         {
             var isInterpolated = CssValueInterpolation.InterpolatableProperties.TryGetValue(property, out var kind);
-            var naturalValue = ReadValue(style, property, isInterpolated, kind, element);
+            var naturalValue = property.Equals("transform", StringComparison.OrdinalIgnoreCase)
+                ? CssValueInterpolation.ReadNaturalTransform(authoredTransform)
+                : ReadValue(style, property, isInterpolated, kind, element);
 
             if (naturalValue is null)
             {

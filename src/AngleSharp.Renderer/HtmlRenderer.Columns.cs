@@ -475,21 +475,26 @@ public sealed partial class HtmlRenderer
                 continue;
             }
 
-            var boxTop = recorded.BorderBoxY - top;
-            var boxBottom = boxTop + recorded.BorderBoxHeight;
             var fragments = new List<RenderRect>();
 
-            for (var column = 0; column < segments.Count; column++)
+            // an inline box on several lines is in the columns line by line
+            foreach (var part in recorded.Fragments ?? [new RenderRect(0f, 0f, recorded.BorderBoxWidth, recorded.BorderBoxHeight)])
             {
-                var (start, end) = segments[column];
-                var isLast = column == segments.Count - 1;
+                var boxTop = recorded.BorderBoxY + part.Y - top;
+                var boxBottom = boxTop + part.Height;
 
-                // a box of no height is where it starts
-                if (boxBottom > boxTop ? boxTop < end && boxBottom > start : boxTop >= start && (boxTop < end || isLast))
+                for (var column = 0; column < segments.Count; column++)
                 {
-                    var fragmentTop = Math.Max(boxTop, start);
-                    var fragmentBottom = Math.Max(fragmentTop, Math.Min(boxBottom, end));
-                    fragments.Add(new RenderRect(recorded.BorderBoxX + (column * columnStep), top + fragmentTop - start, recorded.BorderBoxWidth, fragmentBottom - fragmentTop));
+                    var (start, end) = segments[column];
+                    var isLast = column == segments.Count - 1;
+
+                    // a box of no height is where it starts
+                    if (boxBottom > boxTop ? boxTop < end && boxBottom > start : boxTop >= start && (boxTop < end || isLast))
+                    {
+                        var fragmentTop = Math.Max(boxTop, start);
+                        var fragmentBottom = Math.Max(fragmentTop, Math.Min(boxBottom, end));
+                        fragments.Add(new RenderRect(recorded.BorderBoxX + part.X + (column * columnStep), top + fragmentTop - start, part.Width, fragmentBottom - fragmentTop));
+                    }
                 }
             }
 

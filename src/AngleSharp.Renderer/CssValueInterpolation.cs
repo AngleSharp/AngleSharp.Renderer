@@ -192,6 +192,13 @@ internal static class CssValueInterpolation
         };
     }
 
+    /// <summary>
+    /// The natural value of an element's authored `transform` (see <see cref="ReadNaturalValue"/>),
+    /// e.g. the one of its style map.
+    /// </summary>
+    public static string ReadNaturalTransform(string? authored) =>
+        string.IsNullOrWhiteSpace(authored) ? "none" : authored.Trim();
+
     public static bool ValuesAreEquivalent(CssInterpolationValueKind kind, string a, string b)
     {
         if (string.Equals(a, b, StringComparison.OrdinalIgnoreCase))
