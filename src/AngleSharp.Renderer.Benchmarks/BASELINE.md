@@ -244,3 +244,23 @@ Nested trial layouts: a probe laying out 20 copies of inline-blocks nested 1-5 d
 with the width cache the repeated calls cost a dictionary lookup instead of a shaping pass, so the
 time per layout did not grow (before: 17 / 36 / 89 / 160 / 154 ms, after: 19 / 45 / 76 / 133 /
 123 ms for depths 1-5; single runs of 5 layouts, so +/-20%).
+
+### 2026-11-08, SVGs painted as vectors, PNG on demand
+
+The benchmark page has no SVG, so the table above is not affected and was not measured again. A
+separate run (net10.0, one cold process per case, 800x600, before = the previous commit) on ten
+different 800px icons shown at 16px, and on one 400px SVG of 2000 paths:
+
+| Case | `BuildDisplayList` before / after | First paint before / after | Repaint before / after | Peak RSS before / after |
+|---|---:|---:|---:|---:|
+| Icons in `<img>` | 3,119 / 521 ms | 160.5 / 9.9 ms | 142.92 / 0.69 ms | 178 / 106 MB |
+| Icons as backgrounds | 3,312 / 502 ms | 128.4 / 9.1 ms | 106.37 / 0.82 ms | 170 / 104 MB |
+| 2000 paths in `<img>` | 754 / 548 ms | 27.3 / 26.3 ms | 1.91 / 1.06 ms | 129 / 122 MB |
+| 2000 paths as background | 798 / 552 ms | 23.1 / 20.8 ms | 1.41 / 1.44 ms | 121 / 113 MB |
+| 2000 paths, `background-repeat: round` | 783 / 562 ms | 27.0 / 15.0 ms | 1.93 / 2.86 ms | 120 / 113 MB |
+| 2000 paths as mask | 841 / 554 ms | 30.3 / 28.1 ms | 4.63 / 6.30 ms | 127 / 116 MB |
+
+The build gains come from no longer encoding a 2400x2400 PNG per icon, the repaint gains for icons
+from no longer sampling that raster. Without caching a raster per size (`SvgVectorImage.Draw`) and
+a shader per tile shape, a repaint would replay all vectors: 11 ms instead of 1.44 ms in the
+background case, growing linearly with the number of paths. `border-image` still replays its parts.

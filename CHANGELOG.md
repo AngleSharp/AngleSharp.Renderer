@@ -2,7 +2,7 @@
 
 Released on Saturday, November 7 2026.
 
-- Updated to use a minimum of AngleSharp.Css 1.4.1-beta.424
+- Updated to use a minimum of AngleSharp.Css 1.4.1
 - Improved the performance of layouts, e.g., text fields with a placeholder computed the styles of all their ancestors whenever they were painted
 - Improved the performance of nested flex and grid containers, whose items were laid out (with everything in them) also when only the height of a box around them was measured
 - Improved the garbage collection during layouts: the selectors of the style sheets are only looked at once, equal values of style maps are shared, and transitions and animations are only looked up while any run
@@ -18,6 +18,9 @@ Released on Saturday, November 7 2026.
 - Fixed a button of an automatic height and a `min-height` not centering its label in it
 - Fixed an absolutely positioned box placed by its `bottom` in a block of an automatic height and a `min-height` being placed against the `min-height` instead of the block's height, and one of an automatic height and a `min-height` being placed with its `min-height` as height
 - Fixed selecting the text of a flex item made of several text nodes, which only reached the first one
+- Fixed SVGs being blurred or jagged when scaled (e.g. an 800px icon in a 16px box), in an `<img>`, inline, as a background, mask or `border-image`: they are painted at the resolution they end up at, as in browsers
+- Fixed the slices of an SVG `border-image` counting in the pixels of its oversampled raster instead of its natural size
+- Improved the performance and memory use of SVGs: their PNG (`RenderedImage.Data`) is only rendered when it is read, and repainting reuses what was rendered for the same size
 - Added `NotifyStateChanged` to the DOM harness, for telling the renderer about a change of an element's state it does not see (e.g., the focus)
 - Added `PrepareViewportFrame` to the DOM harness, for a frame of a page that was just loaded early on: only what is in the viewport is styled and laid out, and the frame tells by `RenderedFrame.IsPartial` (it is animating) that the next frame lays out the whole page
 - Added `RenderedFrame.Metrics` telling what the layout of a frame took (`RenderMetrics`: the time of each phase and how much work they did)

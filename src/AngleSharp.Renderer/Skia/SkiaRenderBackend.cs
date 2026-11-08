@@ -690,14 +690,14 @@ public sealed partial class SkiaRenderBackend : IPixelRenderBackend, ITextMeasur
             return paint;
         }
 
-        var image = DecodeImage(imagePaint.Image);
+        var vectorImage = imagePaint.Image.VectorImage;
+        var image = vectorImage is null ? DecodeImage(imagePaint.Image) : null;
 
-        if (image is null)
+        if (vectorImage is null && image is null)
         {
             return paint;
         }
 
-        // the natural size, not the decoded one: an SVG is rasterized oversampled
         var (drawWidth, drawHeight) = ResolveBackgroundImageSize(imagePaint.Size, imagePaint.Image.Width, imagePaint.Image.Height, rect.Width, rect.Height);
 
         if (drawWidth <= 0f || drawHeight <= 0f)
@@ -708,19 +708,26 @@ public sealed partial class SkiaRenderBackend : IPixelRenderBackend, ITextMeasur
         var originX = rect.X + (imagePaint.PositionX.Percentage * (rect.Width - drawWidth)) + imagePaint.PositionX.OffsetPixels;
         var originY = rect.Y + (imagePaint.PositionY.Percentage * (rect.Height - drawHeight)) + imagePaint.PositionY.OffsetPixels;
 
-        var localMatrix = new SKMatrix(
-            drawWidth / image.Width, 0f, originX,
-            0f, drawHeight / image.Height, originY,
-            0f, 0f, 1f);
-
         // `no-repeat` uses Decal (transparent outside the single placed tile), not Clamp - Clamp
         // would smear the image's edge pixels across the rest of the box instead of leaving it
         // uncovered, which is what CSS actually specifies for a non-repeating axis.
         var tileX = imagePaint.RepeatX ? SKShaderTileMode.Repeat : SKShaderTileMode.Decal;
         var tileY = imagePaint.RepeatY ? SKShaderTileMode.Repeat : SKShaderTileMode.Decal;
 
-        paint.Shader = SKShader.CreateImage(image, tileX, tileY, localMatrix);
+        if (vectorImage is not null)
+        {
+            paint.FilterQuality = SKFilterQuality.Low;
+            paint.Shader = vectorImage.CreateShader(vectorImage.Width, vectorImage.Height, 0f, 0f, tileX, tileY, CreateTileMatrix(vectorImage.Width, vectorImage.Height));
+            return paint;
+        }
+
+        paint.Shader = SKShader.CreateImage(image, tileX, tileY, CreateTileMatrix(image!.Width, image.Height));
         return paint;
+
+        SKMatrix CreateTileMatrix(float width, float height) => new(
+            drawWidth / width, 0f, originX,
+            0f, drawHeight / height, originY,
+            0f, 0f, 1f);
     }
 
     /// <summary>
@@ -1041,13 +1048,7 @@ public sealed partial class SkiaRenderBackend : IPixelRenderBackend, ITextMeasur
 
     private static void DrawImage(SKCanvas canvas, DrawImageCommand command)
     {
-        if (command.Image.Data.Length == 0 || command.Rect.IsEmpty)
-        {
-            return;
-        }
-
-        var image = DecodeImage(command.Image);
-        if (image is null)
+        if (command.Rect.IsEmpty)
         {
             return;
         }
@@ -1057,6 +1058,18 @@ public sealed partial class SkiaRenderBackend : IPixelRenderBackend, ITextMeasur
             command.Rect.Y,
             command.Rect.X + command.Rect.Width,
             command.Rect.Y + command.Rect.Height);
+
+        if (command.Image.VectorImage is { } vectorImage)
+        {
+            vectorImage.Draw(canvas, rect);
+            return;
+        }
+
+        var image = DecodeImage(command.Image);
+        if (image is null)
+        {
+            return;
+        }
 
         using var paint = new SKPaint { IsAntialias = true, FilterQuality = SKFilterQuality.High };
         canvas.DrawImage(image, rect, paint);

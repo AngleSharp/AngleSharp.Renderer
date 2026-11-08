@@ -125,7 +125,24 @@ public sealed partial class HtmlRenderer
         public Dictionary<string, CachedImageResource?> Resources { get; } = new(StringComparer.Ordinal);
     }
 
-    private sealed record CachedImageResource(byte[] Bytes, string MimeType, int NaturalWidth, int NaturalHeight);
+    private sealed record CachedImageResource(byte[]? Bytes, SvgVectorImage? VectorImage, string MimeType, int NaturalWidth, int NaturalHeight)
+    {
+        public CachedImageResource(byte[] bytes, string mimeType, int naturalWidth, int naturalHeight)
+            : this(bytes, null, mimeType, naturalWidth, naturalHeight)
+        {
+        }
+
+        public CachedImageResource(SvgVectorImage vectorImage)
+            : this(null, vectorImage, "image/png", vectorImage.NaturalWidth, vectorImage.NaturalHeight)
+        {
+        }
+
+        public RenderedImage CreateImage(int width, int height) => VectorImage is { } vectorImage
+            ? new RenderedImage(vectorImage, width, height)
+            : new RenderedImage(Bytes!, width, height, MimeType);
+
+        public RenderedImage CreateImage() => CreateImage(NaturalWidth, NaturalHeight);
+    }
 
     /// <remarks>
     /// The box is in page coordinates (unscrolled), except for one inside a fixed box
@@ -9184,7 +9201,7 @@ public sealed partial class HtmlRenderer
         var boxRect = new RenderRect(x, y, width, height);
         var (paintRect, needsClip) = ResolveObjectFitRect(boxRect, naturalWidth, naturalHeight, styleMap);
 
-        image = new RenderedImage(imageResource.Bytes, (int)Math.Max(1, Math.Round(width)), (int)Math.Max(1, Math.Round(height)), imageResource.MimeType);
+        image = imageResource.CreateImage((int)Math.Max(1, Math.Round(width)), (int)Math.Max(1, Math.Round(height)));
         rect = paintRect;
         clipRect = needsClip ? boxRect : null;
         return true;
@@ -9400,12 +9417,12 @@ public sealed partial class HtmlRenderer
         // part of the host document, and it is never serialized back to text and re-parsed.
         imageResource = null;
 
-        if (!SvgRasterizer.TryRasterizeElement(element, out var pngBytes, out var naturalWidth, out var naturalHeight, pageStyle))
+        if (!SvgRasterizer.TryRecordElement(element, out var vectorImage, pageStyle))
         {
             return false;
         }
 
-        imageResource = new CachedImageResource(pngBytes, "image/png", naturalWidth, naturalHeight);
+        imageResource = new CachedImageResource(vectorImage!);
         s_inlineSvgCacheByElement.AddOrUpdate(element, new InlineSvgCacheEntry(fingerprint, imageResource));
         return true;
     }
@@ -9722,12 +9739,12 @@ public sealed partial class HtmlRenderer
 
         if (SvgRasterizer.IsSvg(bytes))
         {
-            if (!SvgRasterizer.TryRasterizeMarkup(bytes, out var rasterizedBytes, out var svgNaturalWidth, out var svgNaturalHeight))
+            if (!SvgRasterizer.TryRecordMarkup(bytes, out var vectorImage))
             {
                 return false;
             }
 
-            imageResource = new CachedImageResource(rasterizedBytes, "image/png", svgNaturalWidth, svgNaturalHeight);
+            imageResource = new CachedImageResource(vectorImage!);
             return true;
         }
 
@@ -12153,7 +12170,7 @@ public sealed partial class HtmlRenderer
         {
             if (TryGetOrLoadBackgroundImageResource(element, url, out var resource) && resource is not null)
             {
-                var image = new RenderedImage(resource.Bytes, resource.NaturalWidth, resource.NaturalHeight, resource.MimeType);
+                var image = resource.CreateImage();
                 sourcePaint = new RenderImagePaint(image, false, false, RenderBackgroundPositionComponent.Zero, RenderBackgroundPositionComponent.Zero, RenderBackgroundSize.Auto);
             }
         }
@@ -12976,7 +12993,7 @@ public sealed partial class HtmlRenderer
             {
                 if (loadImage(url) is { } resource)
                 {
-                    var image = new RenderedImage(resource.Bytes, resource.NaturalWidth, resource.NaturalHeight, resource.MimeType);
+                    var image = resource.CreateImage();
                     paint = new RenderImagePaint(
                         image,
                         repeatX != RenderBackgroundRepeat.NoRepeat,

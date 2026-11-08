@@ -47,16 +47,17 @@ public sealed partial class SkiaRenderBackend
         }
 
         var naturalImage = (content as RenderImagePaint)?.Image;
-        var image = naturalImage is not null ? DecodeImage(naturalImage) : null;
+        var vectorImage = naturalImage?.VectorImage;
+        var image = naturalImage is not null && vectorImage is null ? DecodeImage(naturalImage) : null;
 
-        if (content is RenderImagePaint && image is null)
+        if (naturalImage is not null && vectorImage is null && image is null)
         {
             return paint;
         }
 
         // An image keeps its aspect ratio; a gradient has no intrinsic size, so `auto`, `cover`
         // and `contain` all make it as large as the area.
-        var (tileWidth, tileHeight) = image is not null
+        var (tileWidth, tileHeight) = naturalImage is not null
             ? ResolveBackgroundImageSize(size, naturalImage!.Width, naturalImage.Height, area.Width, area.Height)
             : ResolveGradientTileSize(size, area.Width, area.Height);
 
@@ -74,6 +75,13 @@ public sealed partial class SkiaRenderBackend
         if (float.IsNaN(originX) || float.IsNaN(originY))
         {
             // `space` with not even one whole tile fitting paints nothing.
+            return paint;
+        }
+
+        if (vectorImage is not null)
+        {
+            paint.FilterQuality = SKFilterQuality.Low;
+            paint.Shader = vectorImage.CreateShader(tileWidth, tileHeight, gapX, gapY, modeX, modeY, SKMatrix.CreateTranslation(originX, originY));
             return paint;
         }
 
@@ -187,15 +195,17 @@ public sealed partial class SkiaRenderBackend
 
         // decoded images are cached, only a rasterized gradient belongs to this call
         using var gradient = borderImage.Source is RenderGradientPaint gradientPaint ? RasterizeGradient(gradientPaint.Gradient, area.Width, area.Height) : null;
-        var image = borderImage.Source is RenderImagePaint imagePaint ? DecodeImage(imagePaint.Image) : gradient;
+        var vectorImage = (borderImage.Source as RenderImagePaint)?.Image.VectorImage;
+        var image = vectorImage is not null ? null : borderImage.Source is RenderImagePaint imagePaint ? DecodeImage(imagePaint.Image) : gradient;
 
-        if (image is null)
+        if (vectorImage is null && image is null)
         {
             return;
         }
 
-        float imageWidth = image.Width;
-        float imageHeight = image.Height;
+        // an SVG's slices count in its natural size
+        var imageWidth = vectorImage?.Width ?? image!.Width;
+        var imageHeight = vectorImage?.Height ?? image!.Height;
         var sliceTop = Math.Min(ResolveSlice(borderImage.SliceTop, imageHeight), imageHeight);
         var sliceBottom = Math.Min(ResolveSlice(borderImage.SliceBottom, imageHeight), imageHeight - sliceTop);
         var sliceLeft = Math.Min(ResolveSlice(borderImage.SliceLeft, imageWidth), imageWidth);
@@ -250,7 +260,7 @@ public sealed partial class SkiaRenderBackend
                 var tileScaleX = row == 2 ? scaleBottom : scaleTop;
                 var tileScaleY = column == 2 ? scaleRight : scaleLeft;
 
-                DrawImagePart(canvas, image, source, destination, horizontal, vertical, source.Width * tileScaleX, source.Height * tileScaleY, paint);
+                DrawImagePart(canvas, image, vectorImage, source, destination, horizontal, vertical, source.Width * tileScaleX, source.Height * tileScaleY, paint);
             }
         }
     }
@@ -281,7 +291,8 @@ public sealed partial class SkiaRenderBackend
     /// </summary>
     private static void DrawImagePart(
         SKCanvas canvas,
-        SKImage image,
+        SKImage? image,
+        SvgVectorImage? vectorImage,
         SKRect source,
         SKRect destination,
         RenderBorderImageRepeat horizontal,
@@ -300,7 +311,16 @@ public sealed partial class SkiaRenderBackend
         {
             foreach (var (y, height) in rows)
             {
-                canvas.DrawImage(image, source, new SKRect(x, y, x + width, y + height), paint);
+                var tile = new SKRect(x, y, x + width, y + height);
+
+                if (vectorImage is not null)
+                {
+                    vectorImage.DrawPart(canvas, source, tile);
+                }
+                else
+                {
+                    canvas.DrawImage(image, source, tile, paint);
+                }
             }
         }
 
