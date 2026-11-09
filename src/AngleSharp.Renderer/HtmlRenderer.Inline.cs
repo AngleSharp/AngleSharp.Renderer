@@ -2892,6 +2892,18 @@ public sealed partial class HtmlRenderer
     /// </summary>
     private static IntrinsicWidths ComputeOuterIntrinsicWidths(ElementRenderNode element, RenderTextStyle inheritedStyle, float percentageBase, LayoutContext context)
     {
+        var widths = ComputeElementContribution(element, inheritedStyle, percentageBase, context);
+
+        if (s_layoutPass.Value is { } pass)
+        {
+            pass.Contributions[element.Ref] = (percentageBase, widths);
+        }
+
+        return widths;
+    }
+
+    private static IntrinsicWidths ComputeElementContribution(ElementRenderNode element, RenderTextStyle inheritedStyle, float percentageBase, LayoutContext context)
+    {
         if (!GeneratesBoxes(element))
         {
             return IntrinsicWidths.Zero;
@@ -2970,6 +2982,18 @@ public sealed partial class HtmlRenderer
     /// and the widest line it produces without any soft wrapping (max-content).
     /// </summary>
     private static IntrinsicWidths ComputeContentIntrinsicWidths(ElementRenderNode element, RenderTextStyle textStyle, float percentageBase, LayoutContext context)
+    {
+        var widths = ComputeElementContentWidths(element, textStyle, percentageBase, context);
+
+        if (s_layoutPass.Value is { } pass)
+        {
+            pass.ContentWidths[element.Ref] = (percentageBase, widths);
+        }
+
+        return widths;
+    }
+
+    private static IntrinsicWidths ComputeElementContentWidths(ElementRenderNode element, RenderTextStyle textStyle, float percentageBase, LayoutContext context)
     {
         var styleMap = GetOrCreateStyleMap(context, element.Ref, element.ComputedStyle);
         var children = OrderChildrenForPainting(element.Children, context).ToList();

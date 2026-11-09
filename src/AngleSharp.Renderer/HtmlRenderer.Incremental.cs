@@ -19,7 +19,9 @@ using AngleSharp.Renderer.Rendering;
 /// again, with what its layout started from in the last full layout. So does a change of a
 /// block of an ordinary block flow (see <see cref="IsInFlowEntry"/>), as long as it comes out the
 /// same from outside: its box, its intrinsic widths where its container is sized by them, and
-/// what it leaves for the boxes after it. Else the enclosing block is laid out instead.
+/// what it leaves for the boxes after it. A flex or grid item is laid out on its own as well, as
+/// long as all its container read of it is the same (see <see cref="ItemLayout"/>). Else the
+/// enclosing box is laid out instead.
 /// </summary>
 public sealed partial class HtmlRenderer
 {
@@ -33,6 +35,9 @@ public sealed partial class HtmlRenderer
         ":default", ":open", ":indeterminate", ":valid", ":invalid", ":in-range", ":out-of-range", ":target", ":link",
         ":any-link", ":lang", ":dir", ":empty",
     };
+
+    // the pseudo-classes depending on the value of a text field, besides :placeholder-shown (which only needs it to be empty or not)
+    private static readonly string[] s_valueStatePseudoClasses = [":valid", ":invalid", ":in-range", ":out-of-range", ":user-valid", ":user-invalid", ":blank"];
 
     /// <summary>
     /// Where the layout of an out-of-flow (or not rendered) element started in a full layout:
@@ -66,11 +71,131 @@ public sealed partial class HtmlRenderer
         float PreviousBlockMarginBottom = 0f,
         bool SuppressNextBlockTopMargin = false,
         FlowResult? Result = null,
-        bool IsSizedByContent = false);
+        ItemLayout? Item = null,
+        float AbsorbedTopMargin = 0f);
+
+    /// <summary>
+    /// How a flex or grid item was laid out by its container, which is laid out again the same
+    /// way as long as nothing the container read of the item changed.
+    /// </summary>
+    private sealed record ItemLayout(bool IsRowDirection, float? MainSize, float? CrossSize, bool CrossMarginsPlaced, EdgeSizes UsedMargins)
+    {
+        public FlexItemContribution? Flex { get; init; }
+
+        public GridItemContribution? Grid { get; init; }
+
+        /// <summary>The main size an item got by being laid out (see <see cref="FlexItemLayoutInfo.HasDeferredMainSize"/>).</summary>
+        public float DeferredMainSize { get; init; } = float.NaN;
+    }
+
+    /// <summary>
+    /// All a flex container reads of an item to size and place its items: what it resolved of
+    /// the item (without the references to it), and what the item would like as its cross size
+    /// at its final main size (NaN if it has a definite one).
+    /// </summary>
+    private sealed record GridItemContribution(Dictionary<string, string> Properties, float AreaWidth, float MaxY, float MeasuredHeight);
+
+    private sealed record FlexItemContribution(FlexItemLayoutInfo Info, float RelativeTo, float HeightRelativeTo, string? DeferringAlignItems, float FinalMainSize, float EstimatedCrossSize, float CrossAvailable);
+
+    // the top margin of a block with those collapsing through it from its first children (see LayoutElement)
+    private static float GetCollapsedTopMargin(ElementRenderNode node, float containingWidth, LayoutContext context)
+    {
+        var styleMap = GetOrCreateStyleMap(context, node.Ref, node.ComputedStyle);
+        var box = ResolveBoxStyle(styleMap, node.Ref);
+        var marginTop = ParseLength(styleMap, "margin-top", containingWidth, box.Margin.Top, allowAuto: false);
+        var paddingTop = ParseLength(styleMap, "padding-top", containingWidth, box.Padding.Top, allowAuto: false);
+
+        return box.BorderWidth.Top <= 0f && paddingTop <= 0f && !EstablishesBlockFormattingContext(styleMap, false, false, false, false) &&
+            TryGetFirstCollapsibleChildTopMargin(node, containingWidth, context, out var firstChildTopMargin)
+            ? CollapseMargins(marginTop, firstChildTopMargin)
+            : marginTop;
+    }
+
+    /// <summary>
+    /// Lets a flex or grid item be laid out again on its own (see <see cref="RecordLink"/>, which
+    /// decided if its container may be left alone), from the arguments of its layout, which
+    /// starts next.
+    /// </summary>
+    private static void RecordItemEntry(ElementRenderNode node, float x, float y, float width, RenderTextStyle textStyle, float maxY,
+        float positionedX, float positionedY, float positionedWidth, float positionedHeight, ItemLayout item, LayoutContext context)
+    {
+        if (s_layoutCapture.Value is { Entries: not null, Links: { } links } capture)
+        {
+            if (links.Contains(node.Ref))
+            {
+                RecordContributionIfRead(node, textStyle, context);
+            }
+
+            capture.NextItem = links.Contains(node.Ref)
+                ? new LayoutEntry(node, x, y, width, y, false, textStyle, maxY, float.NaN, positionedX, positionedY, positionedWidth, positionedHeight, null, HasBox: true, Item: item)
+                : null;
+        }
+    }
+
+    // what a grid reads of an item to place it and size its tracks, besides its contribution
+    private static readonly string[] s_gridItemProperties =
+    [
+        "display", "grid-area", "grid-column", "grid-column-start", "grid-column-end", "grid-row", "grid-row-start", "grid-row-end", "order", "align-self", "justify-self",
+        "width", "min-width", "max-width", "height", "min-height", "max-height", "box-sizing", "aspect-ratio",
+        "margin-top", "margin-right", "margin-bottom", "margin-left", "padding-top", "padding-right", "padding-bottom", "padding-left",
+        "border-top-width", "border-right-width", "border-bottom-width", "border-left-width",
+    ];
+
+    private static Dictionary<string, string> ReadGridItemProperties(Dictionary<string, string> styleMap)
+    {
+        var properties = new Dictionary<string, string>(s_gridItemProperties.Length, StringComparer.Ordinal);
+
+        foreach (var property in s_gridItemProperties)
+        {
+            if (styleMap.TryGetValue(property, out var value))
+            {
+                properties[property] = value;
+            }
+        }
+
+        return properties;
+    }
+
+    private static GridItemContribution CreateGridItemContribution(ElementRenderNode node, Dictionary<string, string> styleMap, float areaWidth, float maxY, LayoutContext context) =>
+        new(ReadGridItemProperties(styleMap), areaWidth, maxY, context.GridItemHeights.TryGetValue((node.Ref, areaWidth, maxY), out var height) ? height : float.NaN);
+
+    /// <summary>
+    /// A box whose parent's width was read may have been read along with it, without a record of
+    /// its own (inline content is measured as text runs), so what it contributes is taken now,
+    /// before anything changes: the box may be laid out on its own later (see LayoutSnapshot).
+    /// </summary>
+    private static void RecordContributionIfRead(ElementRenderNode node, RenderTextStyle textStyle, LayoutContext context)
+    {
+        if (s_layoutPass.Value is { } pass && !pass.Contributions.ContainsKey(node.Ref) && node.Parent is ElementRenderNode parent &&
+            (pass.Contributions.TryGetValue(parent.Ref, out var read) || pass.ContentWidths.TryGetValue(parent.Ref, out read)))
+        {
+            ComputeOuterIntrinsicWidths(node, textStyle, read.PercentageBase, context);
+        }
+    }
+
+    private static bool TakeItemEntry(LayoutCapture capture, ElementRenderNode node)
+    {
+        if (capture.NextItem is { } entry && ReferenceEquals(entry.Node, node))
+        {
+            capture.NextItem = null;
+            capture.Entries![node.Ref] = entry;
+            return true;
+        }
+
+        return false;
+    }
+
+    private static void RecordDeferredMainSize(ElementRenderNode node, float mainSize)
+    {
+        if (s_layoutCapture.Value is { Entries: { } entries } && entries.TryGetValue(node.Ref, out var entry) && entry.Item is { } item)
+        {
+            entries[node.Ref] = entry with { Item = item with { DeferredMainSize = mainSize } };
+        }
+    }
 
     /// <summary>
     /// What an in-flow block left for the boxes after it: where they start, the margin they
-    /// collapse with, and if it left no floats beside them.
+    /// collapse with, and if it left no floats reaching down to them.
     /// </summary>
     private sealed record FlowResult(float CursorY, float PreviousBlockMarginBottom, bool SuppressNextBlockTopMargin, bool TextIndentConsumed, bool LeftNoFloats);
 
@@ -128,8 +253,21 @@ public sealed partial class HtmlRenderer
 
         var isInFlow = hasBox && !IsOutOfFlowPositioned(styleMap);
 
+        // a float or sticky box of a chained block passes the entries on to its content, as an item does (see RecordLink)
+        if (hasBox && capture.Links is { } links && (IsFloated(styleMap) || IsStickyPositioned(styleMap)))
+        {
+            if (isPlain && node.Parent is ElementRenderNode floatParent && IsChained(capture, floatParent))
+            {
+                links.Add(node.Ref);
+            }
+            else
+            {
+                links.Remove(node.Ref);
+            }
+        }
+
         // only boxes not taking part in the layout of the others, or blocks of a block flow, laid out the ordinary way
-        if (!isPlain || (isInFlow && !IsInFlowEntry(capture, node, styleMap, floats, context)))
+        if (!isPlain || (isInFlow && !IsInFlowEntry(capture, node, styleMap, floats, cursorY, previousBlockMarginBottom, context)))
         {
             capture.Entries!.Remove(node.Ref);
             return;
@@ -137,10 +275,11 @@ public sealed partial class HtmlRenderer
 
         if (isInFlow)
         {
+            RecordContributionIfRead(node, textStyle, context);
             capture.Entries![node.Ref] = new LayoutEntry(node, containingX, containingY, containingWidth, cursorY, textIndentConsumed, textStyle, maxY,
                 containingHeight, positionedContainingX, positionedContainingY, positionedContainingWidth, positionedContainingHeight, null, HasBox: true,
                 IsInFlow: true, PreviousBlockMarginBottom: previousBlockMarginBottom, SuppressNextBlockTopMargin: suppressNextBlockTopMargin,
-                IsSizedByContent: IsSizedByContent(capture, (ElementRenderNode)node.Parent!, context));
+                AbsorbedTopMargin: suppressNextBlockTopMargin ? GetCollapsedTopMargin(node, containingWidth, context) : 0f);
             return;
         }
 
@@ -171,9 +310,11 @@ public sealed partial class HtmlRenderer
     /// the ordinary flow of a block that is one itself (or the root element, or a flex or grid
     /// item of one, see <see cref="RecordLink"/>), with no floats beside it.
     /// </summary>
-    private static bool IsInFlowEntry(LayoutCapture capture, ElementRenderNode node, Dictionary<string, string> styleMap, FloatArea floats, LayoutContext context)
+    private static bool IsInFlowEntry(LayoutCapture capture, ElementRenderNode node, Dictionary<string, string> styleMap, FloatArea floats, float cursorY, float previousBlockMarginBottom, LayoutContext context)
     {
-        if (!floats.IsEmpty || node.Parent is not ElementRenderNode parent || IsFloated(styleMap) || IsStickyPositioned(styleMap) ||
+        // floats ending above it don't get in its way, unless a negative margin takes it back up to them
+        if ((!floats.IsEmpty && (floats.HasFloatsBelow(cursorY) || previousBlockMarginBottom < 0f || ParseLength(styleMap, "margin-top", 0f, 0f, allowAuto: false) < 0f)) ||
+            node.Parent is not ElementRenderNode parent || IsFloated(styleMap) || IsStickyPositioned(styleMap) ||
             ClassifyFlowChild(node, context) != FlowChildKind.Block)
         {
             return false;
@@ -193,14 +334,6 @@ public sealed partial class HtmlRenderer
     private static bool IsChained(LayoutCapture capture, ElementRenderNode node) =>
         node.Ref.ParentElement is null || capture.Links?.Contains(node.Ref) == true ||
         capture.Entries!.TryGetValue(node.Ref, out var entry) && entry.IsInFlow && ReferenceEquals(entry.Node, node);
-
-    // If the size of a parent (or of a box around it) depends on the content of its blocks, which
-    // then have to keep their intrinsic widths (and so their contributions to the size) when laid
-    // out on their own: in a flex or grid item, or in a block of a width like `fit-content`.
-    private static bool IsSizedByContent(LayoutCapture capture, ElementRenderNode parent, LayoutContext context) =>
-        capture.Links?.Contains(parent.Ref) == true ||
-        GetOrCreateStyleMap(context, parent.Ref, parent.ComputedStyle).TryGetValue("width", out var width) && width.Contains("content", StringComparison.OrdinalIgnoreCase) ||
-        capture.Entries!.TryGetValue(parent.Ref, out var entry) && entry.IsSizedByContent;
 
     /// <summary>
     /// Lets a flex or grid item of a chained container pass the in-flow entries on to its
@@ -924,6 +1057,8 @@ public sealed partial class HtmlRenderer
         {
             // how many enclosing roots a change may be laid out with, before a full layout is cheaper
             const int MaxEscalations = 3;
+            // how many elements are not worth a full layout, whatever the size of the document
+            const int MinElementsLaidOutAnyway = 200;
 
             // what is below the viewport was never laid out
             if (IsPartial || _document.DefaultView is not { } window)
@@ -1015,11 +1150,21 @@ public sealed partial class HtmlRenderer
                     }
 
                     var current = root;
+                    var attempted = 0;
 
                     for (var attempt = 0; !TryLayOutAgain(window, current, out var escalates); attempt++)
                     {
                         if (!escalates || attempt == MaxEscalations || current.ParentElement is not { } parentElement ||
                             FindLayoutRoot(parentElement) is not { } enclosing)
+                        {
+                            return false;
+                        }
+
+                        // the attempts must not cost more than the full layout they try to avoid
+                        attempted += current.DescendantsAndSelf<IElement>().Count();
+                        var next = attempted + enclosing.DescendantsAndSelf<IElement>().Count();
+
+                        if (next > MinElementsLaidOutAnyway && next * 2 > _document.DocumentElement.DescendantsAndSelf<IElement>().Count())
                         {
                             return false;
                         }
@@ -1093,6 +1238,10 @@ public sealed partial class HtmlRenderer
                     return !before.Except(after).Concat(after.Except(before)).Any(token => selectors.Refers("." + token));
                 case "id":
                     return !selectors.Refers("#" + previousValue) && !selectors.Refers("#" + value);
+                // what is typed into a text field only matters to the states of its value
+                case "value" when element is AngleSharp.Html.Dom.IHtmlInputElement:
+                    return !s_valueStatePseudoClasses.Any(selectors.Refers) &&
+                        (string.IsNullOrEmpty(previousValue) == string.IsNullOrEmpty(value) || !selectors.Refers(":placeholder-shown"));
                 default:
                     return !selectors.RefersToAttributeState;
             }
@@ -1291,16 +1440,23 @@ public sealed partial class HtmlRenderer
             var result = entry.Result;
             ElementLayoutMetrics laidOutBefore = default;
 
-            if (entry.IsInFlow && (result is not { LeftNoFloats: true } || !_metrics.TryGetValue(root, out laidOutBefore) ||
-                GetSiblingSelectors().HasFirstFormatted || HasStickyAncestor(root) || ReachesOutOfItsSubtree(entry.Node)))
+            if (entry.Item is not null && (!_metrics.TryGetValue(root, out laidOutBefore) || GetSiblingSelectors().HasFirstFormatted || !TryGetStickyShift(root, out _, out _) || ReachesOutOfItsSubtree(entry.Node)))
             {
                 escalates = true;
                 return false;
             }
 
-            // the margin the parent took as its own (see TryGetFirstCollapsibleChildTopMargin)
-            var absorbedTopMargin = entry.IsInFlow && entry.SuppressNextBlockTopMargin ? GetCollapsedTopMargin(entry.Node, entry.ContainingWidth) : 0f;
-            var intrinsicWidths = entry.IsSizedByContent ? ComputeOuterIntrinsicWidths(entry.Node, entry.TextStyle, entry.ContainingWidth, _context) : default;
+            if (entry.IsInFlow && (result is not { LeftNoFloats: true } || !_metrics.TryGetValue(root, out laidOutBefore) ||
+                GetSiblingSelectors().HasFirstFormatted || !TryGetStickyShift(root, out _, out _) || ReachesOutOfItsSubtree(entry.Node)))
+            {
+                escalates = true;
+                return false;
+            }
+
+            // what the layout read of it for sizing the boxes around it, as it can't be asked for
+            // anymore: the text in the DOM has changed, as have the styles after a failed attempt
+            (float PercentageBase, IntrinsicWidths Widths)? contribution = _pass.Contributions.TryGetValue(root, out var read) ? read : null;
+            (float PercentageBase, IntrinsicWidths Widths)? contentWidths = _pass.ContentWidths.TryGetValue(root, out var readContent) ? readContent : null;
 
             // what the display list shows of it, before it is forgotten
             var hadBox = _rendered.TryGetValue(root, out var rendered) ? rendered.Before : entry.HasBox;
@@ -1310,7 +1466,8 @@ public sealed partial class HtmlRenderer
             var styleStart = RenderMetricsRecorder.Now;
             PrepareElementsForRendering(root.DescendantsAndSelf<IElement>());
 
-            var node = window.Render(root, parent, _renderDevice);
+            // the rules are the ones of the layout (changing them needs a full layout, see GetChangedSubtree)
+            var node = _context.GetStyleCollection(root) is { } styleCollection ? window.RenderPartial(root, parent, styleCollection) : window.Render(root, parent, _renderDevice);
             BuildAnonymousTableBoxes(node);
             CollectSpecifiedStyles(node, _context);
             ResolveWritingModeSystems(node, WritingModeKind.HorizontalTb, _context);
@@ -1320,7 +1477,17 @@ public sealed partial class HtmlRenderer
 
             var styleMap = GetOrCreateStyleMap(_context, root, node.ComputedStyle);
 
-            if (entry.IsInFlow)
+            if (entry.Item is { } item)
+            {
+                // the container is left alone if it would see the same item
+                if (!GeneratesBoxes(node) || IsOutOfFlowPositioned(styleMap) || IsStickyPositioned(styleMap) || ReachesOutOfItsSubtree(node) ||
+                    !LooksTheSameToContainer(node, entry, item))
+                {
+                    escalates = true;
+                    return false;
+                }
+            }
+            else if (entry.IsInFlow)
             {
                 // the block has to stay one of the flow
                 if (!GeneratesBoxes(node) || IsOutOfFlowPositioned(styleMap) || IsFloated(styleMap) || IsStickyPositioned(styleMap) ||
@@ -1366,9 +1533,18 @@ public sealed partial class HtmlRenderer
             var previousBlockMarginBottom = entry.PreviousBlockMarginBottom;
             var suppressNextBlockTopMargin = entry.SuppressNextBlockTopMargin;
             var floats = new FloatArea();
+            var enclosingSticky = s_stickyElement;
 
             try
             {
+                // laid out inside its sticky ancestors, which moved it after their layouts
+                s_stickyElement = FindStickyAncestor(root);
+
+                if (entry.Item is not null)
+                {
+                    capture.NextItem = entry with { Node = node };
+                }
+
                 LayoutNode(
                     node,
                     entry.ContainingX,
@@ -1383,11 +1559,27 @@ public sealed partial class HtmlRenderer
                     _context,
                     displayList,
                     entry.MaxY,
+                    isFlexItem: entry.Item is not null,
+                    isRowDirection: entry.Item?.IsRowDirection ?? true,
+                    flexMainSize: entry.Item?.MainSize,
+                    flexCrossSize: entry.Item?.CrossSize,
                     containingHeight: entry.ContainingHeight,
                     positionedContainingX: entry.PositionedContainingX,
                     positionedContainingY: entry.PositionedContainingY,
                     positionedContainingWidth: entry.PositionedContainingWidth,
-                    positionedContainingHeight: positionedContainingHeight);
+                    positionedContainingHeight: positionedContainingHeight,
+                    mainAxisMarginsPlaced: entry.Item is not null,
+                    crossAxisMarginsPlaced: entry.Item?.CrossMarginsPlaced ?? false);
+
+                if (entry.Item is { } placedItem)
+                {
+                    SetUsedMargins(root, placedItem.UsedMargins);
+                }
+
+                if (TryGetStickyShift(root, out var stickyX, out var stickyY) && (stickyX != 0f || stickyY != 0f))
+                {
+                    MoveRecorded(capture, stickyX, stickyY);
+                }
 
                 // the scroll containers around it move its metrics as they did in the full layout
                 for (var ancestor = root.ParentElement; ancestor is not null; ancestor = ancestor.ParentElement)
@@ -1401,16 +1593,25 @@ public sealed partial class HtmlRenderer
             }
             finally
             {
+                s_stickyElement = enclosingSticky;
                 s_layoutCapture.Value = previous;
                 _pass.Metrics.Layout += RenderMetricsRecorder.Since(layoutStart);
             }
 
+            // an item that got its main size by being laid out has to keep it, and so its box
+            if (entry.Item is { } sameItem && ((!float.IsNaN(sameItem.DeferredMainSize) && Math.Max(0f, cursorY - entry.CursorY) != sameItem.DeferredMainSize) ||
+                !capture.TryGet(root, out var laidOutAsItem) || !HasSameBox(laidOutAsItem, laidOutBefore) || !ContributesTheSame(contribution, contentWidths, node, entry)))
+            {
+                escalates = true;
+                return false;
+            }
+
             // the boxes after an in-flow block are where they were if it is the same from outside
             if (entry.IsInFlow && (cursorY != result!.CursorY || previousBlockMarginBottom != result.PreviousBlockMarginBottom ||
-                suppressNextBlockTopMargin != result.SuppressNextBlockTopMargin || textIndentConsumed != result.TextIndentConsumed || !floats.IsEmpty ||
+                suppressNextBlockTopMargin != result.SuppressNextBlockTopMargin || textIndentConsumed != result.TextIndentConsumed || floats.HasFloatsBelow(cursorY) ||
                 !capture.TryGet(root, out var laidOut) || !HasSameBox(laidOut, laidOutBefore) ||
-                (entry.IsSizedByContent && ComputeOuterIntrinsicWidths(node, entry.TextStyle, entry.ContainingWidth, _context) != intrinsicWidths) ||
-                (entry.SuppressNextBlockTopMargin && GetCollapsedTopMargin(node, entry.ContainingWidth) != absorbedTopMargin)))
+                !ContributesTheSame(contribution, contentWidths, node, entry) ||
+                (entry.SuppressNextBlockTopMargin && GetCollapsedTopMargin(node, entry.ContainingWidth, _context) != entry.AbsorbedTopMargin)))
             {
                 escalates = true;
                 return false;
@@ -1432,35 +1633,87 @@ public sealed partial class HtmlRenderer
             return true;
         }
 
+        // what the box around it read of it (if anything) comes out the same
+        private bool ContributesTheSame((float PercentageBase, IntrinsicWidths Widths)? contribution, (float PercentageBase, IntrinsicWidths Widths)? contentWidths, ElementRenderNode node, LayoutEntry entry) =>
+            (contribution is not { } outer || ComputeOuterIntrinsicWidths(node, entry.TextStyle, outer.PercentageBase, _context) == outer.Widths) &&
+            (contentWidths is not { } content || ComputeContentIntrinsicWidths(node, ResolveTextStyle(GetOrCreateStyleMap(_context, node.Ref, node.ComputedStyle), entry.TextStyle, _context), content.PercentageBase, _context) == content.Widths);
+
+        /// <summary>
+        /// Whether a flex or grid container would size and place its items as it did: what it reads
+        /// of the item is the same, including the size the item would like at its main size.
+        /// </summary>
+        private bool LooksTheSameToContainer(ElementRenderNode node, LayoutEntry entry, ItemLayout item)
+        {
+            if (item.Grid is { } grid)
+            {
+                // measured for its row, if at all, which the row has to get again
+                var styleMap = GetOrCreateStyleMap(_context, node.Ref, node.ComputedStyle);
+                var properties = ReadGridItemProperties(styleMap);
+                return properties.Count == grid.Properties.Count && properties.All(property => grid.Properties.GetValueOrDefault(property.Key) == property.Value) &&
+                    (float.IsNaN(grid.MeasuredHeight) || MeasureGridItemHeight(node, grid.AreaWidth, entry.TextStyle, _context, grid.MaxY) == grid.MeasuredHeight);
+            }
+
+            if (item.Flex is not { } flex)
+            {
+                return false;
+            }
+
+            var info = CreateFlexItemLayoutInfo(node, item.IsRowDirection, flex.RelativeTo, flex.HeightRelativeTo, entry.TextStyle, _context, flex.DeferringAlignItems);
+
+            return info with { Node = null!, Style = null! } == flex.Info &&
+                (float.IsNaN(flex.EstimatedCrossSize) || EstimateFlexItemCrossSize(node, flex.FinalMainSize, item.IsRowDirection, entry.TextStyle, _context, flex.CrossAvailable) == flex.EstimatedCrossSize);
+        }
+
         private static bool HasSameBox(ElementLayoutMetrics first, ElementLayoutMetrics second) =>
             first with { Layer = default, Sticky = null } == second with { Layer = default, Sticky = null };
 
-        // the top margin of a block with those collapsing through it from its first children (see LayoutElement)
-        private float GetCollapsedTopMargin(ElementRenderNode node, float containingWidth)
-        {
-            var styleMap = GetOrCreateStyleMap(_context, node.Ref, node.ComputedStyle);
-            var box = ResolveBoxStyle(styleMap, node.Ref);
-            var marginTop = ParseLength(styleMap, "margin-top", containingWidth, box.Margin.Top, allowAuto: false);
-            var paddingTop = ParseLength(styleMap, "padding-top", containingWidth, box.Padding.Top, allowAuto: false);
-
-            return box.BorderWidth.Top <= 0f && paddingTop <= 0f && !EstablishesBlockFormattingContext(styleMap, false, false, false, false) &&
-                TryGetFirstCollapsibleChildTopMargin(node, containingWidth, _context, out var firstChildTopMargin)
-                ? CollapseMargins(marginTop, firstChildTopMargin)
-                : marginTop;
-        }
-
-        // sticky boxes move what they contain (and its metrics) after its layout
-        private bool HasStickyAncestor(IElement element)
+        // The nearest sticky ancestor, which is what the metrics of a box in it name.
+        private IElement? FindStickyAncestor(IElement element)
         {
             for (var ancestor = element.ParentElement; ancestor is not null; ancestor = ancestor.ParentElement)
             {
                 if (_context.StyleMapCache.TryGetValue(ancestor, out var styleMap) && IsStickyPositioned(styleMap))
                 {
-                    return true;
+                    return ancestor;
                 }
             }
 
-            return false;
+            return null;
+        }
+
+        // Sticky boxes move what they contain (and its metrics) after its layout: how far they
+        // moved the element, unless not known (e.g. waiting for a writing-mode system).
+        private bool TryGetStickyShift(IElement element, out float x, out float y)
+        {
+            x = 0f;
+            y = 0f;
+
+            for (var ancestor = element.ParentElement; ancestor is not null; ancestor = ancestor.ParentElement)
+            {
+                if (_context.StyleMapCache.TryGetValue(ancestor, out var styleMap) && IsStickyPositioned(styleMap))
+                {
+                    if (!_stickies.TryGetValue(ancestor, out var sticky))
+                    {
+                        return false;
+                    }
+
+                    x += sticky.OffsetX;
+                    y += sticky.OffsetY;
+                }
+            }
+
+            return true;
+        }
+
+        private static void MoveRecorded(LayoutCapture capture, float x, float y)
+        {
+            foreach (var element in capture.RecordOrder.Distinct<IElement>(ReferenceEqualityComparer.Instance))
+            {
+                if (capture.TryGet(element, out var recorded) && !recorded.IsViewportAnchored)
+                {
+                    capture.Replace(element, recorded with { BorderBoxX = recorded.BorderBoxX + x, BorderBoxY = recorded.BorderBoxY + y });
+                }
+            }
         }
 
         // What a subtree lays out beyond itself: sticky boxes (stuck by an ancestor), content with

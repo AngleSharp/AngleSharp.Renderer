@@ -48,6 +48,16 @@ public sealed partial class HtmlRenderer
     /// </summary>
     private sealed class LayoutPass
     {
+        /// <summary>
+        /// The contribution of each element to the size of its parent, as the layout asked for it
+        /// last. What the contribution was can't be asked for later on: text is read from the DOM,
+        /// which has changed by then (see <see cref="LayoutSnapshot.TryLayOutAgain"/>).
+        /// </summary>
+        public Dictionary<IElement, (float PercentageBase, IntrinsicWidths Widths)> Contributions { get; } = new(ReferenceEqualityComparer.Instance);
+
+        /// <summary>The same for the intrinsic widths of the content of each element, which some boxes read instead.</summary>
+        public Dictionary<IElement, (float PercentageBase, IntrinsicWidths Widths)> ContentWidths { get; } = new(ReferenceEqualityComparer.Instance);
+
         public Dictionary<IWindow, IStyleCollection> StyleCollections { get; } = new(ReferenceEqualityComparer.Instance);
 
         public Dictionary<IElement, (SvgPageStyle? PageStyle, string Fingerprint)> Styles { get; } = new(ReferenceEqualityComparer.Instance);
@@ -282,6 +292,9 @@ public sealed partial class HtmlRenderer
 
         /// <summary>The flex and grid items passing on the in-flow entries of their container to their content (see <see cref="IsInFlowEntry"/>).</summary>
         public HashSet<IElement>? Links { get; init; }
+
+        /// <summary>The entry of the flex or grid item whose layout starts next (see <see cref="RecordItemEntry"/>).</summary>
+        public LayoutEntry? NextItem { get; set; }
 
         /// <summary>The elements in the order their metrics were recorded (see RecordStickyMetrics).</summary>
         public List<IElement> RecordOrder { get; } = [];
@@ -1265,7 +1278,7 @@ public sealed partial class HtmlRenderer
         var computedStyle = node.ComputedStyle;
         var styleMap = GetOrCreateStyleMap(context, node.Ref, node.ComputedStyle);
 
-        if (s_layoutCapture.Value is { Entries: not null } capture)
+        if (s_layoutCapture.Value is { Entries: not null } capture && !TakeItemEntry(capture, node))
         {
             var isPlain = !isFlexItem && !isAtomicInline && !mainAxisMarginsPlaced && contentOffsetY == 0f && s_columnBreakCapture.Value is null &&
                 float.IsNaN(forcedBorderBoxWidth) && float.IsNaN(forcedBorderBoxHeight);
@@ -3174,6 +3187,17 @@ public sealed partial class HtmlRenderer
                         var itemFloats = new FloatArea();
                         var itemRangeStart = displayList.Commands.Count;
                         RecordLink(node, elementChild, styleMap, item.Style, context);
+                        var itemMargins = isRowDirection
+                            ? new EdgeSizes(usedCrossMarginStart, marginEnd, usedCrossMarginEnd, marginStart)
+                            : new EdgeSizes(marginStart, usedCrossMarginEnd, marginEnd, usedCrossMarginStart);
+                        var flexMain = isRowDirection ? childContentWidth : item.HasDeferredMainSize ? (float?)null : childContentHeight;
+                        var flexCross = isRowDirection ? childContentHeight : childContentWidth;
+                        RecordItemEntry(elementChild, childX, childY, childContentWidth, inheritedTextStyle, maxY, itemContainingX, itemContainingY, itemContainingWidth, itemContainingHeight,
+                            new ItemLayout(isRowDirection, flexMain, flexCross, CrossMarginsPlaced: true, itemMargins)
+                            {
+                                Flex = new FlexItemContribution(item with { Node = null!, Style = null! }, containingWidth, definiteContentHeight, item.HasDeferredMainSize ? alignItems : null,
+                                    finalMainSize, item.HasDefiniteCrossSize ? float.NaN : estimatedCrossSize, ColumnCrossAvailable(item)),
+                            }, context);
 
                         LayoutNode(
                             node: elementChild,
@@ -3191,23 +3215,22 @@ public sealed partial class HtmlRenderer
                             maxY: maxY,
                             isFlexItem: true,
                             isRowDirection: isRowDirection,
-                            flexMainSize: isRowDirection ? childContentWidth : item.HasDeferredMainSize ? null : childContentHeight,
-                            flexCrossSize: isRowDirection ? childContentHeight : childContentWidth,
+                            flexMainSize: flexMain,
+                            flexCrossSize: flexCross,
                             positionedContainingX: itemContainingX,
                             positionedContainingY: itemContainingY,
                             positionedContainingWidth: itemContainingWidth,
                             positionedContainingHeight: itemContainingHeight,
                             mainAxisMarginsPlaced: true,
                             crossAxisMarginsPlaced: true);
-                        SetUsedMargins(elementChild.Ref, isRowDirection
-                            ? new EdgeSizes(usedCrossMarginStart, marginEnd, usedCrossMarginEnd, marginStart)
-                            : new EdgeSizes(marginStart, usedCrossMarginEnd, marginEnd, usedCrossMarginStart));
+                        SetUsedMargins(elementChild.Ref, itemMargins);
                         paintOrder.Track(elementChild, displayList, itemRangeStart, context);
 
                         if (item.HasDeferredMainSize)
                         {
                             // the item ends where its border box ends (its margins are placed here)
                             var laidOutMainSize = Math.Max(0f, childBlockCursor - childCursor);
+                            RecordDeferredMainSize(elementChild, laidOutMainSize);
                             containerMainSize += laidOutMainSize - finalMainSize;
                             lineMainSize += laidOutMainSize - finalMainSize;
                             finalMainSize = laidOutMainSize;
@@ -4042,6 +4065,17 @@ public sealed partial class HtmlRenderer
             var childTextIndentConsumed = false;
             var itemRangeStart = displayList.Commands.Count;
             RecordLink(node, elementChild, styleMap, childStyleMap, context);
+            var usedMargins = ResolveUsedGridMargins();
+
+            // an item sized by its own content (not stretched) is measured below as well, which leaves it to the container
+            if (justifySelf == GridSelfAlignment.Stretch && alignSelf == GridSelfAlignment.Stretch && !hasAutoInlineMargin && !hasAutoBlockMargin && GetContentSizeKeyword(childStyleMap, "width") is null)
+            {
+                RecordItemEntry(elementChild, alignedCellX, alignedCellY, resolvedChildContentWidth, inheritedTextStyle, maxY, itemContainingX, itemContainingY, itemContainingWidth, itemContainingHeight,
+                    new ItemLayout(true, resolvedChildContentWidth, resolvedChildContentHeight, CrossMarginsPlaced: false, usedMargins)
+                    {
+                        Grid = CreateGridItemContribution(elementChild, childStyleMap, cellWidth, maxY, context),
+                    }, context);
+            }
 
             LayoutNode(
                 node: elementChild,
@@ -4066,24 +4100,29 @@ public sealed partial class HtmlRenderer
                 positionedContainingWidth: itemContainingWidth,
                 positionedContainingHeight: itemContainingHeight,
                 mainAxisMarginsPlaced: true);
-            var gridBorderBoxWidth = resolvedChildContentWidth + childHorizontalExtras;
-            var gridBorderBoxHeight = resolvedChildContentHeight + childVerticalExtras;
-            var horizontalMarginSpace = Math.Max(0f, cellWidth - gridBorderBoxWidth - ZeroIfNaN(childMarginLeft) - ZeroIfNaN(childMarginRight));
-            var verticalMarginSpace = Math.Max(0f, cellHeight - gridBorderBoxHeight - ZeroIfNaN(childMarginTop) - ZeroIfNaN(childMarginBottom));
-            var usedGridMarginLeft = float.IsNaN(childMarginLeft)
-                ? float.IsNaN(childMarginRight) ? horizontalMarginSpace / 2f : horizontalMarginSpace
-                : childMarginLeft;
-            var usedGridMarginRight = float.IsNaN(childMarginRight)
-                ? float.IsNaN(childMarginLeft) ? horizontalMarginSpace / 2f : horizontalMarginSpace
-                : childMarginRight;
-            var usedGridMarginTop = float.IsNaN(childMarginTop)
-                ? float.IsNaN(childMarginBottom) ? verticalMarginSpace / 2f : verticalMarginSpace
-                : childMarginTop;
-            var usedGridMarginBottom = float.IsNaN(childMarginBottom)
-                ? float.IsNaN(childMarginTop) ? verticalMarginSpace / 2f : verticalMarginSpace
-                : childMarginBottom;
-            SetUsedMargins(elementChild.Ref, new EdgeSizes(usedGridMarginTop, usedGridMarginRight, usedGridMarginBottom, usedGridMarginLeft));
+            SetUsedMargins(elementChild.Ref, usedMargins);
             paintOrder.Track(elementChild, displayList, itemRangeStart, context);
+
+            EdgeSizes ResolveUsedGridMargins()
+            {
+                var gridBorderBoxWidth = resolvedChildContentWidth + childHorizontalExtras;
+                var gridBorderBoxHeight = resolvedChildContentHeight + childVerticalExtras;
+                var horizontalMarginSpace = Math.Max(0f, cellWidth - gridBorderBoxWidth - ZeroIfNaN(childMarginLeft) - ZeroIfNaN(childMarginRight));
+                var verticalMarginSpace = Math.Max(0f, cellHeight - gridBorderBoxHeight - ZeroIfNaN(childMarginTop) - ZeroIfNaN(childMarginBottom));
+                var usedGridMarginLeft = float.IsNaN(childMarginLeft)
+                    ? float.IsNaN(childMarginRight) ? horizontalMarginSpace / 2f : horizontalMarginSpace
+                    : childMarginLeft;
+                var usedGridMarginRight = float.IsNaN(childMarginRight)
+                    ? float.IsNaN(childMarginLeft) ? horizontalMarginSpace / 2f : horizontalMarginSpace
+                    : childMarginRight;
+                var usedGridMarginTop = float.IsNaN(childMarginTop)
+                    ? float.IsNaN(childMarginBottom) ? verticalMarginSpace / 2f : verticalMarginSpace
+                    : childMarginTop;
+                var usedGridMarginBottom = float.IsNaN(childMarginBottom)
+                    ? float.IsNaN(childMarginTop) ? verticalMarginSpace / 2f : verticalMarginSpace
+                    : childMarginBottom;
+                return new EdgeSizes(usedGridMarginTop, usedGridMarginRight, usedGridMarginBottom, usedGridMarginLeft);
+            }
         }
 
         var gridContentWidth = GetGridContentSize(columnSizes, resolvedColumnGap, containingWidth);

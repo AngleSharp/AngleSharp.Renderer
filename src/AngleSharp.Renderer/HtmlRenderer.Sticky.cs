@@ -181,7 +181,7 @@ public sealed partial class HtmlRenderer
         if (capture is { Entries: { } entries } && ReferenceEquals(capture, s_layoutCapture.Value) &&
             entries.TryGetValue(node.Ref, out var entry) && entry.IsInFlow && ReferenceEquals(entry.Node, node))
         {
-            entries[node.Ref] = entry with { Result = new FlowResult(cursorY, previousBlockMarginBottom, suppressNextBlockTopMargin, textIndentConsumed, floats.IsEmpty) };
+            entries[node.Ref] = entry with { Result = new FlowResult(cursorY, previousBlockMarginBottom, suppressNextBlockTopMargin, textIndentConsumed, !floats.HasFloatsBelow(cursorY) && previousBlockMarginBottom >= 0f) };
         }
 
         // where the box that may be laid out on its own is in the display list
