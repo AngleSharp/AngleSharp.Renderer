@@ -75,6 +75,65 @@ layouts do not record where their text comes from:
 harness.IsTextSelectionEnabled = false;
 ```
 
+## Frames and Their Metrics
+
+An interactive host lays out a frame with `PrepareFrame()` and rasterizes it on any thread, as it
+no longer refers to the DOM. Every frame tells what its layout took, e.g., to show it in the
+developer tools of a browser:
+
+```cs
+var frame = harness.PrepareFrame();
+var metrics = frame.Metrics;
+
+Console.WriteLine($"styles {metrics.Style}, boxes {metrics.Layout}, hit testing {metrics.HitTesting}");
+Console.WriteLine($"{metrics.Elements} elements, {metrics.Boxes} boxes, {metrics.TrialLayouts} trial layouts");
+```
+
+`Total` is the sum of the phases: `Setup` (web fonts and the page's default text style), `Style`
+(the render tree, i.e., matching selectors and the cascade), `Layout` (the boxes and what is painted),
+`HitTesting` and `Subframes` (the documents of iframes). The counters tell how much work that was:
+`StyleMaps`, `TextMeasurements`, `Commands` (of the display list), `HitTestEntries` and the
+`AllocatedBytes`. A frame patched by `UpdateFrame()` is `IsIncremental`, and a frame moved with
+`Reposition` needed no layout at all: its metrics are `RenderMetrics.None`.
+
+A change of an element's state, i.e., hovering or focusing it, is often confined to it: only what
+a selector of that state refers to (e.g., `.card:hover .title`) is styled again, and a change of
+its colors, backgrounds, borders, outlines, shadows or text decoration is painted again without
+laying out anything, so `UpdateFrame()` patches the last frame (keeping its hit-test map, unless a
+`cursor` changed). Selectors that style other elements with the state, like `.tip:hover + .note`
+or the rules of a shadow tree, still lay out the document again. The harness knows the hovered
+element, while a host that moves the focus tells it so:
+
+```cs
+field.DoFocus();
+harness.NotifyStateChanged(field);
+var frame = harness.UpdateFrame() ?? harness.PrepareFrame();
+```
+
+A page that was just loaded can be shown early on: `PrepareViewportFrame()` styles and lays out
+only what is in the viewport (with the overscan). If the page goes on below, the frame is
+`IsPartial`: its `ContentHeight` and hit-test map end there, and it is animating, as the next
+frame lays out the whole page. Reading the geometry (e.g., `getBoundingClientRect`) lays it out as
+well, and `UpdateFrame()` doesn't patch a partial frame:
+
+```cs
+var first = harness.PrepareViewportFrame();
+// show it, then
+var frame = first.IsPartial ? harness.PrepareFrame() : first;
+```
+
+Images of a page (e.g., `RenderToPng`) are rendered the same way. A document whose generated
+content uses CSS counters or quotes (with elements they apply to) is styled as a whole, as these
+depend on all elements before.
+
+For a large document, the computed styles of its elements are read on all cores (as AngleSharp.Css
+matches their selectors), while the DOM is not changed. A host without cores to spare turns this off:
+
+```cs
+AppContext.SetSwitch("AngleSharp.Renderer.DisableParallelism", true);
+AppContext.SetSwitch("AngleSharp.Css.DisableParallelism", true);
+```
+
 ## The Virtual Clock
 
 There is no real-time timer anywhere in this renderer. CSS `transition`s and `animation`s are both
@@ -91,8 +150,10 @@ video of an animation) instead of only ever the resting/end states.
 
 ## CSS `transition`
 
-A `transition` animates a property when its own natural value changes for some other reason - in
-this renderer, that means a `:hover` state change:
+A `transition` animates a property when its own natural value changes for some other reason: a
+`:hover` state change, or anything changing the style of an element between two frames (e.g. a
+script adding a class). An element seen for the first time (just inserted, or no longer
+`display: none`) has no transition, like in a browser:
 
 ```cs
 var html = """
@@ -118,10 +179,18 @@ Moving the pointer away mid-transition reverses it smoothly from whatever is cur
 with its own full declared duration - not a jump back to blue, and not just the remaining
 fraction of the original 1s.
 
+Like animations, transitions tell the element about themselves once a frame is painted:
+`transitionrun` (when it is created), `transitionstart` (once its delay is over), `transitionend`
+and `transitioncancel` (replaced or removed before it ended) are dispatched as `TransitionEvent`s,
+with the `propertyName` and the `elapsedTime` in seconds. A property that is not interpolated here
+(see below; e.g. `max-height` or `visibility`) still has these events, while its value changes
+right away; a shorthand like `padding` or `border-color` transitions its longhands.
+
 ## CSS `animation`/`@keyframes`
 
-An `animation` needs no trigger at all - it starts the moment the harness first becomes aware of
-it (pinned to virtual-clock zero, matching a real browser's "starts playing at page load") and
+An `animation` needs no trigger at all - one in the first frame of a document is pinned to
+virtual-clock zero (matching a real browser's "starts playing at page load"), one an element gets
+later (e.g. by a class a script adds) starts at the time of the frame that finds it, and either
 keeps looping per `animation-iteration-count`:
 
 ```cs
@@ -150,8 +219,22 @@ var midway = harness.PaintToPng(); // #box is 50% opaque
 `-duration`, `-delay`, `-timing-function` (`ease`/`linear`/`cubic-bezier()`/`steps()`),
 `-iteration-count` (a number, or `infinite`), `-direction` (`normal`/`reverse`/`alternate`/
 `alternate-reverse`), and `-fill-mode` (`none`/`forwards`/`backwards`/`both`) are all supported.
-`animation-play-state` (pausing) is not - every animation the harness knows about is always
-running.
+`animation-play-state: paused` freezes an animation where it is, and the time it is paused does
+not count.
+
+The frames tell the element about its animations, like a browser: once a frame (or a picture) is
+painted, `animationstart`, `animationiteration`, `animationend` and `animationcancel` (an
+animation the element no longer names before it ended) are dispatched as `AnimationEvent`s, with
+the `animationName` and the `elapsedTime` in seconds. With an event loop they are a task of it,
+else they are dispatched right after painting. Pages often wait for `animationend` before going
+on, e.g. to show the next view of a form.
+
+```cs
+box.AddEventListener("animationend", (_, ev) => Console.WriteLine(((AnimationEvent)ev).AnimationName));
+harness.PrepareFrame();                            // animationstart
+harness.AdvanceTime(TimeSpan.FromSeconds(2));
+harness.PrepareFrame();                            // animationend: "fade"
+```
 
 ## What Can Be Animated
 
@@ -162,10 +245,11 @@ Both `transition` and `animation` only ever interpolate a fixed set of propertie
 - **Numeric lengths/`opacity`** (plain numeric lerp): `opacity`, `width`, `height`, `font-size`,
   `margin-top`/`-right`/`-bottom`/`-left`, `padding-top`/`-right`/`-bottom`/`-left`,
   `border-top-width`/`-right-width`/`-bottom-width`/`-left-width`, `top`, `left`, `right`, `bottom`
+- **Function lists** (function by function): `transform`, `translate`, `rotate`, `scale`,
+  `filter`, `backdrop-filter`
 
 `transition-property: all` and any other property named in a `@keyframes` block are limited to
-this same list - properties this renderer does not otherwise resolve component-wise, such as
-`transform` and `filter`, are not interpolated.
+this same list; other properties change right away (a transition of one still has its events).
 
 ## Scrolling
 

@@ -55,6 +55,20 @@ public sealed class FormControlTests
         Assert.Empty(displayList.Commands.OfType<DrawTextCommand>());
     }
 
+    [Fact]
+    public async Task ButtonOfAMinHeight_CentersItsLabelInIt()
+    {
+        // the "Next" button of the Microsoft login only has a min-height
+        const string Style = "display: block; box-sizing: border-box; padding: 4px 12px; border: 0; font-size: 15px; margin: 0";
+        var displayList = await LayoutAsync($"""
+            <input type="submit" value="A" style="{Style}; height: 32px">
+            <input type="submit" value="B" style="{Style}; min-height: 32px">
+            """);
+
+        var texts = displayList.Commands.OfType<DrawTextCommand>().ToList();
+        Assert.Equal(32f, texts[1].Y - texts[0].Y, precision: 2);
+    }
+
     [Theory]
     [InlineData("date", "", "mm/dd/yyyy")]
     [InlineData("date", "2024-05-03", "05/03/2024")]
@@ -175,6 +189,18 @@ public sealed class FormControlTests
         var text = Assert.Single(displayList.Commands.OfType<DrawTextCommand>(), command => command.Text == "Name");
         Assert.Equal(new RenderColor(1, 2, 3), text.Color);
         Assert.Equal(20f, text.FontSize, precision: 2);
+    }
+
+    [Fact]
+    public async Task Placeholder_InAShadowTreeTakesTheRulesOfItsShadowRoot()
+    {
+        // MDN's sidebar filter is a field in the shadow tree of a custom element
+        var displayList = await LayoutAsync(
+            "<style>::placeholder { color: rgb(200, 0, 0) }</style><div><template shadowrootmode=\"open\">" +
+            "<style>.input::placeholder { color: rgb(1, 2, 3) }</style><input class=\"input\" placeholder=\"Name\"></template></div>");
+
+        var text = Assert.Single(displayList.Commands.OfType<DrawTextCommand>(), command => command.Text == "Name");
+        Assert.Equal(new RenderColor(1, 2, 3), text.Color);
     }
 
     [Theory]

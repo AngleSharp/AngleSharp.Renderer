@@ -36,6 +36,19 @@ internal readonly record struct CssAnimationSpec(
     CssAnimationFillMode FillMode,
     bool IsPaused);
 
+internal enum CssAnimationPhase
+{
+    Idle,
+    Before,
+    Active,
+    After,
+}
+
+/// <summary>
+/// An event of a CSS animation, to be dispatched once the frame that found it is done.
+/// </summary>
+internal readonly record struct CssAnimationEventRecord(IElement Target, string Type, string AnimationName, double ElapsedSeconds);
+
 internal sealed record CssKeyframeStop(double Position, IReadOnlyDictionary<string, string> PropertyValues);
 
 /// <summary>
@@ -65,18 +78,26 @@ internal sealed class CssAnimationTracker
     // same, but they are asked for once per interpolatable property: each time, the element's
     // cascade ran again and every rule of every style sheet was searched for the keyframes.
     private Dictionary<IElement, List<CssAnimationSpec>>? _frameSpecs;
+    private readonly Dictionary<(IElement Element, string Name), (CssAnimationPhase Phase, double Iteration)> _phases = [];
+    private readonly Dictionary<IElement, HashSet<string>> _trackedNames = [];
+    private readonly HashSet<IDocument> _paintedDocuments = [];
+    private readonly HashSet<(IElement Element, string Name)> _pausedNames = [];
+    private List<CssAnimationEventRecord> _pendingEvents = [];
+    private bool _isFirstFrame = true;
     private Dictionary<(IDocument Document, string Name), IReadOnlyList<CssKeyframeStop>?>? _frameKeyframes;
 
     /// <summary>
     /// Caches the animations of elements and the keyframes they refer to until the returned
     /// scope is disposed, i.e. for the duration of painting one frame.
     /// </summary>
-    public IDisposable BeginFrame()
+    public IDisposable BeginFrame(IDocument? document = null)
     {
         IsAnimating = false;
         _frameSpecs = [];
         _frameKeyframes = [];
-        return new FrameScope(this);
+        _isFirstFrame = document is null || !_paintedDocuments.Contains(document);
+        ForgetDisconnectedElements();
+        return new FrameScope(this, document);
     }
 
     /// <summary>
@@ -85,13 +106,223 @@ internal sealed class CssAnimationTracker
     /// </summary>
     public bool IsAnimating { get; private set; }
 
-    private sealed class FrameScope(CssAnimationTracker tracker) : IDisposable
+    /// <summary>
+    /// Gets if an animation seen so far has not ended yet and is not paused, i.e. if time
+    /// passing changes it or gives it events.
+    /// </summary>
+    public bool HasRunningAnimations
+    {
+        get
+        {
+            foreach (var (key, state) in _phases)
+            {
+                if (state.Phase is CssAnimationPhase.Before or CssAnimationPhase.Active && !IsPaused(key))
+                {
+                    return true;
+                }
+            }
+
+            return false;
+        }
+    }
+
+    private bool IsPaused((IElement Element, string Name) key) =>
+        _pausedNames.Contains(key);
+
+    private sealed class FrameScope(CssAnimationTracker tracker, IDocument? document) : IDisposable
     {
         public void Dispose()
         {
             tracker._frameSpecs = null;
             tracker._frameKeyframes = null;
+            tracker._isFirstFrame = false;
+
+            if (document is not null)
+            {
+                tracker._paintedDocuments.Add(document);
+            }
         }
+    }
+
+    /// <summary>
+    /// Takes the events of animations found while painting (see <see cref="Observe"/>), in the
+    /// order they happened.
+    /// </summary>
+    public List<CssAnimationEventRecord> TakeEvents()
+    {
+        var events = _pendingEvents;
+        _pendingEvents = [];
+        return events;
+    }
+
+    /// <summary>
+    /// Follows the animations of an element while a frame is painted, recording the events of
+    /// the ones starting, repeating, ending or being cancelled since the last time it was seen.
+    /// </summary>
+    /// <param name="element">The element whose style was computed.</param>
+    /// <param name="computedStyle">The element's computed style.</param>
+    /// <param name="isAnimated">If the style names any animation.</param>
+    /// <param name="clockMs">The virtual clock.</param>
+    public void Observe(IElement element, ICssStyleDeclaration computedStyle, bool isAnimated, double clockMs)
+    {
+        _trackedNames.TryGetValue(element, out var tracked);
+
+        if (!isAnimated && tracked is null)
+        {
+            return;
+        }
+
+        var specs = isAnimated ? GetAnimationSpecs(element, computedStyle) : [];
+        HashSet<string>? current = null;
+
+        foreach (var spec in specs)
+        {
+            // an animation of keyframes that don't exist does not run, so it has no events
+            if (GetKeyframeStops(element, spec.Name) is not { Count: > 0 })
+            {
+                continue;
+            }
+
+            (current ??= new(StringComparer.Ordinal)).Add(spec.Name);
+            ObserveSpec(element, spec, clockMs);
+        }
+
+        if (tracked is not null)
+        {
+            foreach (var name in tracked.ToArray())
+            {
+                if (current is null || !current.Contains(name))
+                {
+                    Forget(element, name, cancelled: true);
+                }
+            }
+        }
+
+        if (current is not null)
+        {
+            if (!_trackedNames.TryGetValue(element, out tracked))
+            {
+                tracked = new(StringComparer.Ordinal);
+                _trackedNames[element] = tracked;
+            }
+
+            tracked.UnionWith(current);
+        }
+        else
+        {
+            _trackedNames.Remove(element);
+        }
+    }
+
+    private void ObserveSpec(IElement element, CssAnimationSpec spec, double clockMs)
+    {
+        var key = (element, spec.Name);
+        var startMs = GetStartTimeMs(key, clockMs);
+        var effectiveClockMs = ResolveEffectiveClockMs(element, spec, clockMs);
+        var elapsedMs = effectiveClockMs - startMs - spec.DelayMs;
+        var activeDurationMs = spec.DurationMs * spec.IterationCount;
+        var isInfinite = double.IsPositiveInfinity(activeDurationMs);
+        var phase = elapsedMs < 0d ? CssAnimationPhase.Before
+            : isInfinite || elapsedMs < activeDurationMs ? CssAnimationPhase.Active
+            : CssAnimationPhase.After;
+        var iteration = phase switch
+        {
+            CssAnimationPhase.Active => spec.DurationMs > 0d ? Math.Floor(elapsedMs / spec.DurationMs) : 0d,
+            CssAnimationPhase.After => Math.Max(0d, Math.Ceiling(spec.IterationCount) - 1d),
+            _ => 0d,
+        };
+
+        if (!spec.IsPaused && phase != CssAnimationPhase.After)
+        {
+            IsAnimating = true;
+        }
+
+        if (spec.IsPaused)
+        {
+            _pausedNames.Add(key);
+        }
+        else
+        {
+            _pausedNames.Remove(key);
+        }
+
+        _phases.TryGetValue(key, out var previous);
+        _phases[key] = (phase, iteration);
+
+        // the times the events tell, as CSS Animations 1 says (seconds, without the delay)
+        var startElapsed = Math.Max(Math.Min(-spec.DelayMs, activeDurationMs), 0d) / 1000d;
+        var endElapsed = isInfinite ? 0d : activeDurationMs / 1000d;
+
+        switch (previous.Phase, phase)
+        {
+            case (CssAnimationPhase.Idle or CssAnimationPhase.Before, CssAnimationPhase.Active):
+                Record(element, "animationstart", spec.Name, startElapsed);
+                break;
+            case (CssAnimationPhase.Idle or CssAnimationPhase.Before, CssAnimationPhase.After):
+                Record(element, "animationstart", spec.Name, startElapsed);
+                Record(element, "animationend", spec.Name, endElapsed);
+                break;
+            case (CssAnimationPhase.Active, CssAnimationPhase.Active) when iteration != previous.Iteration:
+                Record(element, "animationiteration", spec.Name, iteration * spec.DurationMs / 1000d);
+                break;
+            case (CssAnimationPhase.Active, CssAnimationPhase.After):
+                Record(element, "animationend", spec.Name, endElapsed);
+                break;
+        }
+    }
+
+    private void Record(IElement element, string type, string name, double elapsedSeconds) =>
+        _pendingEvents.Add(new CssAnimationEventRecord(element, type, name, elapsedSeconds));
+
+    // An animation stops once its element no longer names it: naming it again starts it anew.
+    private void Forget(IElement element, string name, bool cancelled)
+    {
+        var key = (element, name);
+
+        if (cancelled && _phases.TryGetValue(key, out var state) && state.Phase is CssAnimationPhase.Before or CssAnimationPhase.Active)
+        {
+            Record(element, "animationcancel", name, 0d);
+        }
+
+        _phases.Remove(key);
+        _pausedNames.Remove(key);
+        _startTimesMs.Remove(key);
+        _pausedAccumulatedMs.Remove(key);
+        _lastObservedClockMs.Remove(key);
+    }
+
+    private void ForgetDisconnectedElements()
+    {
+        if (_trackedNames.Count == 0)
+        {
+            return;
+        }
+
+        foreach (var (element, names) in _trackedNames.ToArray())
+        {
+            if (!element.IsConnected())
+            {
+                foreach (var name in names)
+                {
+                    Forget(element, name, cancelled: false);
+                }
+
+                _trackedNames.Remove(element);
+            }
+        }
+    }
+
+    // An animation found in the first frame of a document runs since the document got ready, i.e.
+    // since the clock started, however long ago that is; one found later starts when it is found.
+    private double GetStartTimeMs((IElement Element, string Name) key, double clockMs)
+    {
+        if (!_startTimesMs.TryGetValue(key, out var startMs))
+        {
+            startMs = _isFirstFrame ? 0d : clockMs;
+            _startTimesMs[key] = startMs;
+        }
+
+        return startMs;
     }
 
     /// <summary>
@@ -172,17 +403,12 @@ internal sealed class CssAnimationTracker
             return null;
         }
 
-        // Pinned to virtual-clock zero the first time this (element, animation-name) pair is
-        // observed, not to whatever the clock happens to read at that moment - an animation begins
-        // playing at document-ready (clock zero) in a real browser regardless of when a viewer
-        // first looks at it, and the same has to hold here regardless of whether a caller happens
-        // to call AdvanceTime one or several times before ever painting for the first time.
-        if (!_startTimesMs.ContainsKey((element, spec.Name)))
-        {
-            _startTimesMs[(element, spec.Name)] = 0d;
-        }
-
-        var startMs = _startTimesMs[(element, spec.Name)];
+        // Pinned to virtual-clock zero when this (element, animation-name) pair is observed in the
+        // first frame of its document - an animation begins playing at document-ready in a real
+        // browser regardless of when a viewer first looks at it, whether or not a caller advanced
+        // the time before painting for the first time - and otherwise to the clock when the
+        // element starts naming the animation (e.g. a class added by script).
+        var startMs = GetStartTimeMs((element, spec.Name), clockMs);
         var effectiveClockMs = ResolveEffectiveClockMs(element, spec, clockMs);
         var elapsedMs = effectiveClockMs - startMs - spec.DelayMs;
         var totalDurationMs = spec.DurationMs * spec.IterationCount;

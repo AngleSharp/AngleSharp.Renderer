@@ -170,6 +170,11 @@ public sealed partial class HtmlRenderer
             // down could still be pulled up into view.
             if (cursorY > maxY && !ContainsBottomStickyBox(children.Skip(index + 1), context))
             {
+                if (index < children.Count - 1)
+                {
+                    NoteCutOff(maxY);
+                }
+
                 paintOrder.Apply(displayList);
                 RecordPaintLayer(paintOrder, children, displayList);
                 return;
@@ -336,6 +341,9 @@ public sealed partial class HtmlRenderer
         public float BoundsRight { get; set; } = float.MinValue;
 
         public float BoundsBottom { get; set; } = float.MinValue;
+
+        /// <summary>Its border box on each line it is on (CSSOM View: its client rects).</summary>
+        public List<RenderRect>? LineFragments { get; set; }
 
         /// <summary>How far its baseline is below that of its parent (`vertical-align`).</summary>
         public float BaselineShift { get; init; }
@@ -1028,6 +1036,11 @@ public sealed partial class HtmlRenderer
 
             if (lineTop > maxY || clamped || lineClamp is { Remaining: <= 0 })
             {
+                if (lineTop > maxY && lineStartIndex < pieces.Count)
+                {
+                    NoteCutOff(maxY);
+                }
+
                 break;
             }
         }
@@ -1060,7 +1073,10 @@ public sealed partial class HtmlRenderer
                     insetLeft: inlineBox.InsetLeft,
                     insetRight: inlineBox.InsetRight,
                     insetTop: inlineBox.InsetTop,
-                    insetBottom: inlineBox.InsetBottom);
+                    insetBottom: inlineBox.InsetBottom,
+                    fragments: inlineBox.LineFragments is { Count: > 1 } lineFragments
+                        ? lineFragments.ConvertAll(fragment => new RenderRect(fragment.X - inlineBox.BoundsLeft, fragment.Y - inlineBox.BoundsTop, fragment.Width, fragment.Height))
+                        : null);
             }
         }
 
@@ -2358,6 +2374,11 @@ public sealed partial class HtmlRenderer
             box.BoundsTop = Math.Min(box.BoundsTop, top);
             box.BoundsBottom = Math.Max(box.BoundsBottom, bottom);
 
+            if (!positioned)
+            {
+                (box.LineFragments ??= []).Add(new RenderRect(left, top, width, height));
+            }
+
             if (box.IsBrokenImage && box.StartsOnLine && !box.TextStyle.IsHidden && box.IsPositioned == positioned)
             {
                 PaintBrokenImageMark(displayList, left, boxBaseline - ascent + ((height - BrokenImageIconSize) / 2f), BrokenImageIconSize, BrokenImageIconSize);
@@ -2629,13 +2650,23 @@ public sealed partial class HtmlRenderer
         float forcedBorderBoxWidth,
         bool isAtomicInline,
         bool isFlexOrGridItem = false,
-        float maxY = float.MaxValue)
+        float maxY = float.MaxValue,
+        bool isHeightOnly = false)
     {
+        var pass = s_layoutPass.Value;
+        // a trial asking for more (e.g., the baseline of an inline-block) needs all of its boxes
+        var wasHeightOnly = s_measuringHeightOnly;
+        s_measuringHeightOnly = isHeightOnly;
         var capture = new LayoutCapture();
         var previous = s_layoutCapture.Value;
         s_layoutCapture.Value = capture;
 
         s_trialDepth++;
+
+        if (pass is not null)
+        {
+            pass.Metrics.TrialLayouts++;
+        }
 
         // a trial is laid out elsewhere, so its lines are no column break candidates
         var previousColumnBreaks = s_columnBreakCapture.Value;
@@ -2686,6 +2717,7 @@ public sealed partial class HtmlRenderer
         finally
         {
             s_trialDepth--;
+            s_measuringHeightOnly = wasHeightOnly;
             context.PositionedScopes.Pop();
             s_layoutCapture.Value = previous;
             s_columnBreakCapture.Value = previousColumnBreaks;
@@ -2860,6 +2892,18 @@ public sealed partial class HtmlRenderer
     /// </summary>
     private static IntrinsicWidths ComputeOuterIntrinsicWidths(ElementRenderNode element, RenderTextStyle inheritedStyle, float percentageBase, LayoutContext context)
     {
+        var widths = ComputeElementContribution(element, inheritedStyle, percentageBase, context);
+
+        if (s_layoutPass.Value is { } pass)
+        {
+            pass.Contributions[element.Ref] = (percentageBase, widths);
+        }
+
+        return widths;
+    }
+
+    private static IntrinsicWidths ComputeElementContribution(ElementRenderNode element, RenderTextStyle inheritedStyle, float percentageBase, LayoutContext context)
+    {
         if (!GeneratesBoxes(element))
         {
             return IntrinsicWidths.Zero;
@@ -2938,6 +2982,18 @@ public sealed partial class HtmlRenderer
     /// and the widest line it produces without any soft wrapping (max-content).
     /// </summary>
     private static IntrinsicWidths ComputeContentIntrinsicWidths(ElementRenderNode element, RenderTextStyle textStyle, float percentageBase, LayoutContext context)
+    {
+        var widths = ComputeElementContentWidths(element, textStyle, percentageBase, context);
+
+        if (s_layoutPass.Value is { } pass)
+        {
+            pass.ContentWidths[element.Ref] = (percentageBase, widths);
+        }
+
+        return widths;
+    }
+
+    private static IntrinsicWidths ComputeElementContentWidths(ElementRenderNode element, RenderTextStyle textStyle, float percentageBase, LayoutContext context)
     {
         var styleMap = GetOrCreateStyleMap(context, element.Ref, element.ComputedStyle);
         var children = OrderChildrenForPainting(element.Children, context).ToList();

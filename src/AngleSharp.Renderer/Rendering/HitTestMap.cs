@@ -139,7 +139,20 @@ public sealed class HitTestMap
             }
             : ClipEscape.None;
 
-    private readonly record struct Entry(IElement Element, RenderRect Box, RenderRect Clip, string Cursor, bool IsInScrollContainer, bool IsViewportAnchored, RenderedFrame? Subframe = null, RenderRect Viewport = default);
+    // what an ancestor with a box tells the boxes in it (see Create)
+    private sealed record AncestorInfo(
+        HtmlRenderer.ElementLayoutMetrics Metrics,
+        bool IsFixed,
+        ClipEscape Escape,
+        bool HasTransformLikeEffect,
+        bool ActsAsContainingBlock,
+        bool IsScrolling,
+        RenderRect Clip,
+        (int Step, int ZIndex, double Order) Rank,
+        RenderTransform2D? Transform);
+
+    // Fragments: where an inline box on several lines is (within Box), if it isn't transformed
+    private readonly record struct Entry(IElement Element, RenderRect Box, RenderRect Clip, string Cursor, bool IsInScrollContainer, bool IsViewportAnchored, RenderedFrame? Subframe = null, RenderRect Viewport = default, RenderRect[]? Fragments = null);
 
     private HitTestMap(Entry[] entries, float offsetY = 0f)
     {
@@ -169,7 +182,7 @@ public sealed class HitTestMap
         {
             var entryY = entry.IsViewportAnchored ? y : y - _offsetY;
 
-            if (Contains(entry.Box, x, entryY) && Contains(entry.Clip, x, entryY))
+            if (Contains(entry.Box, x, entryY) && Contains(entry.Clip, x, entryY) && (entry.Fragments is null || ContainsAny(entry.Fragments, x, entryY)))
             {
                 // what an iframe shows is hit in its document: everything there, as it scrolls of its own
                 if (entry.Subframe is { } frame &&
@@ -186,6 +199,9 @@ public sealed class HitTestMap
         return null;
     }
 
+    /// <summary>Gets the number of boxes in the map (not counting those in iframes).</summary>
+    internal int Count => _entries.Length;
+
     /// <summary>
     /// Gets the map with all boxes moved down by the given distance.
     /// </summary>
@@ -201,6 +217,8 @@ public sealed class HitTestMap
         var order = GetDocumentOrder(document);
         var unordered = (double)order.Count;
         var candidates = new List<(Entry Entry, (int Step, int ZIndex, double Order)[] Key)>(metrics.Count);
+        // what the walks from the boxes up to the root ask of an ancestor, once for each of them
+        var ancestors = new Dictionary<IElement, AncestorInfo?>(ReferenceEqualityComparer.Instance);
 
         foreach (var (element, elementMetrics) in metrics)
         {
@@ -211,10 +229,12 @@ public sealed class HitTestMap
 
             var box = new RenderRect(elementMetrics.BorderBoxX, elementMetrics.BorderBoxY + offsetY, elementMetrics.BorderBoxWidth, elementMetrics.BorderBoxHeight);
             var clip = new RenderRect(-Unbounded, -Unbounded, 2 * Unbounded, 2 * Unbounded);
+            var fragments = elementMetrics.Fragments?.Select(fragment => new RenderRect(box.X + fragment.X, box.Y + fragment.Y, fragment.Width, fragment.Height)).ToArray();
 
             if (GetTransform(styleMaps, element, elementMetrics, offsetY) is { } ownTransform)
             {
                 box = ownTransform.MapBounds(box);
+                fragments = null;
             }
 
             var path = new List<(int Step, int ZIndex, double Order)> { (1, 0, GetOrder(element)) };
@@ -226,44 +246,41 @@ public sealed class HitTestMap
 
             for (var ancestor = element.ParentElement; ancestor is not null; ancestor = ancestor.ParentElement)
             {
-                if (!metrics.TryGetValue(ancestor, out var ancestorMetrics))
+                if (GetAncestorInfo(ancestor) is not { } info)
                 {
                     continue;
                 }
 
-                isViewportAnchored |= IsFixed(styleMaps, ancestor);
+                var ancestorMetrics = info.Metrics;
+                isViewportAnchored |= info.IsFixed;
 
-                if (escapes != ClipEscape.None && styleMaps.TryGetValue(ancestor, out var escapeStyle) &&
-                    (escapes == ClipEscape.ToViewport ? HtmlRenderer.HasTransformLikeEffect(escapeStyle) : HtmlRenderer.ActsAsContainingBlock(escapeStyle, 0f)))
+                if (escapes != ClipEscape.None && (escapes == ClipEscape.ToViewport ? info.HasTransformLikeEffect : info.ActsAsContainingBlock))
                 {
                     escapes = ClipEscape.None;
                 }
 
                 if (escapes == ClipEscape.None && ancestorMetrics.Layer.ClipsOverflow)
                 {
-                    isInScrollContainer |= styleMaps.TryGetValue(ancestor, out var ancestorStyle) && IsScrolling(ancestorStyle);
-                    clip = Intersect(clip, new RenderRect(
-                        ancestorMetrics.BorderBoxX + ancestorMetrics.BorderLeft,
-                        ancestorMetrics.BorderBoxY + ancestorMetrics.BorderTop + offsetY,
-                        ancestorMetrics.BorderBoxWidth - ancestorMetrics.BorderLeft - ancestorMetrics.BorderRight,
-                        ancestorMetrics.BorderBoxHeight - ancestorMetrics.BorderTop - ancestorMetrics.BorderBottom));
+                    isInScrollContainer |= info.IsScrolling;
+                    clip = Intersect(clip, info.Clip);
                 }
 
                 if (ancestorMetrics.Layer.IsLayerRoot)
                 {
-                    path.Add(GetRank(ancestor, ancestorMetrics.Layer));
+                    path.Add(info.Rank);
                 }
 
                 // what is in a transformed box is hit where it is painted
-                if (GetTransform(styleMaps, ancestor, ancestorMetrics, offsetY) is { } ancestorTransform)
+                if (info.Transform is { } ancestorTransform)
                 {
                     box = ancestorTransform.MapBounds(box);
+                    fragments = null;
                     clip = clip.Width >= Unbounded ? clip : ancestorTransform.MapBounds(clip);
                 }
 
                 if (escapes == ClipEscape.None)
                 {
-                    escapes = GetEscape(styleMaps, ancestor);
+                    escapes = info.Escape;
                 }
             }
 
@@ -282,7 +299,7 @@ public sealed class HitTestMap
                 box.Y + elementMetrics.BorderTop + elementMetrics.PaddingTop,
                 Math.Max(0f, box.Width - elementMetrics.BorderLeft - elementMetrics.BorderRight - elementMetrics.PaddingLeft - elementMetrics.PaddingRight),
                 Math.Max(0f, box.Height - elementMetrics.BorderTop - elementMetrics.BorderBottom - elementMetrics.PaddingTop - elementMetrics.PaddingBottom));
-            candidates.Add((new Entry(element, box, clip, cursor, isInScrollContainer, isViewportAnchored, subframe, frameViewport), path.ToArray()));
+            candidates.Add((new Entry(element, box, clip, cursor, isInScrollContainer, isViewportAnchored, subframe, frameViewport, fragments), path.ToArray()));
         }
 
         // top-most first; ties (which only unordered elements can have) keep the first one on top
@@ -293,6 +310,38 @@ public sealed class HitTestMap
             return result != 0 ? result : a.Index.CompareTo(b.Index);
         });
         return new HitTestMap(indexed.Select(m => m.Entry).ToArray());
+
+        AncestorInfo? GetAncestorInfo(IElement ancestor)
+        {
+            if (ancestors.TryGetValue(ancestor, out var info))
+            {
+                return info;
+            }
+
+            if (!metrics.TryGetValue(ancestor, out var ancestorMetrics))
+            {
+                ancestors[ancestor] = null;
+                return null;
+            }
+
+            styleMaps.TryGetValue(ancestor, out var style);
+            info = new AncestorInfo(
+                ancestorMetrics,
+                IsFixed(styleMaps, ancestor),
+                GetEscape(styleMaps, ancestor),
+                style is not null && HtmlRenderer.HasTransformLikeEffect(style),
+                style is not null && HtmlRenderer.ActsAsContainingBlock(style, 0f),
+                style is not null && IsScrolling(style),
+                new RenderRect(
+                    ancestorMetrics.BorderBoxX + ancestorMetrics.BorderLeft,
+                    ancestorMetrics.BorderBoxY + ancestorMetrics.BorderTop + offsetY,
+                    ancestorMetrics.BorderBoxWidth - ancestorMetrics.BorderLeft - ancestorMetrics.BorderRight,
+                    ancestorMetrics.BorderBoxHeight - ancestorMetrics.BorderTop - ancestorMetrics.BorderBottom),
+                ancestorMetrics.Layer.IsLayerRoot ? GetRank(ancestor, ancestorMetrics.Layer) : default,
+                GetTransform(styleMaps, ancestor, ancestorMetrics, offsetY));
+            ancestors[ancestor] = info;
+            return info;
+        }
 
         double GetOrder(IElement element)
         {
@@ -387,6 +436,19 @@ public sealed class HitTestMap
 
     private static bool Contains(RenderRect rect, double x, double y) =>
         x >= rect.X && x <= rect.X + rect.Width && y >= rect.Y && y <= rect.Y + rect.Height;
+
+    private static bool ContainsAny(RenderRect[] rects, double x, double y)
+    {
+        foreach (var rect in rects)
+        {
+            if (Contains(rect, x, y))
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
 
     private static RenderRect Intersect(RenderRect a, RenderRect b)
     {

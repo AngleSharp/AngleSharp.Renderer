@@ -1,3 +1,34 @@
+# 0.11.1
+
+Released on Sunday, November 8 2026.
+
+- Updated to use a minimum of AngleSharp.Css 1.4.1
+- Improved the performance of layouts, e.g., text fields with a placeholder computed the styles of all their ancestors whenever they were painted
+- Improved the performance of nested flex and grid containers, whose items were laid out (with everything in them) also when only the height of a box around them was measured
+- Improved the garbage collection during layouts: the selectors of the style sheets are only looked at once, equal values of style maps are shared, and transitions and animations are only looked up while any run
+- Improved the performance of large documents by reading the computed styles of their elements on all cores (turned off by the AppContext switch `AngleSharp.Renderer.DisableParallelism`)
+- Improved hovering and focusing: only what a selector of the state refers to is styled again, a change of its colors, backgrounds, borders, outlines, shadows or text decoration is painted again without a layout, and the frame keeps its hit-test map unless the cursor changed
+- Improved updating a frame after a change of the page: flex and grid items, the content of floats and sticky boxes, and blocks after floats that ended above them are laid out on their own as long as they look the same to what is around them, with the rules of the last layout instead of gathering them again; typing into a text field only lays out more if a selector depends on what it changes
+- Improved rendering an image of a page (e.g. `RenderToPng`): only the elements laid out in the viewport are styled, unless CSS counters or quotes are used, and the rules of the style sheets are gathered and indexed once per layout instead of twice
+- Fixed updating a frame after a change in a box whose size depends on its content (e.g. a tab in a shrink-to-fit bar), which kept the size from before the change instead of what a layout of the page gives
+- Fixed the line of text reaching into the bottom of the viewport not being painted in an image of a page (e.g. `RenderToPng`)
+- Fixed an inline box going over several lines (e.g. a wrapped link) being hit in the whole rectangle around its lines, covering the links next to it, and `getClientRects` giving that rectangle instead of one per line
+- Fixed the `::placeholder` of text fields in a shadow tree ignoring the rules of the shadow root
+- Fixed a CSS animation that an element gets after its document's first frame (e.g. by a class a script adds) being over already instead of starting then, and one named again after it was removed not starting again
+- Fixed the text nodes next to each other in a flex container being one flex item each, losing the spaces between them (e.g. `Sign in with {provider}` from a template)
+- Fixed the `min-width` and `max-width` of a flex item in a column being ignored with a `width` (e.g. `width: 100%; max-width: 28rem`), which made the column too short for its content
+- Fixed a button of an automatic height and a `min-height` not centering its label in it
+- Fixed an absolutely positioned box placed by its `bottom` in a block of an automatic height and a `min-height` being placed against the `min-height` instead of the block's height, and one of an automatic height and a `min-height` being placed with its `min-height` as height
+- Fixed selecting the text of a flex item made of several text nodes, which only reached the first one
+- Fixed SVGs being blurred or jagged when scaled (e.g. an 800px icon in a 16px box), in an `<img>`, inline, as a background, mask or `border-image`: they are painted at the resolution they end up at, as in browsers
+- Fixed the slices of an SVG `border-image` counting in the pixels of its oversampled raster instead of its natural size
+- Improved the performance and memory use of SVGs: their PNG (`RenderedImage.Data`) is only rendered when it is read, and repainting reuses what was rendered for the same size
+- Added `NotifyStateChanged` to the DOM harness, for telling the renderer about a change of an element's state it does not see (e.g., the focus)
+- Added `PrepareViewportFrame` to the DOM harness, for a frame of a page that was just loaded early on: only what is in the viewport is styled and laid out, and the frame tells by `RenderedFrame.IsPartial` (it is animating) that the next frame lays out the whole page
+- Added `RenderedFrame.Metrics` telling what the layout of a frame took (`RenderMetrics`: the time of each phase and how much work they did)
+- Added the events of CSS animations (`animationstart`, `animationiteration`, `animationend` and `animationcancel`, as `AnimationEvent`), dispatched once the frame that found them is painted
+- Added CSS transitions started by any change of an element's style between two frames (e.g. a class a script adds), not only by hovering, and their events (`transitionrun`, `transitionstart`, `transitionend` and `transitioncancel`, as `TransitionEvent`); a property that is not interpolated still has the events, and shorthands like `padding` transition their longhands
+
 # 0.11.0
 
 Released on Friday, November 6 2026.

@@ -128,8 +128,24 @@ public sealed partial class HtmlRenderer
     /// </summary>
     private static void BuildAnonymousTableBoxes(IRenderNode node)
     {
-        if (node is ElementRenderNode element && element.Children is List<IRenderNode> children &&
-            element.Ref is not IPseudoElement && GeneratesBoxes(element) && !IsReplacedElement(element.Ref))
+        if (node is ElementRenderNode element && element.Children is List<IRenderNode> children)
+        {
+            BuildAnonymousTableBoxes(element, children);
+        }
+
+        foreach (var child in node.Children)
+        {
+            BuildAnonymousTableBoxes(child);
+        }
+    }
+
+    /// <summary>
+    /// Wraps the given children of the element (the ones it has) into the anonymous boxes they
+    /// need (see above), not looking at their own children.
+    /// </summary>
+    private static void BuildAnonymousTableBoxes(ElementRenderNode element, List<IRenderNode> children)
+    {
+        if (element.Ref is not IPseudoElement && GeneratesBoxes(element) && !IsReplacedElement(element.Ref))
         {
             var role = GetTableRole(element);
 
@@ -152,12 +168,8 @@ public sealed partial class HtmlRenderer
                     break;
             }
         }
-
-        foreach (var child in node.Children)
-        {
-            BuildAnonymousTableBoxes(child);
-        }
     }
+
 
     /// <summary>
     /// Wraps every run of children matching <paramref name="isMisplaced"/> into an anonymous box.

@@ -235,6 +235,61 @@ public sealed class InteractiveFrameTests
         Assert.Equal("scaled", frame.HitTestMap.HitTest(100, 150)?.Element.Id);
     }
 
+    [Fact]
+    public async Task Frame_TellsWhatItsLayoutTook()
+    {
+        var (_, harness) = await OpenAsync("""<div style="display: flex"><p style="flex: 1">A text</p><input placeholder="Search"></div><div style="width: 10px; height: 10px"></div>""");
+
+        var metrics = harness.PrepareFrame().Metrics;
+
+        Assert.False(metrics.IsIncremental);
+        Assert.True(metrics.Style > TimeSpan.Zero);
+        Assert.True(metrics.Layout > TimeSpan.Zero);
+        Assert.Equal(metrics.Setup + metrics.Style + metrics.Layout + metrics.HitTesting + metrics.Subframes, metrics.Total);
+        // html, head, style, body, the flex container with its two items, and the box
+        Assert.Equal(8, metrics.Elements);
+        Assert.True(metrics.Boxes >= 6);
+        Assert.True(metrics.TrialLayouts > 0);
+        Assert.True(metrics.StyleMaps >= metrics.Boxes);
+        Assert.True(metrics.TextMeasurements > 0);
+        Assert.True(metrics.Commands > 0);
+        Assert.True(metrics.HitTestEntries > 0);
+        Assert.True(metrics.AllocatedBytes > 0);
+    }
+
+    [Fact]
+    public async Task Frame_MovedToAnotherScrollPositionNeededNoLayout()
+    {
+        var (_, harness) = await OpenAsync("""<div style="height: 1000px"></div>""");
+
+        var frame = harness.PrepareFrame(100).Reposition(50);
+
+        Assert.Same(Rendering.RenderMetrics.None, frame.Metrics);
+        Assert.Equal(TimeSpan.Zero, frame.Metrics.Total);
+    }
+
+    [Fact]
+    public async Task Frame_HitsAnInlineBoxOnSeveralLinesOnlyOnItsLines()
+    {
+        var (document, harness) = await OpenAsync("""<div id="box" style="width: 200px">Some words ahead of <a id="wrapped" href="#">a link over lines</a> <a id="next" href="#">next</a></div>""");
+
+        var frame = harness.PrepareFrame();
+        var wrapped = document.GetElementById("wrapped")!;
+        var next = document.GetElementById("next")!.GetBoundingClientRect();
+        var rects = wrapped.GetClientRects();
+
+        Assert.Equal(2, rects.Length);
+        var (first, second) = (rects.Item(0)!, rects.Item(1)!);
+        Assert.True(second.Top >= first.Bottom - 1);
+        Assert.True(next.Left > second.Right);
+        // left of where the link starts on its first line and right of where it ends on the second
+        Assert.Equal("box", frame.HitTestMap.HitTest(first.Left / 2, (first.Top + first.Bottom) / 2)?.Element.Id);
+        Assert.Equal("next", frame.HitTestMap.HitTest((next.Left + next.Right) / 2, (next.Top + next.Bottom) / 2)?.Element.Id);
+        Assert.Equal("wrapped", frame.HitTestMap.HitTest((first.Left + first.Right) / 2, (first.Top + first.Bottom) / 2)?.Element.Id);
+        Assert.Equal("wrapped", frame.HitTestMap.HitTest((second.Left + second.Right) / 2, (second.Top + second.Bottom) / 2)?.Element.Id);
+        Assert.Equal("box", document.ElementFromPoint(first.Left / 2, (first.Top + first.Bottom) / 2)?.Id);
+    }
+
     private static async Task<(IDocument Document, IDomHarness Harness)> OpenAsync(string body)
     {
         var configuration = Configuration.Default.WithCss().WithRenderDevice(Device);

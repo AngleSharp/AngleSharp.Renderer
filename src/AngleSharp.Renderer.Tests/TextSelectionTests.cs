@@ -35,6 +35,27 @@ public sealed class TextSelectionTests
     }
 
     [Fact]
+    public async Task Drag_OverTextNodesOfOneFlexItem_SelectsInEachNode()
+    {
+        // a template's text nodes ("Sign in with ", "Microsoft") are one anonymous flex item
+        var (document, harness) = await OpenAsync($"""<div id="box" style="{Style} display: flex">Hello </div>""");
+        var box = document.GetElementById("box")!;
+        box.AppendChild(document.CreateTextNode("World"));
+        harness.PrepareFrame();
+
+        Assert.True(harness.BeginTextSelection(CharWidth * 2, 15));
+        harness.ExtendTextSelection(CharWidth * 8, 15);
+        harness.EndTextSelection();
+
+        var selection = document.GetSelection();
+        Assert.Equal("llo Wo", selection.ToString());
+        Assert.Same(box.FirstChild, selection.AnchorNode);
+        Assert.Equal(2, selection.AnchorOffset);
+        Assert.Same(box.LastChild, selection.FocusNode);
+        Assert.Equal(2, selection.FocusOffset);
+    }
+
+    [Fact]
     public async Task Drag_Backwards_KeepsTheAnchorAtThePress()
     {
         var (document, harness) = await OpenAsync($"""<div style="{Style}">Hello World</div>""");

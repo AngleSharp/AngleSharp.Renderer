@@ -1,5 +1,6 @@
 namespace AngleSharp.Renderer;
 
+using System.Linq;
 using AngleSharp.Dom;
 
 /// <summary>
@@ -35,9 +36,13 @@ internal static class HitTesting
         return best;
     }
 
+    // an inline box on several lines is hit on them, not in the box around them
     private static bool Contains(HtmlRenderer.ElementLayoutMetrics metrics, double x, double y) =>
         x >= metrics.BorderBoxX && x <= metrics.BorderBoxX + metrics.BorderBoxWidth &&
-        y >= metrics.BorderBoxY && y <= metrics.BorderBoxY + metrics.BorderBoxHeight;
+        y >= metrics.BorderBoxY && y <= metrics.BorderBoxY + metrics.BorderBoxHeight &&
+        (metrics.Fragments is not { } fragments || fragments.Any(fragment =>
+            x >= metrics.BorderBoxX + fragment.X && x <= metrics.BorderBoxX + fragment.X + fragment.Width &&
+            y >= metrics.BorderBoxY + fragment.Y && y <= metrics.BorderBoxY + fragment.Y + fragment.Height));
 
     private static bool IsClippedAway(IElement element, IReadOnlyDictionary<IElement, HtmlRenderer.ElementLayoutMetrics> metrics, double x, double y)
     {

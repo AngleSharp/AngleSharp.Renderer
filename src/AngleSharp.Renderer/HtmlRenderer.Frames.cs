@@ -116,16 +116,19 @@ public sealed partial class HtmlRenderer
     /// Lays out the document for a frame (see above), which also gives the layout to answer
     /// geometry reads from until the document changes.
     /// </summary>
-    internal RenderedFrame PrepareFrame(IDocument document, IRenderDevice renderDevice, double scrollTop, int overscan, out LayoutSnapshot snapshot)
+    internal RenderedFrame PrepareFrame(IDocument document, IRenderDevice renderDevice, double scrollTop, int overscan, out LayoutSnapshot snapshot, bool viewportOnly = false)
     {
         ArgumentNullException.ThrowIfNull(document);
         ArgumentNullException.ThrowIfNull(renderDevice);
 
         overscan = Math.Max(0, overscan);
         var scrollOffsetY = (float)scrollTop - overscan;
-        // the whole page is laid out: hit testing below the viewport and the scroll extent need it
-        snapshot = LayoutSnapshot.LayOut(document, renderDevice, _textMeasurer, scrollOffsetY, 2 * overscan, isFrame: true, out var displayList);
-        return CreateFrame(document, snapshot, displayList, scrollTop, overscan);
+        // the whole page is laid out: hit testing below the viewport and the scroll extent need
+        // it, unless the frame is to show the viewport only
+        snapshot = LayoutSnapshot.LayOut(document, renderDevice, _textMeasurer, scrollOffsetY, 2 * overscan, isFrame: true, out var displayList, viewportOnly);
+        var frame = CreateFrame(document, snapshot, displayList, scrollTop, overscan);
+        frame.IsPartial = snapshot.IsPartial;
+        return frame;
     }
 
     /// <summary>
@@ -141,21 +144,33 @@ public sealed partial class HtmlRenderer
 
         var displayList = new DisplayList { Fonts = frame.DisplayList.Fonts };
         displayList.InsertRange(0, frame.DisplayList.Commands);
+        var isRepaintOnly = snapshot.IsRepaintOnly;
+        var start = RenderMetricsRecorder.Now;
 
         if (!snapshot.TryPatch(displayList))
         {
             return null;
         }
 
+        // the boxes are where they were: the frame's map and extent stay
+        if (isRepaintOnly)
+        {
+            var metrics = snapshot.TakeMetrics();
+            metrics.Layout += RenderMetricsRecorder.Since(start);
+            return new RenderedFrame(displayList, frame, metrics.Complete(isIncremental: true, frame.Metrics.Boxes, displayList.Commands.Count, frame.HitTestMap.Count));
+        }
+
         snapshot.ResolveSubframes();
 
-        var updated = CreateFrame(document, snapshot, displayList, frame.ScrollTop, frame.OverscanTop);
+        var updated = CreateFrame(document, snapshot, displayList, frame.ScrollTop, frame.OverscanTop, isIncremental: true);
         updated.IsAnimating = frame.IsAnimating;
         return updated;
     }
 
-    private RenderedFrame CreateFrame(IDocument document, LayoutSnapshot snapshot, DisplayList displayList, double scrollTop, int overscan)
+    private RenderedFrame CreateFrame(IDocument document, LayoutSnapshot snapshot, DisplayList displayList, double scrollTop, int overscan, bool isIncremental = false)
     {
+        var recorder = snapshot.TakeMetrics();
+        var hitTestingStart = RenderMetricsRecorder.Now;
         var scrollOffsetY = (float)scrollTop - overscan;
         var (width, height) = snapshot.Viewport;
         var styleMaps = snapshot.StyleMaps;
@@ -188,7 +203,11 @@ public sealed partial class HtmlRenderer
 
         var hitTestMap = HitTestMap.Create(document, metrics, styleMaps, -overscan, snapshot.Subframes);
         var contentHeight = Math.Max(height, (double)contentBottom);
+        recorder.HitTesting += RenderMetricsRecorder.Since(hitTestingStart);
         // fixed boxes are marked in the display list, sticky ones would have to stick anew
-        return new RenderedFrame(displayList, _backend, surface, height, scrollTop, overscan, contentHeight, isScrollShiftable, !hasStickyBoxes, hitTestMap, document: document);
+        return new RenderedFrame(displayList, _backend, surface, height, scrollTop, overscan, contentHeight, isScrollShiftable, !hasStickyBoxes, hitTestMap, document: document)
+        {
+            Metrics = recorder.Complete(isIncremental, metrics.Count, displayList.Commands.Count, hitTestMap.Count),
+        };
     }
 }

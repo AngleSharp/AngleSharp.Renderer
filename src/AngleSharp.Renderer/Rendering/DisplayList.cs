@@ -484,6 +484,24 @@ internal sealed record PushTextFragmentCommand(HtmlRenderer.TextFragment Fragmen
 internal sealed record PopTextFragmentCommand : RenderCommand;
 
 /// <summary>
+/// Marks where the decorations of an element's box (background, shadows, border, outline) start,
+/// up to the next <see cref="PaintAnchorEndCommand"/>, with what is needed to paint them again in
+/// another style without a layout. Only in the display list of an interactive frame; paints nothing.
+/// </summary>
+/// <param name="Element">The element of the box.</param>
+/// <param name="BorderBox">The border box.</param>
+/// <param name="Border">The border widths: left, top, right and bottom as X, Y, Width and Height.</param>
+/// <param name="Padding">The paddings, like <paramref name="Border"/>.</param>
+/// <param name="FillsTransparentBackground">If a transparent background still fills the box.</param>
+/// <param name="Key">What identifies the box from layout to layout: the element, or its host and name for a pseudo-element (which is created anew).</param>
+internal sealed record PaintAnchorCommand(AngleSharp.Dom.IElement Element, object Key, RenderRect BorderBox, RenderRect Border, RenderRect Padding, bool FillsTransparentBackground) : RenderCommand;
+
+/// <summary>
+/// Ends the decorations of a box (see <see cref="PaintAnchorCommand"/>).
+/// </summary>
+internal sealed record PaintAnchorEndCommand : RenderCommand;
+
+/// <summary>
 /// Ends the box started by the matching <see cref="PushViewportAnchorCommand"/>.
 /// </summary>
 public sealed record PopViewportAnchorCommand : RenderCommand;

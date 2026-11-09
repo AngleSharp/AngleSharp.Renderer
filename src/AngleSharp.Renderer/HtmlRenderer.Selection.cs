@@ -313,6 +313,59 @@ public sealed partial class HtmlRenderer
         return CreateTextFragment(context, text, [.. segments], x, top, height, style);
     }
 
+    /// <summary>
+    /// The segments of text painted from a run of text nodes (see <see cref="GetTextRunData"/>),
+    /// from the given position in the text of the run on: each character belongs to the node its
+    /// source offset is in.
+    /// </summary>
+    private static TextSegment[] SplitTextRun(IText first, string runData, int rawStart, string text)
+    {
+        var offsets = new int[text.Length];
+        TextSourceMap.Align(runData, rawStart, text, offsets);
+        var nodes = new List<(IText Node, int Start)>();
+        var start = 0;
+
+        for (INode? sibling = first; sibling is not null; sibling = sibling.NextSibling)
+        {
+            if (sibling is IText node)
+            {
+                nodes.Add((node, start));
+                start += node.Data.Length;
+            }
+            else if (sibling is not IComment)
+            {
+                break;
+            }
+        }
+
+        var segments = new List<TextSegment>();
+
+        for (var index = 0; index < text.Length; index++)
+        {
+            // what is not from the source (e.g. an ellipsis) belongs to where it would be
+            var offset = offsets[index] >= 0 ? offsets[index] : ~offsets[index];
+            var nodeIndex = nodes.Count - 1;
+
+            while (nodeIndex > 0 && nodes[nodeIndex].Start > offset)
+            {
+                nodeIndex--;
+            }
+
+            var (node, nodeStart) = nodes[nodeIndex];
+
+            if (segments.Count > 0 && ReferenceEquals(segments[^1].Node, node))
+            {
+                segments[^1] = segments[^1] with { Length = segments[^1].Length + 1 };
+            }
+            else
+            {
+                segments.Add(new TextSegment(node, Math.Min(offset - nodeStart, node.Data.Length), index, 1));
+            }
+        }
+
+        return [.. segments];
+    }
+
     /// <summary>A space paints nothing, but can be selected.</summary>
     private static void RecordSpaceFragment(LayoutContext context, DisplayList displayList, InlinePiece piece, float lineTop, float lineHeight)
     {

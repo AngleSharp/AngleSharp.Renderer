@@ -30,6 +30,9 @@ internal sealed partial class InteractiveHtmlRendererState : IDomHarness
     private HtmlRenderer.LayoutSnapshot? _lastFrameLayout;
     // the changes the observer delivered on its own, which the metrics have not seen yet
     private readonly List<IMutationRecord> _pendingMutations = [];
+    // the elements whose styles changed with their state (e.g. hovered) since the metrics were taken
+    // (with if the styles of their descendants may have changed, too)
+    private readonly Dictionary<IElement, bool> _pendingRestyles = new(ReferenceEqualityComparer.Instance);
     private const int MaxPendingMutations = 256;
     private (int Width, int Height) _metricsViewport;
 
@@ -167,8 +170,7 @@ internal sealed partial class InteractiveHtmlRendererState : IDomHarness
         }
 
         _hoveredElement = element;
-        UpdateForcedHoverChain(element);
-        OnPaintInvalidated();
+        InvalidateStates(UpdateForcedHoverChain(element), "hover");
     }
 
     private bool UpdateHoveredElementFromMousePosition()
@@ -188,8 +190,7 @@ internal sealed partial class InteractiveHtmlRendererState : IDomHarness
         }
 
         _hoveredElement = nextHovered;
-        UpdateForcedHoverChain(nextHovered);
-        OnPaintInvalidated();
+        InvalidateStates(UpdateForcedHoverChain(nextHovered), "hover");
         return true;
     }
 
@@ -201,7 +202,7 @@ internal sealed partial class InteractiveHtmlRendererState : IDomHarness
     // itself and force each element individually, then clear the previous chain when the hovered
     // element changes - there is no document-wide "clear every forced :hover" API to lean on
     // instead, so this class tracks exactly which elements it forced.
-    private void UpdateForcedHoverChain(IElement? nextHovered)
+    private List<IElement> UpdateForcedHoverChain(IElement? nextHovered)
     {
         var previousChain = _forcedHoverChain.ToList();
         var newChain = new List<IElement>();
@@ -213,14 +214,26 @@ internal sealed partial class InteractiveHtmlRendererState : IDomHarness
             probe = probe.ParentElement;
         }
 
-        var affectedElements = previousChain.Union(newChain).ToList();
+        // the elements both chains have stay hovered (e.g. the body)
+        var affectedElements = previousChain.Except(newChain, ReferenceEqualityComparer.Instance).Concat(newChain.Except(previousChain, ReferenceEqualityComparer.Instance))
+            .Cast<IElement>().Where(element => GetStateEffect(element, "hover") != HtmlRenderer.StateEffect.None).ToList();
 
-        // Snapshot each affected element's *current* (pre-change) natural value before the
-        // pseudo-class mutation below - once :hover is forced/removed, there is no way to ask
-        // AngleSharp.Css what the value used to be, so a freshly-starting transition (nothing
-        // already in flight for that element/property) would otherwise have no "from" value to
-        // animate away from and would jump straight to the new state instead.
-        _transitionTracker.CaptureNaturalValuesBeforeChange(affectedElements);
+        // The natural values before the change are those of the last layout, if there is one: they
+        // are known after the change still, and only an element with a transition needs them.
+        var snapshot = _metrics;
+
+        // there is no way to ask AngleSharp.Css what the value used to be once :hover is forced
+        // (some values, like a transform, are read from the cascade of the element as it is), so
+        // the elements with a transition before are captured now; what the layout did not render
+        // (e.g. a hidden menu) shows no transition
+        if (snapshot is null)
+        {
+            _transitionTracker.CaptureNaturalValuesBeforeChange(affectedElements);
+        }
+        else if (affectedElements.Where(element => snapshot.GetComputedStyle(element) is { } before && HasTransition(before)).ToList() is { Count: > 0 } transitionedBefore)
+        {
+            _transitionTracker.CaptureNaturalValuesBeforeChange(transitionedBefore, element => snapshot.GetComputedStyle(element)!);
+        }
 
         foreach (var element in _forcedHoverChain)
         {
@@ -239,11 +252,160 @@ internal sealed partial class InteractiveHtmlRendererState : IDomHarness
         }
 
         // Every element that either lost or gained :hover may now have a different natural
-        // computed style than a moment ago - re-evaluate them all for CSS `transition`s that
-        // should start animating toward that new style (the union, since an element leaving
-        // :hover needs its own "fade back to resting" transition considered too, not just the
-        // newly-hovered chain's "fade in").
-        _transitionTracker.NotifyElementsMayHaveChanged(affectedElements);
+        // computed style than a moment ago (the union, since an element leaving :hover needs its
+        // own "fade back to resting" transition considered too).
+        if (snapshot is null)
+        {
+            _transitionTracker.NotifyElementsMayHaveChanged(affectedElements);
+            return affectedElements;
+        }
+
+        // Every element that either lost or gained :hover may now have a different natural
+        // computed style - those with a transition (before or after) start animating toward it.
+        // What the layout did not render (e.g. a hidden menu) shows no transition.
+        var computeNow = ComputeStylesNow(affectedElements, snapshot);
+        var transitioning = affectedElements
+            .Where(element => snapshot.GetComputedStyle(element) is { } before && (HasTransition(before) || HasTransition(computeNow(element))))
+            .ToList();
+
+        if (transitioning.Count > 0)
+        {
+            // those with a transition only now: as of the layout, as far as it knows
+            _transitionTracker.CaptureNaturalValuesBeforeChange(transitioning.Where(element => !HasTransition(snapshot.GetComputedStyle(element)!)), element => snapshot.GetComputedStyle(element)!);
+            _transitionTracker.NotifyElementsMayHaveChanged(transitioning, computeNow);
+        }
+
+        return affectedElements;
+    }
+
+    // if a transition-duration of the style is more than 0
+    private static bool HasTransition(ICssStyleDeclaration style) =>
+        HtmlRenderer.SplitTopLevelCommaList(style.GetPropertyValue("transition-duration"))
+            .Any(static duration => CssValueInterpolation.ParseTimeValue(duration) > 0d);
+
+    /// <summary>
+    /// Gets the computed styles of the elements as they are now, each from the style of its
+    /// parent: as computed here for a parent among them (they are ancestors of each other along
+    /// the hover chain), else as of the last layout.
+    /// </summary>
+    private static Func<IElement, ICssStyleDeclaration> ComputeStylesNow(List<IElement> elements, HtmlRenderer.LayoutSnapshot? snapshot)
+    {
+        var computed = new Dictionary<IElement, ICssStyleDeclaration>(ReferenceEqualityComparer.Instance);
+        return Compute;
+
+        ICssStyleDeclaration Compute(IElement element)
+        {
+            if (computed.TryGetValue(element, out var style))
+            {
+                return style;
+            }
+
+            var parent = element.ParentElement;
+            var parentStyle = parent is null ? null : elements.Contains(parent) ? Compute(parent) : snapshot?.GetComputedStyle(parent);
+            style = (parentStyle is not null ? snapshot?.ComputeStyle(element, parentStyle) : null) ?? element.ComputeCurrentStyle();
+            computed[element] = style;
+            return style;
+        }
+    }
+
+    /// <summary>
+    /// Gets what a change of the given state of the element does to the styles (see
+    /// <see cref="HtmlRenderer.LayoutSnapshot.GetStateEffect"/>), as far as the layout of the
+    /// last frame knows; without one, any element may be styled differently.
+    /// </summary>
+    private HtmlRenderer.StateEffect GetStateEffect(IElement element, string pseudoClass) =>
+        _metrics is { } metrics ? metrics.GetStateEffect(element, pseudoClass) : HtmlRenderer.StateEffect.Unconfined;
+
+    /// <summary>
+    /// Takes the elements whose given state changed into the next frame: styled and laid out
+    /// again with their subtrees if a selector refers to it for them, anything else needs a
+    /// full layout. Nothing changes if no selector refers to it.
+    /// </summary>
+    private void InvalidateStates(IEnumerable<IElement> elements, string pseudoClass)
+    {
+        var restyled = new List<(IElement, bool)>();
+
+        foreach (var element in elements)
+        {
+            switch (GetStateEffect(element, pseudoClass))
+            {
+                case HtmlRenderer.StateEffect.Unconfined:
+                    OnPaintInvalidated();
+                    return;
+                case HtmlRenderer.StateEffect.Confined:
+                    restyled.Add((element, true));
+                    break;
+                case HtmlRenderer.StateEffect.Self:
+                    restyled.Add((element, false));
+                    break;
+            }
+        }
+
+        if (restyled.Count > 0)
+        {
+            Restyle(restyled);
+            OnPaintInvalidated(keepsMetrics: true);
+        }
+    }
+
+    private void Restyle(IEnumerable<(IElement Element, bool ReachesDescendants)> elements)
+    {
+        foreach (var (element, reachesDescendants) in elements)
+        {
+            _pendingRestyles[element] = reachesDescendants || _pendingRestyles.GetValueOrDefault(element);
+        }
+    }
+
+    // the states an element itself may be in, besides hover (see NotifyStateChanged)
+    private static readonly string[] s_ownStates =
+    [
+        "focus", "focus-visible", "active", "checked", "indeterminate", "placeholder-shown",
+        "valid", "invalid", "user-valid", "user-invalid", "autofill", "default",
+    ];
+
+    /// <summary>
+    /// Takes a change of the element's state (e.g. it got the focus or another value) into the
+    /// next frame: the element is laid out again, and the elements whose styles may change with
+    /// it (e.g. by <c>:focus-within</c> of an ancestor) are styled again.
+    /// </summary>
+    internal void OnStateChanged(IElement element)
+    {
+        if (_metrics is null)
+        {
+            OnPaintInvalidated();
+            return;
+        }
+
+        foreach (var state in s_ownStates)
+        {
+            if (GetStateEffect(element, state) == HtmlRenderer.StateEffect.Unconfined)
+            {
+                OnPaintInvalidated();
+                return;
+            }
+        }
+
+        // the element itself may show something else (e.g. its value), its subtree is looked at
+        var restyled = new List<(IElement, bool)> { (element, true) };
+
+        for (var ancestor = element.ParentElement; ancestor is not null; ancestor = ancestor.ParentElement)
+        {
+            switch (GetStateEffect(ancestor, "focus-within"))
+            {
+                case HtmlRenderer.StateEffect.Unconfined:
+                    OnPaintInvalidated();
+                    return;
+                case HtmlRenderer.StateEffect.Confined:
+                    restyled.Add((ancestor, true));
+                    break;
+                case HtmlRenderer.StateEffect.Self:
+                    restyled.Add((ancestor, false));
+                    break;
+            }
+        }
+
+        Restyle(restyled);
+        OnPaintInvalidated(keepsMetrics: true);
     }
 
 
@@ -341,13 +503,29 @@ internal sealed partial class InteractiveHtmlRendererState : IDomHarness
 
         _metrics = null;
 
-        using (_animationTracker.BeginFrame())
+        try
         {
-            return _renderer.RenderToPng(targetDocument, RenderDevice);
+            using (_animationTracker.BeginFrame(targetDocument))
+            {
+                _transitionTracker.BeginFrame();
+                var image = _renderer.RenderToPng(targetDocument, RenderDevice);
+                _transitionTracker.EndFrame();
+                return image;
+            }
+        }
+        finally
+        {
+            DispatchAnimationEvents();
         }
     }
 
-    public RenderedFrame PrepareFrame(int overscan = 0)
+    public RenderedFrame PrepareFrame(int overscan = 0) => PrepareFrame(overscan, viewportOnly: false);
+
+    /// <summary>
+    /// Prepares the next frame (see <see cref="PrepareFrame(int)"/>), for <paramref name="viewportOnly"/>
+    /// laying out just what the viewport shows (see <see cref="RenderedFrame.IsPartial"/>).
+    /// </summary>
+    internal RenderedFrame PrepareFrame(int overscan, bool viewportOnly)
     {
         var targetDocument = Context.Active
             ?? throw new InvalidOperationException("No active document is available for painting.");
@@ -368,32 +546,44 @@ internal sealed partial class InteractiveHtmlRendererState : IDomHarness
 
         try
         {
-        using (_animationTracker.BeginFrame())
+        using (_animationTracker.BeginFrame(targetDocument))
         {
-            var frame = _renderer.PrepareFrame(targetDocument, RenderDevice, scrollTop, _isFrameScrollShiftable ? overscan : 0, out var snapshot);
+            _transitionTracker.BeginFrame();
+            var frame = _renderer.PrepareFrame(targetDocument, RenderDevice, scrollTop, _isFrameScrollShiftable ? overscan : 0, out var snapshot, viewportOnly);
 
             if (frame.OverscanTop > 0 && !frame.IsScrollShiftable)
             {
-                frame = _renderer.PrepareFrame(targetDocument, RenderDevice, scrollTop, 0, out snapshot);
+                frame = _renderer.PrepareFrame(targetDocument, RenderDevice, scrollTop, 0, out snapshot, viewportOnly);
             }
+
+            _transitionTracker.EndFrame();
 
             // the frame's layout answers the geometry reads until something changes it
             WatchMutations(targetDocument);
             _metricsObserver!.Flush();
             _pendingMutations.Clear();
-            _metrics = snapshot;
+            _pendingRestyles.Clear();
+            // a frame of the viewport only answers no geometry reads and is not patched (the
+            // next one lays out the whole page), and the observers wait for that one
+            _metrics = frame.IsPartial ? null : snapshot;
             _metricsViewport = (RenderDevice.ViewPortWidth, RenderDevice.ViewPortHeight);
             _lastFrame = frame;
             _lastFrameLayout = snapshot;
             _isFrameScrollShiftable = frame.IsScrollShiftable;
-            frame.IsAnimating = _animationTracker.IsAnimating || _transitionTracker.HasRunningTransitions || HasRunningScriptAnimations || snapshot.Subframes.Values.Any(static entry => entry.Frame?.IsAnimating == true);
-            FrameUpdated?.Invoke(this, EventArgs.Empty);
+            frame.IsAnimating = frame.IsPartial || _animationTracker.IsAnimating || _transitionTracker.HasRunningTransitions || HasRunningScriptAnimations || snapshot.Subframes.Values.Any(static entry => entry.Frame?.IsAnimating == true);
+
+            if (!frame.IsPartial)
+            {
+                FrameUpdated?.Invoke(this, EventArgs.Empty);
+            }
+
             return ShowSelection(frame);
         }
         }
         finally
         {
             _isPreparingFrame = false;
+            DispatchAnimationEvents();
         }
     }
 
@@ -428,7 +618,7 @@ internal sealed partial class InteractiveHtmlRendererState : IDomHarness
         KeepMutations(_metricsObserver!.Flush());
         var metrics = _metrics;
 
-        if (_pendingMutations.Count > 0 && metrics is not null && (_metricsViewport != viewport || !metrics.TryUpdate(_pendingMutations)))
+        if ((_pendingMutations.Count > 0 || _pendingRestyles.Count > 0) && metrics is not null && (_metricsViewport != viewport || !metrics.TryUpdate(_pendingMutations, _pendingRestyles)))
         {
             metrics = null;
         }
@@ -442,6 +632,7 @@ internal sealed partial class InteractiveHtmlRendererState : IDomHarness
         // the changes the layout made itself (see PrepareDocumentForRendering) are in already
         _metricsObserver.Flush();
         _pendingMutations.Clear();
+        _pendingRestyles.Clear();
         _metrics = metrics;
         return metrics;
     }
@@ -452,9 +643,12 @@ internal sealed partial class InteractiveHtmlRendererState : IDomHarness
 
         if (frame is not null)
         {
+            // an animation started by the changes needs the frames to come
+            frame.IsAnimating |= _animationTracker.HasRunningAnimations;
             FrameUpdated?.Invoke(this, EventArgs.Empty);
         }
 
+        DispatchAnimationEvents();
         return frame;
     }
 
@@ -482,14 +676,16 @@ internal sealed partial class InteractiveHtmlRendererState : IDomHarness
             return null;
         }
 
-        if (_pendingMutations.Count > 0 && !metrics.TryUpdate(_pendingMutations))
+        if ((_pendingMutations.Count > 0 || _pendingRestyles.Count > 0) && !metrics.TryUpdate(_pendingMutations, _pendingRestyles))
         {
             _metrics = null;
             _pendingMutations.Clear();
+            _pendingRestyles.Clear();
             return null;
         }
 
         _pendingMutations.Clear();
+        _pendingRestyles.Clear();
         _lastFrame = _renderer.UpdateFrame(document, _lastFrame, metrics);
         return _lastFrame is { } updated ? ShowSelection(updated) : null;
     }
@@ -525,6 +721,7 @@ internal sealed partial class InteractiveHtmlRendererState : IDomHarness
             {
                 _metrics = null;
                 _pendingMutations.Clear();
+                _pendingRestyles.Clear();
             }
         }
     }
@@ -539,6 +736,7 @@ internal sealed partial class InteractiveHtmlRendererState : IDomHarness
         if (!keepsMetrics)
         {
             _metrics = null;
+            _pendingRestyles.Clear();
         }
 
         PaintInvalidated?.Invoke(this, EventArgs.Empty);

@@ -10,18 +10,13 @@ using AngleSharp.Renderer.Skia.Svg;
 using SkiaSharp;
 
 /// <summary>
-/// Rasterizes SVG content into PNG bytes by walking the DOM AngleSharp already parsed and painting
-/// it directly with SkiaSharp (<see cref="SvgElementRenderer"/>) - no second SVG parser is
-/// involved, so an inline &lt;svg&gt; the host document already parsed is never re-parsed.
+/// Records SVG content into a <see cref="SvgVectorImage"/> by walking the DOM AngleSharp already
+/// parsed and painting it directly with SkiaSharp (<see cref="SvgElementRenderer"/>) - no second
+/// SVG parser is involved, so an inline &lt;svg&gt; the host document already parsed is never
+/// re-parsed.
 /// </summary>
 internal static class SvgRasterizer
 {
-    // Rasterizing at natural size only would look sharp at 1:1 but blur once the renderer scales
-    // the resulting PNG up to a larger CSS box (SkiaRenderBackend.DrawImage always scales at draw
-    // time, the same way it does for ordinary raster images). Oversampling trades memory for
-    // headroom against that common case.
-    private const float OversampleFactor = 3f;
-    private const int MaxRasterDimension = 4096;
     private const int SniffLength = 512;
     private const float DefaultNaturalSize = 300f;
 
@@ -49,13 +44,11 @@ internal static class SvgRasterizer
 
     /// <summary>
     /// Parses standalone SVG markup (an `&lt;img&gt;` source or `data:` URI payload) with
-    /// AngleSharp's own HTML/foreign-content parser and rasterizes the resulting element tree.
+    /// AngleSharp's own HTML/foreign-content parser and records the resulting element tree.
     /// </summary>
-    public static bool TryRasterizeMarkup(byte[] svgBytes, out byte[] pngBytes, out int naturalWidth, out int naturalHeight)
+    public static bool TryRecordMarkup(byte[] svgBytes, out SvgVectorImage? vectorImage)
     {
-        pngBytes = [];
-        naturalWidth = 0;
-        naturalHeight = 0;
+        vectorImage = null;
 
         var text = Encoding.UTF8.GetString(svgBytes).TrimStart('﻿', ' ', '\t', '\r', '\n');
         var xmlDeclarationEnd = text.IndexOf("<svg", StringComparison.OrdinalIgnoreCase);
@@ -79,7 +72,7 @@ internal static class SvgRasterizer
                 return false;
             }
 
-            return TryRasterizeElement(svgRoot, out pngBytes, out naturalWidth, out naturalHeight);
+            return TryRecordElement(svgRoot, out vectorImage);
         }
         catch
         {
@@ -88,14 +81,12 @@ internal static class SvgRasterizer
     }
 
     /// <summary>
-    /// Rasterizes an SVG element that was already parsed as part of a larger document (an inline
+    /// Records an SVG element that was already parsed as part of a larger document (an inline
     /// &lt;svg&gt; in the host HTML) - the DOM is walked directly, nothing is re-parsed.
     /// </summary>
-    public static bool TryRasterizeElement(IElement svgRoot, out byte[] pngBytes, out int naturalWidth, out int naturalHeight, SvgPageStyle? pageStyle = null)
+    public static bool TryRecordElement(IElement svgRoot, out SvgVectorImage? vectorImage, SvgPageStyle? pageStyle = null)
     {
-        pngBytes = [];
-        naturalWidth = 0;
-        naturalHeight = 0;
+        vectorImage = null;
 
         try
         {
@@ -106,46 +97,17 @@ internal static class SvgRasterizer
                 return false;
             }
 
-            naturalWidth = (int)Math.Max(1, Math.Round(width));
-            naturalHeight = (int)Math.Max(1, Math.Round(height));
-
-            var scale = OversampleFactor;
-            var maxNatural = Math.Max(width, height);
-
-            if (maxNatural * scale > MaxRasterDimension)
-            {
-                scale = Math.Max(1f, MaxRasterDimension / maxNatural);
-            }
-
-            var pixelWidth = Math.Max(1, (int)Math.Round(width * scale));
-            var pixelHeight = Math.Max(1, (int)Math.Round(height * scale));
-
-            using var bitmap = new SKBitmap(pixelWidth, pixelHeight, SKColorType.Rgba8888, SKAlphaType.Premul);
-            bitmap.Erase(SKColors.Transparent);
-
             var renderContext = SvgRenderContext.Build(svgRoot, pageStyle);
             var initialState = pageStyle is null
                 ? SvgPaintState.Initial
                 : SvgPaintState.Initial.ResolveDeclarations(pageStyle.Inherited, contentViewport);
 
-            using (var canvas = new SKCanvas(bitmap))
-            {
-                canvas.Scale(scale, scale);
-                canvas.Concat(ref viewBoxMatrix);
-                SvgElementRenderer.Render(canvas, svgRoot, initialState, renderContext, contentViewport);
-                canvas.Flush();
-            }
-
-            using var image = SKImage.FromBitmap(bitmap);
-            using var data = image.Encode(SKEncodedImageFormat.Png, 100);
-
-            if (data is null)
-            {
-                return false;
-            }
-
-            pngBytes = data.ToArray();
-            return pngBytes.Length > 0;
+            using var recorder = new SKPictureRecorder();
+            var recording = recorder.BeginRecording(new SKRect(0f, 0f, width, height));
+            recording.Concat(ref viewBoxMatrix);
+            SvgElementRenderer.Render(recording, svgRoot, initialState, renderContext, contentViewport);
+            vectorImage = new SvgVectorImage(recorder.EndRecording(), width, height);
+            return true;
         }
         catch
         {

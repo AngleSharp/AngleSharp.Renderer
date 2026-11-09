@@ -235,7 +235,10 @@ public sealed class IncrementalLayoutTests
 
         var patched = harness.UpdateFrame();
         Assert.NotNull(patched);
+        Assert.True(patched!.Metrics.IsIncremental);
+        Assert.True(patched.Metrics.Layout > TimeSpan.Zero);
         var expected = harness.PrepareFrame();
+        Assert.False(expected.Metrics.IsIncremental);
 
         Assert.Equal(expected.Rasterize().Data, patched!.Rasterize().Data);
         Assert.Equal(expected.HitTestMap.HitTest(330, 250)?.Element, patched.HitTestMap.HitTest(330, 250)?.Element);
@@ -476,6 +479,274 @@ public sealed class IncrementalLayoutTests
         {
             Assert.Equal(expected.Rasterize().Data, patched.Rasterize().Data);
         }
+    }
+
+    private const string ItemsPage = """
+        <!doctype html>
+        <html>
+          <head>
+            <style>
+              html, body { margin: 0; font: 16px sans-serif; }
+              .row { display: flex; gap: 4px; }
+              .fixed { width: 120px; height: 40px; flex: none; overflow: hidden; }
+              .auto { flex: none; }
+              .grid { display: grid; grid-template-columns: 100px 100px; grid-auto-rows: 40px; }
+              .fit { display: flex; width: fit-content; }
+              .fit div { width: 100%; }
+              .col { float: left; width: 150px; }
+              .col::after { content: ""; display: block; clear: both; }
+              .sticky { position: sticky; top: 0; }
+              p { margin: 0; }
+            </style>
+          </head>
+          <body>
+            <div class="row" id="row"><div class="fixed" id="fixed"><span id="fixed-text">Fixed</span></div><div class="auto" id="auto">Auto</div><div class="auto" id="next">Next</div></div>
+            <div class="row" id="stretched"><div class="auto" id="tall" style="width: 60px">Tall</div><div class="auto" id="beside" style="width: 60px; background: red">Beside</div></div>
+            <div class="grid" id="grid"><div id="cell"><span id="cell-text">Cell</span></div><div id="cell2">Cell</div></div>
+            <div class="row"><div class="fit" id="fit"><div id="fit-content"><ul style="margin: 0; padding: 0; display: flex"><li id="fit-item" style="display: block">Item</li></ul></div></div><div class="auto" id="after-fit">After</div></div>
+            <p id="after">After</p>
+            <div id="columns"><div class="col" id="col"><p id="col-text">Column</p></div><div class="col"><p>Column</p></div></div>
+            <p id="below" style="clear: both">Below</p>
+            <div class="sticky" id="sticky"><p id="sticky-text">Sticky</p></div>
+            <div style="height: 2000px"></div>
+          </body>
+        </html>
+        """;
+
+    private static readonly string[] s_itemsPageIds =
+    [
+        "row", "fixed", "fixed-text", "auto", "next", "stretched", "tall", "beside", "grid", "cell", "cell2", "cell-text", "fit", "fit-content", "fit-item", "after-fit",
+        "after", "columns", "col", "col-text", "below", "sticky", "sticky-text",
+    ];
+
+    [Theory]
+    [InlineData("fixed-text", "Changed")]
+    [InlineData("cell-text", "Changed")]
+    [InlineData("col-text", "Changed")]
+    [InlineData("sticky-text", "Changed")]
+    public async Task ChangingTheContentOfAnItemLaysOutJustThatItem(string id, string text)
+    {
+        var (document, harness) = await ParseAsync(ItemsPage);
+        var full = harness.PrepareFrame();
+
+        document.GetElementById(id)!.TextContent = text;
+
+        var patched = harness.UpdateFrame();
+        Assert.NotNull(patched);
+        Assert.True(patched!.Metrics.IsIncremental);
+        Assert.True(patched.Metrics.StyleMaps < full.Metrics.StyleMaps / 3, $"{patched.Metrics.StyleMaps} of {full.Metrics.StyleMaps} elements styled");
+        AssertPatchedLikeFullLayout(document, harness, patched);
+    }
+
+    [Theory]
+    // the next item moves
+    [InlineData("auto", "text", "A much longer text than before")]
+    // the line gets higher, and the item beside it stretches along
+    [InlineData("tall", "text", "A text that goes over several lines")]
+    // the box around the item, which is as wide as its content, grows
+    [InlineData("fit-item", "style", "display: block; padding-left: 7px")]
+    [InlineData("fit-item", "text", "A longer item")]
+    [InlineData("fixed", "style", "order: 5")]
+    [InlineData("fixed", "style", "width: 200px")]
+    [InlineData("fixed", "style", "margin-left: 9px")]
+    [InlineData("fixed", "style", "position: absolute")]
+    [InlineData("fixed", "style", "display: none")]
+    [InlineData("cell", "style", "grid-column: 2")]
+    [InlineData("cell", "style", "align-self: center")]
+    [InlineData("cell", "style", "margin-top: 3px")]
+    [InlineData("cell", "style", "display: none")]
+    [InlineData("col", "style", "float: right")]
+    public async Task ChangingWhatTheContainerReadsOfAnItemGivesTheLayoutOfAFullOne(string id, string kind, string value)
+    {
+        var (document, harness) = await ParseAsync(ItemsPage);
+        harness.PrepareFrame();
+        var element = document.GetElementById(id)!;
+
+        if (kind == "text")
+        {
+            element.TextContent = value;
+        }
+        else
+        {
+            element.SetAttribute("style", value);
+        }
+
+        AssertPatchedLikeFullLayout(document, harness, harness.UpdateFrame());
+    }
+
+    [Fact]
+    public async Task ChangingAnItemAgainAfterItsPatchGivesTheLayoutOfAFullOne()
+    {
+        var (document, harness) = await ParseAsync(ItemsPage);
+        harness.PrepareFrame();
+
+        foreach (var (id, text) in new[] { ("fixed-text", "One"), ("cell-text", "Two"), ("fixed-text", "Three"), ("col-text", "Four"), ("auto", "A much longer text"), ("fixed-text", "Five") })
+        {
+            document.GetElementById(id)!.TextContent = text;
+            var incremental = s_itemsPageIds.Select(other => Describe(document.GetElementById(other)!)).ToList();
+            var patched = harness.UpdateFrame();
+
+            if (patched is not null)
+            {
+                Assert.Equal(s_itemsPageIds.Select(other => Describe(document.GetElementById(other)!)), incremental);
+            }
+        }
+
+        AssertPatchedLikeFullLayout(document, harness, harness.UpdateFrame());
+    }
+
+    [Fact]
+    public async Task ChangingAnItemOfABoxMeasuredAsInlineContentGivesTheLayoutOfAFullOne()
+    {
+        // GitHub's marquee: a grid as wide as its content, with text in nested inline grids
+        var (document, harness) = await ParseAsync("""
+            <!doctype html>
+            <html>
+              <head><style>html, body { margin: 0; font: 16px sans-serif; } ul { margin: 0; padding: 0; list-style: none; display: grid; grid-auto-flow: column; width: max-content; } li, div { display: grid; }</style></head>
+              <body>
+                <ul id="track"><li id="block"><div id="stat"><span id="value" style="display: inline-grid"><span id="text">12345</span></span></div></li><li id="other">Other</li></ul>
+                <p id="after">After</p>
+              </body>
+            </html>
+            """);
+        harness.PrepareFrame();
+
+        document.GetElementById("text")!.TextContent = "A much longer value than before";
+
+        string[] ids = ["track", "block", "stat", "value", "text", "other", "after"];
+        var incremental = ids.Select(id => Describe(document.GetElementById(id)!)).ToList();
+        var patched = harness.UpdateFrame();
+
+        if (patched is not null)
+        {
+            incremental = ids.Select(id => Describe(document.GetElementById(id)!)).ToList();
+        }
+
+        var expected = harness.PrepareFrame();
+        Assert.Equal(ids.Select(id => Describe(document.GetElementById(id)!)), incremental);
+
+        if (patched is not null)
+        {
+            Assert.Equal(expected.Rasterize().Data, patched.Rasterize().Data);
+        }
+    }
+
+    [Theory]
+    // a state not depending on the value: as long as nothing else changed, the field is patched
+    [InlineData("input:checked + p { color: red; }", true)]
+    // a state depending on the value, which changes the paragraph next to the field
+    [InlineData("input:valid + p { margin-top: 30px; }", false)]
+    // the placeholder goes with the first character
+    [InlineData("input:placeholder-shown + p { margin-top: 30px; }", false)]
+    public async Task TypingIntoATextFieldOnlyLaysOutMoreIfAStateOfItsValueIsUsed(string rule, bool isPatched)
+    {
+        var (document, harness) = await ParseAsync($$"""
+            <!doctype html>
+            <html>
+              <head><style>html, body { margin: 0; font: 16px sans-serif; } p { margin: 0; } {{rule}}</style></head>
+              <body><div style="display: flex"><input id="field" placeholder="Search"><p id="next">Next</p></div><p id="after">After</p></body>
+            </html>
+            """);
+        var input = (AngleSharp.Html.Dom.IHtmlInputElement)document.GetElementById("field")!;
+        harness.PrepareFrame();
+
+        input.SetAttribute("value", "typed");
+        input.Value = "typed";
+
+        var patched = harness.UpdateFrame();
+        Assert.Equal(isPatched, patched is not null);
+        var incremental = Describe(document.GetElementById("next")!);
+        var expected = harness.PrepareFrame();
+        Assert.Equal(Describe(document.GetElementById("next")!), incremental);
+
+        if (patched is not null)
+        {
+            Assert.Equal(expected.Rasterize().Data, patched.Rasterize().Data);
+        }
+    }
+
+    [Fact]
+    public async Task TypingMoreIntoATextFieldLeavesThePlaceholderSelectorsAlone()
+    {
+        var (document, harness) = await ParseAsync("""
+            <!doctype html>
+            <html>
+              <head><style>html, body { margin: 0; font: 16px sans-serif; } p { margin: 0; } input:placeholder-shown + p { margin-top: 30px; }</style></head>
+              <body><div style="display: flex"><input id="field" placeholder="Search" value="a"><p id="next">Next</p></div><p id="after">After</p></body>
+            </html>
+            """);
+        var input = (AngleSharp.Html.Dom.IHtmlInputElement)document.GetElementById("field")!;
+        harness.PrepareFrame();
+
+        input.SetAttribute("value", "ab");
+        input.Value = "ab";
+
+        var patched = harness.UpdateFrame();
+        Assert.NotNull(patched);
+        var incremental = Describe(document.GetElementById("next")!);
+        var expected = harness.PrepareFrame();
+        Assert.Equal(Describe(document.GetElementById("next")!), incremental);
+        Assert.Equal(expected.Rasterize().Data, patched!.Rasterize().Data);
+    }
+
+    [Fact]
+    public async Task ABlockAfterAFloatThatEndedAboveItIsLaidOutOnItsOwn()
+    {
+        var (document, harness) = await ParseAsync("""
+            <!doctype html>
+            <html>
+              <head><style>html, body { margin: 0; font: 16px sans-serif; } p { margin: 0; }</style></head>
+              <body>
+                <div style="float: left; width: 50px; height: 20px"></div>
+                <div style="clear: both; height: 0"></div>
+                <p id="first">First</p>
+                <p id="second">Second</p>
+              </body>
+            </html>
+            """);
+        harness.PrepareFrame();
+
+        document.GetElementById("first")!.TextContent = "Changed";
+
+        var patched = harness.UpdateFrame();
+        Assert.NotNull(patched);
+        var expected = harness.PrepareFrame();
+        Assert.Equal(expected.Rasterize().Data, patched!.Rasterize().Data);
+    }
+
+    [Fact]
+    public async Task ABlockBesideAFloatIsNotLaidOutOnItsOwn()
+    {
+        var (document, harness) = await ParseAsync("""
+            <!doctype html>
+            <html>
+              <head><style>html, body { margin: 0; font: 16px sans-serif; } p { margin: 0; }</style></head>
+              <body>
+                <div style="float: left; width: 50px; height: 200px; background: red"></div>
+                <p id="first">First</p>
+                <p id="second">Second</p>
+              </body>
+            </html>
+            """);
+        harness.PrepareFrame();
+
+        document.GetElementById("first")!.TextContent = "A text going around the float";
+
+        AssertSameAsFullLayout(document, harness, "first", "second");
+    }
+
+    private static void AssertPatchedLikeFullLayout(IDocument document, IDomHarness harness, AngleSharp.Renderer.Rendering.RenderedFrame? patched)
+    {
+        if (patched is null)
+        {
+            return;
+        }
+
+        var incremental = s_itemsPageIds.Select(id => document.GetElementById(id) is { } element ? Describe(element) : id).ToList();
+        var expected = harness.PrepareFrame();
+        Assert.False(expected.Metrics.IsIncremental);
+        Assert.Equal(s_itemsPageIds.Select(id => document.GetElementById(id) is { } element ? Describe(element) : id), incremental);
+        Assert.Equal(expected.Rasterize().Data, patched.Rasterize().Data);
     }
 
     private static void AssertSameAsFullLayout(IDocument document, IDomHarness harness, params string[] ids)
