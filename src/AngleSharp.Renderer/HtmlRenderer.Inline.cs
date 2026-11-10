@@ -2,6 +2,7 @@ namespace AngleSharp.Renderer;
 
 using System.Globalization;
 using System.Linq;
+using System.Runtime.CompilerServices;
 using System.Text;
 
 using AngleSharp.Css.Dom;
@@ -544,7 +545,8 @@ public sealed partial class HtmlRenderer
 
         private void CollectElement(ElementRenderNode element, RenderTextStyle parentStyle, InlineBox? parentBox)
         {
-            if (!GeneratesBoxes(element))
+            // a deep subtree is left out once the stack runs low (see LayoutNode)
+            if (!GeneratesBoxes(element) || !RuntimeHelpers.TryEnsureSufficientExecutionStack())
             {
                 return;
             }
@@ -2998,6 +3000,12 @@ public sealed partial class HtmlRenderer
     /// </summary>
     private static IntrinsicWidths ComputeContentIntrinsicWidths(ElementRenderNode element, RenderTextStyle textStyle, float percentageBase, LayoutContext context)
     {
+        // a deep subtree is left out once the stack runs low (see LayoutNode)
+        if (!RuntimeHelpers.TryEnsureSufficientExecutionStack())
+        {
+            return new IntrinsicWidths(0f, 0f);
+        }
+
         var widths = ComputeElementContentWidths(element, textStyle, percentageBase, context);
 
         if (s_layoutPass.Value is { } pass)

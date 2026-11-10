@@ -1237,6 +1237,13 @@ public sealed partial class HtmlRenderer
                 LayoutTextNode(textNode.Ref, containingX, containingWidth, ref cursorY, ref previousBlockMarginBottom, ref suppressNextBlockTopMargin, floats, ref textIndentConsumed, textStyle, context, displayList, maxY);
                 return;
             case ElementRenderNode element:
+                // Every nesting level takes a large stack frame; when the stack runs low the rest of
+                // the subtree is left out instead of ending the process with a stack overflow.
+                if (!RuntimeHelpers.TryEnsureSufficientExecutionStack())
+                {
+                    return;
+                }
+
                 LayoutStickyAwareElement(element, containingX, containingY, containingWidth, ref cursorY, ref previousBlockMarginBottom, ref suppressNextBlockTopMargin, floats, ref textIndentConsumed, textStyle, context, displayList, maxY, isFlexItem, isRowDirection, flexMainSize, flexCrossSize, containingHeight, positionedContainingX, positionedContainingY, positionedContainingWidth, positionedContainingHeight, forcedBorderBoxWidth, isAtomicInline, forcedBorderBoxHeight, contentOffsetY, mainAxisMarginsPlaced, crossAxisMarginsPlaced);
                 return;
             default:
@@ -8304,6 +8311,13 @@ public sealed partial class HtmlRenderer
 
     private static bool TryGetFirstCollapsibleChildTopMargin(ElementRenderNode node, float containingWidth, LayoutContext context, out float marginTop)
     {
+        // a deep subtree is left out once the stack runs low (see LayoutNode)
+        if (!RuntimeHelpers.TryEnsureSufficientExecutionStack())
+        {
+            marginTop = 0f;
+            return false;
+        }
+
         var throughPositive = 0f;
         var throughNegative = 0f;
         var hasThrough = false;
@@ -8386,6 +8400,12 @@ public sealed partial class HtmlRenderer
     /// </summary>
     private static bool IsSelfCollapsing(ElementRenderNode element, LayoutContext context)
     {
+        // a deep subtree is left out once the stack runs low (see LayoutNode)
+        if (!RuntimeHelpers.TryEnsureSufficientExecutionStack())
+        {
+            return false;
+        }
+
         var styleMap = GetOrCreateStyleMap(context, element.Ref, element.ComputedStyle);
 
         if (!IsFlowBlockDisplay(styleMap) || IsReplacedElement(element.Ref) || ResolveFormControlKind(element) != FormControlKind.None)
