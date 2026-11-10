@@ -2,6 +2,7 @@ namespace AngleSharp.Renderer;
 
 using System.Globalization;
 using System.Linq;
+using System.Runtime.CompilerServices;
 using System.Text;
 
 using AngleSharp.Css.Dom;
@@ -2651,6 +2652,82 @@ public sealed partial class HtmlRenderer
     }
 
     /// <summary>
+    /// What a trial layout of an element depends on: the style map it is laid out with (a
+    /// container in a writing-mode system of its own swaps it), the space and style it gets,
+    /// and how it is measured.
+    /// </summary>
+    private readonly record struct TrialLayoutKey(
+        Dictionary<string, string> StyleMap,
+        float ContainingWidth,
+        RenderTextStyle InheritedStyle,
+        float ForcedBorderBoxWidth,
+        bool IsAtomicInline,
+        bool IsFlexOrGridItem,
+        float MaxY,
+        bool IsHeightOnly);
+
+    private readonly record struct TrialLayoutResult(
+        ElementLayoutMetrics? Metrics,
+        float? LastBaselineY,
+        float? FirstBaselineY,
+        IReadOnlyDictionary<IElement, ElementLayoutMetrics> Laidout,
+        float? AutoContentHeight);
+
+    /// <summary>
+    /// A kept trial layout of an element, and the one kept before it for other inputs.
+    /// </summary>
+    private sealed class TrialLayoutEntry(TrialLayoutKey key)
+    {
+        public TrialLayoutKey Key { get; } = key;
+
+        public TrialLayoutResult Result { get; set; }
+
+        public TrialLayoutEntry? Next { get; set; }
+    }
+
+    /// <summary>
+    /// Finds the kept trial layout of an element for these inputs (<paramref name="found"/>), or
+    /// gives a new entry to keep the trial in when it runs inside another trial: only those are
+    /// repeated by the layout around them. Nothing is kept inside a line-clamped box, whose
+    /// lines are counted. Not inlined, so that the large inputs stay out of the frame of
+    /// <see cref="TrialLayout"/>, which is on the stack once per nesting level.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private static TrialLayoutEntry? FindTrialLayout(
+        ElementRenderNode element,
+        float containingWidth,
+        in RenderTextStyle inheritedStyle,
+        in LayoutContext context,
+        float forcedBorderBoxWidth,
+        bool isAtomicInline,
+        bool isFlexOrGridItem,
+        float maxY,
+        bool isHeightOnly,
+        out bool found)
+    {
+        found = false;
+
+        if (context.LineClampScopes.TryPeek(out _))
+        {
+            return null;
+        }
+
+        var key = new TrialLayoutKey(GetOrCreateStyleMap(context, element.Ref, element.ComputedStyle), containingWidth, inheritedStyle,
+            forcedBorderBoxWidth, isAtomicInline, isFlexOrGridItem, maxY, isHeightOnly);
+
+        for (var entry = context.TrialLayouts.GetValueOrDefault(element.Ref); entry is not null; entry = entry.Next)
+        {
+            if (entry.Key == key)
+            {
+                found = true;
+                return entry;
+            }
+        }
+
+        return s_trialDepth > 0 ? new TrialLayoutEntry(key) : null;
+    }
+
+    /// <summary>
     /// Lays out <paramref name="element"/> at the origin into a throwaway display list, capturing
     /// its own border box and the last text baseline painted inside it. Layout metrics recorded
     /// during the trial never reach a real <see cref="CaptureLayoutMetrics"/> capture. A flex or
@@ -2668,6 +2745,18 @@ public sealed partial class HtmlRenderer
         float maxY = float.MaxValue,
         bool isHeightOnly = false)
     {
+        // A trial is laid out on its own (at the origin, with floats, positioned and sticky boxes
+        // of its own), so the same inputs give the same result within a render. Without reusing
+        // it, nested trials (cells of nested tables, nested inline-blocks) lay out every level
+        // again for each level above it (see FindTrialLayout).
+        var entry = FindTrialLayout(element, containingWidth, inheritedStyle, context, forcedBorderBoxWidth, isAtomicInline, isFlexOrGridItem, maxY, isHeightOnly, out var found);
+
+        if (found)
+        {
+            var cached = entry!.Result;
+            return (cached.Metrics, cached.LastBaselineY, cached.FirstBaselineY, cached.Laidout, cached.AutoContentHeight);
+        }
+
         var pass = s_layoutPass.Value;
         // a trial asking for more (e.g., the baseline of an inline-block) needs all of its boxes
         var wasHeightOnly = s_measuringHeightOnly;
@@ -2727,7 +2816,16 @@ public sealed partial class HtmlRenderer
                 isFlexItem: isFlexOrGridItem);
 
             var snapshot = capture.Snapshot();
-            return (snapshot.TryGetValue(element.Ref, out var metrics) ? metrics : null, capture.LastBaselineY, capture.FirstBaselineY, snapshot, capture.AutoContentHeights.TryGetValue(element.Ref, out var autoHeight) ? autoHeight : null);
+            var result = new TrialLayoutResult(snapshot.TryGetValue(element.Ref, out var metrics) ? metrics : null, capture.LastBaselineY, capture.FirstBaselineY, snapshot, capture.AutoContentHeights.TryGetValue(element.Ref, out var autoHeight) ? autoHeight : null);
+
+            if (entry is not null)
+            {
+                entry.Result = result;
+                entry.Next = context.TrialLayouts.GetValueOrDefault(element.Ref);
+                context.TrialLayouts[element.Ref] = entry;
+            }
+
+            return (result.Metrics, result.LastBaselineY, result.FirstBaselineY, result.Laidout, result.AutoContentHeight);
         }
         finally
         {
