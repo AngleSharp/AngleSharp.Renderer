@@ -290,6 +290,26 @@ public sealed class InteractiveFrameTests
         Assert.Equal("box", document.ElementFromPoint(first.Left / 2, (first.Top + first.Bottom) / 2)?.Id);
     }
 
+    [Theory]
+    [InlineData("<table><tr><td>", "</td></tr></table>")]
+    [InlineData("<div style='display: inline-block'>", "</div>")]
+    public async Task NestedTrialLayouts_GrowLinearlyWithTheDepth(string open, string close)
+    {
+        // Every level measures its content with a trial layout; were each level to lay out the
+        // levels below it again, doubling the depth would multiply the trials by about 2^6.
+        var shallow = await CountTrialLayoutsAsync(open, close, depth: 6);
+        var deep = await CountTrialLayoutsAsync(open, close, depth: 12);
+
+        Assert.True(deep <= 3 * shallow, $"{shallow} trial layouts at depth 6, {deep} at depth 12");
+    }
+
+    private static async Task<int> CountTrialLayoutsAsync(string open, string close, int depth)
+    {
+        var body = string.Concat(Enumerable.Repeat(open, depth)) + "leaf" + string.Concat(Enumerable.Repeat(close, depth));
+        var (_, harness) = await OpenAsync(body);
+        return harness.PrepareFrame().Metrics.TrialLayouts;
+    }
+
     private static async Task<(IDocument Document, IDomHarness Harness)> OpenAsync(string body)
     {
         var configuration = Configuration.Default.WithCss().WithRenderDevice(Device);
