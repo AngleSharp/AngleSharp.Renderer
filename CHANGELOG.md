@@ -4,6 +4,7 @@ Released on Wednesday, November 11 2026.
 
 - Fixed adjacent text nodes (e.g. inserted by a script or a framework like Blazor) each starting a line of their own in a block, table cell or flex item: they are laid out as one text, like the single node the parser makes of the same text
 - Fixed the intrinsic width of a row flex container counting each of adjacent text nodes as an item of its own (with a gap between them)
+- Improved deeply nested pages: what is nested too deep for the stack is left out instead of ending the process with a stack overflow (#55) @michaelthyregod
 
 # 0.11.1
 
