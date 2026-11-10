@@ -64,10 +64,25 @@ public sealed partial class HtmlRenderer
             if (run.All(static node => node is TextRenderNode) && !floats.HasFloatsBelow(cursorY))
             {
                 // A run of bare text keeps the dedicated paragraph path, which also implements
-                // `text-overflow: ellipsis` and `-webkit-line-clamp`.
+                // `text-overflow: ellipsis` and `-webkit-line-clamp`. Adjacent text nodes (e.g.
+                // "Picture ", "4", " of 4" inserted by a script) are one paragraph, laid out
+                // from the first of them (see GetTextRunData).
+                HashSet<IText>? covered = null;
+
                 foreach (var textNode in run.Cast<TextRenderNode>())
                 {
-                    LayoutTextNode(textNode.Ref, contentX, contentWidth, ref cursorY, ref previousBlockMarginBottom, ref suppressNextBlockTopMargin, floats, ref textIndentConsumed, textStyle, context, displayList, maxY);
+                    if (covered?.Contains(textNode.Ref) == true)
+                    {
+                        continue;
+                    }
+
+                    if (textNode.Ref.NextSibling is IText or IComment)
+                    {
+                        covered ??= [];
+                        AddFollowingTextRun(textNode.Ref, covered);
+                    }
+
+                    LayoutTextNode(textNode.Ref, contentX, contentWidth, ref cursorY, ref previousBlockMarginBottom, ref suppressNextBlockTopMargin, floats, ref textIndentConsumed, textStyle, context, displayList, maxY, asTextRun: true);
                 }
             }
             else
@@ -3047,7 +3062,9 @@ public sealed partial class HtmlRenderer
                 var item = child switch
                 {
                     ElementRenderNode childElement => ComputeOuterIntrinsicWidths(childElement, textStyle, percentageBase, context),
-                    TextRenderNode textNode when !IsCollapsibleWhiteSpaceOnly(textNode.Ref.Data) => ComputeTextIntrinsicWidths(textNode.Ref.Data, textStyle, context, out _),
+                    // a run of text nodes is one anonymous item, as when laid out
+                    TextRenderNode textNode when !ContinuesTextRun(textNode.Ref) && GetTextRunData(textNode.Ref) is var runData &&
+                        !IsCollapsibleWhiteSpaceOnly(runData) => ComputeTextIntrinsicWidths(runData, textStyle, context, out _),
                     _ => IntrinsicWidths.Zero,
                 };
 

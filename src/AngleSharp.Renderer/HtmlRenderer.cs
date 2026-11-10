@@ -5658,9 +5658,12 @@ public sealed partial class HtmlRenderer
         RenderTextStyle textStyle,
         LayoutContext context,
         DisplayList displayList,
-        float maxY)
+        float maxY,
+        bool asTextRun = false)
     {
-        var text = ExpandTabs(context, ApplyTextTransform(NormalizeWhitespace(textNode.Data, textStyle.WhiteSpace), textStyle.TextTransform, previousEndsWord: false), textStyle);
+        // as a run, the node stands for the text nodes following it, too (see GetTextRunData)
+        var data = asTextRun ? GetTextRunData(textNode) : textNode.Data;
+        var text = ExpandTabs(context, ApplyTextTransform(NormalizeWhitespace(data, textStyle.WhiteSpace), textStyle.TextTransform, previousEndsWord: false), textStyle);
 
         if (text.Length == 0)
         {
@@ -5671,7 +5674,7 @@ public sealed partial class HtmlRenderer
         suppressNextBlockTopMargin = false;
 
         var (bandLeft, bandRight) = floats.GetBand(cursorY, textStyle.FontSize * textStyle.LineHeightMultiplier, containingX, containingX + containingWidth);
-        LayoutWrappedText(text, bandLeft, bandRight - bandLeft, ref cursorY, textStyle, context, displayList, maxY, textIndentConsumed ? 0f : textStyle.TextIndent + textStyle.MarkerIndent, textNode);
+        LayoutWrappedText(text, bandLeft, bandRight - bandLeft, ref cursorY, textStyle, context, displayList, maxY, textIndentConsumed ? 0f : textStyle.TextIndent + textStyle.MarkerIndent, textNode, isTextRun: asTextRun);
         textIndentConsumed = true;
     }
 
@@ -6488,6 +6491,24 @@ public sealed partial class HtmlRenderer
         }
 
         return false;
+    }
+
+    /// <summary>
+    /// Adds the text nodes following the given one in its run (see <see cref="GetTextRunData"/>).
+    /// </summary>
+    private static void AddFollowingTextRun(IText text, HashSet<IText> nodes)
+    {
+        for (var sibling = text.NextSibling; sibling is not null; sibling = sibling.NextSibling)
+        {
+            if (sibling is IText next)
+            {
+                nodes.Add(next);
+            }
+            else if (sibling is not IComment)
+            {
+                break;
+            }
+        }
     }
 
     /// <summary>

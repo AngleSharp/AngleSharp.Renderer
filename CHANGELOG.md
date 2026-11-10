@@ -1,3 +1,10 @@
+# 0.11.2
+
+Released on Wednesday, November 11 2026.
+
+- Fixed adjacent text nodes (e.g. inserted by a script or a framework like Blazor) each starting a line of their own in a block, table cell or flex item: they are laid out as one text, like the single node the parser makes of the same text
+- Fixed the intrinsic width of a row flex container counting each of adjacent text nodes as an item of its own (with a gap between them)
+
 # 0.11.1
 
 Released on Sunday, November 8 2026.
