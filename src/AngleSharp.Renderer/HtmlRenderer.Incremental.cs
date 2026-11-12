@@ -1805,6 +1805,8 @@ public sealed partial class HtmlRenderer
             }
 
             RemoveKeys(_context.MeasuredHeights, key => elements.Contains(key.Element));
+            // a trial holds the layout of its whole subtree, so any change can make one stale
+            _context.TrialLayouts.Clear();
             RemoveKeys(_context.GridItemHeights, key => elements.Contains(key.Element));
 
             static void Collect(IRenderNode node, HashSet<IElement> elements)

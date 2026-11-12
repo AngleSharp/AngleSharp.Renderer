@@ -232,6 +232,10 @@ public sealed partial class HtmlRenderer
         // only needed for what the render tree does not hold (e.g. ::placeholder), so it is built on demand
         public IStyleCollection? StyleCollection => LazyStyleCollection.Value;
 
+        // Trial layouts per element, for this render only (see TrialLayout). The inputs are
+        // large, so they are kept with each result rather than as keys of one big table.
+        public Dictionary<IElement, TrialLayoutEntry> TrialLayouts { get; } = new();
+
         // the device the styles are computed for, and the collections of the shadow trees (see GetStyleCollection)
         public IRenderDevice? Device { get; init; }
 
