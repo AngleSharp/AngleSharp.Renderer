@@ -1,5 +1,7 @@
 namespace AngleSharp.Renderer.Tests;
 
+using System.Runtime.ExceptionServices;
+
 using AngleSharp;
 using AngleSharp.Css;
 using AngleSharp.Dom;
@@ -303,11 +305,37 @@ public sealed class InteractiveFrameTests
         Assert.True(deep <= 3 * shallow, $"{shallow} trial layouts at depth 6, {deep} at depth 12");
     }
 
+    private const int NestedLayoutStackSize = 16 * 1024 * 1024;
+
     private static async Task<int> CountTrialLayoutsAsync(string open, string close, int depth)
     {
         var body = string.Concat(Enumerable.Repeat(open, depth)) + "leaf" + string.Concat(Enumerable.Repeat(close, depth));
         var (_, harness) = await OpenAsync(body);
-        return harness.PrepareFrame().Metrics.TrialLayouts;
+        var trials = 0;
+        Exception? error = null;
+        // Laid out only a few times, the layout stays in the first JIT tier, whose frames are
+        // large: 12 levels need more stack than test threads have on some platforms (macOS).
+        var thread = new Thread(() =>
+        {
+            try
+            {
+                trials = harness.PrepareFrame().Metrics.TrialLayouts;
+            }
+            catch (Exception ex)
+            {
+                error = ex;
+            }
+        }, NestedLayoutStackSize);
+
+        thread.Start();
+        thread.Join();
+
+        if (error is not null)
+        {
+            ExceptionDispatchInfo.Capture(error).Throw();
+        }
+
+        return trials;
     }
 
     private static async Task<(IDocument Document, IDomHarness Harness)> OpenAsync(string body)
