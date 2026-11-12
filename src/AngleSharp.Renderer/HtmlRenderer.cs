@@ -2790,6 +2790,7 @@ public sealed partial class HtmlRenderer
         // percentage heights of the items refer to the container's height, if it is definite (else they are auto)
         var definiteContentHeight = ResolveAuthoredDimension(styleMap, "height", containingHeight, float.NaN, borderTop + borderBottom + paddingTop + paddingBottom);
         var children = OrderChildrenForLayout(FlattenDisplayContents(node.Children, context), context).ToList();
+        CreateStyleMapsInParallel(children.OfType<ElementRenderNode>().ToList(), context);
         // absolutely positioned children do not take part in the flex layout
         var outOfFlowChildren = children
             .OfType<ElementRenderNode>()
@@ -3594,6 +3595,7 @@ public sealed partial class HtmlRenderer
         var gridItems = FlattenDisplayContents(node.Children, context)
             .Where(child => child is ElementRenderNode || (child is TextRenderNode textNode && NormalizeWhitespace(textNode.Ref.Data).Length > 0))
             .ToList();
+        CreateStyleMapsInParallel(gridItems.OfType<ElementRenderNode>().ToList(), context);
         // absolutely positioned children take no cell; they are laid out once the grid's size is known
         var outOfFlowChildren = gridItems
             .OfType<ElementRenderNode>()
@@ -5953,13 +5955,24 @@ public sealed partial class HtmlRenderer
     {
         foreach (var child in children)
         {
-            if (!GeneratesBoxes(child))
+            if (child is not ElementRenderNode element)
+            {
+                if (child is TextRenderNode)
+                {
+                    yield return child;
+                }
+
+                continue;
+            }
+
+            var display = GetDisplayWithoutCreatingStyleMap(element, context);
+
+            if (string.Equals(display?.Trim(), "none", StringComparison.OrdinalIgnoreCase))
             {
                 continue;
             }
 
-            if (child is ElementRenderNode element &&
-                string.Equals(GetDisplay(GetOrCreateStyleMap(context, element.Ref, element.ComputedStyle))?.Trim(), "contents", StringComparison.OrdinalIgnoreCase))
+            if (string.Equals(display?.Trim(), "contents", StringComparison.OrdinalIgnoreCase))
             {
                 foreach (var grandChild in FlattenDisplayContents(element.Children, context))
                 {
@@ -5971,6 +5984,19 @@ public sealed partial class HtmlRenderer
                 yield return child;
             }
         }
+    }
+
+    private static string? GetDisplayWithoutCreatingStyleMap(ElementRenderNode element, LayoutContext context)
+    {
+        if (context.StyleMapCache.TryGetValue(element.Ref, out var styleMap))
+        {
+            return GetDisplay(styleMap);
+        }
+
+        var display = element.ComputedStyle.GetDisplay();
+        return string.IsNullOrWhiteSpace(display)
+            ? ParseStyleAttributeValue(element.Ref.GetAttribute("style"), "display")
+            : display;
     }
 
     private static string? GetDisplay(Dictionary<string, string> styleMap)
@@ -6178,6 +6204,19 @@ public sealed partial class HtmlRenderer
             contentMinimum = 0f;
             hasDeferredMainSize = true;
             deferredMeasureWidth = crossSize > 0f ? crossSize + crossBorderAndPadding : relativeTo;
+        }
+        else if (!isRowDirection && deferringAlignItems is not null &&
+                 !float.IsNaN(specifiedMainSize) &&
+                 float.IsNaN(ResolveFlexBaseSize(childStyle, mainRelativeTo, mainBorderAndPadding)) &&
+                 GetContentSizeKeyword(childStyle, mainProperty) is null)
+        {
+            // In an auto-height, forward, non-wrapping column, a definite item height with an
+            // automatic flex basis already supplies its base size. Its automatic minimum cannot
+            // grow past that specified size, so measuring the subtree to find the content-based
+            // minimum cannot change the hypothetical size. The item is still laid out once at
+            // its final flexed size below.
+            contentMainSize = specifiedMainSize;
+            contentMinimum = specifiedMainSize;
         }
         else
         {
@@ -7972,14 +8011,42 @@ public sealed partial class HtmlRenderer
         var nodes = new List<ElementRenderNode>();
         CollectElementNodes(renderTree, nodes, context);
 
-        if (nodes.Count < MinStyleMapsCreatedInParallel || Environment.ProcessorCount < 2 ||
+        CreateStyleMapsInParallel(nodes, context);
+
+        static void CollectElementNodes(IRenderNode node, List<ElementRenderNode> nodes, LayoutContext context)
+        {
+            if (node is ElementRenderNode element && !context.StyleMapCache.ContainsKey(element.Ref))
+            {
+                nodes.Add(element);
+            }
+
+            foreach (var child in node.Children)
+            {
+                CollectElementNodes(child, nodes, context);
+            }
+        }
+    }
+
+    private static void CreateStyleMapsInParallel(List<ElementRenderNode> candidates, LayoutContext context)
+    {
+        List<ElementRenderNode>? nodes = null;
+
+        foreach (var node in candidates)
+        {
+            if (!context.StyleMapCache.ContainsKey(node.Ref))
+            {
+                (nodes ??= []).Add(node);
+            }
+        }
+
+        if (nodes is null || nodes.Count < MinStyleMapsCreatedInParallel || Environment.ProcessorCount < 2 ||
             (AppContext.TryGetSwitch(DisableParallelismSwitch, out var isDisabled) && isDisabled))
         {
             return;
         }
 
         // what is gathered on first use, before the threads read it
-        if (renderTree is ElementRenderNode { Ref.Owner: { } document })
+        if (nodes[0].Ref.Owner is { } document)
         {
             GetAuthoredRules(document, "-webkit-line-clamp");
             GetAuthoredRules(document, "overflow-wrap");
@@ -8007,18 +8074,6 @@ public sealed partial class HtmlRenderer
             }
         }
 
-        static void CollectElementNodes(IRenderNode node, List<ElementRenderNode> nodes, LayoutContext context)
-        {
-            if (node is ElementRenderNode element && !context.StyleMapCache.ContainsKey(element.Ref))
-            {
-                nodes.Add(element);
-            }
-
-            foreach (var child in node.Children)
-            {
-                CollectElementNodes(child, nodes, context);
-            }
-        }
     }
 
     /// <summary>
@@ -8676,8 +8731,12 @@ public sealed partial class HtmlRenderer
             return false;
         }
 
-        var styleMap = GetOrCreateStyleMap(context, elementChild.Ref, elementChild.ComputedStyle);
-        return HasExplicitZIndex(styleMap) && ParseZIndex(styleMap) < 0;
+        if (context.StyleMapCache.TryGetValue(elementChild.Ref, out var styleMap))
+        {
+            return HasExplicitZIndex(styleMap) && ParseZIndex(styleMap) < 0;
+        }
+
+        return ParseZIndex(elementChild.ComputedStyle.GetPropertyValue("z-index")) < 0;
     }
 
     private static bool IsStickyPositioned(Dictionary<string, string> styleMap) =>
@@ -8685,7 +8744,12 @@ public sealed partial class HtmlRenderer
 
     private static int ParseZIndex(Dictionary<string, string> styleMap)
     {
-        if (!styleMap.TryGetValue("z-index", out var value) || string.IsNullOrWhiteSpace(value))
+        return ParseZIndex(styleMap.GetValueOrDefault("z-index"));
+    }
+
+    private static int ParseZIndex(string? value)
+    {
+        if (string.IsNullOrWhiteSpace(value))
         {
             return 0;
         }

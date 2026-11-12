@@ -34,6 +34,31 @@ public sealed class ViewportFrameTests
     }
 
     [Fact]
+    public async Task ViewportFrame_DoesNotBuildStyleMapsForOffscreenSiblings()
+    {
+        var offscreen = string.Concat(Enumerable.Repeat("""<div style="height: 20px">Offscreen</div>""", 300));
+        var (_, harness) = await OpenAsync("""<div style="height: 1000px">Above the fold</div>""" + offscreen);
+
+        var frame = harness.PrepareViewportFrame();
+
+        Assert.True(frame.IsPartial);
+        Assert.True(frame.Metrics.StyleMaps < 20, $"Created {frame.Metrics.StyleMaps} style maps for content outside the viewport.");
+    }
+
+    [Fact]
+    public async Task ViewportFrame_AutoHeightColumnWithDefiniteItemHeightsDoesNotTrialLayoutItems()
+    {
+        var items = string.Concat(Enumerable.Repeat("""<div style="height: 40px">A fixed-height flex item</div>""", 30));
+        var (_, harness) = await OpenAsync("""<main style="display: flex; flex-direction: column">""" + items + "</main>");
+
+        var partial = harness.PrepareViewportFrame();
+        var whole = harness.PrepareFrame();
+
+        Assert.Equal(0, partial.Metrics.TrialLayouts);
+        AssertSamePixels(whole.Rasterize(), partial.Rasterize());
+    }
+
+    [Fact]
     public async Task ViewportFrame_LooksLikeAFrameOfTheWholePage()
     {
         var (_, harness) = await OpenAsync(TallPage);

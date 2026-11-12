@@ -55,6 +55,29 @@ public sealed class ParallelLayoutTests
         }
     }
 
+    [Fact]
+    public async Task OnDemandFlexItemStylesCanBeCreatedInParallel()
+    {
+        var items = string.Concat(Enumerable.Repeat(
+            """<div style="height: 40px; border: 1px solid #ccc">A fixed-height flex item</div>""", 240));
+
+        var parallel = await LayOutViewportAsync(items);
+        AppContext.SetSwitch(Switch, true);
+
+        try
+        {
+            var sequential = await LayOutViewportAsync(items);
+
+            Assert.True(parallel.IsPartial);
+            Assert.Equal(sequential.Boxes, parallel.Boxes);
+            Assert.Equal(sequential.Pixels, parallel.Pixels);
+        }
+        finally
+        {
+            AppContext.SetSwitch(Switch, false);
+        }
+    }
+
     private static async Task<(int Elements, string Boxes, byte[] Pixels)> LayOutAsync(string body)
     {
         var context = BrowsingContext.New(Configuration.Default.WithCss().WithRenderDevice(Device));
@@ -63,5 +86,14 @@ public sealed class ParallelLayoutTests
         var pixels = harness.PrepareFrame().Rasterize().Data;
         var boxes = string.Join('\n', document.All.Select(element => element.GetBoundingClientRect()).Select(rect => $"{rect.Left} {rect.Top} {rect.Width} {rect.Height}"));
         return (document.All.Length, boxes, pixels);
+    }
+
+    private static async Task<(bool IsPartial, int Boxes, byte[] Pixels)> LayOutViewportAsync(string items)
+    {
+        var context = BrowsingContext.New(Configuration.Default.WithCss().WithRenderDevice(Device));
+        var document = await context.OpenAsync(request => request.Content(
+            $"""<html><body><main style="display: flex; flex-direction: column">{items}</main></body></html>"""));
+        var frame = document.Context.GetDomHarness().PrepareViewportFrame();
+        return (frame.IsPartial, frame.Metrics.Boxes, frame.Rasterize().Data);
     }
 }

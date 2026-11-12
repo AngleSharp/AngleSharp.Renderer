@@ -47,6 +47,23 @@ a per-run-deterministic number and does not have this problem.
 
 ## History
 
+### 2026-11-12, viewport-only first-frame rendering
+
+Measured on Linux with .NET SDK 10.0.100, Release, viewport 1280x800. A fresh document was
+parsed before each timer; each result is the median of the final six iterations in a 12-iteration
+process. These exploratory probe results are not BenchmarkDotNet confidence intervals; absolute
+times vary on this shared machine.
+
+| Fixture | Before: time / allocated | After: time / allocated | Work avoided |
+|---|---:|---:|---|
+| 1,500 block rows | 186 ms / 31.1 MiB | 107 ms / 19.9 MiB | Style maps: 1,521 → 37 |
+| 1,500 fixed-height flex-column rows | 495 ms / 111.9 MiB | 397 ms / 83.7 MiB | Trial layouts: 1,500 → 0; text measurements: 144,000 → 72,000 |
+
+Both fixtures still laid out 37 and 3,003 boxes, respectively. The block result comes from avoiding
+full style maps for off-screen siblings during lookahead; the flex result avoids trial-measuring
+definite item heights before their actual layout. The viewport test suite separately checks pixel
+equivalence and parallel-vs-sequential style preparation.
+
 ### 2026-09-11, initial baseline (before any optimization)
 
 | Method (net10.0) | Mean | Allocated |
