@@ -2635,7 +2635,8 @@ public sealed partial class HtmlRenderer
         bool HasDeferredMainSize = false,
         float DeferredMeasureWidth = float.NaN,
         float CrossMarginStart = 0f,
-        float CrossMarginEnd = 0f)
+        float CrossMarginEnd = 0f,
+        bool DefersMinimum = false)
     {
         /// <summary>The margins along the cross axis, where an auto margin (NaN) counts as zero.</summary>
         public float CrossMargins => UsedMargin(CrossMarginStart) + UsedMargin(CrossMarginEnd);
@@ -2936,6 +2937,22 @@ public sealed partial class HtmlRenderer
             lines.Add(currentLine);
         }
 
+        // Items with a deferred automatic minimum (see CreateFlexItemLayoutInfo) have the same
+        // hypothetical size with it, so the lines are the same; a line that has to shrink, where
+        // the minimum limits how far, gets it now.
+        for (var lineIndex = 0; lineIndex < lines.Count; lineIndex++)
+        {
+            var line = lines[lineIndex];
+
+            if (line.Exists(item => item.DefersMinimum) &&
+                line.Sum(item => item.HypotheticalMainSize) >= containerMainSize - Math.Max(0, line.Count - 1) * mainGap - line.Sum(item => item.MainMargins))
+            {
+                lines[lineIndex] = line.Select(item => item.DefersMinimum
+                    ? CreateFlexItemLayoutInfo(item.Node, isRowDirection, containingWidth, definiteContentHeight, inheritedTextStyle, context, resolvesMinimum: true)
+                    : item).ToList();
+            }
+        }
+
         if (string.Equals(flexWrap, "wrap", StringComparison.OrdinalIgnoreCase) && lines.Count > 1 && containerCrossSize > 0f)
         {
             var availableCrossSpace = Math.Max(0f, containerCrossSize - Math.Max(0, lines.Count - 1) * crossGap);
@@ -2972,8 +2989,10 @@ public sealed partial class HtmlRenderer
         }
 
         // a line's cross size follows from its items' final main sizes (CSS Flexbox §9.4): text
-        // that wraps once shrunk is taller than at the hypothetical size, leaving less free space
-        var lineCrossSizes = lines.Select(line =>
+        // that wraps once shrunk is taller than at the hypothetical size, leaving less free space;
+        // a container without a cross size has none to share, so the lines are only sized as they
+        // are laid out (which lets the lines below the viewport go unmeasured, see below)
+        var lineCrossSizes = containerCrossSize <= 0f ? [] : lines.Select(line =>
         {
             if (line.Count == 0)
             {
@@ -3038,6 +3057,16 @@ public sealed partial class HtmlRenderer
             for (var lineIndex = 0; lineIndex < lines.Count; lineIndex++)
             {
                 var line = lines[lineIndex];
+
+                // As in a block flow, lines starting below the viewport are not laid out: without a
+                // cross size to share, the lines above do not depend on them.
+                if (lineIndex > 0 && isRowDirection && containerCrossSize <= 0f && containingY + currentCrossOffset > maxY &&
+                    !ContainsBottomStickyBox(lines.Skip(lineIndex).SelectMany(rest => rest).Select(item => item.Node), context))
+                {
+                    NoteCutOff(maxY);
+                    break;
+                }
+
                 var lineGap = Math.Max(0, line.Count - 1) * mainGap;
                 var lineMargins = line.Sum(item => item.MainMargins);
                 var lineItems = new List<(FlexItemLayoutInfo Item, float FinalMainSize)>(line.Count);
@@ -3100,6 +3129,18 @@ public sealed partial class HtmlRenderer
                 for (var itemIndex = 0; itemIndex < lineItems.Count; itemIndex++)
                 {
                     var (item, finalMainSize) = lineItems[itemIndex];
+
+                    // As in a block flow, the items of a column starting below the viewport are not
+                    // laid out: their main sizes, and so the column's, are known (unless the ones
+                    // laid out to measure them are needed to share the free space again).
+                    if (!isRowDirection && !isReverseDirection && laidOutHeights is null &&
+                        containingY + lineMainStart + currentMainOffset + (float.IsNaN(item.MainMarginStart) ? autoMarginSize : item.MainMarginStart) > maxY &&
+                        !ContainsBottomStickyBox(lineItems.Skip(itemIndex).Select(entry => entry.Item.Node), context))
+                    {
+                        NoteCutOff(maxY);
+                        break;
+                    }
+
                     var resolvedCrossSize = item.CrossSize;
                     var estimatedCrossSize = item.HasDefiniteCrossSize
                         ? 0f
@@ -3286,7 +3327,7 @@ public sealed partial class HtmlRenderer
         }
 
         var autoContentHeight = isRowDirection
-            ? finalLineCrossSizes.Sum() + Math.Max(0, lines.Count - 1) * crossGap
+            ? finalLineCrossSizes.Sum() + Math.Max(0, finalLineCrossSizes.Count - 1) * crossGap
             : Math.Max(0f, containerMainSize);
         var specifiedContentHeight = ResolveAuthoredDimension(styleMap, "height", containingHeight, float.NaN, verticalBorderAndPadding);
         var minimumContentHeight = ResolveAuthoredDimension(styleMap, "min-height", containingHeight, 0f, verticalBorderAndPadding);
@@ -6103,7 +6144,7 @@ public sealed partial class HtmlRenderer
         return normalized == "auto" ? fallback : normalized;
     }
 
-    private static FlexItemLayoutInfo CreateFlexItemLayoutInfo(IRenderNode child, bool isRowDirection, float relativeTo, float heightRelativeTo, RenderTextStyle inheritedTextStyle, LayoutContext context, string? deferringAlignItems = null)
+    private static FlexItemLayoutInfo CreateFlexItemLayoutInfo(IRenderNode child, bool isRowDirection, float relativeTo, float heightRelativeTo, RenderTextStyle inheritedTextStyle, LayoutContext context, string? deferringAlignItems = null, bool resolvesMinimum = false)
     {
         if (child is TextRenderNode textChild)
         {
@@ -6174,7 +6215,18 @@ public sealed partial class HtmlRenderer
         var hasDeferredMainSize = false;
         var deferredMeasureWidth = float.NaN;
 
-        if (isRowDirection)
+        var defersMinimum = false;
+        var minRaw = childStyle.GetValueOrDefault(isRowDirection ? "min-width" : "min-height")?.Trim();
+
+        if (isRowDirection && !resolvesMinimum && CanSkipFlexItemIntrinsicWidths(childStyle, specifiedMainSize, mainRelativeTo, mainBorderAndPadding, minRaw, out defersMinimum))
+        {
+            // A definite width with an automatic flex basis is the base size, and the automatic
+            // minimum can only be smaller, so the hypothetical size is the same without it. Only
+            // a line that has to shrink reads the minimum: LayoutFlexContainer resolves it there.
+            contentMainSize = specifiedMainSize;
+            contentMinimum = specifiedMainSize;
+        }
+        else if (isRowDirection)
         {
             var intrinsic = TryResolveReplacedContentWidth(elementChild, childStyle, relativeTo, out var replacedWidth)
                 ? new IntrinsicWidths(replacedWidth, replacedWidth)
@@ -6237,7 +6289,6 @@ public sealed partial class HtmlRenderer
         var maxMainSize = float.IsNaN(keywordMaxSize)
             ? ResolveAuthoredDimension(childStyle, isRowDirection ? "max-width" : "max-height", mainRelativeTo, float.NaN, mainBorderAndPadding)
             : keywordMaxSize;
-        var minRaw = childStyle.GetValueOrDefault(minProperty)?.Trim();
         float minMainSize;
 
         if (!float.IsNaN(keywordMinSize))
@@ -6281,7 +6332,32 @@ public sealed partial class HtmlRenderer
             hasDeferredMainSize,
             deferredMeasureWidth,
             CrossMarginStart: ParseLength(childStyle, isRowDirection ? "margin-top" : "margin-left", relativeTo, isRowDirection ? childBox.Margin.Top : childBox.Margin.Left, allowAuto: true),
-            CrossMarginEnd: ParseLength(childStyle, isRowDirection ? "margin-bottom" : "margin-right", relativeTo, isRowDirection ? childBox.Margin.Bottom : childBox.Margin.Right, allowAuto: true));
+            CrossMarginEnd: ParseLength(childStyle, isRowDirection ? "margin-bottom" : "margin-right", relativeTo, isRowDirection ? childBox.Margin.Bottom : childBox.Margin.Right, allowAuto: true),
+            DefersMinimum: defersMinimum);
+    }
+
+    /// <summary>
+    /// Whether a row item's content widths are not needed for its sizes: its width is a definite
+    /// length and its flex basis automatic, so both its base size and its limits are known, and
+    /// its automatic minimum (the only other reader) is either not used - an authored
+    /// <c>min-width</c>, or a scroll container - or deferred (<paramref name="defersMinimum"/>).
+    /// </summary>
+    private static bool CanSkipFlexItemIntrinsicWidths(Dictionary<string, string> style, float specifiedWidth, float relativeTo, float horizontalBorderAndPadding, string? minRaw, out bool defersMinimum)
+    {
+        defersMinimum = false;
+
+        if (float.IsNaN(specifiedWidth) ||
+            GetContentSizeKeyword(style, "width") is not null ||
+            GetContentSizeKeyword(style, "flex-basis") is not null ||
+            GetContentSizeKeyword(style, "min-width") is not null ||
+            GetContentSizeKeyword(style, "max-width") is not null ||
+            !float.IsNaN(ResolveFlexBaseSize(style, relativeTo, horizontalBorderAndPadding)))
+        {
+            return false;
+        }
+
+        defersMinimum = (string.IsNullOrEmpty(minRaw) || string.Equals(minRaw, "auto", StringComparison.OrdinalIgnoreCase)) && !ShouldClipOverflow(style);
+        return true;
     }
 
     /// <summary>
@@ -7571,8 +7647,9 @@ public sealed partial class HtmlRenderer
     {
         private Dictionary<string, CssLengthValue>? _rawLengths;
 
+        // computed style maps of a page hold about 14 entries (31 at the 90th percentile)
         public StyleMap()
-            : base(StringComparer.OrdinalIgnoreCase)
+            : base(16, StringComparer.OrdinalIgnoreCase)
         {
         }
 
@@ -8484,7 +8561,15 @@ public sealed partial class HtmlRenderer
             return false;
         }
 
-        return element.Children.All(child => HasNoInFlowContent(child, styleMap, context));
+        foreach (var child in element.Children)
+        {
+            if (!HasNoInFlowContent(child, styleMap, context))
+            {
+                return false;
+            }
+        }
+
+        return true;
     }
 
     private static bool IsFlowBlockDisplay(Dictionary<string, string> styleMap) =>
@@ -8687,6 +8772,11 @@ public sealed partial class HtmlRenderer
 
         public void Apply(DisplayList displayList)
         {
+            if (_raised.Count == 0)
+            {
+                return;
+            }
+
             var ordered = _raised.OrderBy(m => m.Z).ThenBy(m => m.Order).ToList();
             Applied = ordered.Select(m => new RaisedChild(m.Element, m.Z, m.First, m.Count)).ToList();
 
@@ -8978,17 +9068,20 @@ public sealed partial class HtmlRenderer
             return (0f, 0f);
         }
 
-        var parts = value.Trim().Split(' ', StringSplitOptions.RemoveEmptyEntries);
+        var trimmed = value.AsSpan().Trim();
 
-        if (parts.Length == 0)
+        if (trimmed is "0px" or "0")
         {
             return (0f, 0f);
         }
 
-        var x = ParseRadiusComponent(parts[0], borderBoxWidth);
-        var y = parts.Length > 1 ? ParseRadiusComponent(parts[1], borderBoxHeight) : ParseRadiusComponent(parts[0], borderBoxHeight);
+        var separator = trimmed.IndexOf(' ');
+        var first = (separator < 0 ? trimmed : trimmed[..separator]).ToString();
+        var rest = separator < 0 ? default : trimmed[(separator + 1)..].TrimStart(' ');
+        var secondEnd = rest.IndexOf(' ');
+        var second = rest.IsEmpty ? first : (secondEnd < 0 ? rest : rest[..secondEnd]).ToString();
 
-        return (x, y);
+        return (ParseRadiusComponent(first, borderBoxWidth), ParseRadiusComponent(second, borderBoxHeight));
     }
 
     private static float ParseRadiusComponent(string token, float reference)
@@ -13069,9 +13162,9 @@ public sealed partial class HtmlRenderer
 
     private static bool TryParsePixelValue(string value, out float pixels)
     {
-        var trimmed = value.Trim().ToLowerInvariant();
+        var trimmed = value.AsSpan().Trim();
 
-        if (trimmed.EndsWith("px", StringComparison.Ordinal))
+        if (trimmed.EndsWith("px", StringComparison.OrdinalIgnoreCase))
         {
             return float.TryParse(trimmed[..^2], NumberStyles.Float, CultureInfo.InvariantCulture, out pixels);
         }
@@ -13105,7 +13198,9 @@ public sealed partial class HtmlRenderer
     /// to load, paints nothing.
     /// </summary>
     private static List<BackgroundLayer> ParseBackgroundLayers(Dictionary<string, string> styleMap, IElement element) =>
-        ParseImageLayers(styleMap, element, "background", url => TryGetOrLoadBackgroundImageResource(element, url, out var resource) ? resource : null);
+        !styleMap.TryGetValue("background-image", out var images) || string.IsNullOrWhiteSpace(images) || images.Equals("none", StringComparison.OrdinalIgnoreCase)
+            ? []
+            : ParseImageLayers(styleMap, element, "background", url => TryGetOrLoadBackgroundImageResource(element, url, out var resource) ? resource : null);
 
     /// <summary>
     /// The layers of `background-image` or `mask-image` (<paramref name="prefix"/>), each with
@@ -13115,8 +13210,9 @@ public sealed partial class HtmlRenderer
     private static List<BackgroundLayer> ParseImageLayers(Dictionary<string, string> styleMap, IElement element, string prefix, Func<string, CachedImageResource?> loadImage)
     {
         var layers = new List<BackgroundLayer>();
+        var names = prefix == "mask" ? ImageLayerPropertyNames.Mask : ImageLayerPropertyNames.Background;
 
-        if (!styleMap.TryGetValue($"{prefix}-image", out var images) || string.IsNullOrWhiteSpace(images))
+        if (!styleMap.TryGetValue(names.Image, out var images) || string.IsNullOrWhiteSpace(images))
         {
             return layers;
         }
@@ -13132,9 +13228,9 @@ public sealed partial class HtmlRenderer
                 continue;
             }
 
-            var size = ParseBackgroundSize(GetLayerValue(styleMap, $"{prefix}-size", index));
-            var (positionX, positionY) = ParseBackgroundPosition(GetLayerValue(styleMap, $"{prefix}-position", index));
-            var (repeatX, repeatY) = ParseBackgroundRepeat(GetLayerValue(styleMap, $"{prefix}-repeat", index));
+            var size = ParseBackgroundSize(GetLayerValue(styleMap, names.Size, index));
+            var (positionX, positionY) = ParseBackgroundPosition(GetLayerValue(styleMap, names.Position, index));
+            var (repeatX, repeatY) = ParseBackgroundRepeat(GetLayerValue(styleMap, names.Repeat, index));
             RenderPaint? paint = null;
 
             if (TryExtractCssUrl(item, out var url))
@@ -13172,13 +13268,23 @@ public sealed partial class HtmlRenderer
 
             layers.Add(new BackgroundLayer(
                 paint,
-                (GetLayerValue(styleMap, $"{prefix}-clip", index) ?? string.Empty).ToLowerInvariant(),
-                (GetLayerValue(styleMap, $"{prefix}-origin", index) ?? string.Empty).ToLowerInvariant(),
-                ParseBlendModeKeyword(GetLayerValue(styleMap, $"{prefix}-blend-mode", index)),
+                (GetLayerValue(styleMap, names.Clip, index) ?? string.Empty).ToLowerInvariant(),
+                (GetLayerValue(styleMap, names.Origin, index) ?? string.Empty).ToLowerInvariant(),
+                ParseBlendModeKeyword(GetLayerValue(styleMap, names.BlendMode, index)),
                 index));
         }
 
         return layers;
+    }
+
+    private sealed record ImageLayerPropertyNames(string Image, string Size, string Position, string Repeat, string Clip, string Origin, string BlendMode)
+    {
+        public static readonly ImageLayerPropertyNames Background = Create("background");
+
+        public static readonly ImageLayerPropertyNames Mask = Create("mask");
+
+        private static ImageLayerPropertyNames Create(string prefix) =>
+            new($"{prefix}-image", $"{prefix}-size", $"{prefix}-position", $"{prefix}-repeat", $"{prefix}-clip", $"{prefix}-origin", $"{prefix}-blend-mode");
     }
 
     private static bool TryExtractCssUrl(string value, out string url)
@@ -13248,6 +13354,12 @@ public sealed partial class HtmlRenderer
     private static (RenderBackgroundPositionComponent X, RenderBackgroundPositionComponent Y) ParseBackgroundPosition(string? value)
     {
         if (string.IsNullOrWhiteSpace(value))
+        {
+            return (RenderBackgroundPositionComponent.Zero, RenderBackgroundPositionComponent.Zero);
+        }
+
+        // the initial value
+        if (value is "0% 0%")
         {
             return (RenderBackgroundPositionComponent.Zero, RenderBackgroundPositionComponent.Zero);
         }
@@ -14315,12 +14427,19 @@ public sealed partial class HtmlRenderer
             return [];
         }
 
-        var parts = new List<string>();
-        var current = new StringBuilder();
-        var depth = 0;
-
-        foreach (var character in value)
+        if (!value.Contains(','))
         {
+            return [value.Trim()];
+        }
+
+        var parts = new List<string>();
+        var depth = 0;
+        var start = 0;
+
+        for (var index = 0; index < value.Length; index++)
+        {
+            var character = value[index];
+
             if (character == '(')
             {
                 depth++;
@@ -14331,26 +14450,23 @@ public sealed partial class HtmlRenderer
             }
             else if (character == ',' && depth == 0)
             {
-                var part = current.ToString().Trim();
-                if (part.Length > 0)
-                {
-                    parts.Add(part);
-                }
-
-                current.Clear();
-                continue;
+                AddPart(value.AsSpan(start, index - start));
+                start = index + 1;
             }
-
-            current.Append(character);
         }
 
-        var last = current.ToString().Trim();
-        if (last.Length > 0)
-        {
-            parts.Add(last);
-        }
-
+        AddPart(value.AsSpan(start));
         return parts.ToArray();
+
+        void AddPart(ReadOnlySpan<char> part)
+        {
+            part = part.Trim();
+
+            if (part.Length > 0)
+            {
+                parts.Add(part.ToString());
+            }
+        }
     }
 
     /// <summary>

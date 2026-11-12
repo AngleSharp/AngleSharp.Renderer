@@ -5,6 +5,9 @@ Released on Thursday, November 12 2026.
 - Improved deeply nested pages: what is nested too deep for the stack is left out instead of ending the process with a stack overflow (#55) @michaelthyregod
 - Improved the performance of nested tables and inline-blocks, which were laid out twice as often with every level (#54) @michaelthyregod
 - Improved performance with partial layouting due to an off-screen lookahead which avoids full style-map creation
+- Improved the first frame of pages with long flex containers: the lines of a wrapping row and the items of a column that start below the viewport are not laid out
+- Improved the performance of flex rows: an item with a definite width only measures its content when its line has to shrink
+- Improved the garbage collection while building style maps (about 20% less allocated per frame)
 - Fixed adjacent text nodes (e.g. inserted by a script or a framework like Blazor) each starting a line of their own in a block, table cell or flex item: they are laid out as one text, like the single node the parser makes of the same text
 - Fixed the intrinsic width of a row flex container counting each of adjacent text nodes as an item of its own (with a gap between them)
 

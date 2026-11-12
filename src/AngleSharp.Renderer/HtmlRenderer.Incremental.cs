@@ -1658,7 +1658,8 @@ public sealed partial class HtmlRenderer
                 return false;
             }
 
-            var info = CreateFlexItemLayoutInfo(node, item.IsRowDirection, flex.RelativeTo, flex.HeightRelativeTo, entry.TextStyle, _context, flex.DeferringAlignItems);
+            // an item whose automatic minimum its line resolved is compared with it resolved
+            var info = CreateFlexItemLayoutInfo(node, item.IsRowDirection, flex.RelativeTo, flex.HeightRelativeTo, entry.TextStyle, _context, flex.DeferringAlignItems, resolvesMinimum: !flex.Info.DefersMinimum);
 
             return info with { Node = null!, Style = null! } == flex.Info &&
                 (float.IsNaN(flex.EstimatedCrossSize) || EstimateFlexItemCrossSize(node, flex.FinalMainSize, item.IsRowDirection, entry.TextStyle, _context, flex.CrossAvailable) == flex.EstimatedCrossSize);

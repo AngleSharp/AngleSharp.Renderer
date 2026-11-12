@@ -9214,6 +9214,27 @@ public sealed class HtmlRendererTests
         Assert.Equal(expectedWidth, SingleFill(BuildDisplayList(document), Red).Rect.Width, precision: 2);
     }
 
+    [Theory]
+    [InlineData("nowrap", "width:100px;", 80f)]
+    [InlineData("nowrap", "width:100px; min-width:0;", 50f)]
+    [InlineData("nowrap", "width:100px; overflow:hidden;", 50f)]
+    [InlineData("nowrap", "width:30px;", 30f)]
+    [InlineData("wrap", "width:150px;", 100f)]
+    [InlineData("wrap", "width:40px;", 40f)]
+    public async Task BuildDisplayList_FlexItemsWithADefiniteWidthShrinkOnlyToTheirAutomaticMinimum(string wrap, string style, float expectedWidth)
+    {
+        var document = await ParseAsync($"""
+            <html><body style="margin:0">
+                <div style="display:flex; flex-wrap:{wrap}; width:100px">
+                    <div style="{style} background-color:#ff0000"><span style="display:inline-block; width:80px; height:10px"></span></div>
+                    <div style="{style} background-color:#00ff00"><span style="display:inline-block; width:20px; height:10px"></span></div>
+                </div>
+            </body></html>
+            """);
+
+        Assert.Equal(expectedWidth, SingleFill(BuildDisplayList(document), Red).Rect.Width, precision: 2);
+    }
+
     [Fact]
     public async Task BuildDisplayList_FlexShrinkIsWeightedByTheBaseSize()
     {
