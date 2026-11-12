@@ -1,3 +1,12 @@
+# 0.11.3
+
+Released on Friday, November 13 2026.
+
+- Fixed relatively positioned boxes painting below earlier absolutely positioned siblings: all positioned boxes with `z-index: auto` paint above the in-flow content in tree order (CSS 2.2 Appendix E)
+- Fixed an image with a percentage `width` or `max-width` (e.g., `width: 100%`) widening a `1fr` grid track or other intrinsic size to its natural width: its min-content contribution is zero (compressible replaced elements, CSS Sizing 3)
+- Fixed `justify-content` (e.g., `place-content: center`) not placing the column of a grid without `grid-template-columns`, which always filled the container
+- Fixed a frame painted while an image's response was still being processed taking its stream, which left the image without its natural size (it then was laid out as a broken image)
+
 # 0.11.2
 
 Released on Thursday, November 12 2026.

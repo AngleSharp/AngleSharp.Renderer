@@ -3065,7 +3065,12 @@ public sealed partial class HtmlRenderer
         }
         else if (TryResolveReplacedContentWidth(element, styleMap, percentageBase, out var replacedWidth))
         {
-            content = new IntrinsicWidths(replacedWidth, replacedWidth);
+            // with a percentage width or max-width, a replaced element can shrink to nothing,
+            // e.g. an image with width: 100% in a 1fr grid track (compressible replaced
+            // elements, CSS Sizing 3 §5.2.2)
+            var isCompressible = (rawWidth is not null && IsPercentageValue(rawWidth)) ||
+                (styleMap.TryGetValue("max-width", out var rawMaxWidth) && IsPercentageValue(rawMaxWidth));
+            content = new IntrinsicWidths(isCompressible ? 0f : replacedWidth, replacedWidth);
         }
         else if (formControlKind is FormControlKind.TextLike or FormControlKind.TextArea)
         {

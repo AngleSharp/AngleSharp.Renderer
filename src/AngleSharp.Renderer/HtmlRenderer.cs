@@ -17,6 +17,7 @@ using AngleSharp.Css.Values;
 using AngleSharp.Dom;
 using AngleSharp.Html.Dom;
 using AngleSharp.Io;
+using AngleSharp.Media;
 using AngleSharp.Renderer.Rendering;
 using AngleSharp.Renderer.Skia;
 using AngleSharp.Renderer.Skia.Svg;
@@ -3652,7 +3653,12 @@ public sealed partial class HtmlRenderer
 
         if (columns.Count == 0)
         {
-            columns.Add(GridTrackSize.Fixed(containingWidth));
+            // the implicit column is auto; stretched (justify-content: normal) it fills the
+            // container, which needs no measuring, otherwise it fits its items, which
+            // justify-content places (e.g. an icon centered by place-content: center)
+            columns.Add(styleMap.GetValueOrDefault("justify-content")?.Trim().ToLowerInvariant() is null or "" or "normal" or "stretch"
+                ? GridTrackSize.Fixed(containingWidth)
+                : GridTrackSize.Auto());
         }
 
         var gridVerticalBorderAndPadding = borderTop + borderBottom + paddingTop + paddingBottom;
@@ -8763,7 +8769,8 @@ public sealed partial class HtmlRenderer
             {
                 var styleMap = GetOrCreateStyleMap(context, element.Ref, element.ComputedStyle);
 
-                if ((IsOutOfFlowPositioned(styleMap) || HasExplicitZIndex(styleMap)) && ParseZIndex(styleMap) >= 0)
+                // all positioned boxes, relative ones too, paint above the in-flow content
+                if ((IsOutOfFlowPositioned(styleMap) || IsRelativePositioned(styleMap) || HasExplicitZIndex(styleMap)) && ParseZIndex(styleMap) >= 0)
                 {
                     _raised.Add((ParseZIndex(styleMap), _raised.Count, displayList.Commands[start], count, element.Ref));
                 }
@@ -8780,18 +8787,48 @@ public sealed partial class HtmlRenderer
             var ordered = _raised.OrderBy(m => m.Z).ThenBy(m => m.Order).ToList();
             Applied = ordered.Select(m => new RaisedChild(m.Element, m.Z, m.First, m.Count)).ToList();
 
+            // find the ranges from the end (they are within the commands of the flow), then
+            // move them in one pass: many raised siblings (e.g. relative list items) stay linear
+            var commands = displayList.Commands;
+            var starts = new Dictionary<RenderCommand, int>(ordered.Count, ReferenceEqualityComparer.Instance);
+
+            foreach (var raised in ordered)
+            {
+                starts[raised.First] = -1;
+            }
+
+            var missing = starts.Count;
+
+            for (var index = commands.Count - 1; index >= 0 && missing > 0; index--)
+            {
+                if (starts.TryGetValue(commands[index], out var found) && found < 0)
+                {
+                    starts[commands[index]] = index;
+                    missing--;
+                }
+            }
+
+            var ranges = new List<(int StartIndex, int Count)>(ordered.Count);
+            var expected = -1;
+            var inPlace = true;
+
             foreach (var (_, _, first, count, _) in ordered)
             {
-                var commands = displayList.Commands;
+                var index = starts[first];
 
-                for (var index = commands.Count - 1; index >= 0; index--)
+                if (index >= 0)
                 {
-                    if (ReferenceEquals(commands[index], first))
-                    {
-                        displayList.MoveRangeToEnd(index, Math.Min(count, commands.Count - index));
-                        break;
-                    }
+                    var range = (index, Math.Min(count, commands.Count - index));
+                    // already painting last, in this order (e.g. only raised children)
+                    inPlace &= expected < 0 || index == expected;
+                    expected = index + range.Item2;
+                    ranges.Add(range);
                 }
+            }
+
+            if (ranges.Count > 0 && !(inPlace && expected == commands.Count))
+            {
+                displayList.MoveRangesToEnd(ranges);
             }
         }
     }
@@ -8828,6 +8865,9 @@ public sealed partial class HtmlRenderer
 
         return ParseZIndex(elementChild.ComputedStyle.GetPropertyValue("z-index")) < 0;
     }
+
+    private static bool IsRelativePositioned(Dictionary<string, string> styleMap) =>
+        string.Equals(GetPosition(styleMap), "relative", StringComparison.OrdinalIgnoreCase);
 
     private static bool IsStickyPositioned(Dictionary<string, string> styleMap) =>
         string.Equals(GetPosition(styleMap), "sticky", StringComparison.OrdinalIgnoreCase);
@@ -9801,6 +9841,13 @@ public sealed partial class HtmlRenderer
 
     private delegate bool ImageResourceLoader(IElement element, string source, out CachedImageResource? imageResource);
 
+    /// <summary>
+    /// Set by a loader that found the image still being processed (see
+    /// <see cref="TryLoadImageResource"/>): that is not a missing image to remember.
+    /// </summary>
+    [ThreadStatic]
+    private static bool s_imagePending;
+
     private static bool TryGetOrLoadCachedResource(IElement element, string cacheKey, ImageResourceLoader loader, out CachedImageResource? imageResource)
     {
         imageResource = null;
@@ -9817,9 +9864,10 @@ public sealed partial class HtmlRenderer
             }
         }
 
+        s_imagePending = false;
         var loaded = loader(element, cacheKey, out imageResource);
 
-        if (cache is not null)
+        if (cache is not null && (loaded || !s_imagePending))
         {
             lock (cache.Resources)
             {
@@ -9864,6 +9912,13 @@ public sealed partial class HtmlRenderer
                 bytes = capturedBytes;
                 mimeType = capturedMimeType;
             }
+            else if (response is not null && IsCapturedLater(element, response))
+            {
+                // the image service is (about to be) reading the response: taking its stream
+                // would leave the image without its natural size, so it paints once processed
+                s_imagePending = true;
+                return false;
+            }
             else if (response?.Content is not null)
             {
                 try
@@ -9890,6 +9945,24 @@ public sealed partial class HtmlRenderer
         }
 
         return bytes is not null && TryDecodeImageBytes(bytes, mimeType, out imageResource);
+    }
+
+    /// <summary>
+    /// If the image service of WithRendering() processes the response of an image, which
+    /// AngleSharp does once the download completed - a frame may come first.
+    /// </summary>
+    private static bool IsCapturedLater(IElement element, IResponse response)
+    {
+        try
+        {
+            var type = response.GetContentType().Content;
+            return element.Owner?.Context?.GetResourceService<IImageInfo>(type) is ImageResourceService;
+        }
+        catch (Exception exception) when (exception is ObjectDisposedException or InvalidOperationException)
+        {
+            // already processed (and disposed) without the image service
+            return false;
+        }
     }
 
     /// <summary>

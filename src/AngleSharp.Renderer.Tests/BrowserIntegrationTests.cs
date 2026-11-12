@@ -292,6 +292,90 @@ public sealed class BrowserIntegrationTests
         Assert.Equal(SKColors.Red, rendered.GetPixel(10, 10));
     }
 
+    /// <summary>
+    /// Serves an image whose body arrives only once the gate opens, as a slow network does
+    /// after the headers.
+    /// </summary>
+    private sealed class GatedPngRequester(byte[] png) : BaseRequester
+    {
+        public ManualResetEventSlim Gate { get; } = new(false);
+
+        public override bool SupportsProtocol(string protocol) => true;
+
+        protected override Task<IResponse?> PerformRequestAsync(Request request, CancellationToken cancel) =>
+            Task.FromResult<IResponse?>(new DefaultResponse
+            {
+                Address = request.Address,
+                StatusCode = HttpStatusCode.OK,
+                Headers = new Dictionary<string, string> { ["Content-Type"] = "image/png" },
+                Content = new GatedStream(png, Gate),
+            });
+
+        private sealed class GatedStream(byte[] data, ManualResetEventSlim gate) : MemoryStream(data)
+        {
+            public override int Read(byte[] buffer, int offset, int count)
+            {
+                gate.Wait();
+                return base.Read(buffer, offset, count);
+            }
+
+            public override int Read(Span<byte> buffer)
+            {
+                gate.Wait();
+                return base.Read(buffer);
+            }
+
+            public override async Task<int> ReadAsync(byte[] buffer, int offset, int count, CancellationToken cancellationToken)
+            {
+                await Task.Run(() => gate.Wait(cancellationToken), cancellationToken);
+                return await base.ReadAsync(buffer, offset, count, cancellationToken);
+            }
+
+            public override async ValueTask<int> ReadAsync(Memory<byte> buffer, CancellationToken cancellationToken = default)
+            {
+                await Task.Run(() => gate.Wait(cancellationToken), cancellationToken);
+                return await base.ReadAsync(buffer, cancellationToken);
+            }
+        }
+    }
+
+    [Fact]
+    public async Task FrameBeforeTheImageIsProcessedLeavesItsResponseToTheImageService()
+    {
+        // the tractor store: a frame between the download and the image service took the
+        // response stream, so the image had no natural size (and was laid out as a broken one)
+        using var bitmap = new SKBitmap(40, 20);
+        bitmap.Erase(SKColors.Red);
+        var png = bitmap.Encode(SKEncodedImageFormat.Png, 100).ToArray();
+        var requester = new GatedPngRequester(png);
+        var configuration = Configuration.Default
+            .WithCss()
+            .WithRendering()
+            .WithRenderDevice(CreateDevice())
+            .WithDefaultLoader(new LoaderOptions { IsResourceLoadingEnabled = true })
+            .With(requester);
+        var document = await LoadAsync("<style>body { margin: 0 }</style>", configuration);
+        var image = (IHtmlImageElement)document.CreateElement("img");
+        image.Source = "http://localhost/red.png";
+        document.Body!.AppendChild(image);
+        var download = ((ILoadableElement)image).CurrentDownload!;
+        await download.Task.WaitAsync(TimeSpan.FromSeconds(10));
+
+        // the image service waits for the body now; the frame must not read it
+        await Task.Run(() => Render(document)).WaitAsync(TimeSpan.FromSeconds(10));
+        requester.Gate.Set();
+        var watch = Stopwatch.StartNew();
+
+        while (image.OriginalWidth == 0 && watch.Elapsed < TimeSpan.FromSeconds(10))
+        {
+            await Task.Delay(10);
+        }
+
+        Assert.Equal(40, image.OriginalWidth);
+        using var rendered = SKBitmap.Decode(Render(document));
+        Assert.Equal(SKColors.Red, rendered.GetPixel(30, 10));
+    }
+
     [Fact]
     public async Task LoadedImagesWithoutTheRenderingServicesDoNotFailThePaint()
     {
