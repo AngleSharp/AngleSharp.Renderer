@@ -203,7 +203,7 @@ public sealed partial class HtmlRenderer
     /// <param name="IsHidden">If it is not hit itself (visibility: hidden, pointer-events: none).</param>
     internal readonly record struct HitTestLayer(bool IsLayerRoot, int ZIndex, bool ClipsOverflow, bool IsHidden);
 
-    private readonly record struct LayoutContext(
+    private sealed record class LayoutContext(
         int Width,
         int Height,
         RenderColor TextColor,
@@ -7734,7 +7734,7 @@ public sealed partial class HtmlRenderer
     private static Dictionary<string, string> CreateComputedStyleMap(ICssStyleDeclaration style, IElement? element, LayoutContext? context)
     {
         var map = new StyleMap();
-        var explicitDeclarations = context.HasValue ? GetExplicitDeclarations(context.Value, element) : null;
+        var explicitDeclarations = context is not null ? GetExplicitDeclarations(context, element) : null;
         var inlineStyle = element?.GetAttribute("style");
 
         var displayValue = style.GetDisplay();
