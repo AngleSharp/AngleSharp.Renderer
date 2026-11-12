@@ -34,6 +34,61 @@ public sealed class ViewportFrameTests
     }
 
     [Fact]
+    public async Task ViewportFrame_DoesNotBuildStyleMapsForOffscreenSiblings()
+    {
+        var offscreen = string.Concat(Enumerable.Repeat("""<div style="height: 20px">Offscreen</div>""", 300));
+        var (_, harness) = await OpenAsync("""<div style="height: 1000px">Above the fold</div>""" + offscreen);
+
+        var frame = harness.PrepareViewportFrame();
+
+        Assert.True(frame.IsPartial);
+        Assert.True(frame.Metrics.StyleMaps < 20, $"Created {frame.Metrics.StyleMaps} style maps for content outside the viewport.");
+    }
+
+    [Fact]
+    public async Task ViewportFrame_AutoHeightColumnWithDefiniteItemHeightsDoesNotTrialLayoutItems()
+    {
+        var items = string.Concat(Enumerable.Repeat("""<div style="height: 40px">A fixed-height flex item</div>""", 30));
+        var (_, harness) = await OpenAsync("""<main style="display: flex; flex-direction: column">""" + items + "</main>");
+
+        var partial = harness.PrepareViewportFrame();
+        var whole = harness.PrepareFrame();
+
+        Assert.Equal(0, partial.Metrics.TrialLayouts);
+        AssertSamePixels(whole.Rasterize(), partial.Rasterize());
+    }
+
+    [Fact]
+    public async Task ViewportFrame_WrappingFlexRowLaysOutOnlyTheLinesInView()
+    {
+        var cards = string.Concat(Enumerable.Range(0, 120).Select(index => $"""<div style="width: 80px; background: #{index * 2:x2}ff00"><p>Card {index}</p><span>with text</span></div>"""));
+        var (_, harness) = await OpenAsync("""<div style="display: flex; flex-wrap: wrap; gap: 8px">""" + cards + "</div>" + TallPage);
+
+        var partial = harness.PrepareViewportFrame();
+        var whole = harness.PrepareFrame();
+
+        Assert.True(partial.IsPartial);
+        Assert.True(partial.Metrics.TrialLayouts * 4 < whole.Metrics.TrialLayouts, $"{partial.Metrics.TrialLayouts} trial layouts in view, {whole.Metrics.TrialLayouts} in all.");
+        AssertSamePixels(whole.Rasterize(), partial.Rasterize());
+    }
+
+    [Theory]
+    [InlineData("height: 40px")]
+    [InlineData("padding: 4px")]
+    public async Task ViewportFrame_ColumnLaysOutOnlyTheItemsInView(string itemStyle)
+    {
+        var items = string.Concat(Enumerable.Range(0, 200).Select(index => $"""<div style="{itemStyle}; background: #00{index:x2}ff">Item <span>{index}</span></div>"""));
+        var (_, harness) = await OpenAsync("""<main style="display: flex; flex-direction: column; gap: 4px">""" + items + "</main>" + TallPage);
+
+        var partial = harness.PrepareViewportFrame();
+        var whole = harness.PrepareFrame();
+
+        Assert.True(partial.IsPartial);
+        Assert.True(partial.Metrics.Boxes * 4 < whole.Metrics.Boxes, $"{partial.Metrics.Boxes} boxes laid out in view, {whole.Metrics.Boxes} in all.");
+        AssertSamePixels(whole.Rasterize(), partial.Rasterize());
+    }
+
+    [Fact]
     public async Task ViewportFrame_LooksLikeAFrameOfTheWholePage()
     {
         var (_, harness) = await OpenAsync(TallPage);

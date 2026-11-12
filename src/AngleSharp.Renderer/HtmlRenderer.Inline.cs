@@ -2,6 +2,7 @@ namespace AngleSharp.Renderer;
 
 using System.Globalization;
 using System.Linq;
+using System.Runtime.CompilerServices;
 using System.Text;
 
 using AngleSharp.Css.Dom;
@@ -64,10 +65,25 @@ public sealed partial class HtmlRenderer
             if (run.All(static node => node is TextRenderNode) && !floats.HasFloatsBelow(cursorY))
             {
                 // A run of bare text keeps the dedicated paragraph path, which also implements
-                // `text-overflow: ellipsis` and `-webkit-line-clamp`.
+                // `text-overflow: ellipsis` and `-webkit-line-clamp`. Adjacent text nodes (e.g.
+                // "Picture ", "4", " of 4" inserted by a script) are one paragraph, laid out
+                // from the first of them (see GetTextRunData).
+                HashSet<IText>? covered = null;
+
                 foreach (var textNode in run.Cast<TextRenderNode>())
                 {
-                    LayoutTextNode(textNode.Ref, contentX, contentWidth, ref cursorY, ref previousBlockMarginBottom, ref suppressNextBlockTopMargin, floats, ref textIndentConsumed, textStyle, context, displayList, maxY);
+                    if (covered?.Contains(textNode.Ref) == true)
+                    {
+                        continue;
+                    }
+
+                    if (textNode.Ref.NextSibling is IText or IComment)
+                    {
+                        covered ??= [];
+                        AddFollowingTextRun(textNode.Ref, covered);
+                    }
+
+                    LayoutTextNode(textNode.Ref, contentX, contentWidth, ref cursorY, ref previousBlockMarginBottom, ref suppressNextBlockTopMargin, floats, ref textIndentConsumed, textStyle, context, displayList, maxY, asTextRun: true);
                 }
             }
             else
@@ -529,7 +545,8 @@ public sealed partial class HtmlRenderer
 
         private void CollectElement(ElementRenderNode element, RenderTextStyle parentStyle, InlineBox? parentBox)
         {
-            if (!GeneratesBoxes(element))
+            // a deep subtree is left out once the stack runs low (see LayoutNode)
+            if (!GeneratesBoxes(element) || !RuntimeHelpers.TryEnsureSufficientExecutionStack())
             {
                 return;
             }
@@ -2636,6 +2653,82 @@ public sealed partial class HtmlRenderer
     }
 
     /// <summary>
+    /// What a trial layout of an element depends on: the style map it is laid out with (a
+    /// container in a writing-mode system of its own swaps it), the space and style it gets,
+    /// and how it is measured.
+    /// </summary>
+    private readonly record struct TrialLayoutKey(
+        Dictionary<string, string> StyleMap,
+        float ContainingWidth,
+        RenderTextStyle InheritedStyle,
+        float ForcedBorderBoxWidth,
+        bool IsAtomicInline,
+        bool IsFlexOrGridItem,
+        float MaxY,
+        bool IsHeightOnly);
+
+    private readonly record struct TrialLayoutResult(
+        ElementLayoutMetrics? Metrics,
+        float? LastBaselineY,
+        float? FirstBaselineY,
+        IReadOnlyDictionary<IElement, ElementLayoutMetrics> Laidout,
+        float? AutoContentHeight);
+
+    /// <summary>
+    /// A kept trial layout of an element, and the one kept before it for other inputs.
+    /// </summary>
+    private sealed class TrialLayoutEntry(TrialLayoutKey key)
+    {
+        public TrialLayoutKey Key { get; } = key;
+
+        public TrialLayoutResult Result { get; set; }
+
+        public TrialLayoutEntry? Next { get; set; }
+    }
+
+    /// <summary>
+    /// Finds the kept trial layout of an element for these inputs (<paramref name="found"/>), or
+    /// gives a new entry to keep the trial in when it runs inside another trial: only those are
+    /// repeated by the layout around them. Nothing is kept inside a line-clamped box, whose
+    /// lines are counted. Not inlined, so that the large inputs stay out of the frame of
+    /// <see cref="TrialLayout"/>, which is on the stack once per nesting level.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private static TrialLayoutEntry? FindTrialLayout(
+        ElementRenderNode element,
+        float containingWidth,
+        in RenderTextStyle inheritedStyle,
+        in LayoutContext context,
+        float forcedBorderBoxWidth,
+        bool isAtomicInline,
+        bool isFlexOrGridItem,
+        float maxY,
+        bool isHeightOnly,
+        out bool found)
+    {
+        found = false;
+
+        if (context.LineClampScopes.TryPeek(out _))
+        {
+            return null;
+        }
+
+        var key = new TrialLayoutKey(GetOrCreateStyleMap(context, element.Ref, element.ComputedStyle), containingWidth, inheritedStyle,
+            forcedBorderBoxWidth, isAtomicInline, isFlexOrGridItem, maxY, isHeightOnly);
+
+        for (var entry = context.TrialLayouts.GetValueOrDefault(element.Ref); entry is not null; entry = entry.Next)
+        {
+            if (entry.Key == key)
+            {
+                found = true;
+                return entry;
+            }
+        }
+
+        return s_trialDepth > 0 ? new TrialLayoutEntry(key) : null;
+    }
+
+    /// <summary>
     /// Lays out <paramref name="element"/> at the origin into a throwaway display list, capturing
     /// its own border box and the last text baseline painted inside it. Layout metrics recorded
     /// during the trial never reach a real <see cref="CaptureLayoutMetrics"/> capture. A flex or
@@ -2653,6 +2746,18 @@ public sealed partial class HtmlRenderer
         float maxY = float.MaxValue,
         bool isHeightOnly = false)
     {
+        // A trial is laid out on its own (at the origin, with floats, positioned and sticky boxes
+        // of its own), so the same inputs give the same result within a render. Without reusing
+        // it, nested trials (cells of nested tables, nested inline-blocks) lay out every level
+        // again for each level above it (see FindTrialLayout).
+        var entry = FindTrialLayout(element, containingWidth, inheritedStyle, context, forcedBorderBoxWidth, isAtomicInline, isFlexOrGridItem, maxY, isHeightOnly, out var found);
+
+        if (found)
+        {
+            var cached = entry!.Result;
+            return (cached.Metrics, cached.LastBaselineY, cached.FirstBaselineY, cached.Laidout, cached.AutoContentHeight);
+        }
+
         var pass = s_layoutPass.Value;
         // a trial asking for more (e.g., the baseline of an inline-block) needs all of its boxes
         var wasHeightOnly = s_measuringHeightOnly;
@@ -2712,7 +2817,16 @@ public sealed partial class HtmlRenderer
                 isFlexItem: isFlexOrGridItem);
 
             var snapshot = capture.Snapshot();
-            return (snapshot.TryGetValue(element.Ref, out var metrics) ? metrics : null, capture.LastBaselineY, capture.FirstBaselineY, snapshot, capture.AutoContentHeights.TryGetValue(element.Ref, out var autoHeight) ? autoHeight : null);
+            var result = new TrialLayoutResult(snapshot.TryGetValue(element.Ref, out var metrics) ? metrics : null, capture.LastBaselineY, capture.FirstBaselineY, snapshot, capture.AutoContentHeights.TryGetValue(element.Ref, out var autoHeight) ? autoHeight : null);
+
+            if (entry is not null)
+            {
+                entry.Result = result;
+                entry.Next = context.TrialLayouts.GetValueOrDefault(element.Ref);
+                context.TrialLayouts[element.Ref] = entry;
+            }
+
+            return (result.Metrics, result.LastBaselineY, result.FirstBaselineY, result.Laidout, result.AutoContentHeight);
         }
         finally
         {
@@ -2983,6 +3097,12 @@ public sealed partial class HtmlRenderer
     /// </summary>
     private static IntrinsicWidths ComputeContentIntrinsicWidths(ElementRenderNode element, RenderTextStyle textStyle, float percentageBase, LayoutContext context)
     {
+        // a deep subtree is left out once the stack runs low (see LayoutNode)
+        if (!RuntimeHelpers.TryEnsureSufficientExecutionStack())
+        {
+            return new IntrinsicWidths(0f, 0f);
+        }
+
         var widths = ComputeElementContentWidths(element, textStyle, percentageBase, context);
 
         if (s_layoutPass.Value is { } pass)
@@ -3047,7 +3167,9 @@ public sealed partial class HtmlRenderer
                 var item = child switch
                 {
                     ElementRenderNode childElement => ComputeOuterIntrinsicWidths(childElement, textStyle, percentageBase, context),
-                    TextRenderNode textNode when !IsCollapsibleWhiteSpaceOnly(textNode.Ref.Data) => ComputeTextIntrinsicWidths(textNode.Ref.Data, textStyle, context, out _),
+                    // a run of text nodes is one anonymous item, as when laid out
+                    TextRenderNode textNode when !ContinuesTextRun(textNode.Ref) && GetTextRunData(textNode.Ref) is var runData &&
+                        !IsCollapsibleWhiteSpaceOnly(runData) => ComputeTextIntrinsicWidths(runData, textStyle, context, out _),
                     _ => IntrinsicWidths.Zero,
                 };
 

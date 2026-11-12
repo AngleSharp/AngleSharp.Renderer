@@ -5,6 +5,7 @@ Thanks :heart: to all who contributed to AngleSharp.Renderer via issues, pull re
 AngleSharp.Renderer contains code written by (in order of first pull request / commit):
 
 * [Florian Rappl](https://github.com/FlorianRappl)
+* [Michael Thyregod](https://github.com/michaelthyregod)
 
 Without these awesome people AngleSharp.Renderer could not exist. Thanks to everyone for your contributions! :beers:
 

@@ -47,6 +47,52 @@ a per-run-deterministic number and does not have this problem.
 
 ## History
 
+### 2026-11-13, flex cutoffs below the viewport, deferred flex minimums, fewer allocations
+
+Same probe as the entry below (Linux, .NET 10, Release, viewport 1280x800), but each result is
+the median of the last 15 of 30 iterations. "Viewport" is `PrepareViewportFrame`, "full" is
+`PrepareFrame`. The machine is shared, so a single run can be off by up to 70%; the numbers
+below were repeated until they were stable.
+
+| Fixture | Before | After |
+|---|---:|---:|
+| Dashboard (flex/grid cards), viewport | 329 ms | 81 ms |
+| Dashboard, full frame | 296 ms / 81.6 MiB | 281 ms / 66.1 MiB |
+| 1,500 fixed-height flex-column rows, viewport | 349 ms | 128 ms |
+| 1,500 block rows, viewport | 165 ms | 98 ms |
+
+- A wrapping flex row of an auto height stops laying out lines once a line starts below the
+  viewport, because its line positions depend only on the lines before it. A flex column that is
+  not reversed stops laying out items in the same case. A bottom-sticky box among the rest
+  disables both cutoffs, as it does in block flow.
+- A row flex item with a definite width and an automatic `flex-basis` no longer measures its
+  min-content width up front, because its hypothetical size is its width. The automatic minimum
+  is resolved only for the items of a line that has to shrink. On the dashboard this halved the
+  text measurements, from 31,567 to 16,046.
+- Allocation cuts in style-map parsing: span-based comma splitting, allocation-free pixel
+  parsing, fast paths for zero radii and for the initial `background-position`, and an early
+  return when there is no background image. They saved 15 MiB per dashboard frame with no
+  measurable change in time.
+
+The pixels of all three fixtures are identical to before.
+
+### 2026-11-12, viewport-only first-frame rendering
+
+Measured on Linux with .NET SDK 10.0.100, Release, viewport 1280x800. A fresh document was
+parsed before each timer; each result is the median of the final six iterations in a 12-iteration
+process. These exploratory probe results are not BenchmarkDotNet confidence intervals; absolute
+times vary on this shared machine.
+
+| Fixture | Before: time / allocated | After: time / allocated | Work avoided |
+|---|---:|---:|---|
+| 1,500 block rows | 186 ms / 31.1 MiB | 107 ms / 19.9 MiB | Style maps: 1,521 → 37 |
+| 1,500 fixed-height flex-column rows | 495 ms / 111.9 MiB | 397 ms / 83.7 MiB | Trial layouts: 1,500 → 0; text measurements: 144,000 → 72,000 |
+
+Both fixtures still laid out 37 and 3,003 boxes, respectively. The block result comes from avoiding
+full style maps for off-screen siblings during lookahead; the flex result avoids trial-measuring
+definite item heights before their actual layout. The viewport test suite separately checks pixel
+equivalence and parallel-vs-sequential style preparation.
+
 ### 2026-09-11, initial baseline (before any optimization)
 
 | Method (net10.0) | Mean | Allocated |
