@@ -104,6 +104,23 @@ public sealed class FontFace
     public string UnicodeRange { get; }
 
     /// <summary>
+    /// Gets whether the Unicode range of the face includes the code point, i.e., the face is the
+    /// one to draw it (e.g. Google Fonts declares a family as faces for Latin, Cyrillic, ...).
+    /// </summary>
+    internal bool Covers(int codePoint)
+    {
+        foreach (var range in UnicodeRange.Split(','))
+        {
+            if (AngleSharp.Dom.DocumentFontFaceSet.IncludesCodePoint(range, codePoint))
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    /// <summary>
     /// Gets the font display descriptor.
     /// </summary>
     public string Display { get; }

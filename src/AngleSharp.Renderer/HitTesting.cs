@@ -65,16 +65,19 @@ internal static class HitTesting
         return false;
     }
 
-    // the layer roots from the root down to the element, which ends the path
+    // the layer roots from the root down to the element, which ends the path; a float paints with
+    // its content above the in-flow blocks of its layer, so it counts as a layer there
     private static List<IElement> GetLayerPath(IElement element, IReadOnlyDictionary<IElement, HtmlRenderer.ElementLayoutMetrics> metrics)
     {
         var path = new List<IElement> { element };
+        var isInLayer = metrics.TryGetValue(element, out var elementMetrics) && elementMetrics.Layer.IsLayerRoot;
 
         for (var ancestor = element.ParentElement; ancestor is not null; ancestor = ancestor.ParentElement)
         {
-            if (metrics.TryGetValue(ancestor, out var ancestorMetrics) && ancestorMetrics.Layer.IsLayerRoot)
+            if (metrics.TryGetValue(ancestor, out var ancestorMetrics) && (ancestorMetrics.Layer.IsLayerRoot || (!isInLayer && ancestorMetrics.Layer.IsFloat)))
             {
                 path.Add(ancestor);
+                isInLayer |= ancestorMetrics.Layer.IsLayerRoot;
             }
         }
 
@@ -124,12 +127,13 @@ internal static class HitTesting
         return first.Count.CompareTo(second.Count);
     }
 
-    // (step, z-index) within the stacking context: negative z, in flow, positioned or 0, positive z
+    // (step, z-index) within the stacking context: negative z, in flow (floats above blocks),
+    // positioned or 0, positive z
     private static (int Step, int ZIndex) GetLayerRank(IElement element, IReadOnlyDictionary<IElement, HtmlRenderer.ElementLayoutMetrics> metrics)
     {
         if (!metrics.TryGetValue(element, out var elementMetrics) || !elementMetrics.Layer.IsLayerRoot)
         {
-            return (1, 0);
+            return elementMetrics.Layer.IsFloat ? (1, 1) : (1, 0);
         }
 
         var zIndex = elementMetrics.Layer.ZIndex;

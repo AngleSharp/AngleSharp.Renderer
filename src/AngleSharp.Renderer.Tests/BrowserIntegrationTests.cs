@@ -292,6 +292,90 @@ public sealed class BrowserIntegrationTests
         Assert.Equal(SKColors.Red, rendered.GetPixel(10, 10));
     }
 
+    /// <summary>
+    /// Serves an image whose body arrives only once the gate opens, as a slow network does
+    /// after the headers.
+    /// </summary>
+    private sealed class GatedPngRequester(byte[] png) : BaseRequester
+    {
+        public ManualResetEventSlim Gate { get; } = new(false);
+
+        public override bool SupportsProtocol(string protocol) => true;
+
+        protected override Task<IResponse?> PerformRequestAsync(Request request, CancellationToken cancel) =>
+            Task.FromResult<IResponse?>(new DefaultResponse
+            {
+                Address = request.Address,
+                StatusCode = HttpStatusCode.OK,
+                Headers = new Dictionary<string, string> { ["Content-Type"] = "image/png" },
+                Content = new GatedStream(png, Gate),
+            });
+
+        private sealed class GatedStream(byte[] data, ManualResetEventSlim gate) : MemoryStream(data)
+        {
+            public override int Read(byte[] buffer, int offset, int count)
+            {
+                gate.Wait();
+                return base.Read(buffer, offset, count);
+            }
+
+            public override int Read(Span<byte> buffer)
+            {
+                gate.Wait();
+                return base.Read(buffer);
+            }
+
+            public override async Task<int> ReadAsync(byte[] buffer, int offset, int count, CancellationToken cancellationToken)
+            {
+                await Task.Run(() => gate.Wait(cancellationToken), cancellationToken);
+                return await base.ReadAsync(buffer, offset, count, cancellationToken);
+            }
+
+            public override async ValueTask<int> ReadAsync(Memory<byte> buffer, CancellationToken cancellationToken = default)
+            {
+                await Task.Run(() => gate.Wait(cancellationToken), cancellationToken);
+                return await base.ReadAsync(buffer, cancellationToken);
+            }
+        }
+    }
+
+    [Fact]
+    public async Task FrameBeforeTheImageIsProcessedLeavesItsResponseToTheImageService()
+    {
+        // the tractor store: a frame between the download and the image service took the
+        // response stream, so the image had no natural size (and was laid out as a broken one)
+        using var bitmap = new SKBitmap(40, 20);
+        bitmap.Erase(SKColors.Red);
+        var png = bitmap.Encode(SKEncodedImageFormat.Png, 100).ToArray();
+        var requester = new GatedPngRequester(png);
+        var configuration = Configuration.Default
+            .WithCss()
+            .WithRendering()
+            .WithRenderDevice(CreateDevice())
+            .WithDefaultLoader(new LoaderOptions { IsResourceLoadingEnabled = true })
+            .With(requester);
+        var document = await LoadAsync("<style>body { margin: 0 }</style>", configuration);
+        var image = (IHtmlImageElement)document.CreateElement("img");
+        image.Source = "http://localhost/red.png";
+        document.Body!.AppendChild(image);
+        var download = ((ILoadableElement)image).CurrentDownload!;
+        await download.Task.WaitAsync(TimeSpan.FromSeconds(10));
+
+        // the image service waits for the body now; the frame must not read it
+        await Task.Run(() => Render(document)).WaitAsync(TimeSpan.FromSeconds(10));
+        requester.Gate.Set();
+        var watch = Stopwatch.StartNew();
+
+        while (image.OriginalWidth == 0 && watch.Elapsed < TimeSpan.FromSeconds(10))
+        {
+            await Task.Delay(10);
+        }
+
+        Assert.Equal(40, image.OriginalWidth);
+        using var rendered = SKBitmap.Decode(Render(document));
+        Assert.Equal(SKColors.Red, rendered.GetPixel(30, 10));
+    }
+
     [Fact]
     public async Task LoadedImagesWithoutTheRenderingServicesDoNotFailThePaint()
     {
@@ -312,8 +396,11 @@ public sealed class BrowserIntegrationTests
     [Fact]
     public async Task HarnessDoesNotMultiplyPaintCost()
     {
+        // The cost is counted in what this thread allocates rather than timed: running the cascade
+        // again for each property of each element allocates hundreds of times more. Below 200
+        // elements, the style maps are all created on this thread.
         var rules = string.Concat(Enumerable.Range(0, 2000).Select(i => $".c{i} {{ color: red; margin: {i % 7}px }}\n"));
-        var body = string.Concat(Enumerable.Range(0, 150).Select(i => $"<div class='c{i}'><span>Item {i}</span></div>"));
+        var body = string.Concat(Enumerable.Range(0, 90).Select(i => $"<div class='c{i}'><span>Item {i}</span></div>"));
         var html = $"<style>{rules}</style>{body}";
 
         var plain = await LoadAsync(html);
@@ -323,15 +410,14 @@ public sealed class BrowserIntegrationTests
         var renderer = new HtmlRenderer();
         renderer.RenderToPng(plain, CreateDevice());
         renderer.RenderToPng(interactive, CreateDevice());
-        var watch = Stopwatch.StartNew();
+        var start = GC.GetAllocatedBytesForCurrentThread();
         renderer.RenderToPng(plain, CreateDevice());
-        var plainTime = watch.Elapsed;
-        watch.Restart();
+        var plainBytes = GC.GetAllocatedBytesForCurrentThread() - start;
+        start = GC.GetAllocatedBytesForCurrentThread();
         renderer.RenderToPng(interactive, CreateDevice());
-        var interactiveTime = watch.Elapsed;
+        var interactiveBytes = GC.GetAllocatedBytesForCurrentThread() - start;
 
-        Assert.True(interactiveTime.TotalMilliseconds < plainTime.TotalMilliseconds * 2 + 50,
-            $"plain {plainTime.TotalMilliseconds:F0} ms, interactive {interactiveTime.TotalMilliseconds:F0} ms");
+        Assert.True(interactiveBytes < plainBytes * 2, $"plain {plainBytes / 1024} KiB, interactive {interactiveBytes / 1024} KiB");
     }
 
     [Fact]
@@ -531,5 +617,117 @@ public sealed class BrowserIntegrationTests
         var both = Render(await LoadAsync("<input value='Hi' placeholder='Your name'>"));
 
         Assert.Equal(value, both);
+    }
+
+    [Fact]
+    public async Task AFloatIsHitAboveALaterBlockOverlappingIt()
+    {
+        // Tower Defense: the block of buttons after the floated tower buttons covers them, as it
+        // starts where the floats do; floats are painted (and hit) above the in-flow blocks
+        var document = await LoadAsync("<style>body { margin: 0 }</style><div><button id=f style='float: left; width: 100px; height: 60px'>A</button></div><div id=b style='height: 140px'></div>");
+
+        Assert.Equal("f", document.ElementFromPoint(50, 30)!.Id);
+        Assert.Equal("f", document.Context.GetDomHarness().PrepareFrame().HitTestMap.HitTest(50, 30)?.Element.Id);
+        Assert.Equal("b", document.ElementFromPoint(150, 30)!.Id);
+    }
+
+    [Fact]
+    public async Task AFloatIsPaintedAboveALaterBlockOverlappingIt()
+    {
+        var document = await LoadAsync("<style>body { margin: 0 }</style><div style='float: left; width: 100px; height: 100px; background: red'></div><div style='height: 120px'></div><div style='height: 50px; margin-top: -40px; background: blue'></div><p id=p style='position: relative; margin: 0'>A</p>");
+
+        using var rendered = SKBitmap.Decode(Render(document));
+        Assert.Equal(SKColors.Red, rendered.GetPixel(50, 90));
+        Assert.Equal(SKColors.Blue, rendered.GetPixel(150, 90));
+    }
+
+    [Theory]
+    [InlineData("float: left")]
+    [InlineData("display: inline-block")]
+    [InlineData("")]
+    public async Task APositionedBoxInABoxOfTheFlowIsPaintedAboveALaterBlock(string style)
+    {
+        // Tower Defense: the card shown for a floated tower button is painted above the buttons
+        // after it, with the positioned boxes of the flow around it (CSS 2.2 Appendix E)
+        var document = await LoadAsync($"<style>body {{ margin: 0; background: white }}</style><div style='height: 40px'><div style='{style}; width: 100px; height: 40px'><div style='position: relative; width: 100px; height: 100px; background: red'></div></div></div><div style='height: 50px; background: blue'></div>");
+
+        using var rendered = SKBitmap.Decode(Render(document));
+        Assert.Equal(SKColors.Red, rendered.GetPixel(50, 60));
+        Assert.Equal(SKColors.Blue, rendered.GetPixel(150, 60));
+    }
+
+    [Fact]
+    public async Task APositionedBoxPaintedWithTheFlowStaysInTheEffectsOfItsBox()
+    {
+        // only boxes opening no scope (e.g. an opacity) let it paint with the flow around them
+        var document = await LoadAsync("<style>body { margin: 0; background: white }</style><div style='float: left; opacity: 0.5; width: 100px; height: 40px'><div style='position: relative; width: 100px; height: 100px; background: red'></div></div>");
+
+        using var rendered = SKBitmap.Decode(Render(document));
+        var color = rendered.GetPixel(50, 60);
+        Assert.Equal(255, color.Red);
+        Assert.InRange(color.Green, 100, 160);
+    }
+
+    [Fact]
+    public async Task APositionedBoxShownInAFloatIsPaintedAboveALaterBlockInTheNextFrame()
+    {
+        var document = await LoadAsync("<style>body { margin: 0; background: white } #card { display: none; position: relative; width: 100px; height: 100px; background: red } .shown #card { display: block }</style><div style='height: 40px'><div id=f style='float: left; width: 100px; height: 40px'><div id=card></div></div></div><div style='height: 50px; background: blue'></div>");
+        var harness = document.Context.GetDomHarness();
+        harness.PrepareFrame();
+
+        document.GetElementById("f")!.ClassList.Add("shown");
+        var frame = harness.UpdateFrame() ?? harness.PrepareFrame();
+        var pixels = frame.Rasterize();
+        var offset = ((60 + frame.OverscanTop) * pixels.Width + 50) * 4;
+
+        Assert.Equal(new byte[] { 255, 0, 0, 255 }, pixels.Data.Skip(offset).Take(4).ToArray());
+    }
+
+    [Fact]
+    public async Task AnAbsoluteBoxAtItsStaticPositionKeepsItsMargins()
+    {
+        var document = await LoadAsync("<style>body { margin: 0 }</style><div style='position: relative; padding: 8px'><div style='height: 24px'></div><div id=a style='position: absolute; width: 32px; height: 40px; margin: 8px'></div><div id=b style='position: absolute; left: 50px; width: 32px; height: 40px; margin: 8px 4px'></div></div>");
+
+        var a = document.GetElementById("a")!.GetBoundingClientRect();
+        var b = document.GetElementById("b")!.GetBoundingClientRect();
+
+        Assert.Equal(16d, a.Left, 1);
+        Assert.Equal(40d, a.Top, 1);
+        Assert.Equal(54d, b.Left, 1);
+        Assert.Equal(40d, b.Top, 1);
+    }
+
+    [Fact]
+    public async Task AReplacedElementWithAPercentageWidthPrefersItsNaturalWidth()
+    {
+        // a logo with width: 100% in a shrink-to-fit box (a flex item) is not as wide as the row
+        var document = await LoadAsync("<style>body { margin: 0 }</style><div style='display: flex; width: 600px'><div id=w><svg id=s style='display: block; width: 100%; height: auto' width='132' height='36' viewBox='0 0 132 36'><rect width='132' height='36'/></svg></div><div>Menu</div></div>");
+
+        Assert.Equal(132d, document.GetElementById("w")!.GetBoundingClientRect().Width, 1);
+        Assert.Equal(132d, document.GetElementById("s")!.GetBoundingClientRect().Width, 1);
+    }
+
+    [Fact]
+    public async Task AReplacedElementWithAPercentageHeightIsPaintedInItsBox()
+    {
+        // the height referred to the width of the containing block when painted, so the image
+        // was painted taller than its box
+        var document = await LoadAsync("<style>body { margin: 0; background: white }</style><div style='width: 60px; height: 40px'><svg style='display: block; width: 100%; height: 100%' viewBox='0 0 30 20'><rect width='30' height='20' fill='red'/></svg></div>");
+
+        using var rendered = SKBitmap.Decode(Render(document));
+        Assert.Equal(SKColors.Red, rendered.GetPixel(30, 35));
+        Assert.Equal(SKColors.White, rendered.GetPixel(30, 50));
+    }
+
+    [Fact]
+    public async Task AnSvgInABoxOfAnotherShapeFitsItsViewBox()
+    {
+        // a narrow caret icon in a square box is centered, not stretched (xMidYMid meet)
+        var document = await LoadAsync("<style>body { margin: 0; background: white }</style><svg style='display: block; width: 40px; height: 40px' viewBox='0 0 10 20'><rect width='10' height='20' fill='red'/></svg>");
+
+        using var rendered = SKBitmap.Decode(Render(document));
+        Assert.Equal(SKColors.White, rendered.GetPixel(5, 20));
+        Assert.Equal(SKColors.Red, rendered.GetPixel(20, 20));
+        Assert.Equal(SKColors.White, rendered.GetPixel(35, 20));
     }
 }

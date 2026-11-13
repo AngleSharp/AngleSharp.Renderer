@@ -133,8 +133,10 @@ public sealed partial class HtmlRenderer
             }
 
             // An absolutely positioned child does not interrupt a line in progress; it is laid out
-            // at the static position of the line it appears in.
-            if (classification == FlowChildKind.OutOfFlow && runHasInlineContent)
+            // at the static position of the line it appears in. Neither does a float, which is
+            // placed on the line it appears in if it fits there (CSS 2.1 §9.5.1).
+            if ((classification == FlowChildKind.OutOfFlow || (classification == FlowChildKind.Block && IsFloatedNode(child, context))) &&
+                runHasInlineContent && (classification == FlowChildKind.OutOfFlow || HasVisibleInlineContent(run)))
             {
                 run.Add(child);
                 continue;
@@ -174,7 +176,7 @@ public sealed partial class HtmlRenderer
                 negativeZIndexRanges.Add((childRangeStart, displayList.Commands.Count - childRangeStart));
             }
 
-            paintOrder.Track(child, displayList, childRangeStart, context);
+            paintOrder.Track(child, displayList, childRangeStart, context, isBlockFlow: true);
 
             // `text-indent` only applies to the first formatted line of the container.
             if (classification == FlowChildKind.Block)
@@ -260,6 +262,13 @@ public sealed partial class HtmlRenderer
     }
 
     private static bool IsFloated(Dictionary<string, string> styleMap) => GetFloat(styleMap) is "left" or "right";
+
+    private static bool IsFloatedNode(IRenderNode node, LayoutContext context) =>
+        node is ElementRenderNode element && IsFloated(GetOrCreateStyleMap(context, element.Ref, element.ComputedStyle));
+
+    // Inline content that makes a line: more than collapsible white space.
+    private static bool HasVisibleInlineContent(List<IRenderNode> run) =>
+        run.Exists(static node => node is not TextRenderNode text || !string.IsNullOrWhiteSpace(text.Ref.Data));
 
     /// <summary>
     /// Whether an element participates in an inline formatting context: <c>display: inline</c>
@@ -431,6 +440,16 @@ public sealed partial class HtmlRenderer
         public bool Trimmed { get; set; }
 
         /// <summary>
+        /// Gets if this out-of-flow piece is a float, which is placed beside the line it is on.
+        /// </summary>
+        public bool IsFloat { get; init; }
+
+        /// <summary>
+        /// Gets or sets if the float of this piece has its place already.
+        /// </summary>
+        public bool IsFloatPlaced { get; set; }
+
+        /// <summary>
         /// The bidi formatting characters a BoxStart/BoxEnd stands for (from `unicode-bidi`), or
         /// <see langword="null"/> when the box does not affect the bidi ordering.
         /// </summary>
@@ -564,6 +583,13 @@ public sealed partial class HtmlRenderer
             if (IsOutOfFlowPositioned(styleMap))
             {
                 Pieces.Add(new InlinePiece { Kind = InlinePieceKind.OutOfFlow, Style = parentStyle, Box = parentBox, Element = element });
+                return;
+            }
+
+            // a float takes no room on the line, it is placed beside it (see PlaceLineFloats)
+            if (IsFloated(styleMap))
+            {
+                Pieces.Add(new InlinePiece { Kind = InlinePieceKind.OutOfFlow, IsFloat = true, Style = parentStyle, Box = parentBox, Element = element });
                 return;
             }
 
@@ -917,6 +943,81 @@ public sealed partial class HtmlRenderer
         var emittedAnyLine = false;
         var lineTop = cursorY;
         var lineCount = 0;
+        var deferredFloats = new List<InlinePiece>();
+
+        // A float is placed at the top of the line it is on, if it fits beside what is before it
+        // there (which then moves aside for a left float), else at the top of the next line.
+        bool PlaceLineFloats(int start, int end, float available)
+        {
+            var used = 0f;
+
+            for (var index = start; index < end; index++)
+            {
+                var piece = pieces[index];
+
+                if (piece.IsFloat)
+                {
+                    if (piece.IsFloatPlaced)
+                    {
+                        continue;
+                    }
+
+                    piece.IsFloatPlaced = true;
+
+                    if (used <= 0f || used + MeasureFloatWidth(piece) <= available + 0.01f)
+                    {
+                        PlaceFloat(piece);
+                        return true;
+                    }
+
+                    deferredFloats.Add(piece);
+                }
+                else if (piece.Kind != InlinePieceKind.OutOfFlow && !piece.Trimmed)
+                {
+                    used += piece.Width;
+                }
+            }
+
+            return false;
+        }
+
+        float MeasureFloatWidth(InlinePiece piece)
+        {
+            var (bandLeft, bandRight) = floats.GetBand(lineTop, textStyle.FontSize * textStyle.LineHeightMultiplier, contentX, contentX + contentWidth);
+            var outer = ComputeOuterIntrinsicWidths(piece.Element!, piece.Style, contentWidth, context);
+            return Math.Min(Math.Max(outer.Min, bandRight - bandLeft), outer.Max);
+        }
+
+        void PlaceFloat(InlinePiece piece)
+        {
+            var floatCursorY = lineTop + pendingBlockMargin;
+            var floatPreviousMarginBottom = 0f;
+            var floatSuppressTopMargin = false;
+            var floatTextIndentConsumed = false;
+            var rangeStart = displayList.Commands.Count;
+
+            LayoutNode(
+                node: piece.Element!,
+                containingX: contentX,
+                containingY: floatCursorY,
+                containingWidth: contentWidth,
+                cursorY: ref floatCursorY,
+                previousBlockMarginBottom: ref floatPreviousMarginBottom,
+                suppressNextBlockTopMargin: ref floatSuppressTopMargin,
+                floats: floats,
+                textIndentConsumed: ref floatTextIndentConsumed,
+                textStyle: piece.Style,
+                context: context,
+                displayList: displayList,
+                maxY: maxY,
+                containingHeight: containingHeight,
+                positionedContainingX: positionedContainingX,
+                positionedContainingY: positionedContainingY,
+                positionedContainingWidth: positionedContainingWidth,
+                positionedContainingHeight: positionedContainingHeight);
+
+            paintOrder.Track(piece.Element!, displayList, rangeStart, context);
+        }
 
         while (lineStartIndex < pieces.Count)
         {
@@ -980,6 +1081,18 @@ public sealed partial class HtmlRenderer
             }
 
             var lineEnd = BuildLine(pieces, lineStartIndex, available, context, out var forcedBreak);
+
+            // a float placed beside the line takes some of its room: it is built again
+            if (PlaceLineFloats(lineStartIndex, lineEnd, available))
+            {
+                for (var index = lineStartIndex; index < lineEnd && index < pieces.Count; index++)
+                {
+                    pieces[index].Trimmed = false;
+                }
+
+                continue;
+            }
+
             var linePieces = new List<InlinePiece>(lineEnd - lineStartIndex);
 
             for (var index = lineStartIndex; index < lineEnd; index++)
@@ -1046,6 +1159,14 @@ public sealed partial class HtmlRenderer
             textIndentConsumed = true;
             lineCount++;
 
+            // the floats that did not fit beside the line are below it
+            foreach (var deferred in deferredFloats)
+            {
+                PlaceFloat(deferred);
+            }
+
+            deferredFloats.Clear();
+
             if (lineClamp is not null)
             {
                 lineClamp.Remaining--;
@@ -1060,6 +1181,11 @@ public sealed partial class HtmlRenderer
 
                 break;
             }
+        }
+
+        foreach (var deferred in deferredFloats)
+        {
+            PlaceFloat(deferred);
         }
 
         if (sharedPaintOrder is null)
@@ -2457,7 +2583,7 @@ public sealed partial class HtmlRenderer
     {
         foreach (var piece in linePieces)
         {
-            if (piece.Kind != InlinePieceKind.OutOfFlow)
+            if (piece.Kind != InlinePieceKind.OutOfFlow || piece.IsFloat)
             {
                 continue;
             }
@@ -2949,6 +3075,42 @@ public sealed partial class HtmlRenderer
     /// The used width of a replaced element (<c>&lt;img&gt;</c>, inline <c>&lt;svg&gt;</c>), which
     /// comes from its natural size when no width is authored.
     /// </summary>
+    /// <summary>
+    /// The style of a box for its intrinsic size: percentages of its width would refer to the very
+    /// size being computed, so they count as auto (and none), e.g. an image with <c>width: 100%</c>
+    /// in a shrink-to-fit box contributes its natural width, not the width of the containing block.
+    /// </summary>
+    private static Dictionary<string, string> WithoutPercentageWidths(Dictionary<string, string> styleMap)
+    {
+        var hasPercentageWidth = styleMap.TryGetValue("width", out var width) && IsPercentageValue(width);
+        var hasPercentageMaxWidth = styleMap.TryGetValue("max-width", out var maxWidth) && IsPercentageValue(maxWidth);
+        var hasPercentageMinWidth = styleMap.TryGetValue("min-width", out var minWidth) && IsPercentageValue(minWidth);
+
+        if (!hasPercentageWidth && !hasPercentageMaxWidth && !hasPercentageMinWidth)
+        {
+            return styleMap;
+        }
+
+        var intrinsicStyle = new Dictionary<string, string>(styleMap, styleMap.Comparer);
+
+        if (hasPercentageWidth)
+        {
+            intrinsicStyle.Remove("width");
+        }
+
+        if (hasPercentageMaxWidth)
+        {
+            intrinsicStyle.Remove("max-width");
+        }
+
+        if (hasPercentageMinWidth)
+        {
+            intrinsicStyle.Remove("min-width");
+        }
+
+        return intrinsicStyle;
+    }
+
     private static bool TryResolveReplacedContentWidth(ElementRenderNode element, Dictionary<string, string> styleMap, float containingWidth, out float width)
     {
         width = 0f;
@@ -3063,9 +3225,14 @@ public sealed partial class HtmlRenderer
         {
             content = new IntrinsicWidths(authored, authored);
         }
-        else if (TryResolveReplacedContentWidth(element, styleMap, percentageBase, out var replacedWidth))
+        else if (TryResolveReplacedContentWidth(element, WithoutPercentageWidths(styleMap), percentageBase, out var replacedWidth))
         {
-            content = new IntrinsicWidths(replacedWidth, replacedWidth);
+            // with a percentage width or max-width, a replaced element can shrink to nothing,
+            // e.g. an image with width: 100% in a 1fr grid track (compressible replaced
+            // elements, CSS Sizing 3 §5.2.2), while it prefers its natural size
+            var isCompressible = (rawWidth is not null && IsPercentageValue(rawWidth)) ||
+                (styleMap.TryGetValue("max-width", out var rawMaxWidth) && IsPercentageValue(rawMaxWidth));
+            content = new IntrinsicWidths(isCompressible ? 0f : replacedWidth, replacedWidth);
         }
         else if (formControlKind is FormControlKind.TextLike or FormControlKind.TextArea)
         {
@@ -3103,7 +3270,10 @@ public sealed partial class HtmlRenderer
             return new IntrinsicWidths(0f, 0f);
         }
 
-        var widths = ComputeElementContentWidths(element, textStyle, percentageBase, context);
+        var widths = ApplyColumnIntrinsicWidths(
+            GetOrCreateStyleMap(context, element.Ref, element.ComputedStyle),
+            ComputeElementContentWidths(element, textStyle, percentageBase, context),
+            textStyle.FontSize);
 
         if (s_layoutPass.Value is { } pass)
         {
@@ -3113,6 +3283,51 @@ public sealed partial class HtmlRenderer
         return widths;
     }
 
+    /// <summary>
+    /// The intrinsic widths of a multi-column container, as Blink computes them: a column is at
+    /// least as wide as `column-width` at max-content, and there are `column-count` of them (one
+    /// when only `column-width` is given) with their gaps; e.g. a footer menu with
+    /// `column-width: 300px` in a row flexbox is 300px wide, not as wide as its longest link.
+    /// </summary>
+    private static IntrinsicWidths ApplyColumnIntrinsicWidths(Dictionary<string, string> styleMap, IntrinsicWidths widths, float fontSize)
+    {
+        var count = styleMap.TryGetValue("column-count", out var countValue) &&
+                    int.TryParse(countValue.Trim(), NumberStyles.Integer, CultureInfo.InvariantCulture, out var parsedCount) &&
+                    parsedCount > 0
+            ? parsedCount
+            : 0;
+        var width = styleMap.TryGetValue("column-width", out var widthValue)
+            ? ParseLengthValue(widthValue, float.NaN, allowAuto: true)
+            : float.NaN;
+        var hasWidth = !float.IsNaN(width) && width > 0f;
+
+        if (count == 0 && !hasWidth)
+        {
+            return widths;
+        }
+
+        var min = widths.Min;
+        var max = hasWidth ? Math.Max(widths.Max, width) : widths.Max;
+        var columns = Math.Max(1, count);
+
+        if (columns > 1)
+        {
+            // `column-gap: normal` is 1em for multi-column containers
+            var gap = fontSize;
+
+            if (styleMap.TryGetValue("column-gap", out var gapValue) && !string.Equals(gapValue.Trim(), "normal", StringComparison.OrdinalIgnoreCase))
+            {
+                var parsedGap = ParseLengthValue(gapValue, float.NaN, allowAuto: false);
+                gap = float.IsNaN(parsedGap) ? gap : Math.Max(0f, parsedGap);
+            }
+
+            min = (min * columns) + (gap * (columns - 1));
+            max = (max * columns) + (gap * (columns - 1));
+        }
+
+        return new IntrinsicWidths(min, Math.Max(min, max));
+    }
+
     private static IntrinsicWidths ComputeElementContentWidths(ElementRenderNode element, RenderTextStyle textStyle, float percentageBase, LayoutContext context)
     {
         var styleMap = GetOrCreateStyleMap(context, element.Ref, element.ComputedStyle);
@@ -3120,7 +3335,7 @@ public sealed partial class HtmlRenderer
         var formControlKind = ResolveFormControlKind(element);
 
         if (element.Ref is not IPseudoElement &&
-            (string.Equals(element.Ref.LocalName, "svg", StringComparison.OrdinalIgnoreCase) ||
+            (HidesChildren(element.Ref) ||
              PaintsOwnContent(formControlKind)))
         {
             children = [];

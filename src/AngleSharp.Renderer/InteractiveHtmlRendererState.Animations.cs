@@ -11,6 +11,48 @@ internal sealed partial class InteractiveHtmlRendererState
 
     internal void InvalidateAnimation() => OnPaintInvalidated();
 
+    // canvases drawn into since the last frame, which shows them as they are when it is prepared
+    private readonly List<Canvas2DRenderingContext> _changedCanvases = [];
+
+    /// <summary>
+    /// Tells that a canvas was drawn into: the frame shows it once it is prepared and rasterized
+    /// again, as its boxes are where they were.
+    /// </summary>
+    internal void OnCanvasChanged(Canvas2DRenderingContext context)
+    {
+        lock (_changedCanvases)
+        {
+            _changedCanvases.Add(context);
+        }
+
+        OnPaintInvalidated(keepsMetrics: true);
+    }
+
+    /// <summary>
+    /// Takes what was drawn into the canvases for the frame being prepared (between the tasks of
+    /// the event loop, so no script is drawing).
+    /// </summary>
+    private void PresentCanvases()
+    {
+        Canvas2DRenderingContext[] contexts;
+
+        lock (_changedCanvases)
+        {
+            if (_changedCanvases.Count == 0)
+            {
+                return;
+            }
+
+            contexts = [.. _changedCanvases];
+            _changedCanvases.Clear();
+        }
+
+        foreach (var context in contexts)
+        {
+            context.Present();
+        }
+    }
+
     /// <summary>
     /// Follows the CSS animations of an element whose style was computed for painting, to give
     /// it the events of animations starting, repeating, ending or being cancelled.

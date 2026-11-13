@@ -18,6 +18,12 @@ internal sealed record CssTransitionRun(string From, string To, double StartMs, 
     /// value is the one it changes to right away.
     /// </summary>
     public bool IsEventOnly { get; init; }
+
+    /// <summary>
+    /// Gets if the run starts with the next time the clock advances, as it was found while the
+    /// clock stood still (see <see cref="CssTransitionTracker.DeferStarts"/>).
+    /// </summary>
+    public bool IsStartDeferred { get; init; }
 }
 
 /// <summary>
@@ -75,7 +81,26 @@ internal sealed class CssTransitionTracker
     /// <summary>
     /// Advances the virtual clock every active transition is measured against.
     /// </summary>
-    public void AdvanceTime(TimeSpan delta) => _clockMs += delta.TotalMilliseconds;
+    public void AdvanceTime(TimeSpan delta)
+    {
+        _clockMs += delta.TotalMilliseconds;
+
+        foreach (var (key, run) in _activeRuns.ToArray())
+        {
+            if (run.IsStartDeferred)
+            {
+                _activeRuns[key] = run with { StartMs = _clockMs, IsStartDeferred = false };
+            }
+        }
+    }
+
+    /// <summary>
+    /// Gets or sets if the runs found now start with the next time the clock advances instead of
+    /// the time it shows. The clock only advances with frames laid out as a whole, so one patched
+    /// in between (e.g. a script opening a menu, long after the last frame) would otherwise start
+    /// its runs in the past, and the next frame would find them over already.
+    /// </summary>
+    public bool DeferStarts { get; set; }
 
     /// <summary>
     /// Gets if a transition has not reached its end yet. Runs are only pruned when they are
@@ -348,7 +373,7 @@ internal sealed class CssTransitionTracker
     private void StartRun((IElement Element, string Property) key, string from, string to, CssTransitionSpec spec, bool isEventOnly)
     {
         CancelRun(key);
-        var run = new CssTransitionRun(from, to, _clockMs, spec) { IsEventOnly = isEventOnly, HasStarted = spec.DelayMs <= 0d };
+        var run = new CssTransitionRun(from, to, _clockMs, spec) { IsEventOnly = isEventOnly, HasStarted = spec.DelayMs <= 0d, IsStartDeferred = DeferStarts };
         _activeRuns[key] = run;
         _pendingEvents.Add(new(key.Element, "transitionrun", key.Property, Math.Max(0d, -spec.DelayMs) / 1000d));
 

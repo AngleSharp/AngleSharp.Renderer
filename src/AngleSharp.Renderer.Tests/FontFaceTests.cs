@@ -41,6 +41,18 @@ public sealed class FontFaceTests
         Assert.Equal(await MeasureAsync(string.Empty, "serif"), width, tolerance: 0.01f);
     }
 
+    [Fact]
+    public async Task FamilySplitByUnicodeRange_UsesTheFaceForTheText()
+    {
+        // as Google Fonts declares a family: one face per script, the Latin one last
+        var width = await MeasureAsync(
+            $"@font-face {{ font-family: 'Split'; src: url({MonoDataUri}) format('truetype'); unicode-range: U+0400-045F, U+0490-0491; }}" +
+            $"@font-face {{ font-family: 'Split'; src: url({SerifDataUri}) format('truetype'); unicode-range: U+0000-00FF, U+0131, U+2000-206F; }}",
+            "'Split', sans-serif");
+
+        Assert.Equal(await MeasureAsync(string.Empty, "serif"), width, tolerance: 0.01f);
+    }
+
     [Theory]
     [InlineData("DejaVuSerif-Latin1.woff", "woff")]
     [InlineData("DejaVuSerif-Latin1.woff2", "woff2")]

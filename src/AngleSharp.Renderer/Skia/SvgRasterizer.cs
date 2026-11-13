@@ -90,7 +90,7 @@ internal static class SvgRasterizer
 
         try
         {
-            var (viewBoxMatrix, width, height, contentViewport) = ResolveViewport(svgRoot);
+            var (viewBoxMatrix, width, height, contentViewport, fit) = ResolveViewport(svgRoot);
 
             if (width <= 0f || height <= 0f)
             {
@@ -106,7 +106,9 @@ internal static class SvgRasterizer
             var recording = recorder.BeginRecording(new SKRect(0f, 0f, width, height));
             recording.Concat(ref viewBoxMatrix);
             SvgElementRenderer.Render(recording, svgRoot, initialState, renderContext, contentViewport);
-            vectorImage = new SvgVectorImage(recorder.EndRecording(), width, height);
+            vectorImage = fit is { } viewBoxFit
+                ? new SvgVectorImage(recorder.EndRecording(), width, height, viewBoxFit.ViewBox, viewBoxFit.Align, viewBoxFit.Meet)
+                : new SvgVectorImage(recorder.EndRecording(), width, height);
             return true;
         }
         catch
@@ -115,7 +117,7 @@ internal static class SvgRasterizer
         }
     }
 
-    private static (SKMatrix ViewBoxMatrix, float Width, float Height, SvgViewport ContentViewport) ResolveViewport(IElement svgRoot)
+    private static (SKMatrix ViewBoxMatrix, float Width, float Height, SvgViewport ContentViewport, (SKRect ViewBox, SvgPreserveAspectRatioAlign Align, bool Meet)? Fit) ResolveViewport(IElement svgRoot)
     {
         var viewBox = SvgViewBoxMapping.ParseViewBox(svgRoot.GetAttribute("viewBox"));
         var explicitWidth = ParseLength(svgRoot.GetAttribute("width"));
@@ -153,8 +155,12 @@ internal static class SvgRasterizer
         var (align, meet) = SvgViewBoxMapping.ParsePreserveAspectRatio(svgRoot.GetAttribute("preserveAspectRatio"));
         var matrix = SvgViewBoxMapping.ComputeMatrix(viewBox, width, height, align, meet);
         var contentViewport = viewBox is { } box ? new SvgViewport(box.Width, box.Height) : new SvgViewport(width, height);
+        // where the viewBox ends up in the picture, to fit it into another size later
+        (SKRect, SvgPreserveAspectRatioAlign, bool)? fit = viewBox is { } fitBox
+            ? (matrix.MapRect(new SKRect(fitBox.MinX, fitBox.MinY, fitBox.MinX + fitBox.Width, fitBox.MinY + fitBox.Height)), align, meet)
+            : null;
 
-        return (matrix, width, height, contentViewport);
+        return (matrix, width, height, contentViewport, fit);
     }
 
     private static float? ParseLength(string? value)

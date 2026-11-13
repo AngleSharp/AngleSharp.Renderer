@@ -1,5 +1,6 @@
 namespace AngleSharp.Renderer;
 
+using System.Globalization;
 using System.Linq;
 using System.Runtime.CompilerServices;
 using System.Text;
@@ -402,16 +403,36 @@ public sealed partial class HtmlRenderer
         // each layout with where the box was in the display list before and its commands after
         private readonly Dictionary<IElement, (bool Before, bool Now)> _rendered = new(ReferenceEqualityComparer.Instance);
         private readonly List<(IElement Root, (RenderCommand First, int Count)? Before, IReadOnlyList<RenderCommand> After)> _relayouts = [];
+        // the out-of-flow boxes removed from the document since, whose commands are taken out of
+        // the frame, with the parent they had (see TryRemoveOutOfFlow)
+        private readonly List<(IElement Element, IElement Parent, (RenderCommand First, int Count) Range)> _removals = [];
+        // the compounds that match by the siblings of an element (null if one may match any element)
+        private List<StructuralGroup>? _structuralGroups;
+        private bool _hasStructuralCompounds;
         // the boxes whose decorations are painted again with their new style map (see TryRepaint)
         private readonly Dictionary<object, Dictionary<string, string>> _repaints = [];
         // if a repaint changed a cursor or what can be hit (see TryRepaint)
         private bool _repaintsChangeHitTesting;
+        // the boxes moved by their insets since the layout (see TryMove): how far, the transform
+        // their commands are wrapped into in the frame, and the ones moved since the last patch
+        private readonly Dictionary<IElement, (float X, float Y)> _moves = new(ReferenceEqualityComparer.Instance);
+        private readonly Dictionary<IElement, PushTransformCommand> _moveTransforms = new(ReferenceEqualityComparer.Instance);
+        private readonly HashSet<IElement> _movedSincePatch = new(ReferenceEqualityComparer.Instance);
 
         /// <summary>
         /// Gets if all that changed since the frame is painted again only (see TryRepaint), which
         /// leaves the boxes and what can be hit where they are.
         /// </summary>
-        public bool IsRepaintOnly => _relayouts.Count == 0 && !_repaintsChangeHitTesting && _rendered.Count == 0;
+        public bool IsRepaintOnly => _relayouts.Count == 0 && !_repaintsChangeHitTesting && _rendered.Count == 0 && _movedSincePatch.Count == 0;
+
+        /// <summary>
+        /// Gets the boxes moved since the frame was patched last (see TryMove) if nothing else
+        /// changed where boxes are, else null.
+        /// </summary>
+        public IReadOnlyCollection<IElement>? GetMovedOnly() =>
+            _movedSincePatch.Count > 0 && _relayouts.Count == 0 && _rendered.Count == 0 && !_repaintsChangeHitTesting
+                ? _movedSincePatch.ToArray()
+                : null;
 
         // the elements whose own text is painted again in a new style (see TryRepaint), with their new
         // style map and if their text has no decorations of an ancestor's (which may change as well)
@@ -457,7 +478,7 @@ public sealed partial class HtmlRenderer
         /// Gets if this is a frame's layout that still looks the same: all boxes laid out again
         /// since were not rendered in the frame and are not now.
         /// </summary>
-        public bool IsUnchangedSinceFrame => _isFrameLayout && _repaints.Count == 0 && _recolors.Count == 0 && _rendered.Values.All(rendered => !rendered.Before && !rendered.Now);
+        public bool IsUnchangedSinceFrame => _isFrameLayout && _repaints.Count == 0 && _recolors.Count == 0 && _movedSincePatch.Count == 0 && _rendered.Values.All(rendered => !rendered.Before && !rendered.Now);
 
         /// <summary>Gets if this is a frame's layout (see <see cref="TryPatch"/>).</summary>
         public bool IsFrameLayout => _isFrameLayout;
@@ -480,6 +501,31 @@ public sealed partial class HtmlRenderer
                 return false;
             }
 
+            foreach (var (element, parent, range) in _removals)
+            {
+                // gone with a box laid out again (its commands are replaced as a whole, as they
+                // were in the frame), or already
+                if (_relayouts.Any(relayout => relayout.Root == parent || relayout.Root.Contains(parent)) ||
+                    IndexOf(displayList, range.First) is not (>= 0 and var start))
+                {
+                    continue;
+                }
+
+                if (start + range.Count > displayList.Commands.Count)
+                {
+                    return false;
+                }
+
+                var next = start + range.Count < displayList.Commands.Count ? displayList.Commands[start + range.Count] : null;
+
+                if (!TryResizeEnclosingRanges(displayList, element, start, range.Count, -range.Count, next, parent))
+                {
+                    return false;
+                }
+
+                displayList.ReplaceRange(start, range.Count, []);
+            }
+
             for (var index = 0; index < _relayouts.Count; index++)
             {
                 var (root, before, after) = _relayouts[index];
@@ -496,6 +542,11 @@ public sealed partial class HtmlRenderer
                         return false;
                     }
 
+                    if (!TryResizeEnclosingRanges(displayList, root, start, range.Count, after.Count - range.Count, after.Count > 0 ? after[0] : null))
+                    {
+                        return false;
+                    }
+
                     displayList.ReplaceRange(start, range.Count, after);
                 }
                 else if (after.Count > 0)
@@ -505,8 +556,20 @@ public sealed partial class HtmlRenderer
                         return false;
                     }
 
+                    // the boxes around it paint it as well (e.g. a world moved by its inset, whose
+                    // translation has to include a figure shown in it since)
+                    if (!TryResizeEnclosingRanges(displayList, root, position, 0, after.Count, after[0]))
+                    {
+                        return false;
+                    }
+
                     displayList.InsertRange(position, after);
                 }
+            }
+
+            if (!TryApplyMoves(displayList))
+            {
+                return false;
             }
 
             if (!TryApplyRepaints(displayList))
@@ -517,10 +580,432 @@ public sealed partial class HtmlRenderer
             // the patched display list is the frame from now on
             _rendered.Clear();
             _relayouts.Clear();
+            _removals.Clear();
             _repaints.Clear();
             _recolors.Clear();
             _repaintsChangeHitTesting = false;
             return true;
+        }
+
+        // The commands of a moved box are wrapped into a translation by how far it moved since the
+        // layout, which a later move only changes.
+        private bool TryApplyMoves(DisplayList displayList)
+        {
+            foreach (var root in _movedSincePatch)
+            {
+                // laid out again since
+                if (!_moves.TryGetValue(root, out var offset))
+                {
+                    continue;
+                }
+
+                if (!_ranges.TryGetValue(root, out var range) || IndexOf(displayList, range.First) is not (>= 0 and var start) || start + range.Count > displayList.Commands.Count)
+                {
+                    return false;
+                }
+
+                var transform = new PushTransformCommand(RenderTransform2D.Translate(offset.X, offset.Y));
+
+                if (_moveTransforms.TryGetValue(root, out var existing) && ReferenceEquals(range.First, existing))
+                {
+                    displayList.ReplaceRange(start, 1, [transform]);
+                    _ranges[root] = (transform, range.Count);
+                    ReplaceRangeStarts(existing, transform);
+                }
+                else
+                {
+                    // the boxes it is in (also one starting with it) take the transform in
+                    if (!TryResizeEnclosingRanges(displayList, root, start, range.Count, 2, transform))
+                    {
+                        return false;
+                    }
+
+                    displayList.InsertRange(start + range.Count, [new PopTransformCommand()]);
+                    displayList.InsertRange(start, [transform]);
+                    _ranges[root] = (transform, range.Count + 2);
+                }
+
+                _moveTransforms[root] = transform;
+            }
+
+            _movedSincePatch.Clear();
+            return true;
+        }
+
+        private static bool IsRaisedInFlow(Dictionary<string, string> styleMap) =>
+            IsOutOfFlowPositioned(styleMap) || IsRelativePositioned(styleMap) || HasExplicitZIndex(styleMap);
+
+        private static bool HasOpenScopeBefore(DisplayList displayList, int end)
+        {
+            var depth = 0;
+
+            for (var index = 0; index < end; index++)
+            {
+                var name = displayList.Commands[index].GetType().Name;
+                depth += name.StartsWith("Push", StringComparison.Ordinal) ? 1 : name.StartsWith("Pop", StringComparison.Ordinal) ? -1 : 0;
+            }
+
+            return depth != 0;
+        }
+
+        // The boxes around one whose commands (at the index given, before they are changed) become
+        // that many more or fewer: their ranges grow or shrink, and one starting with the same
+        // command starts with the new first one (false if there is none).
+        private bool TryResizeEnclosingRanges(DisplayList displayList, IElement root, int start, int count, int difference, RenderCommand? first, IElement? parent = null)
+        {
+            for (var ancestor = parent ?? root.ParentElement; ancestor is not null; ancestor = ancestor.ParentElement)
+            {
+                if (_ranges.TryGetValue(ancestor, out var range) && IndexOf(displayList, range.First) is >= 0 and var ancestorStart &&
+                    ancestorStart <= start && ancestorStart + range.Count >= start + count)
+                {
+                    if (ancestorStart == start)
+                    {
+                        if (first is null)
+                        {
+                            return false;
+                        }
+
+                        _ranges[ancestor] = (first, range.Count + difference);
+                    }
+                    else
+                    {
+                        _ranges[ancestor] = (range.First, range.Count + difference);
+                    }
+                }
+            }
+
+            return true;
+        }
+
+        // a range starting with a command replaced starts with its replacement
+        private void ReplaceRangeStarts(RenderCommand before, RenderCommand after)
+        {
+            foreach (var (element, range) in _ranges.ToList())
+            {
+                if (ReferenceEquals(range.First, before))
+                {
+                    _ranges[element] = (after, range.Count);
+                }
+            }
+        }
+
+        /// <summary>
+        /// Moves a box that only changed where its insets place it (e.g. the world of a game
+        /// scrolled by its <c>left</c>, or a sprite placed by its <c>bottom</c>): an absolutely
+        /// positioned box whose changed insets have the opposite one auto, in pixels before and
+        /// after, is the same box elsewhere. Its commands are translated in the frame and its
+        /// boxes moved, instead of laying it out again.
+        /// </summary>
+        /// <param name="element">The element whose style attribute changed.</param>
+        private bool TryMove(IElement element)
+        {
+            if (!_isFrameLayout || !_context.RecordsPaintAnchors || !_ranges.ContainsKey(element) || !_metrics.ContainsKey(element) ||
+                !_context.StyleMapCache.TryGetValue(element, out var before) || _context.BoxSystems.ContainsKey(element) ||
+                before.GetValueOrDefault("position")?.Trim() is not ("absolute" or "fixed") ||
+                element.ParentElement is not { } parent || !_pass.ComputedStyles.TryGetValue(element, out var laidOut) ||
+                // what transitions or animates is not just elsewhere, it gets there
+                CssTransitionTracker.HasTransition(laidOut) || laidOut.GetPropertyValue("animation-name")?.Trim() is not (null or "" or "none"))
+            {
+                return false;
+            }
+
+            // what changed of the style: of the style attribute, when it is known how it was (and that
+            // its insets were the ones laid out), else of the computed style (a cascade of the element)
+            var inline = element.GetStyle();
+            var computed = default(ICssStyleDeclaration);
+            List<string> changed;
+
+            if (inline is null || !_inlineStyles.TryGetValue(element, out var seen) || !TryCompareInline(inline, seen, out changed))
+            {
+                if (!_pass.ComputedStyles.TryGetValue(parent, out var parentStyle) || ComputeStyle(element, parentStyle) is not { } cascaded)
+                {
+                    return false;
+                }
+
+                computed = cascaded;
+                changed = CompareComputed(computed, laidOut);
+                seen = null;
+            }
+
+            var moved = new Dictionary<string, string>(before, StringComparer.OrdinalIgnoreCase);
+            var x = 0f;
+            var y = 0f;
+
+            foreach (var name in changed)
+            {
+                var to = computed is not null ? computed.GetPropertyValue(name) : inline!.GetPropertyValue(name);
+                var opposite = name switch { "left" => "right", "right" => "left", "top" => "bottom", "bottom" => "top", _ => null };
+
+                // the box is placed by the inset alone (its size does not depend on it), which is in
+                // pixels: it moves by how far it is from where it was laid out (or moved to)
+                if (opposite is null || before.GetValueOrDefault(opposite)?.Trim() is not (null or "" or "auto") ||
+                    (computed is not null ? computed.GetPropertyValue(opposite) : inline!.GetPropertyValue(opposite))?.Trim() is not (null or "" or "auto") ||
+                    !TryParsePixels(before.GetValueOrDefault(name), out var fromPixels) || !TryParsePixels(to, out var toPixels))
+                {
+                    // what the style attribute tells is not enough: the cascade tells
+                    if (seen is not null)
+                    {
+                        _inlineStyles.Remove(element);
+                        return TryMove(element);
+                    }
+
+                    return false;
+                }
+
+                switch (name)
+                {
+                    case "left":
+                        x += toPixels - fromPixels;
+                        break;
+                    case "right":
+                        x += fromPixels - toPixels;
+                        break;
+                    case "top":
+                        y += toPixels - fromPixels;
+                        break;
+                    default:
+                        y += fromPixels - toPixels;
+                        break;
+                }
+
+                moved[name] = to;
+            }
+
+            if (changed.Count == 0)
+            {
+                return false;
+            }
+
+            _context.StyleMapCache[element] = moved;
+
+            if (computed is not null)
+            {
+                _pass.ComputedStyles[element] = computed;
+            }
+
+            // the style attribute as it is now, which the next move compares with (its insets are the
+            // ones of the box, unless a rule overrides them)
+            if (inline is not null && (seen is not null || InsetsAreInline(inline, computed!)))
+            {
+                _inlineStyles[element] = SnapshotInline(inline);
+            }
+            else
+            {
+                _inlineStyles.Remove(element);
+            }
+
+            ApplyMove(element, x, y);
+            return true;
+
+            static bool TryParsePixels(string? value, out float pixels)
+            {
+                pixels = 0f;
+                var trimmed = value?.Trim();
+                return trimmed is not null && trimmed.EndsWith("px", StringComparison.Ordinal) &&
+                    float.TryParse(trimmed[..^2], NumberStyles.Float, CultureInfo.InvariantCulture, out pixels);
+            }
+
+            static bool InsetsAreInline(ICssStyleDeclaration inline, ICssStyleDeclaration computed)
+            {
+                foreach (var name in s_insets)
+                {
+                    var declared = inline.GetPropertyValue(name);
+
+                    if (!string.IsNullOrEmpty(declared) && !string.Equals(declared.Trim(), computed.GetPropertyValue(name)?.Trim(), StringComparison.Ordinal))
+                    {
+                        return false;
+                    }
+                }
+
+                return true;
+            }
+        }
+
+        private static readonly string[] s_insets = ["left", "top", "right", "bottom"];
+
+        // The box (with what is in it) is somewhere else by the given offset: its boxes are, and its
+        // commands are translated once the frame is patched (see TryApplyMoves).
+        private void ApplyMove(IElement element, float x, float y)
+        {
+            foreach (var box in EnumerateBoxes(element))
+            {
+                if (_metrics.TryGetValue(box, out var metrics))
+                {
+                    var shifted = metrics with { BorderBoxX = metrics.BorderBoxX + x, BorderBoxY = metrics.BorderBoxY + y };
+                    _metrics[box] = shifted;
+                    _pageMetrics[box] = ToPage(shifted);
+                }
+            }
+
+            var offset = _moves.GetValueOrDefault(element);
+            _moves[element] = (offset.X + x, offset.Y + y);
+            _movedSincePatch.Add(element);
+        }
+
+        // If the box may be moved instead of laid out again when its inset changed: it is placed by
+        // its insets, has a range of commands of its own, and does not transition or animate.
+        private bool CanMove(IElement element, Dictionary<string, string> before, ICssStyleDeclaration computed) =>
+            _isFrameLayout && _context.RecordsPaintAnchors && _ranges.ContainsKey(element) && _metrics.ContainsKey(element) &&
+            !_context.BoxSystems.ContainsKey(element) &&
+            before.GetValueOrDefault("position")?.Trim() is "absolute" or "fixed" &&
+            !CssTransitionTracker.HasTransition(computed) && computed.GetPropertyValue("animation-name")?.Trim() is null or "" or "none";
+
+        // How far a changed inset moves the box (if it alone places it, in pixels before and after).
+        private static bool TryGetInsetMove(string name, Dictionary<string, string> before, Dictionary<string, string> after, ref float x, ref float y)
+        {
+            var opposite = name switch { "left" => "right", "right" => "left", "top" => "bottom", "bottom" => "top", _ => null };
+
+            if (opposite is null || before.GetValueOrDefault(opposite)?.Trim() is not (null or "" or "auto") ||
+                after.GetValueOrDefault(opposite)?.Trim() is not (null or "" or "auto") ||
+                !TryParsePixelValue(before.GetValueOrDefault(name), out var from) || !TryParsePixelValue(after.GetValueOrDefault(name), out var to))
+            {
+                return false;
+            }
+
+            switch (name)
+            {
+                case "left":
+                    x += to - from;
+                    break;
+                case "right":
+                    x += from - to;
+                    break;
+                case "top":
+                    y += to - from;
+                    break;
+                default:
+                    y += from - to;
+                    break;
+            }
+
+            return true;
+        }
+
+        private static bool TryParsePixelValue(string? value, out float pixels)
+        {
+            pixels = 0f;
+            var trimmed = value?.Trim();
+            return trimmed is not null && trimmed.EndsWith("px", StringComparison.Ordinal) &&
+                float.TryParse(trimmed[..^2], NumberStyles.Float, CultureInfo.InvariantCulture, out pixels);
+        }
+
+        // the style attributes of moved boxes as they were last seen (see TryMove)
+        private readonly Dictionary<IElement, Dictionary<string, (ICssValue? Value, bool IsImportant)>> _inlineStyles = new(ReferenceEqualityComparer.Instance);
+
+        private static Dictionary<string, (ICssValue? Value, bool IsImportant)> SnapshotInline(ICssStyleDeclaration inline)
+        {
+            var snapshot = new Dictionary<string, (ICssValue? Value, bool IsImportant)>(StringComparer.Ordinal);
+
+            foreach (var property in inline)
+            {
+                snapshot[property.Name] = (property.RawValue, property.IsImportant);
+            }
+
+            return snapshot;
+        }
+
+        // The declarations of the style attribute that are not as they were (values are immutable,
+        // usually the same instance); false if anything but a value changed, e.g. a declaration removed.
+        private static bool TryCompareInline(ICssStyleDeclaration inline, Dictionary<string, (ICssValue? Value, bool IsImportant)> seen, out List<string> changed)
+        {
+            changed = new List<string>(2);
+
+            if (inline.Length != seen.Count)
+            {
+                return false;
+            }
+
+            foreach (var property in inline)
+            {
+                if (!seen.TryGetValue(property.Name, out var before))
+                {
+                    return false;
+                }
+
+                if (before.IsImportant != property.IsImportant ||
+                    !(ReferenceEquals(before.Value, property.RawValue) || (property.RawValue is { } value && value.Equals(before.Value))))
+                {
+                    changed.Add(property.Name);
+                }
+            }
+
+            return true;
+        }
+
+        // what changed of the computed style, compared with the one of the layout (the values are
+        // compared as they are: serializing all of them costs more than the move saves)
+        private static List<string> CompareComputed(ICssStyleDeclaration computed, ICssStyleDeclaration laidOut)
+        {
+            var changed = new List<string>(2);
+
+            foreach (var property in computed)
+            {
+                if (!IsSameValue(property, laidOut.GetProperty(property.Name)))
+                {
+                    changed.Add(property.Name);
+                }
+            }
+
+            if (computed.Length != laidOut.Length)
+            {
+                foreach (var property in laidOut)
+                {
+                    if (computed.GetProperty(property.Name) is null)
+                    {
+                        changed.Add(property.Name);
+                    }
+                }
+            }
+
+            return changed;
+        }
+
+        // the element, its descendants, and their pseudo-elements, which have boxes of their own
+        private IEnumerable<IElement> EnumerateBoxes(IElement root)
+        {
+            foreach (var element in root.DescendantsAndSelf<IElement>())
+            {
+                yield return element;
+
+                if (_pass.Nodes.TryGetValue(element, out var node))
+                {
+                    foreach (var child in node.Children)
+                    {
+                        if (child is ElementRenderNode { Ref: IPseudoElement pseudo })
+                        {
+                            yield return pseudo;
+                        }
+                    }
+                }
+            }
+        }
+
+        private static bool IsSameValue(ICssProperty property, ICssProperty? other) =>
+            other is not null && (ReferenceEquals(property.RawValue, other.RawValue) || (property.RawValue is { } value && value.Equals(other.RawValue)));
+
+        private static bool IsInSubtree(IElement root, IElement element) =>
+            ReferenceEquals(root, element) || root.Contains(element) ||
+            (element is IPseudoElement && element.ParentElement is { } host && (ReferenceEquals(root, host) || root.Contains(host)));
+
+        // how far the boxes around one were moved since the layout, which its own layout does not know of
+        private (float X, float Y) GetMovedOffset(IElement element)
+        {
+            var x = 0f;
+            var y = 0f;
+
+            if (_moves.Count > 0)
+            {
+                for (var ancestor = element.ParentElement; ancestor is not null; ancestor = ancestor.ParentElement)
+                {
+                    if (_moves.TryGetValue(ancestor, out var offset))
+                    {
+                        x += offset.X;
+                        y += offset.Y;
+                    }
+                }
+            }
+
+            return (x, y);
         }
 
         // the properties that change what a box paints of its own, but not where anything is
@@ -569,6 +1054,11 @@ public sealed partial class HtmlRenderer
             var repaints = new List<(object Key, Dictionary<string, string> StyleMap)>();
             var recolors = new List<(IElement Element, (Dictionary<string, string>, bool) Text)>();
             var changesHitTesting = false;
+            // the element may also have moved by its insets (e.g. a sprite showing another frame elsewhere)
+            var moveX = 0f;
+            var moveY = 0f;
+            var hasMoved = false;
+
             if (!Compare(node, reachesDescendants))
             {
                 return false;
@@ -591,6 +1081,12 @@ public sealed partial class HtmlRenderer
             }
 
             _repaintsChangeHitTesting |= changesHitTesting;
+            _inlineStyles.Remove(element);
+
+            if (hasMoved)
+            {
+                ApplyMove(element, moveX, moveY);
+            }
 
             return true;
 
@@ -636,6 +1132,13 @@ public sealed partial class HtmlRenderer
 
                         // what the children inherit changed (custom properties are none of the style map's)
                         visitsChildren |= s_inheritedProperties.Contains(name);
+
+                        if (ReferenceEquals(target, element) && s_insets.Contains(name) && CanMove(element, before, elementNode.ComputedStyle) &&
+                            TryGetInsetMove(name, before, after, ref moveX, ref moveY))
+                        {
+                            hasMoved = true;
+                            continue;
+                        }
 
                         if (s_inertProperties.Contains(name))
                         {
@@ -867,10 +1370,71 @@ public sealed partial class HtmlRenderer
                 return false;
             }
 
+            // the boxes whose commands these are in have as many more or fewer
+            if (!TryAdjustRanges(commands, replacements))
+            {
+                return false;
+            }
+
             for (var i = replacements.Count - 1; i >= 0; i--)
             {
                 var (start, count, replacement) = replacements[i];
                 displayList.ReplaceRange(start, count, replacement);
+            }
+
+            return true;
+        }
+
+        // Makes the ranges of the boxes fit the commands once the given ones are replaced (a box
+        // painted again may paint more or fewer of them); false if a replacement cuts a range.
+        private bool TryAdjustRanges(IReadOnlyList<RenderCommand> commands, List<(int Start, int Count, IReadOnlyList<RenderCommand> Commands)> replacements)
+        {
+            if (replacements.TrueForAll(static replacement => replacement.Count == replacement.Commands.Count && replacement.Count != 1))
+            {
+                return true;
+            }
+
+            var positions = new Dictionary<RenderCommand, int>(commands.Count, ReferenceEqualityComparer.Instance);
+
+            for (var index = 0; index < commands.Count; index++)
+            {
+                positions[commands[index]] = index;
+            }
+
+            foreach (var (element, range) in _ranges.ToList())
+            {
+                if (!positions.TryGetValue(range.First, out var start))
+                {
+                    continue;
+                }
+
+                var end = start + range.Count;
+                var first = range.First;
+                var count = range.Count;
+
+                foreach (var (replacedStart, replacedCount, replacement) in replacements)
+                {
+                    var replacedEnd = replacedStart + replacedCount;
+
+                    if (replacedEnd <= start || replacedStart >= end)
+                    {
+                        continue;
+                    }
+
+                    if (replacedStart < start || replacedEnd > end || (replacedStart == start && replacement.Count == 0))
+                    {
+                        return false;
+                    }
+
+                    count += replacement.Count - replacedCount;
+
+                    if (replacedStart == start)
+                    {
+                        first = replacement[0];
+                    }
+                }
+
+                _ranges[element] = (first, count);
             }
 
             return true;
@@ -1068,9 +1632,27 @@ public sealed partial class HtmlRenderer
 
             var roots = new List<IElement>();
 
+            // a changed style attribute may only paint differently (e.g. a sprite showing another
+            // frame by its background-position), which is looked at once the roots are known
+            var restyledByAttribute = new List<IElement>();
+
             foreach (var record in records)
             {
-                if (GetChangedSubtree(record) is not { } changed || !AddRoot(changed))
+                if (TryRemoveOutOfFlow(record))
+                {
+                    continue;
+                }
+
+                if (GetChangedSubtree(record) is not { } changed)
+                {
+                    return false;
+                }
+
+                if (record is { Type: "attributes", AttributeName: "style" } && ReferenceEquals(changed, record.Target))
+                {
+                    restyledByAttribute.Add(changed);
+                }
+                else if (!AddRoot(changed))
                 {
                     return false;
                 }
@@ -1095,6 +1677,21 @@ public sealed partial class HtmlRenderer
 
             bool TryRestyle()
             {
+                foreach (var element in restyledByAttribute)
+                {
+                    // laid out with its root anyway, or gone with its subtree (e.g. a coin of a game
+                    // removed after its style changed), which the record of its removal lays out
+                    if (roots.Any(root => root.Contains(element)) || element.Owner != _document || !_document.Contains(element))
+                    {
+                        continue;
+                    }
+
+                    if (!TryMove(element) && !TryRepaint(window, element, reachesDescendants: false) && !AddRoot(element))
+                    {
+                        return false;
+                    }
+                }
+
                 foreach (var (element, reachesDescendants) in restyled ?? new Dictionary<IElement, bool>())
                 {
                     // what has no box (e.g. in a hidden menu) gets none by its own style: the ancestor
@@ -1179,6 +1776,146 @@ public sealed partial class HtmlRenderer
             finally
             {
                 s_layoutPass.Value = previousPass;
+            }
+
+            return true;
+        }
+
+        // An out-of-flow box (or one without a box) removed from its parent changes nothing of the
+        // boxes around it (e.g. a coin of a game, of hundreds of sprites in the same parent), unless
+        // a selector matching by the siblings of an element applies: its commands are taken out.
+        private bool TryRemoveOutOfFlow(IMutationRecord record)
+        {
+            if (record.Type != "childList" || record.Target is not IElement parent || record.Added is { Length: > 0 } ||
+                record.Removed is not { Length: > 0 } removed || ChangesStyleSheets(record) || !_metrics.ContainsKey(parent))
+            {
+                return false;
+            }
+
+            var elements = new List<IElement>();
+
+            foreach (var node in removed)
+            {
+                switch (node)
+                {
+                    case IElement element when element.Parent is null && IsRemovableOutOfFlow(element):
+                        elements.Add(element);
+                        break;
+                    case IText text when string.IsNullOrWhiteSpace(text.Data):
+                    case IComment:
+                        break;
+                    default:
+                        return false;
+                }
+            }
+
+            if (!KeepsRelationalMatches(parent) || !KeepsStructuralMatches(parent, elements))
+            {
+                return false;
+            }
+
+            foreach (var element in elements)
+            {
+                if (_ranges.TryGetValue(element, out var range))
+                {
+                    _removals.Add((element, parent, range));
+                }
+
+                if (_entries.TryGetValue(element, out var entry))
+                {
+                    Forget(entry.Node);
+                }
+
+                foreach (var gone in element.DescendantsAndSelf<IElement>())
+                {
+                    _entries.Remove(gone);
+                    _layers.Remove(gone);
+                    _ranges.Remove(gone);
+                    _metrics.Remove(gone);
+                    _pageMetrics.Remove(gone);
+                    _moves.Remove(gone);
+                    _moveTransforms.Remove(gone);
+                    _movedSincePatch.Remove(gone);
+                    _inlineStyles.Remove(gone);
+                }
+
+                _rendered[element] = (true, false);
+            }
+
+            return true;
+        }
+
+        // laid out on its own (out of the flow), or not rendered at all
+        private bool IsRemovableOutOfFlow(IElement element)
+        {
+            if (!_metrics.ContainsKey(element) && !_ranges.ContainsKey(element))
+            {
+                return !element.DescendantsAndSelf<IElement>().Any(_metrics.ContainsKey);
+            }
+
+            return _entries.TryGetValue(element, out var entry) && !entry.IsInFlow && entry.Item is null && entry.HasBox &&
+                _context.StyleMapCache.TryGetValue(element, out var styleMap) && IsOutOfFlowPositioned(styleMap) && !IsStickyPositioned(styleMap) &&
+                // the counters of the boxes after it count it
+                !element.DescendantsAndSelf<IElement>().Any(UsesCounters);
+
+            bool UsesCounters(IElement candidate) =>
+                _context.StyleMapCache.TryGetValue(candidate, out var map) &&
+                new[] { "counter-increment", "counter-reset", "counter-set" }.Any(name => map.GetValueOrDefault(name)?.Trim() is { Length: > 0 } value && !value.Equals("none", StringComparison.OrdinalIgnoreCase));
+        }
+
+        // if no selector matching by the siblings of an element (e.g. :nth-child, :last-child,
+        // + or ~) or by its children (:empty) may match the parent or one of its children
+        private bool KeepsStructuralMatches(IElement parent, List<IElement> removed)
+        {
+            if (!_hasStructuralCompounds)
+            {
+                _structuralGroups = StructuralGroup.Collect(_document);
+                _hasStructuralCompounds = true;
+            }
+
+            if (_structuralGroups is not { } groups)
+            {
+                return false;
+            }
+
+            if (groups.Count == 0)
+            {
+                return true;
+            }
+
+            var children = parent.Children.Concat(removed).ToList();
+            var tags = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            var classes = new HashSet<string>(StringComparer.Ordinal);
+            var ids = new HashSet<string>(StringComparer.Ordinal);
+
+            foreach (var child in children)
+            {
+                tags.Add(child.LocalName);
+                classes.UnionWith(child.ClassList);
+
+                if (child.Id is { Length: > 0 } id)
+                {
+                    ids.Add(id);
+                }
+            }
+
+            bool MayMatchAChild(StructuralCompound compound) =>
+                (compound.Tag is not { } tag || tags.Contains(tag)) && compound.Classes.All(classes.Contains) && compound.Ids.All(ids.Contains) &&
+                children.Any(child => TryMatches(child, compound.Selector) != false);
+
+            foreach (var group in groups)
+            {
+                // a compound of an element's own structure (e.g. :empty, :nth-child) may match the
+                // parent or a child; compounds related by sibling combinators all have to match children
+                if (group.Compounds.Count == 1 && TryMatches(parent, group.Compounds[0].Selector) != false)
+                {
+                    return false;
+                }
+
+                if (group.Compounds.All(MayMatchAChild))
+                {
+                    return false;
+                }
             }
 
             return true;
@@ -1477,6 +2214,14 @@ public sealed partial class HtmlRenderer
 
             var styleMap = GetOrCreateStyleMap(_context, root, node.ComputedStyle);
 
+            // a positioned box shown now paints with the flow around its parent, unless that is
+            // positioned itself (see PaintOrder), which only a layout of that flow knows
+            if (before is null && GeneratesBoxes(node) && IsRaisedInFlow(styleMap) &&
+                (root.ParentElement is not { } parentElement || !_context.StyleMapCache.TryGetValue(parentElement, out var parentStyle) || !IsRaisedInFlow(parentStyle)))
+            {
+                return false;
+            }
+
             if (entry.Item is { } item)
             {
                 // the container is left alone if it would see the same item
@@ -1529,6 +2274,7 @@ public sealed partial class HtmlRenderer
             var previous = s_layoutCapture.Value;
             s_layoutCapture.Value = capture;
 
+            _context.HoistCandidates.Clear();
             var cursorY = entry.CursorY;
             var previousBlockMarginBottom = entry.PreviousBlockMarginBottom;
             var suppressNextBlockTopMargin = entry.SuppressNextBlockTopMargin;
@@ -1598,6 +2344,19 @@ public sealed partial class HtmlRenderer
                 _pass.Metrics.Layout += RenderMetricsRecorder.Since(layoutStart);
             }
 
+            // a positioned box in it that paints with the flow around it (see PaintOrder), which it
+            // would in a full layout if it is no stacking context or clip (a new one, as the root
+            // of one there was not laid out on its own)
+            if (!IsRaisedInFlow(styleMap) && !IsStickyPositioned(styleMap) &&
+                _context.HoistCandidates.Any(candidate => ReferenceEquals(candidate.DisplayList, displayList) && root.Contains(candidate.Element) &&
+                    displayList.Commands.IndexOf(candidate.First) is >= 0 and var position && !HasOpenScopeBefore(displayList, position)))
+            {
+                _context.HoistCandidates.Clear();
+                return false;
+            }
+
+            _context.HoistCandidates.Clear();
+
             // an item that got its main size by being laid out has to keep it, and so its box
             if (entry.Item is { } sameItem && ((!float.IsNaN(sameItem.DeferredMainSize) && Math.Max(0f, cursorY - entry.CursorY) != sameItem.DeferredMainSize) ||
                 !capture.TryGet(root, out var laidOutAsItem) || !HasSameBox(laidOutAsItem, laidOutBefore) || !ContributesTheSame(contribution, contentWidths, node, entry)))
@@ -1619,10 +2378,33 @@ public sealed partial class HtmlRenderer
 
             var hitTestingStart = RenderMetricsRecorder.Now;
 
+            // laid out where it was before the boxes around it moved, which its commands are
+            // translated by in the frame (see TryApplyMoves), as are its boxes here
+            var movedOffset = GetMovedOffset(root);
+
             foreach (var (element, metrics) in AddHitTestLayers(capture.Snapshot(), _context))
             {
-                _metrics[element] = metrics;
-                _pageMetrics[element] = ToPage(metrics);
+                var placed = movedOffset == default ? metrics : metrics with { BorderBoxX = metrics.BorderBoxX + movedOffset.X, BorderBoxY = metrics.BorderBoxY + movedOffset.Y };
+                _metrics[element] = placed;
+                _pageMetrics[element] = ToPage(placed);
+            }
+
+            // what moved in it is laid out where it is now, with what its style is now
+            if (_moves.Count > 0)
+            {
+                foreach (var moved in _moves.Keys.Where(moved => IsInSubtree(root, moved)).ToList())
+                {
+                    _moves.Remove(moved);
+                    _moveTransforms.Remove(moved);
+                }
+            }
+
+            if (_inlineStyles.Count > 0)
+            {
+                foreach (var seen in _inlineStyles.Keys.Where(seen => IsInSubtree(root, seen)).ToList())
+                {
+                    _inlineStyles.Remove(seen);
+                }
             }
 
             _pass.Metrics.HitTesting += RenderMetricsRecorder.Since(hitTestingStart);
@@ -1831,6 +2613,315 @@ public sealed partial class HtmlRenderer
                     dictionary.Remove(key);
                 }
             }
+        }
+    }
+
+    /// <summary>
+    /// A compound of a selector that matches an element by its siblings or children (with a
+    /// structural pseudo-class, or next to a sibling combinator), without its pseudo-classes: what
+    /// it matches may be affected by adding or removing a sibling, or a child.
+    /// </summary>
+    private sealed record StructuralGroup(IReadOnlyList<StructuralCompound> Compounds)
+    {
+        /// <summary>
+        /// Gets the compounds of the document's rules: each one of an element's own structure,
+        /// or those related by sibling combinators together; null if one of the former may match
+        /// any element.
+        /// </summary>
+        public static List<StructuralGroup>? Collect(IDocument document) => StructuralCompound.Collect(document);
+    }
+
+    private sealed record StructuralCompound(string Selector, string? Tag, IReadOnlyList<string> Classes, IReadOnlyList<string> Ids)
+    {
+        private static readonly string[] s_structural = [":nth-", ":first-child", ":last-child", ":only-child", ":first-of-type", ":last-of-type", ":only-of-type", ":empty"];
+
+        /// <summary>
+        /// Gets the compounds of the document's rules, or null if one of them may match any element.
+        /// </summary>
+        public static List<StructuralGroup>? Collect(IDocument document)
+        {
+            var compounds = new List<StructuralGroup>();
+            var seen = new HashSet<string>(StringComparer.Ordinal);
+
+            foreach (var sheet in document.StyleSheets.OfType<ICssStyleSheet>())
+            {
+                if (!Add(sheet.Rules, compounds, seen))
+                {
+                    return null;
+                }
+            }
+
+            return compounds;
+        }
+
+        private static bool Add(ICssRuleList rules, List<StructuralGroup> compounds, HashSet<string> seen)
+        {
+            foreach (var rule in rules)
+            {
+                var added = rule switch
+                {
+                    ICssStyleRule style => Add(style.SelectorText, compounds, seen) && Add(style.Rules, compounds, seen),
+                    ICssGroupingRule group => Add(group.Rules, compounds, seen),
+                    ICssImportRule { Sheet: { } sheet } => Add(sheet.Rules, compounds, seen),
+                    _ => true,
+                };
+
+                if (!added)
+                {
+                    return false;
+                }
+            }
+
+            return true;
+        }
+
+        private static bool Add(string? selectorText, List<StructuralGroup> compounds, HashSet<string> seen)
+        {
+            if (string.IsNullOrEmpty(selectorText) || (!selectorText.Contains('+') && !selectorText.Contains('~') && !s_structural.Any(selectorText.Contains)))
+            {
+                return true;
+            }
+
+            foreach (var complex in Split(selectorText, ","))
+            {
+                var parts = SplitCompounds(complex);
+                var chain = new List<StructuralCompound>();
+                var chainIsUniversal = true;
+
+                for (var index = 0; index < parts.Count; index++)
+                {
+                    var (compound, combinatorBefore) = parts[index];
+                    var continuesChain = index + 1 < parts.Count && parts[index + 1].CombinatorBefore is '+' or '~';
+                    var isInChain = combinatorBefore is '+' or '~' || continuesChain;
+                    var selector = StripPseudo(compound);
+                    var isUniversal = selector.Length == 0 || selector == "*";
+
+                    if (isInChain)
+                    {
+                        chain.Add(Parse(isUniversal ? "*" : selector));
+                        chainIsUniversal &= isUniversal;
+
+                        if (!continuesChain)
+                        {
+                            // siblings any element may be are no structure of a parent's own
+                            if (chainIsUniversal)
+                            {
+                                return false;
+                            }
+
+                            if (seen.Add(string.Join(" ~ ", chain.Select(item => item.Selector))))
+                            {
+                                compounds.Add(new StructuralGroup(chain.ToArray()));
+                            }
+
+                            chain.Clear();
+                            chainIsUniversal = true;
+                        }
+                    }
+                    else if (s_structural.Any(compound.Contains))
+                    {
+                        if (isUniversal)
+                        {
+                            return false;
+                        }
+
+                        if (seen.Add(selector))
+                        {
+                            compounds.Add(new StructuralGroup([Parse(selector)]));
+                        }
+                    }
+                }
+            }
+
+            return true;
+        }
+
+        // the compounds with the combinator before each, split outside of parentheses, brackets and strings
+        private static List<(string Compound, char CombinatorBefore)> SplitCompounds(string complex)
+        {
+            var parts = new List<(string, char)>();
+            var depth = 0;
+            var quote = '\0';
+            var current = new System.Text.StringBuilder();
+            var combinator = '\0';
+            var pending = '\0';
+
+            foreach (var c in complex.Trim())
+            {
+                if (quote != '\0')
+                {
+                    quote = c == quote ? '\0' : quote;
+                }
+                else if (c is '"' or '\'')
+                {
+                    quote = c;
+                }
+                else if (c is '(' or '[')
+                {
+                    depth++;
+                }
+                else if (c is ')' or ']')
+                {
+                    depth--;
+                }
+                else if (depth == 0 && (c is '>' or '+' or '~' || char.IsWhiteSpace(c)))
+                {
+                    if (current.Length > 0)
+                    {
+                        parts.Add((current.ToString(), combinator));
+                        current.Clear();
+                        pending = ' ';
+                    }
+
+                    if (c is '>' or '+' or '~')
+                    {
+                        pending = c;
+                    }
+
+                    continue;
+                }
+
+                if (current.Length == 0)
+                {
+                    combinator = pending;
+                    pending = '\0';
+                }
+
+                current.Append(c);
+            }
+
+            if (current.Length > 0)
+            {
+                parts.Add((current.ToString(), combinator));
+            }
+
+            return parts;
+        }
+
+        private static IEnumerable<string> Split(string text, string separator)
+        {
+            var depth = 0;
+            var start = 0;
+
+            for (var index = 0; index < text.Length; index++)
+            {
+                var c = text[index];
+                depth += c is '(' or '[' ? 1 : c is ')' or ']' ? -1 : 0;
+
+                if (depth == 0 && string.CompareOrdinal(text, index, separator, 0, separator.Length) == 0)
+                {
+                    yield return text[start..index];
+                    start = index + separator.Length;
+                }
+            }
+
+            yield return text[start..];
+        }
+
+        // the compound without its pseudo-classes and pseudo-elements, which matches at least what it does
+        private static string StripPseudo(string compound)
+        {
+            var result = new System.Text.StringBuilder();
+            var depth = 0;
+            var inPseudo = false;
+
+            for (var index = 0; index < compound.Length; index++)
+            {
+                var c = compound[index];
+
+                if (c == '\\' && index + 1 < compound.Length)
+                {
+                    if (!inPseudo)
+                    {
+                        result.Append(c).Append(compound[index + 1]);
+                    }
+
+                    index++;
+                    continue;
+                }
+
+                if (depth == 0 && c == ':')
+                {
+                    inPseudo = true;
+                    continue;
+                }
+
+                if (inPseudo)
+                {
+                    if (c == '(')
+                    {
+                        depth++;
+                    }
+                    else if (c == ')')
+                    {
+                        depth--;
+                    }
+                    else if (depth == 0 && c is '.' or '#' or '[')
+                    {
+                        inPseudo = false;
+                        result.Append(c);
+                    }
+
+                    continue;
+                }
+
+                result.Append(c);
+            }
+
+            return result.ToString().Trim();
+        }
+
+        private static StructuralCompound Parse(string selector)
+        {
+            // escaped or namespaced names are matched as they are, without looking for them first
+            if (selector.Contains('\\') || selector.Contains('|'))
+            {
+                return new StructuralCompound(selector, null, [], []);
+            }
+
+            var classes = new List<string>();
+            var ids = new List<string>();
+            string? tag = null;
+            var index = 0;
+
+            while (index < selector.Length && (char.IsLetterOrDigit(selector[index]) || selector[index] is '-' or '_'))
+            {
+                index++;
+            }
+
+            if (index > 0)
+            {
+                tag = selector[..index];
+            }
+
+            while (index < selector.Length)
+            {
+                var c = selector[index];
+
+                if (c == '[')
+                {
+                    // the value of an attribute selector may hold anything
+                    index = selector.IndexOf(']', index) is >= 0 and var end ? end + 1 : selector.Length;
+                    continue;
+                }
+
+                if (c is '.' or '#')
+                {
+                    var start = ++index;
+
+                    while (index < selector.Length && (char.IsLetterOrDigit(selector[index]) || selector[index] is '-' or '_'))
+                    {
+                        index++;
+                    }
+
+                    (c == '.' ? classes : ids).Add(selector[start..index]);
+                    continue;
+                }
+
+                index++;
+            }
+
+            return new StructuralCompound(selector, tag, classes, ids);
         }
     }
 

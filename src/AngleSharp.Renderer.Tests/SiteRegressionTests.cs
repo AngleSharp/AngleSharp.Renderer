@@ -1460,6 +1460,113 @@ public sealed class SiteRegressionTests
         return document;
     }
 
+    [Fact]
+    public async Task RelativeBox_PaintsAboveEarlierAbsoluteSibling()
+    {
+        // the tractor store's cart button: the icon in a relative box was hidden by the
+        // button's absolutely positioned ::before (positioned boxes paint in tree order)
+        var document = await OpenAsync("""
+            <style>
+              .button { position: relative; width: 60px; height: 60px }
+              .button::before { content: ""; position: absolute; inset: 0; background: #ffffff }
+              .inner { position: relative; height: 60px; background: #ff0000 }
+            </style>
+            <div class="button"><div class="inner"></div></div>
+            """);
+
+        var commands = new HtmlRenderer().BuildDisplayList(document, Device).Commands.OfType<FillRectCommand>().ToList();
+        var before = commands.FindIndex(command => command.Color == new RenderColor(0xff, 0xff, 0xff) && command.Rect.Width == 60);
+        var inner = commands.FindIndex(command => command.Color == new RenderColor(0xff, 0x00, 0x00));
+
+        Assert.True(before >= 0 && inner > before, $"::before at {before}, inner at {inner}");
+    }
+
+    [Fact]
+    public async Task Image_WithPercentageWidth_DoesNotWidenGridTrack()
+    {
+        // the tractor store's home page: an image with width: 100% in a 1fr track can shrink
+        // to nothing (compressible replaced element), so both tracks stay equal
+        var document = await OpenAsync($"""
+            <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 16px; width: 600px">
+              <a id="first" style="display: block"><img src="{GeneratedContentTests.PngDataUri(1000, 560)}" style="width: 100%"></a>
+              <a id="second" style="display: block"><img src="{GeneratedContentTests.PngDataUri(1000, 560)}" style="width: 100%"></a>
+            </div>
+            """);
+
+        var first = document.GetElementById("first")!.GetBoundingClientRect();
+        var second = document.GetElementById("second")!.GetBoundingClientRect();
+
+        Assert.Equal(292, first.Width, precision: 0);
+        Assert.Equal(292, second.Width, precision: 0);
+        Assert.Equal(308, second.Left, precision: 0);
+    }
+
+    [Fact]
+    public async Task Image_WithPercentageMaxWidth_DoesNotWidenGridTrack()
+    {
+        var document = await OpenAsync($"""
+            <div style="display: grid; grid-template-columns: 1fr 1fr; width: 400px">
+              <div id="first"><img src="{GeneratedContentTests.PngDataUri(1000, 100)}" style="max-width: 100%; display: block"></div>
+              <div></div>
+            </div>
+            """);
+
+        Assert.Equal(200, document.GetElementById("first")!.GetBoundingClientRect().Width, precision: 0);
+    }
+
+    [Theory]
+    [InlineData("justify-content: center", 16.5)]
+    [InlineData("justify-content: end", 33)]
+    [InlineData("justify-content: normal", 0)]
+    public async Task ImplicitGridColumn_IsPlacedByJustifyContent(string alignment, double left)
+    {
+        // the tractor store's cart button centers its icon with place-content: center (which
+        // sets justify-content from AngleSharp.Css 1.4.2) in a grid without template columns
+        var document = await OpenAsync($"""
+            <div style="display: grid; {alignment}; width: 66px; height: 66px">
+              <div id="icon" style="width: 33px; height: 33px"></div>
+            </div>
+            """);
+
+        Assert.Equal(left, document.GetElementById("icon")!.GetBoundingClientRect().Left, precision: 1);
+    }
+
+    [Fact]
+    public async Task Float_AfterTextOnALine_IsPlacedOnThatLine()
+    {
+        // a close button floated right at the end of a dialog's title
+        var document = await OpenAsync("""
+            <h2 style="margin: 0; padding: 16px 32px; font-size: 16px; line-height: 20px">Title<a id="close" style="float: right">X</a></h2>
+            <div style="width: 300px; line-height: 20px"><span id="text">Some text</span><b id="left" style="float: left">F</b> more</div>
+            """);
+
+        var close = document.GetElementById("close")!.GetBoundingClientRect();
+        var left = document.GetElementById("left")!.GetBoundingClientRect();
+        var text = document.GetElementById("text")!.GetBoundingClientRect();
+
+        Assert.Equal(16d, close.Top, 1);
+        Assert.Equal(800d - 32d, close.Right, 1);
+        Assert.Equal(text.Top, left.Top, 1);
+        Assert.Equal(0d, left.Left, 1);
+        // what was before a left float on its line moves aside
+        Assert.Equal(left.Right, text.Left, 1);
+    }
+
+    [Fact]
+    public async Task PositionedBox_WithMaxHeightAndAutoMargins_IsCentered()
+    {
+        var document = await OpenAsync("""
+            <div id="dialog" style="position: fixed; top: 0; left: 0; right: 0; bottom: 0; margin: auto; max-width: 50%; max-height: 50%">Dialog</div>
+            """);
+
+        var dialog = document.GetElementById("dialog")!.GetBoundingClientRect();
+
+        Assert.Equal(200d, dialog.Left, 1);
+        Assert.Equal(150d, dialog.Top, 1);
+        Assert.Equal(400d, dialog.Width, 1);
+        Assert.Equal(300d, dialog.Height, 1);
+    }
+
     private static async Task<IDocument> OpenAsync(string body)
     {
         var context = BrowsingContext.New(Configuration.Default.WithCss().WithRenderDevice(Device));

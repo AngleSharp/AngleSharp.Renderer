@@ -166,6 +166,39 @@ public class CssTransitionEventTests
         Assert.Equal(["transitionrun padding-left 0", "transitionstart padding-left 0"], events);
     }
 
+    [Fact]
+    public async Task ClassChangedOnAFixedBox_PatchedFrameAnimatesFromTheNextTick()
+    {
+        // a menu sliding in, long after the last frame (the clock only moves with frames)
+        var (document, harness) = await OpenAsync("""
+            <style>
+              .menu { position: fixed; top: 0; left: 0; bottom: 0; width: 100px; transform: translateX(-100%); transition: transform 1s linear }
+              .menu.open { transform: none }
+            </style>
+            <div id="menu" class="menu">Menu</div><p>Content</p>
+            """);
+        var menu = document.GetElementById("menu")!;
+        harness.PrepareFrame();
+
+        menu.ClassList.Add("open");
+        var patched = harness.UpdateFrame();
+
+        Assert.NotNull(patched);
+        Assert.True(patched!.IsAnimating);
+
+        harness.AdvanceTime(TimeSpan.FromSeconds(5));
+        Assert.True(harness.PrepareFrame().IsAnimating);
+        harness.AdvanceTime(TimeSpan.FromMilliseconds(500));
+        harness.PrepareFrame();
+
+        Assert.Contains("-50", harness.GetTransitioningValue(menu, "transform"));
+
+        harness.AdvanceTime(TimeSpan.FromMilliseconds(600));
+
+        Assert.False(harness.PrepareFrame().IsAnimating);
+        Assert.Null(harness.GetTransitioningValue(menu, "transform"));
+    }
+
     private static double Opacity(IDomHarness harness, IElement element) =>
         double.Parse(harness.GetTransitioningValue(element, "opacity")!, CultureInfo.InvariantCulture);
 

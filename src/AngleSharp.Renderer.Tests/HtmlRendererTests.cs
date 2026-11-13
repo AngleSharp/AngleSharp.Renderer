@@ -2190,6 +2190,142 @@ public sealed class HtmlRendererTests
         Assert.All(autoFillWidths, width => Assert.True(width < 155f));
     }
 
+    [Fact]
+    public async Task BuildDisplayList_AutoFitKeepsTheTracksOfItemsSpanningSeveralColumns()
+    {
+        // a dashboard of tiles (Piral): 500px fit floor((500+10)/80) = 6 tracks, which 3 items
+        // spanning 2 columns each fill side by side; keeping only 3 tracks (one per item) wrapped them
+        var document = await ParseAsync("""
+            <html><body style="margin:0">
+                <div style="display:grid; grid-template-columns:repeat(auto-fit, 70px); gap:10px; width:500px;">
+                    <div style="grid-column:span 2; width:150px; height:150px; background-color:#ff0000;"></div>
+                    <div style="grid-column:span 2; width:150px; height:150px; background-color:#00ff00;"></div>
+                    <div style="grid-column:span 2; width:150px; height:150px; background-color:#0000ff;"></div>
+                </div>
+            </body></html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, new DefaultRenderDevice
+        {
+            ViewPortWidth = 600,
+            ViewPortHeight = 400,
+            FontSize = 16f,
+        });
+
+        var tiles = displayList.Commands
+            .OfType<FillRectCommand>()
+            .Where(command => command.Rect.Width == 150f)
+            .OrderBy(command => command.Rect.X)
+            .ToArray();
+
+        Assert.Equal(3, tiles.Length);
+        Assert.Equal(new[] { 0f, 160f, 320f }, tiles.Select(tile => tile.Rect.X).ToArray());
+        Assert.All(tiles, tile => Assert.Equal(0f, tile.Rect.Y));
+    }
+
+    [Theory]
+    [InlineData("column-width:300px", 300f)]
+    [InlineData("column-count:3; column-gap:10px", 3 * 40f + 2 * 10f)]
+    [InlineData("column-count:2; column-width:100px; column-gap:20px", 2 * 100f + 20f)]
+    public async Task BuildDisplayList_SizesAMultiColumnFlexItemByItsColumns(string columns, float expectedWidth)
+    {
+        // a row flex item is as wide as its max-content: for a multi-column box that is at least
+        // column-width per column (Piral's footer menu), times the columns, with their gaps
+        var document = await ParseAsync($"""
+            <html><body style="margin:0">
+                <div style="display:flex;">
+                    <div style="{columns}; background-color:#ff0000;"><div style="width:40px; height:10px;"></div></div>
+                </div>
+            </body></html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, new DefaultRenderDevice
+        {
+            ViewPortWidth = 800,
+            ViewPortHeight = 200,
+            FontSize = 16f,
+        });
+
+        var box = displayList.Commands
+            .OfType<FillRectCommand>()
+            .Single(command => command.Color == new RenderColor(255, 0, 0));
+
+        Assert.Equal(expectedWidth, box.Rect.Width, precision: 2);
+    }
+
+    [Theory]
+    [InlineData("70px")]
+    [InlineData("repeat(auto-fit, 70px)")]
+    public async Task BuildDisplayList_GridGrownByItsFlexContainerStretchesItsAutoRows(string templateRows)
+    {
+        // `flex: 1` makes the grid as tall as the column flexbox (as Piral's dashboard), and its
+        // auto row takes the rest of that height (align-content: normal), as in browsers; an
+        // auto-repeat still counts against the grid's own (auto) height, so it repeats once
+        var document = await ParseAsync($"""
+            <html><body style="margin:0">
+                <div style="display:flex; flex-direction:column; height:400px;">
+                    <div style="display:grid; flex:1; grid-template-columns:70px 70px; grid-template-rows:{templateRows}; gap:10px; background-color:#eeeeee;">
+                        <div style="grid-row:span 2; height:150px; background-color:#ff0000;"></div>
+                        <div style="background-color:#0000ff;"></div>
+                        <div style="background-color:#00ff00;"></div>
+                    </div>
+                </div>
+            </body></html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, new DefaultRenderDevice
+        {
+            ViewPortWidth = 400,
+            ViewPortHeight = 500,
+            FontSize = 16f,
+        });
+
+        var fills = displayList.Commands.OfType<FillRectCommand>().ToArray();
+        var grid = fills.Single(command => command.Color == new RenderColor(0xee, 0xee, 0xee));
+        var stretched = fills.Single(command => command.Color == new RenderColor(0, 0, 255));
+
+        Assert.Equal(400f, grid.Rect.Height);
+        var second = fills.Single(command => command.Color == new RenderColor(0, 255, 0));
+
+        // the explicit row keeps its 70px; the implicit one below takes the rest
+        Assert.Equal(70f, stretched.Rect.Height);
+        Assert.Equal(80f, second.Rect.Y);
+        Assert.Equal(320f, second.Rect.Height);
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_GrowsImplicitRowsForItemsOfSmallerSpansFirst()
+    {
+        // the 4-row item comes second, but the rows fit it once the 2-row items grew them (as in
+        // browsers): before, it spread itself over rows 2-4 first and pushed the last item down
+        var document = await ParseAsync("""
+            <html><body style="margin:0">
+                <div style="display:grid; grid-template-columns:70px 70px; grid-template-rows:70px; gap:10px;">
+                    <div style="grid-column:2; grid-row:1 / span 2; height:150px; background-color:#ff0000;"></div>
+                    <div style="grid-column:1; grid-row:1 / span 4; height:310px; background-color:#00ff00;"></div>
+                    <div style="grid-column:2; grid-row:3 / span 2; height:150px; background-color:#0000ff;"></div>
+                </div>
+            </body></html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, new DefaultRenderDevice
+        {
+            ViewPortWidth = 400,
+            ViewPortHeight = 400,
+            FontSize = 16f,
+        });
+
+        var lower = displayList.Commands
+            .OfType<FillRectCommand>()
+            .Single(command => command.Rect.Height == 150f && command.Rect.Y > 0f);
+
+        Assert.Equal(160f, lower.Rect.Y);
+    }
+
 
     [Fact]
     public async Task BuildDisplayList_ClampsAutoTrackToItsMinMaxLengthBounds()

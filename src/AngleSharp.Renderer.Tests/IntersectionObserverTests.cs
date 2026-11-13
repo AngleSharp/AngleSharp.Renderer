@@ -288,7 +288,6 @@ public sealed class IntersectionObserverTests
 
         document.GetElementById("spacer")!.SetAttribute("style", "height: 1000px");
         document.Body!.AppendChild(document.CreateElement("div"));
-        await Eventually(() => !probe.Last.IsIntersecting);
 
         Assert.False(probe.Last.IsIntersecting);
     }
@@ -360,50 +359,44 @@ public sealed class IntersectionObserverTests
         var document = await context.OpenAsync(request => request.Content("""
             <!doctype html><html><head><style>html, body { margin: 0; padding: 0; }</style></head><body><div id="spacer" style="height: 0"></div><div id="t" style="height: 50px"></div></body></html>
             """));
-        var calls = new System.Collections.Concurrent.ConcurrentBag<int>();
+        var calls = new System.Collections.Concurrent.ConcurrentQueue<(int Thread, bool IsIntersecting)>();
+        var inView = new TaskCompletionSource();
+        var outOfView = new TaskCompletionSource();
         var spacer = document.GetElementById("spacer")!;
 
-        await loop.RunAsync(() => new IntersectionObserver(document.DefaultView!, (_, _) => calls.Add(Environment.CurrentManagedThreadId)).Observe(document.GetElementById("t")!));
-        await Eventually(() => !calls.IsEmpty);
-        var before = calls.Count;
+        await loop.RunAsync(() => new IntersectionObserver(document.DefaultView!, (entries, _) =>
+        {
+            calls.Enqueue((Environment.CurrentManagedThreadId, entries[^1].IsIntersecting));
+            (entries[^1].IsIntersecting ? inView : outOfView).TrySetResult();
+        }).Observe(document.GetElementById("t")!));
+        await inView.Task;
 
-        // an even number of changes, so nothing is left to tell, but a look at every one would see
+        // an odd number of changes, ending out of view, which a look at every one would tell 201 times
         await loop.RunAsync(() =>
         {
-            for (var i = 1; i <= 200; i++)
+            for (var i = 1; i <= 201; i++)
             {
                 spacer.SetAttribute("style", i % 2 == 0 ? "height: 0" : "height: 1000px");
             }
         });
-        await Task.Delay(100);
+        await outOfView.Task;
 
-        Assert.True(calls.Count - before <= 2, $"The observer told {calls.Count - before} times.");
-        Assert.All(calls, m => Assert.Equal(loop.ThreadId, m));
-    }
-
-    private static async Task Eventually(Func<bool> condition)
-    {
-        for (var i = 0; i < 200 && !condition(); i++)
-        {
-            await Task.Delay(10);
-        }
+        Assert.Equal([true, false], calls.Select(call => call.IsIntersecting));
+        Assert.All(calls, call => Assert.Equal(loop.ThreadId, call.Thread));
     }
 
     private static async Task<(IDocument Document, IHtmlInlineFrameElement Frame, IDomHarness Harness)> OpenFrameAsync(string body, string content)
     {
+        // the frame is loaded with the page, which is complete only once its frames are
         var context = BrowsingContext.New(Configuration.Default.WithCss().WithRenderDevice(Device).WithDefaultLoader(new LoaderOptions { IsResourceLoadingEnabled = true }));
+        var srcdoc = $$"""<!doctype html><html><head><style>html, body { margin: 0; padding: 0; }</style></head><body>{{content}}</body></html>""";
         var document = await context.OpenAsync(request => request.Address("https://example.com/").Content($$"""
-            <!doctype html><html><head><style>html, body { margin: 0; padding: 0; }</style></head><body>{{body}}</body></html>
+            <!doctype html><html><head><style>html, body { margin: 0; padding: 0; }</style></head><body>{{body.Replace("<iframe", $"<iframe srcdoc='{srcdoc}'")}}</body></html>
             """));
         var frame = (IHtmlInlineFrameElement)document.QuerySelector("iframe")!;
-        frame.SetAttribute("srcdoc", $$"""<!doctype html><html><head><style>html, body { margin: 0; padding: 0; }</style></head><body>{{content}}</body></html>""");
 
-        for (var i = 0; i < 300 && frame.ContentDocument?.Body?.ChildElementCount is null or 0; i++)
-        {
-            await Task.Delay(10);
-        }
-
-        Assert.NotNull(frame.ContentDocument);
+        Assert.Equal(DocumentReadyState.Complete, document.ReadyState);
+        Assert.NotNull(frame.ContentDocument?.Body?.FirstElementChild);
         return (document, frame, context.GetDomHarness());
     }
 
@@ -414,7 +407,7 @@ public sealed class IntersectionObserverTests
         var probe = new Probe();
 
         new IntersectionObserver(frame.ContentWindow!, probe.Callback).Observe(frame.ContentDocument!.GetElementById("t")!);
-        await Eventually(() => probe.Entries.Count > 0);
+        Assert.NotEmpty(probe.Entries);
 
         Assert.True(probe.Last.IsIntersecting);
         Assert.Equal(1d, probe.Last.IntersectionRatio);
@@ -429,7 +422,7 @@ public sealed class IntersectionObserverTests
         var probe = new Probe();
 
         new IntersectionObserver(frame.ContentWindow!, probe.Callback).Observe(frame.ContentDocument!.GetElementById("t")!);
-        await Eventually(() => probe.Entries.Count > 0);
+        Assert.NotEmpty(probe.Entries);
 
         Assert.False(probe.Last.IsIntersecting);
     }
@@ -440,11 +433,10 @@ public sealed class IntersectionObserverTests
         var (document, frame, harness) = await OpenFrameAsync("""<div style="height: 1000px"></div><iframe style="border: 0; display: block; width: 100px; height: 100px"></iframe><div style="height: 1000px"></div>""", """<div id="t" style="height: 50px"></div>""");
         var probe = new Probe();
         new IntersectionObserver(frame.ContentWindow!, probe.Callback).Observe(frame.ContentDocument!.GetElementById("t")!);
-        await Eventually(() => probe.Entries.Count > 0);
+        Assert.NotEmpty(probe.Entries);
         Assert.False(probe.Last.IsIntersecting);
 
         harness.SetScrollTop(document.DocumentElement, 950, 2000);
-        await Eventually(() => probe.Last.IsIntersecting);
 
         Assert.True(probe.Last.IsIntersecting);
         // still in the coordinates of the frame, where it is at the top
@@ -458,7 +450,7 @@ public sealed class IntersectionObserverTests
         var probe = new Probe();
 
         new IntersectionObserver(frame.ContentWindow!, probe.Callback).Observe(frame.ContentDocument!.GetElementById("t")!);
-        await Eventually(() => probe.Entries.Count > 0);
+        Assert.NotEmpty(probe.Entries);
 
         Assert.Equal(0.5d, probe.Last.IntersectionRatio, 3);
     }
@@ -470,7 +462,7 @@ public sealed class IntersectionObserverTests
         var probe = new Probe();
 
         new IntersectionObserver(frame.ContentWindow!, probe.Callback).Observe(frame.ContentDocument!.GetElementById("t")!);
-        await Eventually(() => probe.Entries.Count > 0);
+        Assert.NotEmpty(probe.Entries);
 
         Assert.False(probe.Last.IsIntersecting);
     }
@@ -482,7 +474,7 @@ public sealed class IntersectionObserverTests
         var probe = new Probe();
 
         new IntersectionObserver(frame.ContentWindow!, probe.Callback, new IntersectionObserverOptions { RootMargin = "1000px" }).Observe(frame.ContentDocument!.GetElementById("t")!);
-        await Eventually(() => probe.Entries.Count > 0);
+        Assert.NotEmpty(probe.Entries);
 
         Assert.True(probe.Last.IsIntersecting);
         Assert.Null(probe.Last.RootBounds);
@@ -496,7 +488,7 @@ public sealed class IntersectionObserverTests
         var inner = frame.ContentDocument!;
 
         new IntersectionObserver(frame.ContentWindow!, probe.Callback, new IntersectionObserverOptions { Root = inner }).Observe(inner.GetElementById("t")!);
-        await Eventually(() => probe.Entries.Count > 0);
+        Assert.NotEmpty(probe.Entries);
 
         Assert.True(probe.Last.IsIntersecting);
     }

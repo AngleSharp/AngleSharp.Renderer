@@ -17,6 +17,7 @@ using AngleSharp.Css.Values;
 using AngleSharp.Dom;
 using AngleSharp.Html.Dom;
 using AngleSharp.Io;
+using AngleSharp.Media;
 using AngleSharp.Renderer.Rendering;
 using AngleSharp.Renderer.Skia;
 using AngleSharp.Renderer.Skia.Svg;
@@ -137,6 +138,11 @@ public sealed partial class HtmlRenderer
 
     private sealed record CachedImageResource(byte[]? Bytes, SvgVectorImage? VectorImage, string MimeType, int NaturalWidth, int NaturalHeight)
     {
+        /// <summary>
+        /// Gets the canvas whose bitmap this is, painted as it is when the frame is rasterized.
+        /// </summary>
+        public IHtmlCanvasElement? Canvas { get; init; }
+
         public CachedImageResource(byte[] bytes, string mimeType, int naturalWidth, int naturalHeight)
             : this(bytes, null, mimeType, naturalWidth, naturalHeight)
         {
@@ -147,7 +153,9 @@ public sealed partial class HtmlRenderer
         {
         }
 
-        public RenderedImage CreateImage(int width, int height) => VectorImage is { } vectorImage
+        public RenderedImage CreateImage(int width, int height) => Canvas is { } canvas
+            ? new RenderedImage(canvas, width, height)
+            : VectorImage is { } vectorImage
             ? new RenderedImage(vectorImage, width, height)
             : new RenderedImage(Bytes!, width, height, MimeType);
 
@@ -200,9 +208,10 @@ public sealed partial class HtmlRenderer
     /// <param name="ZIndex">Its z-index, 0 for auto.</param>
     /// <param name="ClipsOverflow">If its content is clipped to its padding box.</param>
     /// <param name="IsHidden">If it is not hit itself (visibility: hidden, pointer-events: none).</param>
-    internal readonly record struct HitTestLayer(bool IsLayerRoot, int ZIndex, bool ClipsOverflow, bool IsHidden);
+    /// <param name="IsFloat">If it floats: it paints with its content above the in-flow blocks of its layer.</param>
+    internal readonly record struct HitTestLayer(bool IsLayerRoot, int ZIndex, bool ClipsOverflow, bool IsHidden, bool IsFloat = false);
 
-    private readonly record struct LayoutContext(
+    private sealed record class LayoutContext(
         int Width,
         int Height,
         RenderColor TextColor,
@@ -255,7 +264,13 @@ public sealed partial class HtmlRenderer
 
         // if the decorations of the boxes are marked, which only a frame needs (see PaintBoxDecorations)
         public bool RecordsPaintAnchors { get; init; }
+
+        // the positioned boxes painting last in a flow, which the flow around its box paints last
+        // in turn if that box opens no scope around them (see PaintOrder)
+        public List<HoistCandidate> HoistCandidates { get; } = [];
     }
+
+    private readonly record struct HoistCandidate(DisplayList DisplayList, int Z, RenderCommand First, int Count, IElement Element);
 
     /// <summary>
     /// The lines a box with `-webkit-line-clamp` has left for its content. Every line laid out
@@ -371,6 +386,9 @@ public sealed partial class HtmlRenderer
             styleMap.GetValueOrDefault("transform")?.Trim() is { Length: > 0 } transform && !transform.Equals("none", StringComparison.OrdinalIgnoreCase);
         var visibility = styleMap.GetValueOrDefault("visibility")?.Trim();
         var pointerEvents = styleMap.GetValueOrDefault("pointer-events")?.Trim();
+        // a float of a flex or grid container is an item like the others
+        var isFloat = !isItem && position is not ("absolute" or "fixed") &&
+            styleMap.GetValueOrDefault("float")?.Trim().ToLowerInvariant() is "left" or "right" or "inline-start" or "inline-end";
 
         return new HitTestLayer(
             isPositioned || isStackingContext,
@@ -378,7 +396,8 @@ public sealed partial class HtmlRenderer
             ShouldClipOverflow(styleMap),
             string.Equals(visibility, "hidden", StringComparison.OrdinalIgnoreCase) ||
             string.Equals(visibility, "collapse", StringComparison.OrdinalIgnoreCase) ||
-            string.Equals(pointerEvents, "none", StringComparison.OrdinalIgnoreCase));
+            string.Equals(pointerEvents, "none", StringComparison.OrdinalIgnoreCase),
+            isFloat);
     }
 
     private static void RecordLayoutMetrics(
@@ -1716,18 +1735,19 @@ public sealed partial class HtmlRenderer
         // with both offsets of an axis auto, an absolutely positioned box stays where it would be in flow
         var hasStaticX = isAbsolute && float.IsNaN(rightOffset) && float.IsNaN(ParseLength(styleMap, "left", flowContainingWidth, float.NaN, allowAuto: true));
         var hasStaticY = isAbsolute && float.IsNaN(bottomOffset) && float.IsNaN(ParseLength(styleMap, "top", flowContainingWidth, float.NaN, allowAuto: true));
-        // an offset places the margin box of an absolutely positioned box
+        // an offset places the margin box of an absolutely positioned box, as does the static
+        // position (the margins were left out of the flow position)
         var borderBoxX = isFixed
             ? context.Padding + leftOffset + positionedMargins.Left
             : isAbsolute
-                ? hasStaticX ? flowBorderBoxX : absoluteContainingX + leftOffset + positionedMargins.Left
+                ? hasStaticX ? flowBorderBoxX + positionedMargins.Left : absoluteContainingX + leftOffset + positionedMargins.Left
                 : flowBorderBoxX + (isRelative ? leftOffset : 0f);
         // `position: sticky` is laid out at its natural position; its container shifts it once
         // its own box is known (see ResolveStickyBoxes).
         var borderBoxY = isFixed
             ? context.Padding + topOffset + positionedMargins.Top
             : isAbsolute
-                ? hasStaticY ? flowBorderBoxY : absoluteContainingY + topOffset + positionedMargins.Top
+                ? hasStaticY ? flowBorderBoxY + positionedMargins.Top : absoluteContainingY + topOffset + positionedMargins.Top
                 : flowBorderBoxY + (isRelative ? topOffset : 0f);
         var contentX = borderBoxX + borderLeft + paddingLeft;
         var contentY = borderBoxY + borderTop + paddingTop;
@@ -1781,6 +1801,18 @@ public sealed partial class HtmlRenderer
             if (!float.IsNaN(stretchTop) && !float.IsNaN(stretchBottom))
             {
                 resolvedContentHeight = Math.Max(0f, stretchContainingHeight - stretchTop - stretchBottom - positionedMargins.Top - positionedMargins.Bottom - verticalBorderAndPadding);
+
+                // the height is limited first, then auto margins take what is left (e.g. a dialog
+                // with inset: 0, margin: auto and max-height: 90% is centered)
+                var stretchMaximum = ResolveAuthoredDimension(styleMap, "max-height", heightReference, float.NaN, verticalBorderAndPadding);
+                var stretchMinimum = ResolveAuthoredDimension(styleMap, "min-height", heightReference, 0f, verticalBorderAndPadding);
+
+                if (!float.IsNaN(stretchMaximum))
+                {
+                    resolvedContentHeight = Math.Min(resolvedContentHeight, stretchMaximum);
+                }
+
+                resolvedContentHeight = Math.Max(resolvedContentHeight, stretchMinimum);
             }
         }
 
@@ -1940,7 +1972,7 @@ public sealed partial class HtmlRenderer
         // pseudo is not itself the foreign-namespaced SVG subtree, and must still get to paint its own
         // single synthetic text child below rather than being emptied out like the real <svg> root is.
         var orderedChildren = element is not IPseudoElement &&
-                               (string.Equals(tagName, "svg", StringComparison.OrdinalIgnoreCase) ||
+                               (HidesChildren(element) ||
                                PaintsOwnContent(formControlKind) ||
                                (formControlKind == FormControlKind.TextArea && ResolveChangedTextAreaValue(element) is not null))
             ? []
@@ -2049,7 +2081,9 @@ public sealed partial class HtmlRenderer
                 flowBorderBoxX,
                 flowBorderBoxY,
                 borderBoxX,
-                borderBoxY);
+                borderBoxY,
+                // the height the box got from its flex container (e.g. grown by `flex: 1`) or otherwise
+                float.IsNaN(resolvedContentHeight) ? null : resolvedContentHeight);
             LayoutHeldBackBoxes(itemsScope, cursorY - flowBorderBoxY - borderTop - borderBottom, context, displayList);
 
             if (isFloat)
@@ -2303,75 +2337,24 @@ public sealed partial class HtmlRenderer
 
         // Percentage radii refer to the border box, which is only known now.
         box = box with { BorderRadius = ResolveBorderRadii(styleMap, borderBoxWidth, borderBoxHeight) };
-        var boxPaintBuffer = new DisplayList();
-
-        // A `visibility: hidden` box keeps its place and its scopes (which visible descendants
-        // still paint in) but paints none of its own decorations.
-        var decorationBuffer = currentTextStyle.IsHidden ? new DisplayList() : boxPaintBuffer;
-        var effects = OpenElementEffectScopes(
-            boxPaintBuffer,
-            decorationBuffer,
+        var (effects, contentScroll) = PaintElementBox(
+            node,
             styleMap,
-            element,
-            borderBoxX,
-            borderBoxY,
-            borderBoxWidth,
-            borderBoxHeight,
+            box,
+            context,
+            displayList,
+            boxPaintInsertIndex,
+            negativeZIndexRanges,
+            new RenderRect(borderBoxX, borderBoxY, borderBoxWidth, borderBoxHeight),
             new EdgeSizes(borderTop, borderRight, borderBottom, borderLeft),
             new EdgeSizes(paddingTop, paddingRight, paddingBottom, paddingLeft),
-            box.BorderRadius,
+            currentTextStyle.IsHidden,
             currentTextStyle.FontSize,
-            BlendsInside(displayList, boxPaintInsertIndex));
-        var createsStackingContext = HasExplicitZIndex(styleMap) || effects.CreatesStackingContext;
-
-        PaintBoxDecorations(decorationBuffer, context, styleMap, node, box, new RenderRect(borderBoxX, borderBoxY, borderBoxWidth, borderBoxHeight), new EdgeSizes(borderTop, borderRight, borderBottom, borderLeft), new EdgeSizes(paddingTop, paddingRight, paddingBottom, paddingLeft), fillsTransparentBackground: false);
-
-        if (clipsOverflow)
-        {
-            // Per spec, overflow clips at the padding edge - content can extend into the padding
-            // but not past it - so the clip rect is the padding box, not the border box. Border
-            // and outline are unaffected because they were already appended above, outside this
-            // clip scope's push.
-            var clipRect = new RenderRect(
-                borderBoxX + borderLeft,
-                borderBoxY + borderTop,
-                Math.Max(0f, borderBoxWidth - borderLeft - borderRight),
-                Math.Max(0f, borderBoxHeight - borderTop - borderBottom));
-            boxPaintBuffer.PushClip(clipRect, box.BorderRadius.ClampToBox(borderBoxWidth, borderBoxHeight));
-        }
-
-        var contentScroll = clipsOverflow ? GetContentScrollOffset(node.Ref) : default;
-
-        if (contentScroll != default)
-        {
-            boxPaintBuffer.PushTransform(RenderTransform2D.Translate(-contentScroll.X, -contentScroll.Y));
-        }
-
-        var paintInsertionIndex = boxPaintInsertIndex;
-
-        if (!createsStackingContext && negativeZIndexRanges.Count > 0)
-        {
-            paintInsertionIndex = negativeZIndexRanges.Max(range => range.StartIndex + range.Count);
-        }
-
-        displayList.InsertRange(paintInsertionIndex, boxPaintBuffer.Commands);
-
-        // the content painted below the box (negative z-index) is still clipped and scrolled by it
-        if (clipsOverflow && paintInsertionIndex != boxPaintInsertIndex)
-        {
-            var clipRect = new RenderRect(borderBoxX + borderLeft, borderBoxY + borderTop, Math.Max(0f, borderBoxWidth - borderLeft - borderRight), Math.Max(0f, borderBoxHeight - borderTop - borderBottom));
-
-            foreach (var (start, count) in negativeZIndexRanges.OrderByDescending(range => range.StartIndex))
-            {
-                var clip = new PushClipCommand(clipRect, box.BorderRadius.ClampToBox(borderBoxWidth, borderBoxHeight));
-                displayList.InsertRange(start + count, contentScroll != default ? [new PopTransformCommand(), new PopClipCommand()] : [new PopClipCommand()]);
-                displayList.InsertRange(start, contentScroll != default ? [clip, new PushTransformCommand(RenderTransform2D.Translate(-contentScroll.X, -contentScroll.Y))] : [clip]);
-            }
-        }
+            clipsOverflow);
 
         ResolveStickyBoxes(displayList, context.StickyScopes.Peek(), new RenderRect(contentX, contentY, contentWidth, contentHeight), context);
 
-        if (TryResolveReplacedElementImage(node, styleMap, flowContainingWidth, borderBoxX + borderLeft + paddingLeft, borderBoxY + borderTop + paddingTop, out var image, out var imageRect, out var objectFitClipRect))
+        if (TryResolveReplacedElementImage(node, styleMap, flowContainingWidth, borderBoxX + borderLeft + paddingLeft, borderBoxY + borderTop + paddingTop, out var image, out var imageRect, out var objectFitClipRect, (contentWidth, contentHeight)))
         {
             var roundedContentClip = GetRoundedContentClip(box.BorderRadius, borderBoxX, borderBoxY, borderBoxWidth, borderBoxHeight, new EdgeSizes(borderTop, borderRight, borderBottom, borderLeft), new EdgeSizes(paddingTop, paddingRight, paddingBottom, paddingLeft));
 
@@ -2466,6 +2449,95 @@ public sealed partial class HtmlRenderer
     private readonly record struct ElementEffectScopes(bool Transform, bool BlendMode, bool Isolation, bool Opacity, bool Filter, bool ClipPath, bool Mask, bool BackdropFilter)
     {
         public bool CreatesStackingContext => Transform || BlendMode || Isolation || Opacity || Filter || ClipPath || Mask || BackdropFilter;
+    }
+
+    /// <summary>
+    /// Paints the box of an element behind its children, laid out from
+    /// <paramref name="boxPaintInsertIndex"/> on, and opens its effect, clip and scroll scopes around
+    /// them (see LayoutElement). Not inlined: what it needs stays out of the frame of LayoutElement,
+    /// which is on the stack once per nesting level.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private static (ElementEffectScopes Effects, (float X, float Y) ContentScroll) PaintElementBox(
+        ElementRenderNode node,
+        Dictionary<string, string> styleMap,
+        in BoxStyle box,
+        LayoutContext context,
+        DisplayList displayList,
+        int boxPaintInsertIndex,
+        List<(int StartIndex, int Count)> negativeZIndexRanges,
+        RenderRect borderBox,
+        EdgeSizes border,
+        EdgeSizes padding,
+        bool isHidden,
+        float fontSize,
+        bool clipsOverflow)
+    {
+        var boxPaintBuffer = new DisplayList();
+
+        // A `visibility: hidden` box keeps its place and its scopes (which visible descendants
+        // still paint in) but paints none of its own decorations.
+        var decorationBuffer = isHidden ? new DisplayList() : boxPaintBuffer;
+        var effects = OpenElementEffectScopes(
+            boxPaintBuffer,
+            decorationBuffer,
+            styleMap,
+            node.Ref,
+            borderBox.X,
+            borderBox.Y,
+            borderBox.Width,
+            borderBox.Height,
+            border,
+            padding,
+            box.BorderRadius,
+            fontSize,
+            BlendsInside(displayList, boxPaintInsertIndex));
+        var createsStackingContext = HasExplicitZIndex(styleMap) || effects.CreatesStackingContext;
+
+        PaintBoxDecorations(decorationBuffer, context, styleMap, node, box, borderBox, border, padding, fillsTransparentBackground: false);
+
+        // Per spec, overflow clips at the padding edge - content can extend into the padding but
+        // not past it - so the clip rect is the padding box, not the border box. Border and outline
+        // are unaffected because they were already appended above, outside this clip scope's push.
+        var clipRect = new RenderRect(
+            borderBox.X + border.Left,
+            borderBox.Y + border.Top,
+            Math.Max(0f, borderBox.Width - border.Left - border.Right),
+            Math.Max(0f, borderBox.Height - border.Top - border.Bottom));
+
+        if (clipsOverflow)
+        {
+            boxPaintBuffer.PushClip(clipRect, box.BorderRadius.ClampToBox(borderBox.Width, borderBox.Height));
+        }
+
+        var contentScroll = clipsOverflow ? GetContentScrollOffset(node.Ref) : default;
+
+        if (contentScroll != default)
+        {
+            boxPaintBuffer.PushTransform(RenderTransform2D.Translate(-contentScroll.X, -contentScroll.Y));
+        }
+
+        var paintInsertionIndex = boxPaintInsertIndex;
+
+        if (!createsStackingContext && negativeZIndexRanges.Count > 0)
+        {
+            paintInsertionIndex = negativeZIndexRanges.Max(range => range.StartIndex + range.Count);
+        }
+
+        displayList.InsertRange(paintInsertionIndex, boxPaintBuffer.Commands);
+
+        // the content painted below the box (negative z-index) is still clipped and scrolled by it
+        if (clipsOverflow && paintInsertionIndex != boxPaintInsertIndex)
+        {
+            foreach (var (start, count) in negativeZIndexRanges.OrderByDescending(range => range.StartIndex))
+            {
+                var clip = new PushClipCommand(clipRect, box.BorderRadius.ClampToBox(borderBox.Width, borderBox.Height));
+                displayList.InsertRange(start + count, contentScroll != default ? [new PopTransformCommand(), new PopClipCommand()] : [new PopClipCommand()]);
+                displayList.InsertRange(start, contentScroll != default ? [clip, new PushTransformCommand(RenderTransform2D.Translate(-contentScroll.X, -contentScroll.Y))] : [clip]);
+            }
+        }
+
+        return (effects, contentScroll);
     }
 
     /// <summary>
@@ -3429,7 +3501,9 @@ public sealed partial class HtmlRenderer
                 Math.Max(0f, borderBoxHeight - borderTop - borderBottom - paddingTop - paddingBottom)),
             context);
 
-        if (TryResolveReplacedElementImage(node, styleMap, containingWidth, borderBoxX + borderLeft + paddingLeft, borderBoxY + borderTop + paddingTop, out var image, out var imageRect, out var objectFitClipRect))
+        var usedContentSize = (Math.Max(0f, borderBoxWidth - borderLeft - borderRight - paddingLeft - paddingRight), Math.Max(0f, borderBoxHeight - borderTop - borderBottom - paddingTop - paddingBottom));
+
+        if (TryResolveReplacedElementImage(node, styleMap, containingWidth, borderBoxX + borderLeft + paddingLeft, borderBoxY + borderTop + paddingTop, out var image, out var imageRect, out var objectFitClipRect, usedContentSize))
         {
             var roundedContentClip = GetRoundedContentClip(box.BorderRadius, borderBoxX, borderBoxY, borderBoxWidth, borderBoxHeight, new EdgeSizes(borderTop, borderRight, borderBottom, borderLeft), new EdgeSizes(paddingTop, paddingRight, paddingBottom, paddingLeft));
 
@@ -3612,7 +3686,8 @@ public sealed partial class HtmlRenderer
         float flowBorderBoxX,
         float flowBorderBoxY,
         float borderBoxX,
-        float borderBoxY)
+        float borderBoxY,
+        float? usedContentHeight = null)
     {
         // what the items are placed against (see ActsAsContainingBlock); its height comes when it is laid out
         var itemsContainingBlock = ActsAsContainingBlock(styleMap, positionedContainingX);
@@ -3648,17 +3723,26 @@ public sealed partial class HtmlRenderer
         var explicitGridTemplateColumns = styleMap.GetValueOrDefault("grid-template-columns") ?? string.Empty;
         var columnLineNames = new Dictionary<string, List<int>>(StringComparer.Ordinal);
         var rowLineNames = new Dictionary<string, List<int>>(StringComparer.Ordinal);
-        var columns = ParseGridTrackListStructured(explicitGridTemplateColumns, containingWidth, resolvedColumnGap, gridItems.Count, columnLineNames);
+        var columns = ParseGridTrackListStructured(explicitGridTemplateColumns, containingWidth, resolvedColumnGap, CountSpannedGridColumns(gridItems, context), columnLineNames);
 
         if (columns.Count == 0)
         {
-            columns.Add(GridTrackSize.Fixed(containingWidth));
+            // the implicit column is auto; stretched (justify-content: normal) it fills the
+            // container, which needs no measuring, otherwise it fits its items, which
+            // justify-content places (e.g. an icon centered by place-content: center)
+            columns.Add(styleMap.GetValueOrDefault("justify-content")?.Trim().ToLowerInvariant() is null or "" or "normal" or "stretch"
+                ? GridTrackSize.Fixed(containingWidth)
+                : GridTrackSize.Auto());
         }
 
         var gridVerticalBorderAndPadding = borderTop + borderBottom + paddingTop + paddingBottom;
-        var containerHeight = ResolveDefiniteContentHeight(styleMap, containingWidth, gridVerticalBorderAndPadding);
+        var authoredContainerHeight = ResolveDefiniteContentHeight(styleMap, containingWidth, gridVerticalBorderAndPadding);
+        // a height given from outside (a flex container growing the grid) sizes the rows like an
+        // authored one, but the track list (e.g. how often `repeat(auto-fit, 70px)` repeats) is
+        // resolved against the grid's own height, as browsers do
+        var containerHeight = usedContentHeight ?? authoredContainerHeight;
         var explicitGridTemplateRows = styleMap.GetValueOrDefault("grid-template-rows") ?? string.Empty;
-        var rows = ParseGridTrackListStructured(explicitGridTemplateRows, containerHeight, lineNames: rowLineNames);
+        var rows = ParseGridTrackListStructured(explicitGridTemplateRows, authoredContainerHeight, lineNames: rowLineNames);
         var hasExplicitRowTracks = rows.Count > 0;
         var explicitRowCount = rows.Count;
         var autoRowDefinitions = styleMap.TryGetValue("grid-auto-rows", out var autoRowsValue)
@@ -3686,6 +3770,9 @@ public sealed partial class HtmlRenderer
         // grow Auto rows to their items' authored heights (content heights are measured below).
         var itemPlacements = new List<(ElementRenderNode Element, GridPlacement Column, GridPlacement Row)>();
         var columnContributions = new List<(GridPlacement Column, IntrinsicWidths Widths)>();
+        // items spanning several rows grow them once all single-span items did, by increasing span
+        // (CSS Grid 1, 11.5.3), or a tall item spread itself over rows a later item fills anyway
+        var spanningRowGrowths = new List<(GridPlacement Row, float Height)>();
         var namedAreas = ParseGridTemplateAreas(styleMap.TryGetValue("grid-template-areas", out var areasValue) ? areasValue : null);
 
         // Every area also names the lines around it: `name-start` and `name-end`.
@@ -3821,7 +3908,7 @@ public sealed partial class HtmlRenderer
 
                 FloorFlexibleTrack(elementChild, childStyleMap, areaColumn);
 
-                GrowGridTrackSpan(rows, areaRow, ResolveGridItemAuthoredHeight(childStyleMap, containingWidth), resolvedRowGap);
+                GrowGridRowsOrDefer(rows, spanningRowGrowths, areaRow, ResolveGridItemAuthoredHeight(childStyleMap, containingWidth), resolvedRowGap);
 
                 currentColumn = 0;
                 currentRow = 0;
@@ -3922,7 +4009,7 @@ public sealed partial class HtmlRenderer
 
             FloorFlexibleTrack(elementChild, childStyleMap, effectivePlacementColumn);
 
-            GrowGridTrackSpan(rows, effectivePlacementRow, authoredItemHeight, resolvedRowGap);
+            GrowGridRowsOrDefer(rows, spanningRowGrowths, effectivePlacementRow, authoredItemHeight, resolvedRowGap);
 
             currentColumn++;
             if (currentColumn >= columns.Count)
@@ -3931,6 +4018,8 @@ public sealed partial class HtmlRenderer
                 currentRow++;
             }
         }
+
+        GrowGridRowsBySpan(rows, spanningRowGrowths, resolvedRowGap);
 
         // Between passes: distribute each axis's remaining free space across its own `fr` tracks.
         // Row `fr` tracks only grow when the container has a definite height to distribute - `fr`
@@ -3978,9 +4067,11 @@ public sealed partial class HtmlRenderer
             }
             else
             {
-                GrowGridTrackSpan(rows, placementRow, measuredHeight, resolvedRowGap);
+                GrowGridRowsOrDefer(rows, spanningRowGrowths, placementRow, measuredHeight, resolvedRowGap);
             }
         }
+
+        GrowGridRowsBySpan(rows, spanningRowGrowths, resolvedRowGap);
 
         if (!float.IsNaN(containerHeight))
         {
@@ -5093,6 +5184,31 @@ public sealed partial class HtmlRenderer
         public static readonly GridLines None = new(new Dictionary<string, List<int>>(StringComparer.Ordinal), 0);
     }
 
+    /// <summary>
+    /// The columns the items take when placed side by side, which is what `repeat(auto-fit, ...)`
+    /// keeps of its tracks (see ResolveGridRepeatCount): counting items instead wrapped items
+    /// spanning several columns (e.g. a dashboard of tiles with `grid-column: span 2`).
+    /// </summary>
+    private static int CountSpannedGridColumns(List<IRenderNode> gridItems, LayoutContext context)
+    {
+        var count = 0;
+
+        foreach (var item in gridItems)
+        {
+            var span = 1;
+
+            if (item is ElementRenderNode element)
+            {
+                var itemStyle = GetOrCreateStyleMap(context, element.Ref, element.ComputedStyle);
+                span = Math.Max(1, ParseGridLinePlacement(itemStyle.GetValueOrDefault("grid-column"), GridLines.None).Span);
+            }
+
+            count += span;
+        }
+
+        return count;
+    }
+
     private static GridPlacement ResolveGridPlacementFromMap(Dictionary<string, string> childStyleMap, string propertyName, int fallbackIndex, GridLines? lines = null)
     {
         var (start, span) = ParseGridLinePlacement(childStyleMap.GetValueOrDefault(propertyName), lines ?? GridLines.None);
@@ -5481,6 +5597,35 @@ public sealed partial class HtmlRenderer
                 track.Pixels += freeSpace / stretchable.Count;
             }
         }
+    }
+
+    /// <summary>
+    /// Grows the row of an item spanning one, and keeps an item spanning several for
+    /// <see cref="GrowGridRowsBySpan"/>.
+    /// </summary>
+    private static void GrowGridRowsOrDefer(List<GridTrackSize> rows, List<(GridPlacement Row, float Height)> spanning, GridPlacement placement, float height, float gap)
+    {
+        if (placement.Span > 1)
+        {
+            spanning.Add((placement, height));
+        }
+        else
+        {
+            GrowGridTrackSpan(rows, placement, height, gap);
+        }
+    }
+
+    /// <summary>
+    /// Grows the rows of the items spanning several, those spanning fewer first (CSS Grid 1, 11.5.3).
+    /// </summary>
+    private static void GrowGridRowsBySpan(List<GridTrackSize> rows, List<(GridPlacement Row, float Height)> spanning, float gap)
+    {
+        foreach (var (placement, height) in spanning.OrderBy(static item => item.Row.Span))
+        {
+            GrowGridTrackSpan(rows, placement, height, gap);
+        }
+
+        spanning.Clear();
     }
 
     /// <summary>
@@ -7728,7 +7873,7 @@ public sealed partial class HtmlRenderer
     private static Dictionary<string, string> CreateComputedStyleMap(ICssStyleDeclaration style, IElement? element, LayoutContext? context)
     {
         var map = new StyleMap();
-        var explicitDeclarations = context.HasValue ? GetExplicitDeclarations(context.Value, element) : null;
+        var explicitDeclarations = context is not null ? GetExplicitDeclarations(context, element) : null;
         var inlineStyle = element?.GetAttribute("style");
 
         var displayValue = style.GetDisplay();
@@ -8746,28 +8891,160 @@ public sealed partial class HtmlRenderer
     /// <summary>
     /// Moves the commands of the children painted above the in-flow content (positioned or
     /// z-indexed, with a z-index of at least 0) to the end, ordered by z-index and then by
-    /// document order (CSS 2.2 Appendix E), once all siblings are laid out.
+    /// document order (CSS 2.2 Appendix E), once all siblings are laid out. In a block flow, the
+    /// floats go there as well, below those: they paint above the in-flow blocks after them
+    /// (whose lines make room for them).
     /// </summary>
     private sealed class PaintOrder
     {
+        // the "z-index" of the floats moved, below that of all positioned boxes
+        private const int FloatLayer = int.MinValue;
+
         private readonly List<(int Z, int Order, RenderCommand First, int Count, IElement Element)> _raised = [];
+        private LayoutContext? _context;
+        // if boxes were taken out of the children, whose ranges then hold theirs (see Hoist)
+        private bool _hasHoisted;
 
         /// <summary>Gets the children moved to the end, in the order they paint (once applied).</summary>
         public IReadOnlyList<RaisedChild> Applied { get; private set; } = [];
 
-        public void Track(IRenderNode child, DisplayList displayList, int start, LayoutContext context)
+        public void Track(IRenderNode child, DisplayList displayList, int start, LayoutContext context, bool isBlockFlow = false)
         {
             var count = displayList.Commands.Count - start;
+            _context = context;
 
             if (count > 0 && child is ElementRenderNode element && !IsStickyElement(child, context))
             {
                 var styleMap = GetOrCreateStyleMap(context, element.Ref, element.ComputedStyle);
 
-                if ((IsOutOfFlowPositioned(styleMap) || HasExplicitZIndex(styleMap)) && ParseZIndex(styleMap) >= 0)
+                // all positioned boxes, relative ones too, paint above the in-flow content
+                if ((IsOutOfFlowPositioned(styleMap) || IsRelativePositioned(styleMap) || HasExplicitZIndex(styleMap)) && ParseZIndex(styleMap) >= 0)
                 {
                     _raised.Add((ParseZIndex(styleMap), _raised.Count, displayList.Commands[start], count, element.Ref));
                 }
+                else if (!HasExplicitZIndex(styleMap))
+                {
+                    if (isBlockFlow && IsFloated(styleMap) && !IsOutOfFlowPositioned(styleMap) && !IsRelativePositioned(styleMap))
+                    {
+                        _raised.Add((FloatLayer, _raised.Count, displayList.Commands[start], count, element.Ref));
+                    }
+
+                    // the positioned boxes in it paint with those of this flow (e.g. a tooltip in a
+                    // floated button above the blocks after it, CSS 2.2 Appendix E)
+                    Hoist(element.Ref, displayList, start, count, context);
+                    return;
+                }
             }
+
+            if (child is ElementRenderNode other)
+            {
+                Hoist(other.Ref, null, 0, 0, context);
+            }
+        }
+
+        // Takes the positioned boxes painting last in the box of a child (not a stacking context
+        // itself) as children of this flow, if the box opens no scope around them (e.g. a clip, an
+        // opacity or a transform); those that stay in it are no candidates anymore.
+        private void Hoist(IElement box, DisplayList? displayList, int start, int count, LayoutContext context)
+        {
+            var candidates = context.HoistCandidates;
+
+            if (candidates.Count == 0)
+            {
+                return;
+            }
+
+            List<HoistCandidate>? inside = null;
+
+            for (var index = candidates.Count - 1; index >= 0; index--)
+            {
+                var candidate = candidates[index];
+
+                if (!ReferenceEquals(candidate.Element, box) && box.Contains(candidate.Element))
+                {
+                    candidates.RemoveAt(index);
+
+                    if (ReferenceEquals(candidate.DisplayList, displayList))
+                    {
+                        (inside ??= []).Add(candidate);
+                    }
+                }
+            }
+
+            if (inside is null)
+            {
+                return;
+            }
+
+            var commands = displayList!.Commands;
+
+            for (var index = inside.Count - 1; index >= 0; index--)
+            {
+                var candidate = inside[index];
+
+                if (IndexOf(commands, candidate.First, start, count) is >= 0 and var position &&
+                    position + candidate.Count <= start + count && !HasOpenScope(commands, start, position))
+                {
+                    _raised.Add((candidate.Z, _raised.Count, candidate.First, candidate.Count, candidate.Element));
+                    _hasHoisted = true;
+                    ForgetRanges(candidate.Element.ParentElement, box);
+                }
+            }
+        }
+
+        // the boxes it leaves no longer have their commands in one piece, which a frame can't
+        // replace: an enclosing box is laid out again instead (see LayoutSnapshot)
+        private static void ForgetRanges(IElement? from, IElement to)
+        {
+            if (s_layoutCapture.Value is not { Entries: { } entries, Ranges: { } ranges })
+            {
+                return;
+            }
+
+            for (var current = from; current is not null; current = current.ParentElement)
+            {
+                entries.Remove(current);
+                ranges.Remove(current);
+
+                if (ReferenceEquals(current, to))
+                {
+                    break;
+                }
+            }
+        }
+
+        private static bool HasOpenScope(IReadOnlyList<RenderCommand> commands, int start, int end)
+        {
+            var depth = 0;
+
+            for (var index = start; index < end; index++)
+            {
+                var name = commands[index].GetType().Name;
+
+                if (name.StartsWith("Push", StringComparison.Ordinal))
+                {
+                    depth++;
+                }
+                else if (name.StartsWith("Pop", StringComparison.Ordinal))
+                {
+                    depth--;
+                }
+            }
+
+            return depth != 0;
+        }
+
+        private static int IndexOf(IReadOnlyList<RenderCommand> commands, RenderCommand command, int start, int count)
+        {
+            for (var index = Math.Min(commands.Count, start + count) - 1; index >= start; index--)
+            {
+                if (ReferenceEquals(commands[index], command))
+                {
+                    return index;
+                }
+            }
+
+            return -1;
         }
 
         public void Apply(DisplayList displayList)
@@ -8780,16 +9057,97 @@ public sealed partial class HtmlRenderer
             var ordered = _raised.OrderBy(m => m.Z).ThenBy(m => m.Order).ToList();
             Applied = ordered.Select(m => new RaisedChild(m.Element, m.Z, m.First, m.Count)).ToList();
 
+            // find the ranges from the end (they are within the commands of the flow), then
+            // move them in one pass: many raised siblings (e.g. relative list items) stay linear
+            var commands = displayList.Commands;
+            var starts = new Dictionary<RenderCommand, int>(ordered.Count, ReferenceEqualityComparer.Instance);
+
+            foreach (var raised in ordered)
+            {
+                starts[raised.First] = -1;
+            }
+
+            var missing = starts.Count;
+
+            for (var index = commands.Count - 1; index >= 0 && missing > 0; index--)
+            {
+                if (starts.TryGetValue(commands[index], out var found) && found < 0)
+                {
+                    starts[commands[index]] = index;
+                    missing--;
+                }
+            }
+
+            var located = new List<(int StartIndex, int Count)>(ordered.Count);
+
             foreach (var (_, _, first, count, _) in ordered)
             {
-                var commands = displayList.Commands;
+                var index = starts[first];
+                located.Add(index >= 0 ? (index, Math.Min(count, commands.Count - index)) : (-1, 0));
+            }
 
-                for (var index = commands.Count - 1; index >= 0; index--)
+            var ranges = new List<(int StartIndex, int Count)>(ordered.Count);
+            var expected = -1;
+            var inPlace = true;
+
+            for (var item = 0; item < located.Count; item++)
+            {
+                var (index, count) = located[item];
+
+                if (index < 0)
                 {
-                    if (ReferenceEquals(commands[index], first))
+                    continue;
+                }
+
+                // a float keeps what was taken out of it to paint above it (see Hoist)
+                var end = index + count;
+
+                if (!_hasHoisted)
+                {
+                    AddRange((index, count));
+                    continue;
+                }
+
+                var holes = located.Where((other, at) => at != item && other.StartIndex >= index && other.StartIndex + other.Count <= end && (other.Count < count || at > item))
+                    .OrderBy(other => other.StartIndex).ToList();
+
+                foreach (var hole in holes)
+                {
+                    if (hole.StartIndex > index)
                     {
-                        displayList.MoveRangeToEnd(index, Math.Min(count, commands.Count - index));
-                        break;
+                        AddRange((index, hole.StartIndex - index));
+                    }
+
+                    index = Math.Max(index, hole.StartIndex + hole.Count);
+                }
+
+                if (end > index)
+                {
+                    AddRange((index, end - index));
+                }
+            }
+
+            void AddRange((int StartIndex, int Count) range)
+            {
+                // already painting last, in this order (e.g. only raised children)
+                inPlace &= expected < 0 || range.StartIndex == expected;
+                expected = range.StartIndex + range.Count;
+                ranges.Add(range);
+            }
+
+            if (ranges.Count > 0 && !(inPlace && expected == commands.Count))
+            {
+                displayList.MoveRangesToEnd(ranges);
+            }
+
+            // the positioned ones may paint with the flow around this one in turn
+            if (_context is { } context)
+            {
+                foreach (var (z, _, first, count, element) in ordered)
+                {
+                    if (z != FloatLayer)
+                    {
+                        context.HoistCandidates.Add(new HoistCandidate(displayList, z, first, count, element));
                     }
                 }
             }
@@ -8828,6 +9186,9 @@ public sealed partial class HtmlRenderer
 
         return ParseZIndex(elementChild.ComputedStyle.GetPropertyValue("z-index")) < 0;
     }
+
+    private static bool IsRelativePositioned(Dictionary<string, string> styleMap) =>
+        string.Equals(GetPosition(styleMap), "relative", StringComparison.OrdinalIgnoreCase);
 
     private static bool IsStickyPositioned(Dictionary<string, string> styleMap) =>
         string.Equals(GetPosition(styleMap), "sticky", StringComparison.OrdinalIgnoreCase);
@@ -9326,6 +9687,7 @@ public sealed partial class HtmlRenderer
         ? s_generatedContentImages.TryGetValue(element, out _)
         : string.Equals(element.LocalName, "img", StringComparison.OrdinalIgnoreCase) ||
           string.Equals(element.LocalName, "svg", StringComparison.OrdinalIgnoreCase) ||
+          IsCanvas(element) ||
           (IsImageInput(element) && HasLoadableImageSource(element));
 
     private static bool HasLoadableImageSource(IElement element) =>
@@ -9336,11 +9698,12 @@ public sealed partial class HtmlRenderer
         string.Equals(element.LocalName, "input", StringComparison.OrdinalIgnoreCase) &&
         string.Equals(element.GetAttribute("type")?.Trim(), "image", StringComparison.OrdinalIgnoreCase);
 
-    private static bool TryResolveReplacedElementImage(ElementRenderNode node, Dictionary<string, string> styleMap, float containingWidth, float x, float y, out RenderedImage? image, out RenderRect rect, out RenderRect? clipRect) =>
-        TryResolveImage(node, styleMap, containingWidth, x, y, out image, out rect, out clipRect) ||
-        TryResolveInlineSvg(node, styleMap, containingWidth, x, y, out image, out rect, out clipRect);
+    private static bool TryResolveReplacedElementImage(ElementRenderNode node, Dictionary<string, string> styleMap, float containingWidth, float x, float y, out RenderedImage? image, out RenderRect rect, out RenderRect? clipRect, (float Width, float Height)? usedSize = null) =>
+        TryResolveImage(node, styleMap, containingWidth, x, y, out image, out rect, out clipRect, usedSize) ||
+        TryResolveInlineSvg(node, styleMap, containingWidth, x, y, out image, out rect, out clipRect, usedSize) ||
+        TryResolveCanvas(node, styleMap, containingWidth, x, y, out image, out rect, out clipRect, usedSize);
 
-    private static bool TryResolveImage(ElementRenderNode node, Dictionary<string, string> styleMap, float containingWidth, float x, float y, out RenderedImage? image, out RenderRect rect, out RenderRect? clipRect)
+    private static bool TryResolveImage(ElementRenderNode node, Dictionary<string, string> styleMap, float containingWidth, float x, float y, out RenderedImage? image, out RenderRect rect, out RenderRect? clipRect, (float Width, float Height)? usedSize = null)
     {
         image = null;
         rect = default;
@@ -9368,10 +9731,10 @@ public sealed partial class HtmlRenderer
             return false;
         }
 
-        return TryResolveReplacedElementRect(imageResource, styleMap, containingWidth, x, y, out image, out rect, out clipRect);
+        return TryResolveReplacedElementRect(imageResource, styleMap, containingWidth, x, y, out image, out rect, out clipRect, usedSize);
     }
 
-    private static bool TryResolveInlineSvg(ElementRenderNode node, Dictionary<string, string> styleMap, float containingWidth, float x, float y, out RenderedImage? image, out RenderRect rect, out RenderRect? clipRect)
+    private static bool TryResolveInlineSvg(ElementRenderNode node, Dictionary<string, string> styleMap, float containingWidth, float x, float y, out RenderedImage? image, out RenderRect rect, out RenderRect? clipRect, (float Width, float Height)? usedSize = null)
     {
         image = null;
         rect = default;
@@ -9389,10 +9752,10 @@ public sealed partial class HtmlRenderer
             return false;
         }
 
-        return TryResolveReplacedElementRect(imageResource, styleMap, containingWidth, x, y, out image, out rect, out clipRect);
+        return TryResolveReplacedElementRect(imageResource, styleMap, containingWidth, x, y, out image, out rect, out clipRect, usedSize);
     }
 
-    private static bool TryResolveReplacedElementRect(CachedImageResource imageResource, Dictionary<string, string> styleMap, float containingWidth, float x, float y, out RenderedImage? image, out RenderRect rect, out RenderRect? clipRect)
+    private static bool TryResolveReplacedElementRect(CachedImageResource imageResource, Dictionary<string, string> styleMap, float containingWidth, float x, float y, out RenderedImage? image, out RenderRect rect, out RenderRect? clipRect, (float Width, float Height)? usedSize = null)
     {
         image = null;
         rect = default;
@@ -9437,6 +9800,12 @@ public sealed partial class HtmlRenderer
         {
             width = Math.Clamp(width, minWidth, Math.Max(minWidth, maxWidth));
             height = Math.Clamp(height, minHeight, Math.Max(minHeight, maxHeight));
+        }
+
+        // the content box as laid out, which knows what a percentage height refers to
+        if (usedSize is { Width: > 0f, Height: > 0f } used)
+        {
+            (width, height) = used;
         }
 
         var boxRect = new RenderRect(x, y, width, height);
@@ -9801,6 +10170,13 @@ public sealed partial class HtmlRenderer
 
     private delegate bool ImageResourceLoader(IElement element, string source, out CachedImageResource? imageResource);
 
+    /// <summary>
+    /// Set by a loader that found the image still being processed (see
+    /// <see cref="TryLoadImageResource"/>): that is not a missing image to remember.
+    /// </summary>
+    [ThreadStatic]
+    private static bool s_imagePending;
+
     private static bool TryGetOrLoadCachedResource(IElement element, string cacheKey, ImageResourceLoader loader, out CachedImageResource? imageResource)
     {
         imageResource = null;
@@ -9817,9 +10193,10 @@ public sealed partial class HtmlRenderer
             }
         }
 
+        s_imagePending = false;
         var loaded = loader(element, cacheKey, out imageResource);
 
-        if (cache is not null)
+        if (cache is not null && (loaded || !s_imagePending))
         {
             lock (cache.Resources)
             {
@@ -9864,6 +10241,13 @@ public sealed partial class HtmlRenderer
                 bytes = capturedBytes;
                 mimeType = capturedMimeType;
             }
+            else if (response is not null && IsCapturedLater(element, response))
+            {
+                // the image service is (about to be) reading the response: taking its stream
+                // would leave the image without its natural size, so it paints once processed
+                s_imagePending = true;
+                return false;
+            }
             else if (response?.Content is not null)
             {
                 try
@@ -9890,6 +10274,24 @@ public sealed partial class HtmlRenderer
         }
 
         return bytes is not null && TryDecodeImageBytes(bytes, mimeType, out imageResource);
+    }
+
+    /// <summary>
+    /// If the image service of WithRendering() processes the response of an image, which
+    /// AngleSharp does once the download completed - a frame may come first.
+    /// </summary>
+    private static bool IsCapturedLater(IElement element, IResponse response)
+    {
+        try
+        {
+            var type = response.GetContentType().Content;
+            return element.Owner?.Context?.GetResourceService<IImageInfo>(type) is ImageResourceService;
+        }
+        catch (Exception exception) when (exception is ObjectDisposedException or InvalidOperationException)
+        {
+            // already processed (and disposed) without the image service
+            return false;
+        }
     }
 
     /// <summary>

@@ -81,6 +81,53 @@ public sealed class DisplayList
     }
 
     /// <summary>
+    /// Moves the given contiguous ranges of already-appended commands (none overlapping) to the
+    /// end in the given order, in one pass; the commands in between close the gaps.
+    /// </summary>
+    internal void MoveRangesToEnd(IReadOnlyList<(int StartIndex, int Count)> ranges)
+    {
+        var lowest = int.MaxValue;
+
+        foreach (var (startIndex, _) in ranges)
+        {
+            lowest = Math.Min(lowest, startIndex);
+        }
+
+        if (lowest >= _commands.Count)
+        {
+            return;
+        }
+
+        var tail = _commands.Count - lowest;
+        var isMoved = new bool[tail];
+        var reordered = new List<RenderCommand>(tail);
+
+        foreach (var (startIndex, count) in ranges)
+        {
+            for (var i = startIndex - lowest; i < startIndex - lowest + count; i++)
+            {
+                isMoved[i] = true;
+            }
+        }
+
+        for (var i = 0; i < tail; i++)
+        {
+            if (!isMoved[i])
+            {
+                reordered.Add(_commands[lowest + i]);
+            }
+        }
+
+        foreach (var (startIndex, count) in ranges)
+        {
+            reordered.AddRange(_commands.GetRange(startIndex, count));
+        }
+
+        _commands.RemoveRange(lowest, tail);
+        _commands.AddRange(reordered);
+    }
+
+    /// <summary>
     /// Moves a contiguous range of already-appended commands to the current end of the list,
     /// preserving their own relative order. Used for a stuck `position: sticky` element painted as
     /// a normal, in-sequence page child (so its layout - cursor advancement, margin collapse - stays
