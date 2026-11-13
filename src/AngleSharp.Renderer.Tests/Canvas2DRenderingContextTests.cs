@@ -133,6 +133,41 @@ public sealed class Canvas2DRenderingContextTests
         Assert.Equal(0, bitmap.GetPixel(5, 5).Alpha);
     }
 
+    [Theory]
+    [InlineData(0d, 2d, true)]
+    [InlineData(2d, 0d, false)]
+    [InlineData(0d, 4d, true)]
+    public async Task Arc_OfAFullTurnAgainstItsDirection_IsTheWholeCircle(double start, double end, bool anticlockwise)
+    {
+        var context = await CreateContextAsync();
+
+        // e.g. arc(x, y, r, 0, 2 * Math.PI, true), as games draw their round sprites
+        context.FillStyle = "#ff0000";
+        context.BeginPath();
+        context.Arc(50d, 50d, 40d, start * Math.PI, end * Math.PI, anticlockwise);
+        context.Fill();
+
+        using var bitmap = SKBitmap.Decode(context.ToImage("image/png"));
+        Assert.Equal(new SKColor(255, 0, 0, 255), bitmap.GetPixel(50, 20));
+        Assert.Equal(new SKColor(255, 0, 0, 255), bitmap.GetPixel(50, 80));
+    }
+
+    [Fact]
+    public async Task Arc_AgainstItsDirection_GoesTheOtherWayRound()
+    {
+        var context = await CreateContextAsync();
+
+        // from 0 to π anticlockwise is the upper half (y grows downwards)
+        context.FillStyle = "#ff0000";
+        context.BeginPath();
+        context.Arc(50d, 50d, 40d, 0d, Math.PI, true);
+        context.Fill();
+
+        using var bitmap = SKBitmap.Decode(context.ToImage("image/png"));
+        Assert.Equal(new SKColor(255, 0, 0, 255), bitmap.GetPixel(50, 25));
+        Assert.Equal(0, bitmap.GetPixel(50, 75).Alpha);
+    }
+
     [Fact]
     public async Task Transformations_MoveRotateAndScaleWhatIsDrawn()
     {

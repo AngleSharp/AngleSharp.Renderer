@@ -502,6 +502,7 @@ internal sealed partial class InteractiveHtmlRendererState : IDomHarness
         }
 
         _metrics = null;
+        PresentCanvases();
 
         try
         {
@@ -529,6 +530,7 @@ internal sealed partial class InteractiveHtmlRendererState : IDomHarness
     {
         var targetDocument = Context.Active
             ?? throw new InvalidOperationException("No active document is available for painting.");
+        PresentCanvases();
 
         // Overscan is only right for pages scrolling as a whole: boxes attached to the viewport
         // would be painted relative to the surface instead. Whether a page has any is only known
@@ -640,6 +642,7 @@ internal sealed partial class InteractiveHtmlRendererState : IDomHarness
     public RenderedFrame? UpdateFrame()
     {
         RenderedFrame? frame;
+        PresentCanvases();
         _transitionTracker.DeferStarts = true;
 
         try

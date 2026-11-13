@@ -1,5 +1,6 @@
 namespace AngleSharp.Renderer.Skia;
 
+using AngleSharp.Renderer.Skia.Svg;
 using SkiaSharp;
 
 /// <summary>
@@ -32,12 +33,30 @@ internal sealed class SvgVectorImage
     private readonly List<(RasterPlacement Placement, SKImage Raster, SvgRasterBudget.Ticket Ticket)> _rasters = [];
     private readonly List<(TileShape Shape, SKShader Shader)> _shaders = [];
 
+    // where the viewBox is in the picture and how it fits into another viewport, if it has one
+    private readonly (SKRect ViewBox, SvgPreserveAspectRatioAlign Align, bool Meet)? _fit;
+
     public SvgVectorImage(SKPicture picture, float width, float height)
     {
         Picture = picture;
         Width = width;
         Height = height;
         _png = new Lazy<byte[]>(EncodePng);
+    }
+
+    /// <summary>
+    /// Creates the image of an SVG with a <c>viewBox</c> (where it is in the picture): painted at
+    /// another size, the box it is painted into is its viewport, into which the viewBox fits as
+    /// its <c>preserveAspectRatio</c> tells, e.g. a narrow icon in a square box is centered, not
+    /// stretched.
+    /// </summary>
+    public SvgVectorImage(SKPicture picture, float width, float height, SKRect viewBox, SvgPreserveAspectRatioAlign align, bool meet)
+        : this(picture, width, height)
+    {
+        if (align != SvgPreserveAspectRatioAlign.None && viewBox.Width > 0f && viewBox.Height > 0f)
+        {
+            _fit = (viewBox, align, meet);
+        }
     }
 
     public SKPicture Picture { get; }
@@ -108,9 +127,28 @@ internal sealed class SvgVectorImage
         var count = canvas.Save();
         canvas.ClipRect(destination, antialias: true);
         canvas.Translate(destination.Left, destination.Top);
-        canvas.Scale(destination.Width / Width, destination.Height / Height);
+        var mapping = MapInto(destination.Width, destination.Height);
+        canvas.Concat(ref mapping);
         canvas.DrawPicture(Picture);
         canvas.RestoreToCount(count);
+    }
+
+    /// <summary>
+    /// Maps the picture into a viewport of the given size at the origin: scaled to it, or with
+    /// its viewBox fitted into it if the size has another aspect ratio.
+    /// </summary>
+    private SKMatrix MapInto(float width, float height)
+    {
+        var scale = SKMatrix.CreateScale(width / Width, height / Height);
+
+        if (_fit is not { } fit || Math.Abs((width * Height) - (height * Width)) <= 0.001f * Math.Max(1f, width * Height))
+        {
+            return scale;
+        }
+
+        var box = fit.ViewBox;
+        var fitted = SvgViewBoxMapping.ComputeMatrix((box.Left, box.Top, box.Width, box.Height), width, height, fit.Align, fit.Meet);
+        return fitted;
     }
 
     /// <summary>
@@ -234,8 +272,11 @@ internal sealed class SvgVectorImage
         var canvas = surface.Canvas;
         canvas.Clear(SKColors.Transparent);
         canvas.Translate(placement.OffsetX / PlacementUnitsPerPixel, placement.OffsetY / PlacementUnitsPerPixel);
-        canvas.Scale(placement.Width / PlacementUnitsPerPixel / Width, placement.Height / PlacementUnitsPerPixel / Height);
-        canvas.ClipRect(new SKRect(0f, 0f, Width, Height), antialias: true);
+        var width = placement.Width / PlacementUnitsPerPixel;
+        var height = placement.Height / PlacementUnitsPerPixel;
+        canvas.ClipRect(new SKRect(0f, 0f, width, height), antialias: true);
+        var mapping = MapInto(width, height);
+        canvas.Concat(ref mapping);
         canvas.DrawPicture(Picture);
         canvas.Flush();
         return surface.Snapshot();
@@ -246,7 +287,10 @@ internal sealed class SvgVectorImage
         var cell = new SKRect(0f, 0f, shape.Width + shape.GapX, shape.Height + shape.GapY);
         using var recorder = new SKPictureRecorder();
         var canvas = recorder.BeginRecording(cell);
-        DrawPart(canvas, new SKRect(0f, 0f, Width, Height), new SKRect(0f, 0f, shape.Width, shape.Height));
+        canvas.ClipRect(new SKRect(0f, 0f, shape.Width, shape.Height));
+        var mapping = MapInto(shape.Width, shape.Height);
+        canvas.Concat(ref mapping);
+        canvas.DrawPicture(Picture);
         using var picture = recorder.EndRecording();
         return picture.ToShader(shape.ModeX, shape.ModeY, cell);
     }

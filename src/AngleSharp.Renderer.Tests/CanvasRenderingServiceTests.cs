@@ -77,7 +77,30 @@ public sealed class CanvasRenderingServiceTests
         context.FillRect(0d, 0d, 40d, 30d);
 
         Assert.Equal(2, invalidated);
+        Assert.Same(frame, harness.UpdateFrame());
         Assert.Equal(new RenderColor(0, 255, 0), GetPixel(frame.Rasterize(), 20, 15));
+    }
+
+    [Fact]
+    public async Task ACanvasDrawnIntoIsShownAsItWasWhenTheFrameWasPrepared()
+    {
+        var (document, harness) = await OpenScriptedAsync("<canvas id='c' width='40' height='30'></canvas>");
+        var canvas = (IHtmlCanvasElement)document.GetElementById("c")!;
+        var context = Assert.IsType<Canvas2DRenderingContext>(canvas.GetContext("2d"));
+        context.FillStyle = "#0000ff";
+        context.FillRect(0d, 0d, 40d, 30d);
+        var frame = harness.PrepareFrame();
+
+        // a script clearing the canvas to draw it again, while the frame is rasterized
+        context.ClearRect(0d, 0d, 40d, 30d);
+
+        Assert.Equal(new RenderColor(0, 0, 255), GetPixel(frame.Rasterize(), 20, 15));
+
+        context.FillStyle = "#ff0000";
+        context.FillRect(0d, 0d, 40d, 30d);
+        var next = harness.UpdateFrame() ?? harness.PrepareFrame();
+
+        Assert.Equal(new RenderColor(255, 0, 0), GetPixel(next.Rasterize(), 20, 15));
     }
 
     private static readonly DefaultRenderDevice Device = new() { ViewPortWidth = 200, ViewPortHeight = 100, FontSize = 16 };

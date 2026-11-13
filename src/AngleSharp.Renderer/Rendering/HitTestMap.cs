@@ -311,6 +311,16 @@ public sealed class HitTestMap
             }
 
             var path = withKey ? new List<(int Step, int ZIndex, double Order)> { (1, 0, GetOrder(element)) } : null;
+            // a float paints (and is hit) above the in-flow blocks of its layer, also the later
+            // ones overlapping it, with what is in it (CSS 2.2 Appendix E): it is ranked as if it
+            // was a layer of its own there, up to the first layer root around it
+            var isInLayer = elementMetrics.Layer.IsLayerRoot;
+
+            if (path is not null && !isInLayer && elementMetrics.Layer.IsFloat)
+            {
+                path[0] = FloatRank(element);
+            }
+
             var isInScrollContainer = false;
             var isViewportAnchored = IsFixed(styleMaps, element);
 
@@ -341,6 +351,11 @@ public sealed class HitTestMap
                 if (path is not null && ancestorMetrics.Layer.IsLayerRoot)
                 {
                     path.Add(GetRank(ancestor, ancestorMetrics.Layer));
+                    isInLayer = true;
+                }
+                else if (path is not null && !isInLayer && ancestorMetrics.Layer.IsFloat)
+                {
+                    path.Add(FloatRank(ancestor));
                 }
 
                 // what is in a transformed box is hit where it is painted
@@ -429,6 +444,9 @@ public sealed class HitTestMap
 
             return _unordered;
         }
+
+        // in flow (step 1), above the blocks (0) of the layer
+        private (int Step, int ZIndex, double Order) FloatRank(IElement element) => (1, 1, GetOrder(element));
 
         private (int Step, int ZIndex, double Order) GetRank(IElement element, HtmlRenderer.HitTestLayer layer)
         {

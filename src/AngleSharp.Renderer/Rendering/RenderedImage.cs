@@ -76,10 +76,11 @@ public sealed class RenderedImage
     internal AngleSharp.Html.Dom.IHtmlCanvasElement? Canvas { get; }
 
     /// <summary>
-    /// Gets the bitmap of the canvas as it is now, or null if nothing was drawn into it.
+    /// Gets the bitmap of the canvas as frames show it (see <see cref="Canvas2DRenderingContext.Present"/>), or
+    /// null if nothing was drawn into it.
     /// </summary>
     internal SkiaSharp.SKImage? GetCanvasSnapshot() =>
-        Canvas is { } canvas ? CanvasRenderingService.GetContext(canvas)?.GetSnapshot() : null;
+        Canvas is { } canvas ? CanvasRenderingService.GetContext(canvas)?.GetFrameSnapshot() : null;
 
     private byte[] EncodeCanvas()
     {

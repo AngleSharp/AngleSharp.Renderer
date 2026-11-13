@@ -3075,6 +3075,42 @@ public sealed partial class HtmlRenderer
     /// The used width of a replaced element (<c>&lt;img&gt;</c>, inline <c>&lt;svg&gt;</c>), which
     /// comes from its natural size when no width is authored.
     /// </summary>
+    /// <summary>
+    /// The style of a box for its intrinsic size: percentages of its width would refer to the very
+    /// size being computed, so they count as auto (and none), e.g. an image with <c>width: 100%</c>
+    /// in a shrink-to-fit box contributes its natural width, not the width of the containing block.
+    /// </summary>
+    private static Dictionary<string, string> WithoutPercentageWidths(Dictionary<string, string> styleMap)
+    {
+        var hasPercentageWidth = styleMap.TryGetValue("width", out var width) && IsPercentageValue(width);
+        var hasPercentageMaxWidth = styleMap.TryGetValue("max-width", out var maxWidth) && IsPercentageValue(maxWidth);
+        var hasPercentageMinWidth = styleMap.TryGetValue("min-width", out var minWidth) && IsPercentageValue(minWidth);
+
+        if (!hasPercentageWidth && !hasPercentageMaxWidth && !hasPercentageMinWidth)
+        {
+            return styleMap;
+        }
+
+        var intrinsicStyle = new Dictionary<string, string>(styleMap, styleMap.Comparer);
+
+        if (hasPercentageWidth)
+        {
+            intrinsicStyle.Remove("width");
+        }
+
+        if (hasPercentageMaxWidth)
+        {
+            intrinsicStyle.Remove("max-width");
+        }
+
+        if (hasPercentageMinWidth)
+        {
+            intrinsicStyle.Remove("min-width");
+        }
+
+        return intrinsicStyle;
+    }
+
     private static bool TryResolveReplacedContentWidth(ElementRenderNode element, Dictionary<string, string> styleMap, float containingWidth, out float width)
     {
         width = 0f;
@@ -3189,11 +3225,11 @@ public sealed partial class HtmlRenderer
         {
             content = new IntrinsicWidths(authored, authored);
         }
-        else if (TryResolveReplacedContentWidth(element, styleMap, percentageBase, out var replacedWidth))
+        else if (TryResolveReplacedContentWidth(element, WithoutPercentageWidths(styleMap), percentageBase, out var replacedWidth))
         {
             // with a percentage width or max-width, a replaced element can shrink to nothing,
             // e.g. an image with width: 100% in a 1fr grid track (compressible replaced
-            // elements, CSS Sizing 3 §5.2.2)
+            // elements, CSS Sizing 3 §5.2.2), while it prefers its natural size
             var isCompressible = (rawWidth is not null && IsPercentageValue(rawWidth)) ||
                 (styleMap.TryGetValue("max-width", out var rawMaxWidth) && IsPercentageValue(rawMaxWidth));
             content = new IntrinsicWidths(isCompressible ? 0f : replacedWidth, replacedWidth);

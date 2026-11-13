@@ -32,7 +32,7 @@ public sealed partial class HtmlRenderer
         element is not IPseudoElement &&
         (string.Equals(element.LocalName, "svg", StringComparison.OrdinalIgnoreCase) || IsCanvas(element));
 
-    private static bool TryResolveCanvas(ElementRenderNode node, Dictionary<string, string> styleMap, float containingWidth, float x, float y, out RenderedImage? image, out RenderRect rect, out RenderRect? clipRect)
+    private static bool TryResolveCanvas(ElementRenderNode node, Dictionary<string, string> styleMap, float containingWidth, float x, float y, out RenderedImage? image, out RenderRect rect, out RenderRect? clipRect, (float Width, float Height)? usedSize = null)
     {
         image = null;
         rect = default;
@@ -44,7 +44,7 @@ public sealed partial class HtmlRenderer
         }
 
         var resource = new CachedImageResource(null, null, "image/png", Math.Max(0, canvas.Width), Math.Max(0, canvas.Height)) { Canvas = canvas };
-        return TryResolveReplacedElementRect(resource, styleMap, containingWidth, x, y, out image, out rect, out clipRect);
+        return TryResolveReplacedElementRect(resource, styleMap, containingWidth, x, y, out image, out rect, out clipRect, usedSize);
     }
 
     /// <summary>

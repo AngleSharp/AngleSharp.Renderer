@@ -208,7 +208,8 @@ public sealed partial class HtmlRenderer
     /// <param name="ZIndex">Its z-index, 0 for auto.</param>
     /// <param name="ClipsOverflow">If its content is clipped to its padding box.</param>
     /// <param name="IsHidden">If it is not hit itself (visibility: hidden, pointer-events: none).</param>
-    internal readonly record struct HitTestLayer(bool IsLayerRoot, int ZIndex, bool ClipsOverflow, bool IsHidden);
+    /// <param name="IsFloat">If it floats: it paints with its content above the in-flow blocks of its layer.</param>
+    internal readonly record struct HitTestLayer(bool IsLayerRoot, int ZIndex, bool ClipsOverflow, bool IsHidden, bool IsFloat = false);
 
     private sealed record class LayoutContext(
         int Width,
@@ -379,6 +380,9 @@ public sealed partial class HtmlRenderer
             styleMap.GetValueOrDefault("transform")?.Trim() is { Length: > 0 } transform && !transform.Equals("none", StringComparison.OrdinalIgnoreCase);
         var visibility = styleMap.GetValueOrDefault("visibility")?.Trim();
         var pointerEvents = styleMap.GetValueOrDefault("pointer-events")?.Trim();
+        // a float of a flex or grid container is an item like the others
+        var isFloat = !isItem && position is not ("absolute" or "fixed") &&
+            styleMap.GetValueOrDefault("float")?.Trim().ToLowerInvariant() is "left" or "right" or "inline-start" or "inline-end";
 
         return new HitTestLayer(
             isPositioned || isStackingContext,
@@ -386,7 +390,8 @@ public sealed partial class HtmlRenderer
             ShouldClipOverflow(styleMap),
             string.Equals(visibility, "hidden", StringComparison.OrdinalIgnoreCase) ||
             string.Equals(visibility, "collapse", StringComparison.OrdinalIgnoreCase) ||
-            string.Equals(pointerEvents, "none", StringComparison.OrdinalIgnoreCase));
+            string.Equals(pointerEvents, "none", StringComparison.OrdinalIgnoreCase),
+            isFloat);
     }
 
     private static void RecordLayoutMetrics(
@@ -1724,18 +1729,19 @@ public sealed partial class HtmlRenderer
         // with both offsets of an axis auto, an absolutely positioned box stays where it would be in flow
         var hasStaticX = isAbsolute && float.IsNaN(rightOffset) && float.IsNaN(ParseLength(styleMap, "left", flowContainingWidth, float.NaN, allowAuto: true));
         var hasStaticY = isAbsolute && float.IsNaN(bottomOffset) && float.IsNaN(ParseLength(styleMap, "top", flowContainingWidth, float.NaN, allowAuto: true));
-        // an offset places the margin box of an absolutely positioned box
+        // an offset places the margin box of an absolutely positioned box, as does the static
+        // position (the margins were left out of the flow position)
         var borderBoxX = isFixed
             ? context.Padding + leftOffset + positionedMargins.Left
             : isAbsolute
-                ? hasStaticX ? flowBorderBoxX : absoluteContainingX + leftOffset + positionedMargins.Left
+                ? hasStaticX ? flowBorderBoxX + positionedMargins.Left : absoluteContainingX + leftOffset + positionedMargins.Left
                 : flowBorderBoxX + (isRelative ? leftOffset : 0f);
         // `position: sticky` is laid out at its natural position; its container shifts it once
         // its own box is known (see ResolveStickyBoxes).
         var borderBoxY = isFixed
             ? context.Padding + topOffset + positionedMargins.Top
             : isAbsolute
-                ? hasStaticY ? flowBorderBoxY : absoluteContainingY + topOffset + positionedMargins.Top
+                ? hasStaticY ? flowBorderBoxY + positionedMargins.Top : absoluteContainingY + topOffset + positionedMargins.Top
                 : flowBorderBoxY + (isRelative ? topOffset : 0f);
         var contentX = borderBoxX + borderLeft + paddingLeft;
         var contentY = borderBoxY + borderTop + paddingTop;
@@ -2342,7 +2348,7 @@ public sealed partial class HtmlRenderer
 
         ResolveStickyBoxes(displayList, context.StickyScopes.Peek(), new RenderRect(contentX, contentY, contentWidth, contentHeight), context);
 
-        if (TryResolveReplacedElementImage(node, styleMap, flowContainingWidth, borderBoxX + borderLeft + paddingLeft, borderBoxY + borderTop + paddingTop, out var image, out var imageRect, out var objectFitClipRect))
+        if (TryResolveReplacedElementImage(node, styleMap, flowContainingWidth, borderBoxX + borderLeft + paddingLeft, borderBoxY + borderTop + paddingTop, out var image, out var imageRect, out var objectFitClipRect, (contentWidth, contentHeight)))
         {
             var roundedContentClip = GetRoundedContentClip(box.BorderRadius, borderBoxX, borderBoxY, borderBoxWidth, borderBoxHeight, new EdgeSizes(borderTop, borderRight, borderBottom, borderLeft), new EdgeSizes(paddingTop, paddingRight, paddingBottom, paddingLeft));
 
@@ -3489,7 +3495,9 @@ public sealed partial class HtmlRenderer
                 Math.Max(0f, borderBoxHeight - borderTop - borderBottom - paddingTop - paddingBottom)),
             context);
 
-        if (TryResolveReplacedElementImage(node, styleMap, containingWidth, borderBoxX + borderLeft + paddingLeft, borderBoxY + borderTop + paddingTop, out var image, out var imageRect, out var objectFitClipRect))
+        var usedContentSize = (Math.Max(0f, borderBoxWidth - borderLeft - borderRight - paddingLeft - paddingRight), Math.Max(0f, borderBoxHeight - borderTop - borderBottom - paddingTop - paddingBottom));
+
+        if (TryResolveReplacedElementImage(node, styleMap, containingWidth, borderBoxX + borderLeft + paddingLeft, borderBoxY + borderTop + paddingTop, out var image, out var imageRect, out var objectFitClipRect, usedContentSize))
         {
             var roundedContentClip = GetRoundedContentClip(box.BorderRadius, borderBoxX, borderBoxY, borderBoxWidth, borderBoxHeight, new EdgeSizes(borderTop, borderRight, borderBottom, borderLeft), new EdgeSizes(paddingTop, paddingRight, paddingBottom, paddingLeft));
 
@@ -9502,12 +9510,12 @@ public sealed partial class HtmlRenderer
         string.Equals(element.LocalName, "input", StringComparison.OrdinalIgnoreCase) &&
         string.Equals(element.GetAttribute("type")?.Trim(), "image", StringComparison.OrdinalIgnoreCase);
 
-    private static bool TryResolveReplacedElementImage(ElementRenderNode node, Dictionary<string, string> styleMap, float containingWidth, float x, float y, out RenderedImage? image, out RenderRect rect, out RenderRect? clipRect) =>
-        TryResolveImage(node, styleMap, containingWidth, x, y, out image, out rect, out clipRect) ||
-        TryResolveInlineSvg(node, styleMap, containingWidth, x, y, out image, out rect, out clipRect) ||
-        TryResolveCanvas(node, styleMap, containingWidth, x, y, out image, out rect, out clipRect);
+    private static bool TryResolveReplacedElementImage(ElementRenderNode node, Dictionary<string, string> styleMap, float containingWidth, float x, float y, out RenderedImage? image, out RenderRect rect, out RenderRect? clipRect, (float Width, float Height)? usedSize = null) =>
+        TryResolveImage(node, styleMap, containingWidth, x, y, out image, out rect, out clipRect, usedSize) ||
+        TryResolveInlineSvg(node, styleMap, containingWidth, x, y, out image, out rect, out clipRect, usedSize) ||
+        TryResolveCanvas(node, styleMap, containingWidth, x, y, out image, out rect, out clipRect, usedSize);
 
-    private static bool TryResolveImage(ElementRenderNode node, Dictionary<string, string> styleMap, float containingWidth, float x, float y, out RenderedImage? image, out RenderRect rect, out RenderRect? clipRect)
+    private static bool TryResolveImage(ElementRenderNode node, Dictionary<string, string> styleMap, float containingWidth, float x, float y, out RenderedImage? image, out RenderRect rect, out RenderRect? clipRect, (float Width, float Height)? usedSize = null)
     {
         image = null;
         rect = default;
@@ -9535,10 +9543,10 @@ public sealed partial class HtmlRenderer
             return false;
         }
 
-        return TryResolveReplacedElementRect(imageResource, styleMap, containingWidth, x, y, out image, out rect, out clipRect);
+        return TryResolveReplacedElementRect(imageResource, styleMap, containingWidth, x, y, out image, out rect, out clipRect, usedSize);
     }
 
-    private static bool TryResolveInlineSvg(ElementRenderNode node, Dictionary<string, string> styleMap, float containingWidth, float x, float y, out RenderedImage? image, out RenderRect rect, out RenderRect? clipRect)
+    private static bool TryResolveInlineSvg(ElementRenderNode node, Dictionary<string, string> styleMap, float containingWidth, float x, float y, out RenderedImage? image, out RenderRect rect, out RenderRect? clipRect, (float Width, float Height)? usedSize = null)
     {
         image = null;
         rect = default;
@@ -9556,10 +9564,10 @@ public sealed partial class HtmlRenderer
             return false;
         }
 
-        return TryResolveReplacedElementRect(imageResource, styleMap, containingWidth, x, y, out image, out rect, out clipRect);
+        return TryResolveReplacedElementRect(imageResource, styleMap, containingWidth, x, y, out image, out rect, out clipRect, usedSize);
     }
 
-    private static bool TryResolveReplacedElementRect(CachedImageResource imageResource, Dictionary<string, string> styleMap, float containingWidth, float x, float y, out RenderedImage? image, out RenderRect rect, out RenderRect? clipRect)
+    private static bool TryResolveReplacedElementRect(CachedImageResource imageResource, Dictionary<string, string> styleMap, float containingWidth, float x, float y, out RenderedImage? image, out RenderRect rect, out RenderRect? clipRect, (float Width, float Height)? usedSize = null)
     {
         image = null;
         rect = default;
@@ -9604,6 +9612,12 @@ public sealed partial class HtmlRenderer
         {
             width = Math.Clamp(width, minWidth, Math.Max(minWidth, maxWidth));
             height = Math.Clamp(height, minHeight, Math.Max(minHeight, maxHeight));
+        }
+
+        // the content box as laid out, which knows what a percentage height refers to
+        if (usedSize is { Width: > 0f, Height: > 0f } used)
+        {
+            (width, height) = used;
         }
 
         var boxRect = new RenderRect(x, y, width, height);

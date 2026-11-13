@@ -17,7 +17,10 @@ using SkiaSharp;
 /// </summary>
 /// <remarks>
 /// Script draws on the event loop, while frames are rasterized on other threads: the bitmap is
-/// only touched under a lock, and a frame draws a copy of it taken then.
+/// only touched under a lock. A frame of an interactive document draws the copy taken when it was
+/// prepared (see <see cref="Present"/>), as a browser shows a canvas after the task drawing into it
+/// ended: a copy taken while the raster runs could show a script's drawing half done, e.g. right
+/// after it cleared the canvas, which flickers.
 /// </remarks>
 public sealed class Canvas2DRenderingContext : ICanvasRenderingContext2D
 {
@@ -31,6 +34,9 @@ public sealed class Canvas2DRenderingContext : ICanvasRenderingContext2D
     private SKPath _path = new();
     private bool _hasCurrentPoint;
     private SKImage? _snapshot;
+    // what frames show, see Present
+    private SKImage? _presented;
+    private bool _isPresented;
     private int _invalidationRequested;
     private FontFaceSet? _fonts;
     private long _fontsLoadedAt;
@@ -612,18 +618,15 @@ public sealed class Canvas2DRenderingContext : ICanvasRenderingContext2D
         {
             sweep = -FullCircle;
         }
-        else
+        // against its direction, it goes the other way round to the end angle, which is the
+        // whole ellipse when that is a full turn away (e.g. 0 to 2π anticlockwise, as Chromium)
+        else if (!anticlockwise && sweep < 0d)
         {
-            sweep %= FullCircle;
-
-            if (!anticlockwise && sweep < 0d)
-            {
-                sweep += FullCircle;
-            }
-            else if (anticlockwise && sweep > 0d)
-            {
-                sweep -= FullCircle;
-            }
+            sweep = FullCircle - (-sweep % FullCircle);
+        }
+        else if (anticlockwise && sweep > 0d)
+        {
+            sweep = -(FullCircle - (sweep % FullCircle));
         }
 
         var oval = new SKRect((float)(x - radiusX), (float)(y - radiusY), (float)(x + radiusX), (float)(y + radiusY));
@@ -1005,10 +1008,40 @@ public sealed class Canvas2DRenderingContext : ICanvasRenderingContext2D
     {
         lock (_sync)
         {
-            EnsureBitmapSizeLocked();
-            Interlocked.Exchange(ref _invalidationRequested, 0);
-            return _snapshot ??= SKImage.FromBitmap(_bitmap);
+            return GetSnapshotLocked();
         }
+    }
+
+    /// <summary>
+    /// Gets what a frame shows of the canvas: what was drawn until the frame was prepared (see
+    /// <see cref="Present"/>) if an interactive document presents it, else what is drawn now.
+    /// </summary>
+    internal SKImage? GetFrameSnapshot()
+    {
+        lock (_sync)
+        {
+            return _isPresented ? _presented : GetSnapshotLocked();
+        }
+    }
+
+    /// <summary>
+    /// Takes what was drawn until now for the frames to show, which happens when a frame is
+    /// prepared, i.e. between the tasks of the event loop.
+    /// </summary>
+    internal void Present()
+    {
+        lock (_sync)
+        {
+            _isPresented = true;
+            _presented = GetSnapshotLocked();
+            Interlocked.Exchange(ref _invalidationRequested, 0);
+        }
+    }
+
+    private SKImage GetSnapshotLocked()
+    {
+        EnsureBitmapSizeLocked();
+        return _snapshot ??= SKImage.FromBitmap(_bitmap);
     }
 
     /// <summary>
@@ -1248,10 +1281,10 @@ public sealed class Canvas2DRenderingContext : ICanvasRenderingContext2D
     // there is (its boxes are where they were).
     private void Invalidate()
     {
-        if (Interlocked.Exchange(ref _invalidationRequested, 1) == 0 &&
-            Host.Owner?.Context is { } context && context.TryGetDomHarness(out var harness) && harness is InteractiveHtmlRendererState state)
+        if (Host.Owner?.Context is { } context && context.TryGetDomHarness(out var harness) && harness is InteractiveHtmlRendererState state &&
+            Interlocked.Exchange(ref _invalidationRequested, 1) == 0)
         {
-            state.OnCanvasChanged();
+            state.OnCanvasChanged(this);
         }
     }
 
