@@ -12,6 +12,12 @@ internal sealed partial class InteractiveHtmlRendererState
     internal void InvalidateAnimation() => OnPaintInvalidated();
 
     /// <summary>
+    /// Tells that a canvas was drawn into: the frame shows it once it is rasterized again, as
+    /// its boxes are where they were.
+    /// </summary>
+    internal void OnCanvasChanged() => OnPaintInvalidated(keepsMetrics: true);
+
+    /// <summary>
     /// Follows the CSS animations of an element whose style was computed for painting, to give
     /// it the events of animations starting, repeating, ending or being cancelled.
     /// </summary>

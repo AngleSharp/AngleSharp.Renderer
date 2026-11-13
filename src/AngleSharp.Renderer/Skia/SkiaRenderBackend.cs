@@ -1065,6 +1065,18 @@ public sealed partial class SkiaRenderBackend : IPixelRenderBackend, ITextMeasur
             return;
         }
 
+        if (command.Image.Canvas is not null)
+        {
+            // what was drawn into the canvas until now; nothing drawn is transparent
+            if (command.Image.GetCanvasSnapshot() is { } bitmap)
+            {
+                using var bitmapPaint = new SKPaint { IsAntialias = true, FilterQuality = SKFilterQuality.Medium };
+                canvas.DrawImage(bitmap, rect, bitmapPaint);
+            }
+
+            return;
+        }
+
         var image = DecodeImage(command.Image);
         if (image is null)
         {

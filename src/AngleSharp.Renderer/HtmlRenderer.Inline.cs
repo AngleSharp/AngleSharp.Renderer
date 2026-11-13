@@ -133,8 +133,10 @@ public sealed partial class HtmlRenderer
             }
 
             // An absolutely positioned child does not interrupt a line in progress; it is laid out
-            // at the static position of the line it appears in.
-            if (classification == FlowChildKind.OutOfFlow && runHasInlineContent)
+            // at the static position of the line it appears in. Neither does a float, which is
+            // placed on the line it appears in if it fits there (CSS 2.1 §9.5.1).
+            if ((classification == FlowChildKind.OutOfFlow || (classification == FlowChildKind.Block && IsFloatedNode(child, context))) &&
+                runHasInlineContent && (classification == FlowChildKind.OutOfFlow || HasVisibleInlineContent(run)))
             {
                 run.Add(child);
                 continue;
@@ -260,6 +262,13 @@ public sealed partial class HtmlRenderer
     }
 
     private static bool IsFloated(Dictionary<string, string> styleMap) => GetFloat(styleMap) is "left" or "right";
+
+    private static bool IsFloatedNode(IRenderNode node, LayoutContext context) =>
+        node is ElementRenderNode element && IsFloated(GetOrCreateStyleMap(context, element.Ref, element.ComputedStyle));
+
+    // Inline content that makes a line: more than collapsible white space.
+    private static bool HasVisibleInlineContent(List<IRenderNode> run) =>
+        run.Exists(static node => node is not TextRenderNode text || !string.IsNullOrWhiteSpace(text.Ref.Data));
 
     /// <summary>
     /// Whether an element participates in an inline formatting context: <c>display: inline</c>
@@ -431,6 +440,16 @@ public sealed partial class HtmlRenderer
         public bool Trimmed { get; set; }
 
         /// <summary>
+        /// Gets if this out-of-flow piece is a float, which is placed beside the line it is on.
+        /// </summary>
+        public bool IsFloat { get; init; }
+
+        /// <summary>
+        /// Gets or sets if the float of this piece has its place already.
+        /// </summary>
+        public bool IsFloatPlaced { get; set; }
+
+        /// <summary>
         /// The bidi formatting characters a BoxStart/BoxEnd stands for (from `unicode-bidi`), or
         /// <see langword="null"/> when the box does not affect the bidi ordering.
         /// </summary>
@@ -564,6 +583,13 @@ public sealed partial class HtmlRenderer
             if (IsOutOfFlowPositioned(styleMap))
             {
                 Pieces.Add(new InlinePiece { Kind = InlinePieceKind.OutOfFlow, Style = parentStyle, Box = parentBox, Element = element });
+                return;
+            }
+
+            // a float takes no room on the line, it is placed beside it (see PlaceLineFloats)
+            if (IsFloated(styleMap))
+            {
+                Pieces.Add(new InlinePiece { Kind = InlinePieceKind.OutOfFlow, IsFloat = true, Style = parentStyle, Box = parentBox, Element = element });
                 return;
             }
 
@@ -917,6 +943,81 @@ public sealed partial class HtmlRenderer
         var emittedAnyLine = false;
         var lineTop = cursorY;
         var lineCount = 0;
+        var deferredFloats = new List<InlinePiece>();
+
+        // A float is placed at the top of the line it is on, if it fits beside what is before it
+        // there (which then moves aside for a left float), else at the top of the next line.
+        bool PlaceLineFloats(int start, int end, float available)
+        {
+            var used = 0f;
+
+            for (var index = start; index < end; index++)
+            {
+                var piece = pieces[index];
+
+                if (piece.IsFloat)
+                {
+                    if (piece.IsFloatPlaced)
+                    {
+                        continue;
+                    }
+
+                    piece.IsFloatPlaced = true;
+
+                    if (used <= 0f || used + MeasureFloatWidth(piece) <= available + 0.01f)
+                    {
+                        PlaceFloat(piece);
+                        return true;
+                    }
+
+                    deferredFloats.Add(piece);
+                }
+                else if (piece.Kind != InlinePieceKind.OutOfFlow && !piece.Trimmed)
+                {
+                    used += piece.Width;
+                }
+            }
+
+            return false;
+        }
+
+        float MeasureFloatWidth(InlinePiece piece)
+        {
+            var (bandLeft, bandRight) = floats.GetBand(lineTop, textStyle.FontSize * textStyle.LineHeightMultiplier, contentX, contentX + contentWidth);
+            var outer = ComputeOuterIntrinsicWidths(piece.Element!, piece.Style, contentWidth, context);
+            return Math.Min(Math.Max(outer.Min, bandRight - bandLeft), outer.Max);
+        }
+
+        void PlaceFloat(InlinePiece piece)
+        {
+            var floatCursorY = lineTop + pendingBlockMargin;
+            var floatPreviousMarginBottom = 0f;
+            var floatSuppressTopMargin = false;
+            var floatTextIndentConsumed = false;
+            var rangeStart = displayList.Commands.Count;
+
+            LayoutNode(
+                node: piece.Element!,
+                containingX: contentX,
+                containingY: floatCursorY,
+                containingWidth: contentWidth,
+                cursorY: ref floatCursorY,
+                previousBlockMarginBottom: ref floatPreviousMarginBottom,
+                suppressNextBlockTopMargin: ref floatSuppressTopMargin,
+                floats: floats,
+                textIndentConsumed: ref floatTextIndentConsumed,
+                textStyle: piece.Style,
+                context: context,
+                displayList: displayList,
+                maxY: maxY,
+                containingHeight: containingHeight,
+                positionedContainingX: positionedContainingX,
+                positionedContainingY: positionedContainingY,
+                positionedContainingWidth: positionedContainingWidth,
+                positionedContainingHeight: positionedContainingHeight);
+
+            paintOrder.Track(piece.Element!, displayList, rangeStart, context);
+        }
 
         while (lineStartIndex < pieces.Count)
         {
@@ -980,6 +1081,18 @@ public sealed partial class HtmlRenderer
             }
 
             var lineEnd = BuildLine(pieces, lineStartIndex, available, context, out var forcedBreak);
+
+            // a float placed beside the line takes some of its room: it is built again
+            if (PlaceLineFloats(lineStartIndex, lineEnd, available))
+            {
+                for (var index = lineStartIndex; index < lineEnd && index < pieces.Count; index++)
+                {
+                    pieces[index].Trimmed = false;
+                }
+
+                continue;
+            }
+
             var linePieces = new List<InlinePiece>(lineEnd - lineStartIndex);
 
             for (var index = lineStartIndex; index < lineEnd; index++)
@@ -1046,6 +1159,14 @@ public sealed partial class HtmlRenderer
             textIndentConsumed = true;
             lineCount++;
 
+            // the floats that did not fit beside the line are below it
+            foreach (var deferred in deferredFloats)
+            {
+                PlaceFloat(deferred);
+            }
+
+            deferredFloats.Clear();
+
             if (lineClamp is not null)
             {
                 lineClamp.Remaining--;
@@ -1060,6 +1181,11 @@ public sealed partial class HtmlRenderer
 
                 break;
             }
+        }
+
+        foreach (var deferred in deferredFloats)
+        {
+            PlaceFloat(deferred);
         }
 
         if (sharedPaintOrder is null)
@@ -2457,7 +2583,7 @@ public sealed partial class HtmlRenderer
     {
         foreach (var piece in linePieces)
         {
-            if (piece.Kind != InlinePieceKind.OutOfFlow)
+            if (piece.Kind != InlinePieceKind.OutOfFlow || piece.IsFloat)
             {
                 continue;
             }
@@ -3173,7 +3299,7 @@ public sealed partial class HtmlRenderer
         var formControlKind = ResolveFormControlKind(element);
 
         if (element.Ref is not IPseudoElement &&
-            (string.Equals(element.Ref.LocalName, "svg", StringComparison.OrdinalIgnoreCase) ||
+            (HidesChildren(element.Ref) ||
              PaintsOwnContent(formControlKind)))
         {
             children = [];

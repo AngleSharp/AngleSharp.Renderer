@@ -1531,6 +1531,42 @@ public sealed class SiteRegressionTests
         Assert.Equal(left, document.GetElementById("icon")!.GetBoundingClientRect().Left, precision: 1);
     }
 
+    [Fact]
+    public async Task Float_AfterTextOnALine_IsPlacedOnThatLine()
+    {
+        // a close button floated right at the end of a dialog's title
+        var document = await OpenAsync("""
+            <h2 style="margin: 0; padding: 16px 32px; font-size: 16px; line-height: 20px">Title<a id="close" style="float: right">X</a></h2>
+            <div style="width: 300px; line-height: 20px"><span id="text">Some text</span><b id="left" style="float: left">F</b> more</div>
+            """);
+
+        var close = document.GetElementById("close")!.GetBoundingClientRect();
+        var left = document.GetElementById("left")!.GetBoundingClientRect();
+        var text = document.GetElementById("text")!.GetBoundingClientRect();
+
+        Assert.Equal(16d, close.Top, 1);
+        Assert.Equal(800d - 32d, close.Right, 1);
+        Assert.Equal(text.Top, left.Top, 1);
+        Assert.Equal(0d, left.Left, 1);
+        // what was before a left float on its line moves aside
+        Assert.Equal(left.Right, text.Left, 1);
+    }
+
+    [Fact]
+    public async Task PositionedBox_WithMaxHeightAndAutoMargins_IsCentered()
+    {
+        var document = await OpenAsync("""
+            <div id="dialog" style="position: fixed; top: 0; left: 0; right: 0; bottom: 0; margin: auto; max-width: 50%; max-height: 50%">Dialog</div>
+            """);
+
+        var dialog = document.GetElementById("dialog")!.GetBoundingClientRect();
+
+        Assert.Equal(200d, dialog.Left, 1);
+        Assert.Equal(150d, dialog.Top, 1);
+        Assert.Equal(400d, dialog.Width, 1);
+        Assert.Equal(300d, dialog.Height, 1);
+    }
+
     private static async Task<IDocument> OpenAsync(string body)
     {
         var context = BrowsingContext.New(Configuration.Default.WithCss().WithRenderDevice(Device));

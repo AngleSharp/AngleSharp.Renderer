@@ -2,6 +2,11 @@
 
 Released on Friday, November 13 2026.
 
+- Fixed a canvas not showing what was drawn into it: with scripting it is a replaced element painting its bitmap (as it is when the frame is rasterized, so drawing needs no layout), instead of its fallback content (e.g. "Your browser does not support the canvas element")
+- Fixed `getContext("2d")` giving a new context with an empty bitmap on every call, and `fill()` only drawing the outline of a path
+- Fixed a CSS transition started by a change confined to an out-of-flow box (e.g. a fixed side menu sliding in with `transform`) staying at its start value, as the patched frame did not ask for the frames to come; it also starts with the next frame, not at the time of the last full one
+- Fixed a float following text on a line (e.g. a close button with `float: right` at the end of a title) being placed below the line instead of on it when it fits there
+- Fixed an absolutely positioned box with `top` and `bottom`, `margin: auto` and a `max-height` (e.g. a dialog with `inset: 0`) not being centered vertically, as the free space was taken before the height was limited
 - Fixed `repeat(auto-fit, ...)` keeping one track per grid item, which wrapped items spanning several columns (e.g., a dashboard of tiles with `grid-column: span 2`); it keeps the columns the items span
 - Fixed implicit grid rows growing for items spanning several rows in document order, which made a tall item push later ones down; items spanning fewer rows come first, as in CSS Grid
 - Fixed a font family declared as several `@font-face` rules split by `unicode-range` (as Google Fonts does) drawing with the first rule's face, which lacked the letters of the text, so the text fell back to the next family; the face whose range covers a character draws it
@@ -11,6 +16,7 @@ Released on Friday, November 13 2026.
 - Fixed an image with a percentage `width` or `max-width` (e.g., `width: 100%`) widening a `1fr` grid track or other intrinsic size to its natural width: its min-content contribution is zero (compressible replaced elements, CSS Sizing 3)
 - Fixed `justify-content` (e.g., `place-content: center`) not placing the column of a grid without `grid-template-columns`, which always filled the container
 - Fixed a frame painted while an image's response was still being processed taking its stream, which left the image without its natural size (it then was laid out as a broken image)
+- Added the drawing API of `CanvasRenderingContext2D` for script (paths with arcs and curves, `fill`/`stroke`/`clip`, transformations, `globalAlpha`, composite operations, shadows, gradients, patterns, `fillText`/`strokeText`/`measureText` with the document's web fonts, `drawImage` of images and canvases, line styles), which before only exposed `save`/`restore` and the size
 
 # 0.11.2
 

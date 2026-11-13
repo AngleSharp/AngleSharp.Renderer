@@ -138,6 +138,11 @@ public sealed partial class HtmlRenderer
 
     private sealed record CachedImageResource(byte[]? Bytes, SvgVectorImage? VectorImage, string MimeType, int NaturalWidth, int NaturalHeight)
     {
+        /// <summary>
+        /// Gets the canvas whose bitmap this is, painted as it is when the frame is rasterized.
+        /// </summary>
+        public IHtmlCanvasElement? Canvas { get; init; }
+
         public CachedImageResource(byte[] bytes, string mimeType, int naturalWidth, int naturalHeight)
             : this(bytes, null, mimeType, naturalWidth, naturalHeight)
         {
@@ -148,7 +153,9 @@ public sealed partial class HtmlRenderer
         {
         }
 
-        public RenderedImage CreateImage(int width, int height) => VectorImage is { } vectorImage
+        public RenderedImage CreateImage(int width, int height) => Canvas is { } canvas
+            ? new RenderedImage(canvas, width, height)
+            : VectorImage is { } vectorImage
             ? new RenderedImage(vectorImage, width, height)
             : new RenderedImage(Bytes!, width, height, MimeType);
 
@@ -1782,6 +1789,18 @@ public sealed partial class HtmlRenderer
             if (!float.IsNaN(stretchTop) && !float.IsNaN(stretchBottom))
             {
                 resolvedContentHeight = Math.Max(0f, stretchContainingHeight - stretchTop - stretchBottom - positionedMargins.Top - positionedMargins.Bottom - verticalBorderAndPadding);
+
+                // the height is limited first, then auto margins take what is left (e.g. a dialog
+                // with inset: 0, margin: auto and max-height: 90% is centered)
+                var stretchMaximum = ResolveAuthoredDimension(styleMap, "max-height", heightReference, float.NaN, verticalBorderAndPadding);
+                var stretchMinimum = ResolveAuthoredDimension(styleMap, "min-height", heightReference, 0f, verticalBorderAndPadding);
+
+                if (!float.IsNaN(stretchMaximum))
+                {
+                    resolvedContentHeight = Math.Min(resolvedContentHeight, stretchMaximum);
+                }
+
+                resolvedContentHeight = Math.Max(resolvedContentHeight, stretchMinimum);
             }
         }
 
@@ -1941,7 +1960,7 @@ public sealed partial class HtmlRenderer
         // pseudo is not itself the foreign-namespaced SVG subtree, and must still get to paint its own
         // single synthetic text child below rather than being emptied out like the real <svg> root is.
         var orderedChildren = element is not IPseudoElement &&
-                               (string.Equals(tagName, "svg", StringComparison.OrdinalIgnoreCase) ||
+                               (HidesChildren(element) ||
                                PaintsOwnContent(formControlKind) ||
                                (formControlKind == FormControlKind.TextArea && ResolveChangedTextAreaValue(element) is not null))
             ? []
@@ -9434,6 +9453,7 @@ public sealed partial class HtmlRenderer
         ? s_generatedContentImages.TryGetValue(element, out _)
         : string.Equals(element.LocalName, "img", StringComparison.OrdinalIgnoreCase) ||
           string.Equals(element.LocalName, "svg", StringComparison.OrdinalIgnoreCase) ||
+          IsCanvas(element) ||
           (IsImageInput(element) && HasLoadableImageSource(element));
 
     private static bool HasLoadableImageSource(IElement element) =>
@@ -9446,7 +9466,8 @@ public sealed partial class HtmlRenderer
 
     private static bool TryResolveReplacedElementImage(ElementRenderNode node, Dictionary<string, string> styleMap, float containingWidth, float x, float y, out RenderedImage? image, out RenderRect rect, out RenderRect? clipRect) =>
         TryResolveImage(node, styleMap, containingWidth, x, y, out image, out rect, out clipRect) ||
-        TryResolveInlineSvg(node, styleMap, containingWidth, x, y, out image, out rect, out clipRect);
+        TryResolveInlineSvg(node, styleMap, containingWidth, x, y, out image, out rect, out clipRect) ||
+        TryResolveCanvas(node, styleMap, containingWidth, x, y, out image, out rect, out clipRect);
 
     private static bool TryResolveImage(ElementRenderNode node, Dictionary<string, string> styleMap, float containingWidth, float x, float y, out RenderedImage? image, out RenderRect rect, out RenderRect? clipRect)
     {

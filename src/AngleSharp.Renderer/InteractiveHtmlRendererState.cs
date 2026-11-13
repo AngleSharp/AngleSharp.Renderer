@@ -639,12 +639,22 @@ internal sealed partial class InteractiveHtmlRendererState : IDomHarness
 
     public RenderedFrame? UpdateFrame()
     {
-        var frame = UpdateLastFrame();
+        RenderedFrame? frame;
+        _transitionTracker.DeferStarts = true;
+
+        try
+        {
+            frame = UpdateLastFrame();
+        }
+        finally
+        {
+            _transitionTracker.DeferStarts = false;
+        }
 
         if (frame is not null)
         {
-            // an animation started by the changes needs the frames to come
-            frame.IsAnimating |= _animationTracker.HasRunningAnimations;
+            // an animation or transition started by the changes needs the frames to come
+            frame.IsAnimating |= _animationTracker.HasRunningAnimations || _transitionTracker.HasRunningTransitions;
             FrameUpdated?.Invoke(this, EventArgs.Empty);
         }
 
