@@ -2,6 +2,8 @@
 
 Released on Friday, November 13 2026.
 
+- Improved frames of pages changing the styles of positioned boxes by script, e.g. a game moving its sprites (Mario 5: about 10 ms instead of 150 ms per frame): changes of the same attribute between two frames are taken as one (more than 256 changes dropped the update of the frame, so every frame was laid out as a whole); a box moved by its inset (`left`, `top`, `right` or `bottom` in pixels, with the opposite one `auto`) is moved in the frame instead of laid out again with its content; a style attribute change that only paints differently (e.g. the `background-position` of a sprite) is painted again without a layout, also when the box moved at the same time; a box moved again is moved without computing its style when only its insets changed in its style attribute; the map of what can be hit is updated for the moved boxes only (a box that transitions or animates is laid out as before)
+- Fixed a box painted again with more or fewer commands than before (e.g. getting a `box-shadow` on hover) leaving the boxes around it with the wrong commands in the frame, so that a later change of them patched the frame wrongly
 - Improved deeply nested pages: about 70% more levels are laid out before the stack runs low, e.g. 72 instead of 42 nested blocks on a 1.5 MB stack (#58) @michaelthyregod
 - Fixed `getContext("2d")` giving a new context with an empty bitmap on every call, and `fill()` only drawing the outline of a path
 - Fixed a canvas not showing what was drawn into it: with scripting it is a replaced element painting its bitmap (as it is when the frame is rasterized, so drawing needs no layout), instead of its fallback content (e.g. "Your browser does not support the canvas element")

@@ -29,7 +29,7 @@ internal sealed partial class InteractiveHtmlRendererState : IDomHarness
     private RenderedFrame? _lastFrame;
     private HtmlRenderer.LayoutSnapshot? _lastFrameLayout;
     // the changes the observer delivered on its own, which the metrics have not seen yet
-    private readonly List<IMutationRecord> _pendingMutations = [];
+    private readonly PendingMutationList _pendingMutations = new();
     // the elements whose styles changed with their state (e.g. hovered) since the metrics were taken
     // (with if the styles of their descendants may have changed, too)
     private readonly Dictionary<IElement, bool> _pendingRestyles = new(ReferenceEqualityComparer.Instance);
@@ -725,7 +725,10 @@ internal sealed partial class InteractiveHtmlRendererState : IDomHarness
 
         if (_metrics is not null)
         {
-            _pendingMutations.AddRange(records);
+            foreach (var record in records)
+            {
+                _pendingMutations.Add(record);
+            }
 
             if (_pendingMutations.Count > MaxPendingMutations)
             {
@@ -767,5 +770,44 @@ internal sealed partial class InteractiveHtmlRendererState : IDomHarness
         }
 
         return value;
+    }
+
+    /// <summary>
+    /// The mutations since the layout was taken. A script changing the same attribute over and
+    /// over (e.g. a game moving its sprites by their style many times between two frames) leaves
+    /// one record of it: the oldest, which has the value the layout saw, while the value now is
+    /// read from the element.
+    /// </summary>
+    private sealed class PendingMutationList : List<IMutationRecord>
+    {
+        private readonly HashSet<(INode Target, string Name)> _attributes = new(TargetComparer.Instance);
+
+        public new void Add(IMutationRecord record)
+        {
+            if (record.Type == "attributes" && record.AttributeName is { } name && record.AttributeNamespace is null && !_attributes.Add((record.Target, name)))
+            {
+                return;
+            }
+
+            base.Add(record);
+        }
+
+        public new void Clear()
+        {
+            _attributes.Clear();
+            base.Clear();
+        }
+
+        // nodes compare by identity (Equals of a node tells if it is alike)
+        private sealed class TargetComparer : IEqualityComparer<(INode Target, string Name)>
+        {
+            public static readonly TargetComparer Instance = new();
+
+            public bool Equals((INode Target, string Name) x, (INode Target, string Name) y) =>
+                ReferenceEquals(x.Target, y.Target) && string.Equals(x.Name, y.Name, StringComparison.Ordinal);
+
+            public int GetHashCode((INode Target, string Name) obj) =>
+                HashCode.Combine(RuntimeHelpers.GetHashCode(obj.Target), obj.Name);
+        }
     }
 }

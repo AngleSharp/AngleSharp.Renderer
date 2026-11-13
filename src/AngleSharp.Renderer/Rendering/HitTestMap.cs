@@ -148,7 +148,6 @@ public sealed class HitTestMap
         bool ActsAsContainingBlock,
         bool IsScrolling,
         RenderRect Clip,
-        (int Step, int ZIndex, double Order) Rank,
         RenderTransform2D? Transform);
 
     // Fragments: where an inline box on several lines is (within Box), if it isn't transformed
@@ -214,19 +213,93 @@ public sealed class HitTestMap
 
     internal static HitTestMap Create(IDocument document, IReadOnlyDictionary<IElement, HtmlRenderer.ElementLayoutMetrics> metrics, IReadOnlyDictionary<IElement, Dictionary<string, string>> styleMaps, float offsetY, IReadOnlyDictionary<IElement, HtmlRenderer.SubframeEntry>? subframes = null)
     {
-        var order = GetDocumentOrder(document);
-        var unordered = (double)order.Count;
+        var builder = new EntryBuilder(metrics, styleMaps, offsetY, subframes, GetDocumentOrder(document));
         var candidates = new List<(Entry Entry, (int Step, int ZIndex, double Order)[] Key)>(metrics.Count);
-        // what the walks from the boxes up to the root ask of an ancestor, once for each of them
-        var ancestors = new Dictionary<IElement, AncestorInfo?>(ReferenceEqualityComparer.Instance);
 
         foreach (var (element, elementMetrics) in metrics)
         {
-            if (elementMetrics.Layer.IsHidden)
+            if (!elementMetrics.Layer.IsHidden)
+            {
+                candidates.Add(builder.Build(element, elementMetrics));
+            }
+        }
+
+        // top-most first; ties (which only unordered elements can have) keep the first one on top
+        var indexed = candidates.Select((m, i) => (m.Entry, m.Key, Index: i)).ToList();
+        indexed.Sort((a, b) =>
+        {
+            var result = ComparePaintOrder(b.Key, a.Key);
+            return result != 0 ? result : a.Index.CompareTo(b.Index);
+        });
+        return new HitTestMap(indexed.Select(m => m.Entry).ToArray());
+    }
+
+    /// <summary>
+    /// The map with the boxes in the subtrees of the given elements where the metrics have them
+    /// now, e.g. after the elements were moved: what can be hit and in which order is the same,
+    /// so the other boxes and the order are kept. Null if the map can't be updated so (it was
+    /// shifted, or a box in the subtrees is not in it as it was).
+    /// </summary>
+    internal HitTestMap? WithMovedBoxes(IReadOnlyCollection<IElement> roots, IReadOnlyDictionary<IElement, HtmlRenderer.ElementLayoutMetrics> metrics, IReadOnlyDictionary<IElement, Dictionary<string, string>> styleMaps, float offsetY)
+    {
+        if (_offsetY != 0f)
+        {
+            return null;
+        }
+
+        var builder = new EntryBuilder(metrics, styleMaps, offsetY, null, null);
+        var entries = (Entry[])_entries.Clone();
+
+        for (var index = 0; index < entries.Length; index++)
+        {
+            var entry = entries[index];
+
+            if (!IsInAny(roots, entry.Element))
             {
                 continue;
             }
 
+            if (entry.Subframe is not null || !metrics.TryGetValue(entry.Element, out var elementMetrics) || elementMetrics.Layer.IsHidden)
+            {
+                return null;
+            }
+
+            entries[index] = builder.Build(entry.Element, elementMetrics, withKey: false).Entry;
+        }
+
+        return new HitTestMap(entries);
+
+        static bool IsInAny(IReadOnlyCollection<IElement> roots, IElement element)
+        {
+            var host = element is IPseudoElement ? element.ParentElement : element;
+
+            foreach (var root in roots)
+            {
+                if (host is not null && (ReferenceEquals(root, host) || root.Contains(host)))
+                {
+                    return true;
+                }
+            }
+
+            return false;
+        }
+    }
+
+    // Makes the entry of a box (and the key it is ordered by): where it can be hit, clipped by the
+    // boxes around it, and what it is in.
+    private sealed class EntryBuilder(
+        IReadOnlyDictionary<IElement, HtmlRenderer.ElementLayoutMetrics> metrics,
+        IReadOnlyDictionary<IElement, Dictionary<string, string>> styleMaps,
+        float offsetY,
+        IReadOnlyDictionary<IElement, HtmlRenderer.SubframeEntry>? subframes,
+        Dictionary<IElement, (int Start, int End)>? order)
+    {
+        // what the walks from the boxes up to the root ask of an ancestor, once for each of them
+        private readonly Dictionary<IElement, AncestorInfo?> _ancestors = new(ReferenceEqualityComparer.Instance);
+        private readonly double _unordered = order?.Count ?? 0;
+
+        public (Entry Entry, (int Step, int ZIndex, double Order)[] Key) Build(IElement element, HtmlRenderer.ElementLayoutMetrics elementMetrics, bool withKey = true)
+        {
             var box = new RenderRect(elementMetrics.BorderBoxX, elementMetrics.BorderBoxY + offsetY, elementMetrics.BorderBoxWidth, elementMetrics.BorderBoxHeight);
             var clip = new RenderRect(-Unbounded, -Unbounded, 2 * Unbounded, 2 * Unbounded);
             var fragments = elementMetrics.Fragments?.Select(fragment => new RenderRect(box.X + fragment.X, box.Y + fragment.Y, fragment.Width, fragment.Height)).ToArray();
@@ -237,7 +310,7 @@ public sealed class HitTestMap
                 fragments = null;
             }
 
-            var path = new List<(int Step, int ZIndex, double Order)> { (1, 0, GetOrder(element)) };
+            var path = withKey ? new List<(int Step, int ZIndex, double Order)> { (1, 0, GetOrder(element)) } : null;
             var isInScrollContainer = false;
             var isViewportAnchored = IsFixed(styleMaps, element);
 
@@ -265,9 +338,9 @@ public sealed class HitTestMap
                     clip = Intersect(clip, info.Clip);
                 }
 
-                if (ancestorMetrics.Layer.IsLayerRoot)
+                if (path is not null && ancestorMetrics.Layer.IsLayerRoot)
                 {
-                    path.Add(info.Rank);
+                    path.Add(GetRank(ancestor, ancestorMetrics.Layer));
                 }
 
                 // what is in a transformed box is hit where it is painted
@@ -284,12 +357,12 @@ public sealed class HitTestMap
                 }
             }
 
-            if (elementMetrics.Layer.IsLayerRoot)
+            if (path is not null && elementMetrics.Layer.IsLayerRoot)
             {
                 path[0] = GetRank(element, elementMetrics.Layer);
             }
 
-            path.Reverse();
+            path?.Reverse();
             var cursor = styleMaps.TryGetValue(element, out var styleMap) && styleMap.TryGetValue("cursor", out var value)
                 ? value.Trim().ToLowerInvariant()
                 : "auto";
@@ -299,28 +372,19 @@ public sealed class HitTestMap
                 box.Y + elementMetrics.BorderTop + elementMetrics.PaddingTop,
                 Math.Max(0f, box.Width - elementMetrics.BorderLeft - elementMetrics.BorderRight - elementMetrics.PaddingLeft - elementMetrics.PaddingRight),
                 Math.Max(0f, box.Height - elementMetrics.BorderTop - elementMetrics.BorderBottom - elementMetrics.PaddingTop - elementMetrics.PaddingBottom));
-            candidates.Add((new Entry(element, box, clip, cursor, isInScrollContainer, isViewportAnchored, subframe, frameViewport, fragments), path.ToArray()));
+            return (new Entry(element, box, clip, cursor, isInScrollContainer, isViewportAnchored, subframe, frameViewport, fragments), path?.ToArray() ?? []);
         }
 
-        // top-most first; ties (which only unordered elements can have) keep the first one on top
-        var indexed = candidates.Select((m, i) => (m.Entry, m.Key, Index: i)).ToList();
-        indexed.Sort((a, b) =>
+        private AncestorInfo? GetAncestorInfo(IElement ancestor)
         {
-            var result = ComparePaintOrder(b.Key, a.Key);
-            return result != 0 ? result : a.Index.CompareTo(b.Index);
-        });
-        return new HitTestMap(indexed.Select(m => m.Entry).ToArray());
-
-        AncestorInfo? GetAncestorInfo(IElement ancestor)
-        {
-            if (ancestors.TryGetValue(ancestor, out var info))
+            if (_ancestors.TryGetValue(ancestor, out var info))
             {
                 return info;
             }
 
             if (!metrics.TryGetValue(ancestor, out var ancestorMetrics))
             {
-                ancestors[ancestor] = null;
+                _ancestors[ancestor] = null;
                 return null;
             }
 
@@ -337,14 +401,18 @@ public sealed class HitTestMap
                     ancestorMetrics.BorderBoxY + ancestorMetrics.BorderTop + offsetY,
                     ancestorMetrics.BorderBoxWidth - ancestorMetrics.BorderLeft - ancestorMetrics.BorderRight,
                     ancestorMetrics.BorderBoxHeight - ancestorMetrics.BorderTop - ancestorMetrics.BorderBottom),
-                ancestorMetrics.Layer.IsLayerRoot ? GetRank(ancestor, ancestorMetrics.Layer) : default,
                 GetTransform(styleMaps, ancestor, ancestorMetrics, offsetY));
-            ancestors[ancestor] = info;
+            _ancestors[ancestor] = info;
             return info;
         }
 
-        double GetOrder(IElement element)
+        private double GetOrder(IElement element)
         {
+            if (order is null)
+            {
+                return _unordered;
+            }
+
             if (order.TryGetValue(element, out var index))
             {
                 return index.Start;
@@ -359,10 +427,10 @@ public sealed class HitTestMap
                     : hostIndex.End + 0.5;
             }
 
-            return unordered;
+            return _unordered;
         }
 
-        (int Step, int ZIndex, double Order) GetRank(IElement element, HtmlRenderer.HitTestLayer layer)
+        private (int Step, int ZIndex, double Order) GetRank(IElement element, HtmlRenderer.HitTestLayer layer)
         {
             // (step, z-index) within the stacking context: negative z, in flow, positioned or 0, positive z
             var step = layer.ZIndex < 0 ? 0 : layer.ZIndex > 0 ? 3 : 2;

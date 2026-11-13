@@ -145,6 +145,7 @@ public sealed partial class HtmlRenderer
         var displayList = new DisplayList { Fonts = frame.DisplayList.Fonts };
         displayList.InsertRange(0, frame.DisplayList.Commands);
         var isRepaintOnly = snapshot.IsRepaintOnly;
+        var movedBoxes = snapshot.GetMovedOnly();
         var start = RenderMetricsRecorder.Now;
 
         if (!snapshot.TryPatch(displayList))
@@ -162,12 +163,16 @@ public sealed partial class HtmlRenderer
 
         snapshot.ResolveSubframes();
 
-        var updated = CreateFrame(document, snapshot, displayList, frame.ScrollTop, frame.OverscanTop, isIncremental: true);
+        // the boxes that moved are elsewhere in the frame's map, all else is where it was
+        var hitTestMap = movedBoxes is not null && snapshot.Subframes.Count == 0
+            ? frame.HitTestMap.WithMovedBoxes(movedBoxes, snapshot.LayoutMetrics, snapshot.StyleMaps, -frame.OverscanTop)
+            : null;
+        var updated = CreateFrame(document, snapshot, displayList, frame.ScrollTop, frame.OverscanTop, isIncremental: true, hitTestMap);
         updated.IsAnimating = frame.IsAnimating;
         return updated;
     }
 
-    private RenderedFrame CreateFrame(IDocument document, LayoutSnapshot snapshot, DisplayList displayList, double scrollTop, int overscan, bool isIncremental = false)
+    private RenderedFrame CreateFrame(IDocument document, LayoutSnapshot snapshot, DisplayList displayList, double scrollTop, int overscan, bool isIncremental = false, HitTestMap? hitTestMap = null)
     {
         var recorder = snapshot.TakeMetrics();
         var hitTestingStart = RenderMetricsRecorder.Now;
@@ -201,7 +206,7 @@ public sealed partial class HtmlRenderer
             }
         }
 
-        var hitTestMap = HitTestMap.Create(document, metrics, styleMaps, -overscan, snapshot.Subframes);
+        hitTestMap ??= HitTestMap.Create(document, metrics, styleMaps, -overscan, snapshot.Subframes);
         var contentHeight = Math.Max(height, (double)contentBottom);
         recorder.HitTesting += RenderMetricsRecorder.Since(hitTestingStart);
         // fixed boxes are marked in the display list, sticky ones would have to stick anew
