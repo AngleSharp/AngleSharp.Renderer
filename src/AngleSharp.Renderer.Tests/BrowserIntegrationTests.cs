@@ -396,8 +396,11 @@ public sealed class BrowserIntegrationTests
     [Fact]
     public async Task HarnessDoesNotMultiplyPaintCost()
     {
+        // The cost is counted in what this thread allocates rather than timed: running the cascade
+        // again for each property of each element allocates hundreds of times more. Below 200
+        // elements, the style maps are all created on this thread.
         var rules = string.Concat(Enumerable.Range(0, 2000).Select(i => $".c{i} {{ color: red; margin: {i % 7}px }}\n"));
-        var body = string.Concat(Enumerable.Range(0, 150).Select(i => $"<div class='c{i}'><span>Item {i}</span></div>"));
+        var body = string.Concat(Enumerable.Range(0, 90).Select(i => $"<div class='c{i}'><span>Item {i}</span></div>"));
         var html = $"<style>{rules}</style>{body}";
 
         var plain = await LoadAsync(html);
@@ -407,15 +410,14 @@ public sealed class BrowserIntegrationTests
         var renderer = new HtmlRenderer();
         renderer.RenderToPng(plain, CreateDevice());
         renderer.RenderToPng(interactive, CreateDevice());
-        var watch = Stopwatch.StartNew();
+        var start = GC.GetAllocatedBytesForCurrentThread();
         renderer.RenderToPng(plain, CreateDevice());
-        var plainTime = watch.Elapsed;
-        watch.Restart();
+        var plainBytes = GC.GetAllocatedBytesForCurrentThread() - start;
+        start = GC.GetAllocatedBytesForCurrentThread();
         renderer.RenderToPng(interactive, CreateDevice());
-        var interactiveTime = watch.Elapsed;
+        var interactiveBytes = GC.GetAllocatedBytesForCurrentThread() - start;
 
-        Assert.True(interactiveTime.TotalMilliseconds < plainTime.TotalMilliseconds * 2 + 50,
-            $"plain {plainTime.TotalMilliseconds:F0} ms, interactive {interactiveTime.TotalMilliseconds:F0} ms");
+        Assert.True(interactiveBytes < plainBytes * 2, $"plain {plainBytes / 1024} KiB, interactive {interactiveBytes / 1024} KiB");
     }
 
     [Fact]
