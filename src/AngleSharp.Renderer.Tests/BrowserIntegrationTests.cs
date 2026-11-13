@@ -641,6 +641,48 @@ public sealed class BrowserIntegrationTests
         Assert.Equal(SKColors.Blue, rendered.GetPixel(150, 90));
     }
 
+    [Theory]
+    [InlineData("float: left")]
+    [InlineData("display: inline-block")]
+    [InlineData("")]
+    public async Task APositionedBoxInABoxOfTheFlowIsPaintedAboveALaterBlock(string style)
+    {
+        // Tower Defense: the card shown for a floated tower button is painted above the buttons
+        // after it, with the positioned boxes of the flow around it (CSS 2.2 Appendix E)
+        var document = await LoadAsync($"<style>body {{ margin: 0; background: white }}</style><div style='height: 40px'><div style='{style}; width: 100px; height: 40px'><div style='position: relative; width: 100px; height: 100px; background: red'></div></div></div><div style='height: 50px; background: blue'></div>");
+
+        using var rendered = SKBitmap.Decode(Render(document));
+        Assert.Equal(SKColors.Red, rendered.GetPixel(50, 60));
+        Assert.Equal(SKColors.Blue, rendered.GetPixel(150, 60));
+    }
+
+    [Fact]
+    public async Task APositionedBoxPaintedWithTheFlowStaysInTheEffectsOfItsBox()
+    {
+        // only boxes opening no scope (e.g. an opacity) let it paint with the flow around them
+        var document = await LoadAsync("<style>body { margin: 0; background: white }</style><div style='float: left; opacity: 0.5; width: 100px; height: 40px'><div style='position: relative; width: 100px; height: 100px; background: red'></div></div>");
+
+        using var rendered = SKBitmap.Decode(Render(document));
+        var color = rendered.GetPixel(50, 60);
+        Assert.Equal(255, color.Red);
+        Assert.InRange(color.Green, 100, 160);
+    }
+
+    [Fact]
+    public async Task APositionedBoxShownInAFloatIsPaintedAboveALaterBlockInTheNextFrame()
+    {
+        var document = await LoadAsync("<style>body { margin: 0; background: white } #card { display: none; position: relative; width: 100px; height: 100px; background: red } .shown #card { display: block }</style><div style='height: 40px'><div id=f style='float: left; width: 100px; height: 40px'><div id=card></div></div></div><div style='height: 50px; background: blue'></div>");
+        var harness = document.Context.GetDomHarness();
+        harness.PrepareFrame();
+
+        document.GetElementById("f")!.ClassList.Add("shown");
+        var frame = harness.UpdateFrame() ?? harness.PrepareFrame();
+        var pixels = frame.Rasterize();
+        var offset = ((60 + frame.OverscanTop) * pixels.Width + 50) * 4;
+
+        Assert.Equal(new byte[] { 255, 0, 0, 255 }, pixels.Data.Skip(offset).Take(4).ToArray());
+    }
+
     [Fact]
     public async Task AnAbsoluteBoxAtItsStaticPositionKeepsItsMargins()
     {

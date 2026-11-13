@@ -264,7 +264,13 @@ public sealed partial class HtmlRenderer
 
         // if the decorations of the boxes are marked, which only a frame needs (see PaintBoxDecorations)
         public bool RecordsPaintAnchors { get; init; }
+
+        // the positioned boxes painting last in a flow, which the flow around its box paints last
+        // in turn if that box opens no scope around them (see PaintOrder)
+        public List<HoistCandidate> HoistCandidates { get; } = [];
     }
+
+    private readonly record struct HoistCandidate(DisplayList DisplayList, int Z, RenderCommand First, int Count, IElement Element);
 
     /// <summary>
     /// The lines a box with `-webkit-line-clamp` has left for its content. Every line laid out
@@ -8895,6 +8901,9 @@ public sealed partial class HtmlRenderer
         private const int FloatLayer = int.MinValue;
 
         private readonly List<(int Z, int Order, RenderCommand First, int Count, IElement Element)> _raised = [];
+        private LayoutContext? _context;
+        // if boxes were taken out of the children, whose ranges then hold theirs (see Hoist)
+        private bool _hasHoisted;
 
         /// <summary>Gets the children moved to the end, in the order they paint (once applied).</summary>
         public IReadOnlyList<RaisedChild> Applied { get; private set; } = [];
@@ -8902,6 +8911,7 @@ public sealed partial class HtmlRenderer
         public void Track(IRenderNode child, DisplayList displayList, int start, LayoutContext context, bool isBlockFlow = false)
         {
             var count = displayList.Commands.Count - start;
+            _context = context;
 
             if (count > 0 && child is ElementRenderNode element && !IsStickyElement(child, context))
             {
@@ -8912,11 +8922,129 @@ public sealed partial class HtmlRenderer
                 {
                     _raised.Add((ParseZIndex(styleMap), _raised.Count, displayList.Commands[start], count, element.Ref));
                 }
-                else if (isBlockFlow && IsFloated(styleMap) && !IsOutOfFlowPositioned(styleMap) && !IsRelativePositioned(styleMap) && !HasExplicitZIndex(styleMap))
+                else if (!HasExplicitZIndex(styleMap))
                 {
-                    _raised.Add((FloatLayer, _raised.Count, displayList.Commands[start], count, element.Ref));
+                    if (isBlockFlow && IsFloated(styleMap) && !IsOutOfFlowPositioned(styleMap) && !IsRelativePositioned(styleMap))
+                    {
+                        _raised.Add((FloatLayer, _raised.Count, displayList.Commands[start], count, element.Ref));
+                    }
+
+                    // the positioned boxes in it paint with those of this flow (e.g. a tooltip in a
+                    // floated button above the blocks after it, CSS 2.2 Appendix E)
+                    Hoist(element.Ref, displayList, start, count, context);
+                    return;
                 }
             }
+
+            if (child is ElementRenderNode other)
+            {
+                Hoist(other.Ref, null, 0, 0, context);
+            }
+        }
+
+        // Takes the positioned boxes painting last in the box of a child (not a stacking context
+        // itself) as children of this flow, if the box opens no scope around them (e.g. a clip, an
+        // opacity or a transform); those that stay in it are no candidates anymore.
+        private void Hoist(IElement box, DisplayList? displayList, int start, int count, LayoutContext context)
+        {
+            var candidates = context.HoistCandidates;
+
+            if (candidates.Count == 0)
+            {
+                return;
+            }
+
+            List<HoistCandidate>? inside = null;
+
+            for (var index = candidates.Count - 1; index >= 0; index--)
+            {
+                var candidate = candidates[index];
+
+                if (!ReferenceEquals(candidate.Element, box) && box.Contains(candidate.Element))
+                {
+                    candidates.RemoveAt(index);
+
+                    if (ReferenceEquals(candidate.DisplayList, displayList))
+                    {
+                        (inside ??= []).Add(candidate);
+                    }
+                }
+            }
+
+            if (inside is null)
+            {
+                return;
+            }
+
+            var commands = displayList!.Commands;
+
+            for (var index = inside.Count - 1; index >= 0; index--)
+            {
+                var candidate = inside[index];
+
+                if (IndexOf(commands, candidate.First, start, count) is >= 0 and var position &&
+                    position + candidate.Count <= start + count && !HasOpenScope(commands, start, position))
+                {
+                    _raised.Add((candidate.Z, _raised.Count, candidate.First, candidate.Count, candidate.Element));
+                    _hasHoisted = true;
+                    ForgetRanges(candidate.Element.ParentElement, box);
+                }
+            }
+        }
+
+        // the boxes it leaves no longer have their commands in one piece, which a frame can't
+        // replace: an enclosing box is laid out again instead (see LayoutSnapshot)
+        private static void ForgetRanges(IElement? from, IElement to)
+        {
+            if (s_layoutCapture.Value is not { Entries: { } entries, Ranges: { } ranges })
+            {
+                return;
+            }
+
+            for (var current = from; current is not null; current = current.ParentElement)
+            {
+                entries.Remove(current);
+                ranges.Remove(current);
+
+                if (ReferenceEquals(current, to))
+                {
+                    break;
+                }
+            }
+        }
+
+        private static bool HasOpenScope(IReadOnlyList<RenderCommand> commands, int start, int end)
+        {
+            var depth = 0;
+
+            for (var index = start; index < end; index++)
+            {
+                var name = commands[index].GetType().Name;
+
+                if (name.StartsWith("Push", StringComparison.Ordinal))
+                {
+                    depth++;
+                }
+                else if (name.StartsWith("Pop", StringComparison.Ordinal))
+                {
+                    depth--;
+                }
+            }
+
+            return depth != 0;
+        }
+
+        private static int IndexOf(IReadOnlyList<RenderCommand> commands, RenderCommand command, int start, int count)
+        {
+            for (var index = Math.Min(commands.Count, start + count) - 1; index >= start; index--)
+            {
+                if (ReferenceEquals(commands[index], command))
+                {
+                    return index;
+                }
+            }
+
+            return -1;
         }
 
         public void Apply(DisplayList displayList)
@@ -8950,27 +9078,78 @@ public sealed partial class HtmlRenderer
                 }
             }
 
-            var ranges = new List<(int StartIndex, int Count)>(ordered.Count);
-            var expected = -1;
-            var inPlace = true;
+            var located = new List<(int StartIndex, int Count)>(ordered.Count);
 
             foreach (var (_, _, first, count, _) in ordered)
             {
                 var index = starts[first];
+                located.Add(index >= 0 ? (index, Math.Min(count, commands.Count - index)) : (-1, 0));
+            }
 
-                if (index >= 0)
+            var ranges = new List<(int StartIndex, int Count)>(ordered.Count);
+            var expected = -1;
+            var inPlace = true;
+
+            for (var item = 0; item < located.Count; item++)
+            {
+                var (index, count) = located[item];
+
+                if (index < 0)
                 {
-                    var range = (index, Math.Min(count, commands.Count - index));
-                    // already painting last, in this order (e.g. only raised children)
-                    inPlace &= expected < 0 || index == expected;
-                    expected = index + range.Item2;
-                    ranges.Add(range);
+                    continue;
                 }
+
+                // a float keeps what was taken out of it to paint above it (see Hoist)
+                var end = index + count;
+
+                if (!_hasHoisted)
+                {
+                    AddRange((index, count));
+                    continue;
+                }
+
+                var holes = located.Where((other, at) => at != item && other.StartIndex >= index && other.StartIndex + other.Count <= end && (other.Count < count || at > item))
+                    .OrderBy(other => other.StartIndex).ToList();
+
+                foreach (var hole in holes)
+                {
+                    if (hole.StartIndex > index)
+                    {
+                        AddRange((index, hole.StartIndex - index));
+                    }
+
+                    index = Math.Max(index, hole.StartIndex + hole.Count);
+                }
+
+                if (end > index)
+                {
+                    AddRange((index, end - index));
+                }
+            }
+
+            void AddRange((int StartIndex, int Count) range)
+            {
+                // already painting last, in this order (e.g. only raised children)
+                inPlace &= expected < 0 || range.StartIndex == expected;
+                expected = range.StartIndex + range.Count;
+                ranges.Add(range);
             }
 
             if (ranges.Count > 0 && !(inPlace && expected == commands.Count))
             {
                 displayList.MoveRangesToEnd(ranges);
+            }
+
+            // the positioned ones may paint with the flow around this one in turn
+            if (_context is { } context)
+            {
+                foreach (var (z, _, first, count, element) in ordered)
+                {
+                    if (z != FloatLayer)
+                    {
+                        context.HoistCandidates.Add(new HoistCandidate(displayList, z, first, count, element));
+                    }
+                }
             }
         }
     }

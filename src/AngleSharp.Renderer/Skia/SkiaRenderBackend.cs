@@ -1070,7 +1070,10 @@ public sealed partial class SkiaRenderBackend : IPixelRenderBackend, ITextMeasur
             // what was drawn into the canvas until now; nothing drawn is transparent
             if (command.Image.GetCanvasSnapshot() is { } bitmap)
             {
-                using var bitmapPaint = new SKPaint { IsAntialias = true, FilterQuality = SKFilterQuality.Medium };
+                // a new snapshot each frame (e.g. of a game): mipmaps would be built again for each
+                // one, and anti-aliased edges at a fractional position take Skia ten times as long
+                var matrix = canvas.TotalMatrix;
+                using var bitmapPaint = new SKPaint { IsAntialias = matrix.SkewX != 0f || matrix.SkewY != 0f, FilterQuality = SKFilterQuality.Low };
                 canvas.DrawImage(bitmap, rect, bitmapPaint);
             }
 

@@ -101,6 +101,105 @@ public sealed class StyleAttributeUpdateTests
     }
 
     [Fact]
+    public async Task ABoxRemovedAfterItsStyleChangedStillPatchesTheFrame()
+    {
+        var (document, harness) = await OpenAsync(Scene);
+        harness.PrepareFrame();
+        var enemy = document.GetElementById("enemy")!;
+
+        // e.g. a coin moving up once more before the game removes it
+        enemy.GetStyle().SetProperty("bottom", "30px");
+        enemy.GetStyle().SetProperty("background-position", "-16px 0px");
+        enemy.Remove();
+
+        AssertSameAsFullLayout(document, harness, harness.UpdateFrame());
+    }
+
+    [Theory]
+    [InlineData("")]
+    [InlineData(".was-validated :valid ~ .valid-feedback { display: block }")]
+    [InlineData("li:first-child, .tile + .other, .menu:empty { color: red }")]
+    public async Task RemovingAPositionedBoxTakesItsCommandsOutWithoutALayout(string rule)
+    {
+        // a coin of Mario 5 disappearing, one of hundreds of sprites of the world (with the
+        // structural rules of Bootstrap matching none of them)
+        var (document, harness) = await OpenAsync(Scene.Replace("</style>", rule + "</style>"));
+        harness.PrepareFrame();
+
+        document.GetElementById("enemy")!.Remove();
+        var patched = harness.UpdateFrame();
+
+        Assert.NotNull(patched);
+        Assert.Equal(TimeSpan.Zero, patched!.Metrics.Style);
+        AssertSameAsFullLayout(document, harness, patched);
+    }
+
+    [Fact]
+    public async Task ChangesAfterARemovedBoxStillPatchTheFrame()
+    {
+        var (document, harness) = await OpenAsync(Scene);
+        harness.PrepareFrame();
+
+        document.GetElementById("first")!.Remove();
+        harness.UpdateFrame();
+        document.GetElementById("world")!.GetStyle().SetProperty("left", "-20px");
+        document.GetElementById("hero")!.GetStyle().SetProperty("background-position", "-16px 0px");
+        document.GetElementById("label")!.TextContent = "Score 100";
+
+        AssertSameAsFullLayout(document, harness, harness.UpdateFrame());
+    }
+
+    [Theory]
+    [InlineData(".figure:last-child { background: rgb(255, 0, 0) }")]
+    [InlineData(".tile + .figure { background: rgb(255, 0, 0) }")]
+    [InlineData(".world:empty { display: none }")]
+    [InlineData(":nth-child(2) { outline: 2px solid red }")]
+    public async Task RemovingABoxOthersAreMatchedByIsLaidOut(string rule)
+    {
+        var (document, harness) = await OpenAsync(Scene.Replace("</style>", rule + "</style>"));
+        harness.PrepareFrame();
+
+        document.GetElementById("enemy")!.Remove();
+        document.GetElementById("label")!.Remove();
+
+        AssertSameAsFullLayout(document, harness, harness.UpdateFrame());
+    }
+
+    [Fact]
+    public async Task ABoxShownInAMovedBoxMovesWithIt()
+    {
+        // the figure is painted inside the translation the world got for its move
+        var (document, harness) = await OpenAsync(Scene.Replace("id=\"hero\" style=\"", "id=\"hero\" style=\"display: none; "));
+        harness.PrepareFrame();
+
+        document.GetElementById("hero")!.GetStyle().SetProperty("display", "block");
+        document.GetElementById("world")!.GetStyle().SetProperty("left", "-55.5px");
+
+        AssertSameAsFullLayout(document, harness, harness.UpdateFrame());
+    }
+
+    [Fact]
+    public async Task ABoxRemovedWhileItsParentIsLaidOutAgainPatchesTheFrame()
+    {
+        var (document, harness) = await OpenAsync(Scene);
+        harness.PrepareFrame();
+        var world = document.GetElementById("world")!;
+        var coin = document.CreateElement("div");
+        coin.ClassName = "tile";
+        coin.SetAttribute("style", "left: 59px; bottom: 44px");
+        world.AppendChild(coin);
+        harness.UpdateFrame();
+
+        var other = document.CreateElement("div");
+        other.ClassName = "tile";
+        other.SetAttribute("style", "left: 142px; bottom: 17px");
+        world.AppendChild(other);
+        coin.Remove();
+
+        AssertSameAsFullLayout(document, harness, harness.UpdateFrame());
+    }
+
+    [Fact]
     public async Task AnInsetOverriddenByARuleDoesNotMoveTheBox()
     {
         var (document, harness) = await OpenAsync(Scene.Replace("</style>", "#hero { left: 60px !important; }</style>"));
@@ -288,6 +387,116 @@ public sealed class StyleAttributeUpdateTests
 
             switch (random.Next(9))
             {
+                case 0:
+                    figure.SetProperty("left", Px(random.Next(0, 300)));
+                    break;
+                case 1:
+                    figure.SetProperty("left", Px(random.Next(0, 300)));
+                    figure.SetProperty("background-position", Px(-16 * random.Next(2)) + " 0px");
+                    break;
+                case 2:
+                    figure.SetProperty("bottom", Px(random.Next(0, 80)));
+                    figure.SetProperty("width", Px(random.Next(12, 20)));
+                    break;
+                case 3:
+                    figure.SetProperty("display", random.Next(2) == 0 ? "none" : "block");
+                    break;
+                case 4:
+                    tile.SetProperty("background-position", Px(-20 * random.Next(2)) + " 0px");
+                    break;
+                case 5:
+                    tile.SetProperty("left", Px(random.Next(0, 300)));
+                    break;
+                case 6:
+                    document.GetElementById("world")!.GetStyle().SetProperty("left", Px(-random.Next(0, 300) / 2.0));
+                    break;
+                case 7:
+                    document.GetElementById("coins")!.TextContent = random.Next(100).ToString(CultureInfo.InvariantCulture);
+                    break;
+                default:
+                    figure.SetProperty("box-shadow", random.Next(2) == 0 ? "none" : "1px 1px 0px rgb(0, 0, 0)");
+                    break;
+            }
+
+            // a frame now and then, as the changes come in between frames
+            if (random.Next(3) == 0 && harness.UpdateFrame() is null)
+            {
+                harness.PrepareFrame();
+            }
+        }
+
+        AssertSameAsFullLayout(document, harness, harness.UpdateFrame() ?? harness.PrepareFrame());
+    }
+
+    [Theory]
+    [InlineData(1)]
+    [InlineData(2)]
+    [InlineData(3)]
+    [InlineData(4)]
+    [InlineData(5)]
+    [InlineData(6)]
+    [InlineData(7)]
+    [InlineData(8)]
+    public async Task RandomCoinsOfAGameAreWhatALayoutShows(int seed)
+    {
+        // a game whose coins come and go, while the rest changes
+        var world = new System.Text.StringBuilder();
+
+        for (var i = 0; i < 10; i++)
+        {
+            world.Append(CultureInfo.InvariantCulture, $"<div class=\"tile\" id=\"c{i}\" style=\"left: {15 + i * 25}px; bottom: {60 + (i % 2) * 20}px\"></div> ");
+        }
+
+        for (var i = 0; i < 12; i++)
+        {
+            world.Append(CultureInfo.InvariantCulture, $"<div class=\"tile\" id=\"t{i}\" style=\"left: {i * 20}px; bottom: {(i % 3) * 20}px\"></div>");
+        }
+
+        for (var i = 0; i < 5; i++)
+        {
+            world.Append(CultureInfo.InvariantCulture, $"<div class=\"figure\" id=\"f{i}\" style=\"left: {30 + i * 40}px; bottom: 20px; background-position: 0px 0px{(i == 4 ? "; display: none" : "")}\"></div>");
+        }
+
+        var page = Scene[..Scene.IndexOf("<div class=\"game\"", StringComparison.Ordinal)] + $"""
+            <div class="game" id="game">
+              <div class="world" id="world" style="left: 0px">{world}</div>
+              <div class="gauge" id="coins" style="position: absolute; left: 10px; top: 10px; z-index: 1000; width: 30px; height: 12px; background: rgb(0, 0, 0)">0</div>
+              <div class="gauge" id="lives" style="position: absolute; right: 10px; top: 10px; z-index: 1000; width: 30px; height: 12px; background: rgb(200, 0, 0)"></div>
+            </div>
+            """;
+        var (document, harness) = await OpenAsync(page);
+        harness.PrepareFrame();
+        var random = new Random(seed);
+        string Px(double value) => value.ToString(CultureInfo.InvariantCulture) + "px";
+        var coins = Enumerable.Range(0, 10).Select(i => document.GetElementById($"c{i}")!).ToList();
+
+        for (var step = 0; step < 40; step++)
+        {
+            var figure = document.GetElementById($"f{random.Next(5)}")!.GetStyle();
+            var tile = document.GetElementById($"t{random.Next(12)}")!.GetStyle();
+
+            switch (random.Next(12))
+            {
+                case 9:
+                    // a coin popping out of a box
+                    var added = document.CreateElement("div");
+                    added.ClassName = "tile";
+                    added.SetAttribute("style", $"left: {Px(random.Next(0, 300))}; bottom: {Px(random.Next(0, 100))}");
+                    document.GetElementById("world")!.AppendChild(added);
+                    coins.Add(added);
+                    break;
+                case >= 10 when coins.Count > 0:
+                    var coin = coins[random.Next(coins.Count)];
+
+                    // sometimes moved once more before it is removed
+                    if (random.Next(2) == 0)
+                    {
+                        coin.GetStyle().SetProperty("bottom", Px(random.Next(0, 100)));
+                    }
+
+                    coin.Remove();
+                    coins.Remove(coin);
+                    break;
                 case 0:
                     figure.SetProperty("left", Px(random.Next(0, 300)));
                     break;

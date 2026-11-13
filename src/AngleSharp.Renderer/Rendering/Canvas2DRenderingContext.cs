@@ -1184,8 +1184,12 @@ public sealed class Canvas2DRenderingContext : ICanvasRenderingContext2D
 
         using var paint = new SKPaint
         {
-            IsAntialias = true,
-            FilterQuality = _state.ImageSmoothingEnabled ? SKFilterQuality.Medium : SKFilterQuality.None,
+            // like Chromium, only the edges of a rotated or skewed image are anti-aliased: those of one
+            // at a fractional offset made Skia draw it about ten times slower (4 ms for 512x512 pixels)
+            IsAntialias = _state.Transform.SkewX != 0f || _state.Transform.SkewY != 0f,
+            // the quality of imageSmoothingQuality's default ("low"): bilinear, as Chromium does, while
+            // mipmaps made a scaled or rotated draw of 512x512 pixels take about 10 ms
+            FilterQuality = _state.ImageSmoothingEnabled ? SKFilterQuality.Low : SKFilterQuality.None,
             Color = SKColors.White.WithAlpha(ToAlpha(_state.GlobalAlpha)),
             BlendMode = _state.BlendMode,
             ImageFilter = CreateShadowFilter(),
@@ -1229,7 +1233,7 @@ public sealed class Canvas2DRenderingContext : ICanvasRenderingContext2D
         {
             paint.Shader = pattern.CreateShader(isStroke ? SKMatrix.Identity : _state.Transform);
             paint.Color = SKColors.White.WithAlpha(ToAlpha(alpha));
-            paint.FilterQuality = _state.ImageSmoothingEnabled ? SKFilterQuality.Medium : SKFilterQuality.None;
+            paint.FilterQuality = _state.ImageSmoothingEnabled ? SKFilterQuality.Low : SKFilterQuality.None;
         }
         else
         {
