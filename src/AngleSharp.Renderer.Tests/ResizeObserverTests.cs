@@ -36,14 +36,6 @@ public sealed class ResizeObserverTests
         return (document, context.GetDomHarness(), document.DefaultView!);
     }
 
-    private static async Task Eventually(Func<bool> condition)
-    {
-        for (var i = 0; i < 200 && !condition(); i++)
-        {
-            await Task.Delay(10);
-        }
-    }
-
     [Fact]
     public async Task FirstCallbackTellsTheSizes()
     {
@@ -111,7 +103,6 @@ public sealed class ResizeObserverTests
 
         target.SetAttribute("style", "width: 100px; height: 70px");
         document.Body!.AppendChild(document.CreateElement("div"));
-        await Eventually(() => probe.Entries.Count > 1);
 
         Assert.Equal(70d, probe.Last.ContentRect.Height);
     }
@@ -258,14 +249,14 @@ public sealed class ResizeObserverTests
     public async Task ElementInAFrameHasTheSizeTheFrameGivesIt()
     {
         var context = BrowsingContext.New(Configuration.Default.WithCss().WithRenderDevice(Device).WithDefaultLoader(new AngleSharp.Io.LoaderOptions { IsResourceLoadingEnabled = true }));
-        var document = await context.OpenAsync(request => request.Address("https://example.com/").Content("""<!doctype html><html><body style="margin: 0"><iframe style="border: 0; display: block; width: 100px; height: 100px"></iframe></body></html>"""));
+        // the frame is loaded with the page, which is complete only once its frames are
+        var document = await context.OpenAsync(request => request.Address("https://example.com/").Content("""<!doctype html><html><body style="margin: 0"><iframe srcdoc='<!doctype html><html><body style="margin: 0"><div id="t" style="height: 50px"></div></body></html>' style="border: 0; display: block; width: 100px; height: 100px"></iframe></body></html>"""));
         var frame = (AngleSharp.Html.Dom.IHtmlInlineFrameElement)document.QuerySelector("iframe")!;
-        frame.SetAttribute("srcdoc", """<!doctype html><html><body style="margin: 0"><div id="t" style="height: 50px"></div></body></html>""");
-        await Eventually(() => frame.ContentDocument?.GetElementById("t") is not null);
+        Assert.Equal(DocumentReadyState.Complete, document.ReadyState);
         var probe = new Probe();
 
         new ResizeObserver(frame.ContentWindow!, probe.Callback).Observe(frame.ContentDocument!.GetElementById("t")!);
-        await Eventually(() => probe.Entries.Count > 0);
+        Assert.NotEmpty(probe.Entries);
 
         Assert.Equal(100d, probe.Entries[0].ContentRect.Width);
     }
@@ -343,7 +334,7 @@ public sealed class ResizeObserverTests
 
         Assert.Equal(["resize"], told);
         target.SetAttribute("style", "height: 300px");
-        await Eventually(() => told.Count >= 2);
+        Assert.Equal(2, told.Count);
         Assert.Equal("resize", told[1]);
     }
 

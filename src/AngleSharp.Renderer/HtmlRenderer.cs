@@ -210,7 +210,7 @@ public sealed partial class HtmlRenderer
     /// <param name="IsHidden">If it is not hit itself (visibility: hidden, pointer-events: none).</param>
     internal readonly record struct HitTestLayer(bool IsLayerRoot, int ZIndex, bool ClipsOverflow, bool IsHidden);
 
-    private readonly record struct LayoutContext(
+    private sealed record class LayoutContext(
         int Width,
         int Height,
         RenderColor TextColor,
@@ -2325,71 +2325,20 @@ public sealed partial class HtmlRenderer
 
         // Percentage radii refer to the border box, which is only known now.
         box = box with { BorderRadius = ResolveBorderRadii(styleMap, borderBoxWidth, borderBoxHeight) };
-        var boxPaintBuffer = new DisplayList();
-
-        // A `visibility: hidden` box keeps its place and its scopes (which visible descendants
-        // still paint in) but paints none of its own decorations.
-        var decorationBuffer = currentTextStyle.IsHidden ? new DisplayList() : boxPaintBuffer;
-        var effects = OpenElementEffectScopes(
-            boxPaintBuffer,
-            decorationBuffer,
+        var (effects, contentScroll) = PaintElementBox(
+            node,
             styleMap,
-            element,
-            borderBoxX,
-            borderBoxY,
-            borderBoxWidth,
-            borderBoxHeight,
+            box,
+            context,
+            displayList,
+            boxPaintInsertIndex,
+            negativeZIndexRanges,
+            new RenderRect(borderBoxX, borderBoxY, borderBoxWidth, borderBoxHeight),
             new EdgeSizes(borderTop, borderRight, borderBottom, borderLeft),
             new EdgeSizes(paddingTop, paddingRight, paddingBottom, paddingLeft),
-            box.BorderRadius,
+            currentTextStyle.IsHidden,
             currentTextStyle.FontSize,
-            BlendsInside(displayList, boxPaintInsertIndex));
-        var createsStackingContext = HasExplicitZIndex(styleMap) || effects.CreatesStackingContext;
-
-        PaintBoxDecorations(decorationBuffer, context, styleMap, node, box, new RenderRect(borderBoxX, borderBoxY, borderBoxWidth, borderBoxHeight), new EdgeSizes(borderTop, borderRight, borderBottom, borderLeft), new EdgeSizes(paddingTop, paddingRight, paddingBottom, paddingLeft), fillsTransparentBackground: false);
-
-        if (clipsOverflow)
-        {
-            // Per spec, overflow clips at the padding edge - content can extend into the padding
-            // but not past it - so the clip rect is the padding box, not the border box. Border
-            // and outline are unaffected because they were already appended above, outside this
-            // clip scope's push.
-            var clipRect = new RenderRect(
-                borderBoxX + borderLeft,
-                borderBoxY + borderTop,
-                Math.Max(0f, borderBoxWidth - borderLeft - borderRight),
-                Math.Max(0f, borderBoxHeight - borderTop - borderBottom));
-            boxPaintBuffer.PushClip(clipRect, box.BorderRadius.ClampToBox(borderBoxWidth, borderBoxHeight));
-        }
-
-        var contentScroll = clipsOverflow ? GetContentScrollOffset(node.Ref) : default;
-
-        if (contentScroll != default)
-        {
-            boxPaintBuffer.PushTransform(RenderTransform2D.Translate(-contentScroll.X, -contentScroll.Y));
-        }
-
-        var paintInsertionIndex = boxPaintInsertIndex;
-
-        if (!createsStackingContext && negativeZIndexRanges.Count > 0)
-        {
-            paintInsertionIndex = negativeZIndexRanges.Max(range => range.StartIndex + range.Count);
-        }
-
-        displayList.InsertRange(paintInsertionIndex, boxPaintBuffer.Commands);
-
-        // the content painted below the box (negative z-index) is still clipped and scrolled by it
-        if (clipsOverflow && paintInsertionIndex != boxPaintInsertIndex)
-        {
-            var clipRect = new RenderRect(borderBoxX + borderLeft, borderBoxY + borderTop, Math.Max(0f, borderBoxWidth - borderLeft - borderRight), Math.Max(0f, borderBoxHeight - borderTop - borderBottom));
-
-            foreach (var (start, count) in negativeZIndexRanges.OrderByDescending(range => range.StartIndex))
-            {
-                var clip = new PushClipCommand(clipRect, box.BorderRadius.ClampToBox(borderBoxWidth, borderBoxHeight));
-                displayList.InsertRange(start + count, contentScroll != default ? [new PopTransformCommand(), new PopClipCommand()] : [new PopClipCommand()]);
-                displayList.InsertRange(start, contentScroll != default ? [clip, new PushTransformCommand(RenderTransform2D.Translate(-contentScroll.X, -contentScroll.Y))] : [clip]);
-            }
-        }
+            clipsOverflow);
 
         ResolveStickyBoxes(displayList, context.StickyScopes.Peek(), new RenderRect(contentX, contentY, contentWidth, contentHeight), context);
 
@@ -2488,6 +2437,95 @@ public sealed partial class HtmlRenderer
     private readonly record struct ElementEffectScopes(bool Transform, bool BlendMode, bool Isolation, bool Opacity, bool Filter, bool ClipPath, bool Mask, bool BackdropFilter)
     {
         public bool CreatesStackingContext => Transform || BlendMode || Isolation || Opacity || Filter || ClipPath || Mask || BackdropFilter;
+    }
+
+    /// <summary>
+    /// Paints the box of an element behind its children, laid out from
+    /// <paramref name="boxPaintInsertIndex"/> on, and opens its effect, clip and scroll scopes around
+    /// them (see LayoutElement). Not inlined: what it needs stays out of the frame of LayoutElement,
+    /// which is on the stack once per nesting level.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private static (ElementEffectScopes Effects, (float X, float Y) ContentScroll) PaintElementBox(
+        ElementRenderNode node,
+        Dictionary<string, string> styleMap,
+        in BoxStyle box,
+        LayoutContext context,
+        DisplayList displayList,
+        int boxPaintInsertIndex,
+        List<(int StartIndex, int Count)> negativeZIndexRanges,
+        RenderRect borderBox,
+        EdgeSizes border,
+        EdgeSizes padding,
+        bool isHidden,
+        float fontSize,
+        bool clipsOverflow)
+    {
+        var boxPaintBuffer = new DisplayList();
+
+        // A `visibility: hidden` box keeps its place and its scopes (which visible descendants
+        // still paint in) but paints none of its own decorations.
+        var decorationBuffer = isHidden ? new DisplayList() : boxPaintBuffer;
+        var effects = OpenElementEffectScopes(
+            boxPaintBuffer,
+            decorationBuffer,
+            styleMap,
+            node.Ref,
+            borderBox.X,
+            borderBox.Y,
+            borderBox.Width,
+            borderBox.Height,
+            border,
+            padding,
+            box.BorderRadius,
+            fontSize,
+            BlendsInside(displayList, boxPaintInsertIndex));
+        var createsStackingContext = HasExplicitZIndex(styleMap) || effects.CreatesStackingContext;
+
+        PaintBoxDecorations(decorationBuffer, context, styleMap, node, box, borderBox, border, padding, fillsTransparentBackground: false);
+
+        // Per spec, overflow clips at the padding edge - content can extend into the padding but
+        // not past it - so the clip rect is the padding box, not the border box. Border and outline
+        // are unaffected because they were already appended above, outside this clip scope's push.
+        var clipRect = new RenderRect(
+            borderBox.X + border.Left,
+            borderBox.Y + border.Top,
+            Math.Max(0f, borderBox.Width - border.Left - border.Right),
+            Math.Max(0f, borderBox.Height - border.Top - border.Bottom));
+
+        if (clipsOverflow)
+        {
+            boxPaintBuffer.PushClip(clipRect, box.BorderRadius.ClampToBox(borderBox.Width, borderBox.Height));
+        }
+
+        var contentScroll = clipsOverflow ? GetContentScrollOffset(node.Ref) : default;
+
+        if (contentScroll != default)
+        {
+            boxPaintBuffer.PushTransform(RenderTransform2D.Translate(-contentScroll.X, -contentScroll.Y));
+        }
+
+        var paintInsertionIndex = boxPaintInsertIndex;
+
+        if (!createsStackingContext && negativeZIndexRanges.Count > 0)
+        {
+            paintInsertionIndex = negativeZIndexRanges.Max(range => range.StartIndex + range.Count);
+        }
+
+        displayList.InsertRange(paintInsertionIndex, boxPaintBuffer.Commands);
+
+        // the content painted below the box (negative z-index) is still clipped and scrolled by it
+        if (clipsOverflow && paintInsertionIndex != boxPaintInsertIndex)
+        {
+            foreach (var (start, count) in negativeZIndexRanges.OrderByDescending(range => range.StartIndex))
+            {
+                var clip = new PushClipCommand(clipRect, box.BorderRadius.ClampToBox(borderBox.Width, borderBox.Height));
+                displayList.InsertRange(start + count, contentScroll != default ? [new PopTransformCommand(), new PopClipCommand()] : [new PopClipCommand()]);
+                displayList.InsertRange(start, contentScroll != default ? [clip, new PushTransformCommand(RenderTransform2D.Translate(-contentScroll.X, -contentScroll.Y))] : [clip]);
+            }
+        }
+
+        return (effects, contentScroll);
     }
 
     /// <summary>
@@ -7821,7 +7859,7 @@ public sealed partial class HtmlRenderer
     private static Dictionary<string, string> CreateComputedStyleMap(ICssStyleDeclaration style, IElement? element, LayoutContext? context)
     {
         var map = new StyleMap();
-        var explicitDeclarations = context.HasValue ? GetExplicitDeclarations(context.Value, element) : null;
+        var explicitDeclarations = context is not null ? GetExplicitDeclarations(context, element) : null;
         var inlineStyle = element?.GetAttribute("style");
 
         var displayValue = style.GetDisplay();
