@@ -8885,16 +8885,21 @@ public sealed partial class HtmlRenderer
     /// <summary>
     /// Moves the commands of the children painted above the in-flow content (positioned or
     /// z-indexed, with a z-index of at least 0) to the end, ordered by z-index and then by
-    /// document order (CSS 2.2 Appendix E), once all siblings are laid out.
+    /// document order (CSS 2.2 Appendix E), once all siblings are laid out. In a block flow, the
+    /// floats go there as well, below those: they paint above the in-flow blocks after them
+    /// (whose lines make room for them).
     /// </summary>
     private sealed class PaintOrder
     {
+        // the "z-index" of the floats moved, below that of all positioned boxes
+        private const int FloatLayer = int.MinValue;
+
         private readonly List<(int Z, int Order, RenderCommand First, int Count, IElement Element)> _raised = [];
 
         /// <summary>Gets the children moved to the end, in the order they paint (once applied).</summary>
         public IReadOnlyList<RaisedChild> Applied { get; private set; } = [];
 
-        public void Track(IRenderNode child, DisplayList displayList, int start, LayoutContext context)
+        public void Track(IRenderNode child, DisplayList displayList, int start, LayoutContext context, bool isBlockFlow = false)
         {
             var count = displayList.Commands.Count - start;
 
@@ -8906,6 +8911,10 @@ public sealed partial class HtmlRenderer
                 if ((IsOutOfFlowPositioned(styleMap) || IsRelativePositioned(styleMap) || HasExplicitZIndex(styleMap)) && ParseZIndex(styleMap) >= 0)
                 {
                     _raised.Add((ParseZIndex(styleMap), _raised.Count, displayList.Commands[start], count, element.Ref));
+                }
+                else if (isBlockFlow && IsFloated(styleMap) && !IsOutOfFlowPositioned(styleMap) && !IsRelativePositioned(styleMap) && !HasExplicitZIndex(styleMap))
+                {
+                    _raised.Add((FloatLayer, _raised.Count, displayList.Commands[start], count, element.Ref));
                 }
             }
         }

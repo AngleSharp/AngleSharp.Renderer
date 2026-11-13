@@ -618,4 +618,74 @@ public sealed class BrowserIntegrationTests
 
         Assert.Equal(value, both);
     }
+
+    [Fact]
+    public async Task AFloatIsHitAboveALaterBlockOverlappingIt()
+    {
+        // Tower Defense: the block of buttons after the floated tower buttons covers them, as it
+        // starts where the floats do; floats are painted (and hit) above the in-flow blocks
+        var document = await LoadAsync("<style>body { margin: 0 }</style><div><button id=f style='float: left; width: 100px; height: 60px'>A</button></div><div id=b style='height: 140px'></div>");
+
+        Assert.Equal("f", document.ElementFromPoint(50, 30)!.Id);
+        Assert.Equal("f", document.Context.GetDomHarness().PrepareFrame().HitTestMap.HitTest(50, 30)?.Element.Id);
+        Assert.Equal("b", document.ElementFromPoint(150, 30)!.Id);
+    }
+
+    [Fact]
+    public async Task AFloatIsPaintedAboveALaterBlockOverlappingIt()
+    {
+        var document = await LoadAsync("<style>body { margin: 0 }</style><div style='float: left; width: 100px; height: 100px; background: red'></div><div style='height: 120px'></div><div style='height: 50px; margin-top: -40px; background: blue'></div><p id=p style='position: relative; margin: 0'>A</p>");
+
+        using var rendered = SKBitmap.Decode(Render(document));
+        Assert.Equal(SKColors.Red, rendered.GetPixel(50, 90));
+        Assert.Equal(SKColors.Blue, rendered.GetPixel(150, 90));
+    }
+
+    [Fact]
+    public async Task AnAbsoluteBoxAtItsStaticPositionKeepsItsMargins()
+    {
+        var document = await LoadAsync("<style>body { margin: 0 }</style><div style='position: relative; padding: 8px'><div style='height: 24px'></div><div id=a style='position: absolute; width: 32px; height: 40px; margin: 8px'></div><div id=b style='position: absolute; left: 50px; width: 32px; height: 40px; margin: 8px 4px'></div></div>");
+
+        var a = document.GetElementById("a")!.GetBoundingClientRect();
+        var b = document.GetElementById("b")!.GetBoundingClientRect();
+
+        Assert.Equal(16d, a.Left, 1);
+        Assert.Equal(40d, a.Top, 1);
+        Assert.Equal(54d, b.Left, 1);
+        Assert.Equal(40d, b.Top, 1);
+    }
+
+    [Fact]
+    public async Task AReplacedElementWithAPercentageWidthPrefersItsNaturalWidth()
+    {
+        // a logo with width: 100% in a shrink-to-fit box (a flex item) is not as wide as the row
+        var document = await LoadAsync("<style>body { margin: 0 }</style><div style='display: flex; width: 600px'><div id=w><svg id=s style='display: block; width: 100%; height: auto' width='132' height='36' viewBox='0 0 132 36'><rect width='132' height='36'/></svg></div><div>Menu</div></div>");
+
+        Assert.Equal(132d, document.GetElementById("w")!.GetBoundingClientRect().Width, 1);
+        Assert.Equal(132d, document.GetElementById("s")!.GetBoundingClientRect().Width, 1);
+    }
+
+    [Fact]
+    public async Task AReplacedElementWithAPercentageHeightIsPaintedInItsBox()
+    {
+        // the height referred to the width of the containing block when painted, so the image
+        // was painted taller than its box
+        var document = await LoadAsync("<style>body { margin: 0; background: white }</style><div style='width: 60px; height: 40px'><svg style='display: block; width: 100%; height: 100%' viewBox='0 0 30 20'><rect width='30' height='20' fill='red'/></svg></div>");
+
+        using var rendered = SKBitmap.Decode(Render(document));
+        Assert.Equal(SKColors.Red, rendered.GetPixel(30, 35));
+        Assert.Equal(SKColors.White, rendered.GetPixel(30, 50));
+    }
+
+    [Fact]
+    public async Task AnSvgInABoxOfAnotherShapeFitsItsViewBox()
+    {
+        // a narrow caret icon in a square box is centered, not stretched (xMidYMid meet)
+        var document = await LoadAsync("<style>body { margin: 0; background: white }</style><svg style='display: block; width: 40px; height: 40px' viewBox='0 0 10 20'><rect width='10' height='20' fill='red'/></svg>");
+
+        using var rendered = SKBitmap.Decode(Render(document));
+        Assert.Equal(SKColors.White, rendered.GetPixel(5, 20));
+        Assert.Equal(SKColors.Red, rendered.GetPixel(20, 20));
+        Assert.Equal(SKColors.White, rendered.GetPixel(35, 20));
+    }
 }

@@ -176,7 +176,7 @@ public sealed partial class HtmlRenderer
                 negativeZIndexRanges.Add((childRangeStart, displayList.Commands.Count - childRangeStart));
             }
 
-            paintOrder.Track(child, displayList, childRangeStart, context);
+            paintOrder.Track(child, displayList, childRangeStart, context, isBlockFlow: true);
 
             // `text-indent` only applies to the first formatted line of the container.
             if (classification == FlowChildKind.Block)
