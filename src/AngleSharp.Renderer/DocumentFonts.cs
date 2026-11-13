@@ -417,7 +417,7 @@ public sealed class DocumentFontFaceSet : EventTarget, IEnumerable<DocumentFontF
         return text.EnumerateRunes().Any(rune => ranges.Any(range => IncludesCodePoint(range, rune.Value)));
     }
 
-    private static bool IncludesCodePoint(string range, int codePoint)
+    internal static bool IncludesCodePoint(string range, int codePoint)
     {
         var token = range.Trim();
         if (!token.StartsWith("U+", StringComparison.OrdinalIgnoreCase))

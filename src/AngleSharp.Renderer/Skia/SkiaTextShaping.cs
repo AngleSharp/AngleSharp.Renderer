@@ -182,7 +182,14 @@ internal static class SkiaTextShaping
     /// <summary>
     /// Resolves one entry of a <c>font-family</c> list, or reports that it is unavailable.
     /// </summary>
-    private static bool TryResolveFamily(string family, SKFontStyle fontStyle, FontFaceSet faces, float requestedWeight, out SKTypeface typeface)
+    private static bool TryResolveFamily(string family, SKFontStyle fontStyle, FontFaceSet faces, float requestedWeight, out SKTypeface typeface) =>
+        TryResolveFamily(family, fontStyle, faces, requestedWeight, 'a', out typeface);
+
+    /// <summary>
+    /// Resolves one entry of a <c>font-family</c> list for drawing the code point, which picks
+    /// the declared face whose unicode range includes it, or reports that it is unavailable.
+    /// </summary>
+    private static bool TryResolveFamily(string family, SKFontStyle fontStyle, FontFaceSet faces, float requestedWeight, int codePoint, out SKTypeface typeface)
     {
         var normalized = family.Trim('\'', '"', ' ');
         var isBold = fontStyle.Weight >= (int)SKFontStyleWeight.Bold;
@@ -205,7 +212,7 @@ internal static class SkiaTextShaping
 
         // A declared face takes precedence over an installed font of the same name.
         if (!faces.IsEmpty &&
-            faces.TryMatch(normalized, requestedWeight, isItalic, out var face) &&
+            faces.TryMatch(normalized, requestedWeight, isItalic, codePoint, out var face) &&
             TryResolveFaceTypeface(face, fontStyle, out typeface))
         {
             return true;
@@ -227,7 +234,7 @@ internal static class SkiaTextShaping
 
         foreach (var family in font.FontFamily.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
         {
-            if (TryResolveFamily(family, fontStyle, faces, font.FontWeight, out var typeface) && HasGlyph(typeface, codepoint))
+            if (TryResolveFamily(family, fontStyle, faces, font.FontWeight, codepoint, out var typeface) && HasGlyph(typeface, codepoint))
             {
                 return typeface;
             }
@@ -267,7 +274,7 @@ internal static class SkiaTextShaping
 
             foreach (var family in font.FontFamily.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
             {
-                if (faces.TryMatch(family.Trim('\'', '"', ' '), font.FontWeight, font.IsItalic, out var face) &&
+                if (faces.TryMatch(family.Trim('\'', '"', ' '), font.FontWeight, font.IsItalic, codepoint, out var face) &&
                     TryResolveFaceTypeface(face, fontStyle, out var declared) && HasGlyph(declared, codepoint))
                 {
                     return declared;

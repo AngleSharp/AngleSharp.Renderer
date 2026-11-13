@@ -2,6 +2,11 @@
 
 Released on Friday, November 13 2026.
 
+- Fixed `repeat(auto-fit, ...)` keeping one track per grid item, which wrapped items spanning several columns (e.g., a dashboard of tiles with `grid-column: span 2`); it keeps the columns the items span
+- Fixed implicit grid rows growing for items spanning several rows in document order, which made a tall item push later ones down; items spanning fewer rows come first, as in CSS Grid
+- Fixed a font family declared as several `@font-face` rules split by `unicode-range` (as Google Fonts does) drawing with the first rule's face, which lacked the letters of the text, so the text fell back to the next family; the face whose range covers a character draws it
+- Fixed a grid container grown by its flex container (e.g. `flex: 1` in a column) keeping the height of its content, so its auto rows did not take the rest of the height
+- Fixed the intrinsic widths of a multi-column container ignoring its columns, so a shrink-to-fit box with `column-width` (e.g. a menu in a row flexbox) was only as wide as its content; it is at least `column-width` per column, with the gaps between columns
 - Fixed relatively positioned boxes painting below earlier absolutely positioned siblings: all positioned boxes with `z-index: auto` paint above the in-flow content in tree order (CSS 2.2 Appendix E)
 - Fixed an image with a percentage `width` or `max-width` (e.g., `width: 100%`) widening a `1fr` grid track or other intrinsic size to its natural width: its min-content contribution is zero (compressible replaced elements, CSS Sizing 3)
 - Fixed `justify-content` (e.g., `place-content: center`) not placing the column of a grid without `grid-template-columns`, which always filled the container

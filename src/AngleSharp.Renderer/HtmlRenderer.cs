@@ -2050,7 +2050,9 @@ public sealed partial class HtmlRenderer
                 flowBorderBoxX,
                 flowBorderBoxY,
                 borderBoxX,
-                borderBoxY);
+                borderBoxY,
+                // the height the box got from its flex container (e.g. grown by `flex: 1`) or otherwise
+                float.IsNaN(resolvedContentHeight) ? null : resolvedContentHeight);
             LayoutHeldBackBoxes(itemsScope, cursorY - flowBorderBoxY - borderTop - borderBottom, context, displayList);
 
             if (isFloat)
@@ -3613,7 +3615,8 @@ public sealed partial class HtmlRenderer
         float flowBorderBoxX,
         float flowBorderBoxY,
         float borderBoxX,
-        float borderBoxY)
+        float borderBoxY,
+        float? usedContentHeight = null)
     {
         // what the items are placed against (see ActsAsContainingBlock); its height comes when it is laid out
         var itemsContainingBlock = ActsAsContainingBlock(styleMap, positionedContainingX);
@@ -3649,7 +3652,7 @@ public sealed partial class HtmlRenderer
         var explicitGridTemplateColumns = styleMap.GetValueOrDefault("grid-template-columns") ?? string.Empty;
         var columnLineNames = new Dictionary<string, List<int>>(StringComparer.Ordinal);
         var rowLineNames = new Dictionary<string, List<int>>(StringComparer.Ordinal);
-        var columns = ParseGridTrackListStructured(explicitGridTemplateColumns, containingWidth, resolvedColumnGap, gridItems.Count, columnLineNames);
+        var columns = ParseGridTrackListStructured(explicitGridTemplateColumns, containingWidth, resolvedColumnGap, CountSpannedGridColumns(gridItems, context), columnLineNames);
 
         if (columns.Count == 0)
         {
@@ -3662,9 +3665,13 @@ public sealed partial class HtmlRenderer
         }
 
         var gridVerticalBorderAndPadding = borderTop + borderBottom + paddingTop + paddingBottom;
-        var containerHeight = ResolveDefiniteContentHeight(styleMap, containingWidth, gridVerticalBorderAndPadding);
+        var authoredContainerHeight = ResolveDefiniteContentHeight(styleMap, containingWidth, gridVerticalBorderAndPadding);
+        // a height given from outside (a flex container growing the grid) sizes the rows like an
+        // authored one, but the track list (e.g. how often `repeat(auto-fit, 70px)` repeats) is
+        // resolved against the grid's own height, as browsers do
+        var containerHeight = usedContentHeight ?? authoredContainerHeight;
         var explicitGridTemplateRows = styleMap.GetValueOrDefault("grid-template-rows") ?? string.Empty;
-        var rows = ParseGridTrackListStructured(explicitGridTemplateRows, containerHeight, lineNames: rowLineNames);
+        var rows = ParseGridTrackListStructured(explicitGridTemplateRows, authoredContainerHeight, lineNames: rowLineNames);
         var hasExplicitRowTracks = rows.Count > 0;
         var explicitRowCount = rows.Count;
         var autoRowDefinitions = styleMap.TryGetValue("grid-auto-rows", out var autoRowsValue)
@@ -3692,6 +3699,9 @@ public sealed partial class HtmlRenderer
         // grow Auto rows to their items' authored heights (content heights are measured below).
         var itemPlacements = new List<(ElementRenderNode Element, GridPlacement Column, GridPlacement Row)>();
         var columnContributions = new List<(GridPlacement Column, IntrinsicWidths Widths)>();
+        // items spanning several rows grow them once all single-span items did, by increasing span
+        // (CSS Grid 1, 11.5.3), or a tall item spread itself over rows a later item fills anyway
+        var spanningRowGrowths = new List<(GridPlacement Row, float Height)>();
         var namedAreas = ParseGridTemplateAreas(styleMap.TryGetValue("grid-template-areas", out var areasValue) ? areasValue : null);
 
         // Every area also names the lines around it: `name-start` and `name-end`.
@@ -3827,7 +3837,7 @@ public sealed partial class HtmlRenderer
 
                 FloorFlexibleTrack(elementChild, childStyleMap, areaColumn);
 
-                GrowGridTrackSpan(rows, areaRow, ResolveGridItemAuthoredHeight(childStyleMap, containingWidth), resolvedRowGap);
+                GrowGridRowsOrDefer(rows, spanningRowGrowths, areaRow, ResolveGridItemAuthoredHeight(childStyleMap, containingWidth), resolvedRowGap);
 
                 currentColumn = 0;
                 currentRow = 0;
@@ -3928,7 +3938,7 @@ public sealed partial class HtmlRenderer
 
             FloorFlexibleTrack(elementChild, childStyleMap, effectivePlacementColumn);
 
-            GrowGridTrackSpan(rows, effectivePlacementRow, authoredItemHeight, resolvedRowGap);
+            GrowGridRowsOrDefer(rows, spanningRowGrowths, effectivePlacementRow, authoredItemHeight, resolvedRowGap);
 
             currentColumn++;
             if (currentColumn >= columns.Count)
@@ -3937,6 +3947,8 @@ public sealed partial class HtmlRenderer
                 currentRow++;
             }
         }
+
+        GrowGridRowsBySpan(rows, spanningRowGrowths, resolvedRowGap);
 
         // Between passes: distribute each axis's remaining free space across its own `fr` tracks.
         // Row `fr` tracks only grow when the container has a definite height to distribute - `fr`
@@ -3984,9 +3996,11 @@ public sealed partial class HtmlRenderer
             }
             else
             {
-                GrowGridTrackSpan(rows, placementRow, measuredHeight, resolvedRowGap);
+                GrowGridRowsOrDefer(rows, spanningRowGrowths, placementRow, measuredHeight, resolvedRowGap);
             }
         }
+
+        GrowGridRowsBySpan(rows, spanningRowGrowths, resolvedRowGap);
 
         if (!float.IsNaN(containerHeight))
         {
@@ -5099,6 +5113,31 @@ public sealed partial class HtmlRenderer
         public static readonly GridLines None = new(new Dictionary<string, List<int>>(StringComparer.Ordinal), 0);
     }
 
+    /// <summary>
+    /// The columns the items take when placed side by side, which is what `repeat(auto-fit, ...)`
+    /// keeps of its tracks (see ResolveGridRepeatCount): counting items instead wrapped items
+    /// spanning several columns (e.g. a dashboard of tiles with `grid-column: span 2`).
+    /// </summary>
+    private static int CountSpannedGridColumns(List<IRenderNode> gridItems, LayoutContext context)
+    {
+        var count = 0;
+
+        foreach (var item in gridItems)
+        {
+            var span = 1;
+
+            if (item is ElementRenderNode element)
+            {
+                var itemStyle = GetOrCreateStyleMap(context, element.Ref, element.ComputedStyle);
+                span = Math.Max(1, ParseGridLinePlacement(itemStyle.GetValueOrDefault("grid-column"), GridLines.None).Span);
+            }
+
+            count += span;
+        }
+
+        return count;
+    }
+
     private static GridPlacement ResolveGridPlacementFromMap(Dictionary<string, string> childStyleMap, string propertyName, int fallbackIndex, GridLines? lines = null)
     {
         var (start, span) = ParseGridLinePlacement(childStyleMap.GetValueOrDefault(propertyName), lines ?? GridLines.None);
@@ -5487,6 +5526,35 @@ public sealed partial class HtmlRenderer
                 track.Pixels += freeSpace / stretchable.Count;
             }
         }
+    }
+
+    /// <summary>
+    /// Grows the row of an item spanning one, and keeps an item spanning several for
+    /// <see cref="GrowGridRowsBySpan"/>.
+    /// </summary>
+    private static void GrowGridRowsOrDefer(List<GridTrackSize> rows, List<(GridPlacement Row, float Height)> spanning, GridPlacement placement, float height, float gap)
+    {
+        if (placement.Span > 1)
+        {
+            spanning.Add((placement, height));
+        }
+        else
+        {
+            GrowGridTrackSpan(rows, placement, height, gap);
+        }
+    }
+
+    /// <summary>
+    /// Grows the rows of the items spanning several, those spanning fewer first (CSS Grid 1, 11.5.3).
+    /// </summary>
+    private static void GrowGridRowsBySpan(List<GridTrackSize> rows, List<(GridPlacement Row, float Height)> spanning, float gap)
+    {
+        foreach (var (placement, height) in spanning.OrderBy(static item => item.Row.Span))
+        {
+            GrowGridTrackSpan(rows, placement, height, gap);
+        }
+
+        spanning.Clear();
     }
 
     /// <summary>

@@ -3108,7 +3108,10 @@ public sealed partial class HtmlRenderer
             return new IntrinsicWidths(0f, 0f);
         }
 
-        var widths = ComputeElementContentWidths(element, textStyle, percentageBase, context);
+        var widths = ApplyColumnIntrinsicWidths(
+            GetOrCreateStyleMap(context, element.Ref, element.ComputedStyle),
+            ComputeElementContentWidths(element, textStyle, percentageBase, context),
+            textStyle.FontSize);
 
         if (s_layoutPass.Value is { } pass)
         {
@@ -3116,6 +3119,51 @@ public sealed partial class HtmlRenderer
         }
 
         return widths;
+    }
+
+    /// <summary>
+    /// The intrinsic widths of a multi-column container, as Blink computes them: a column is at
+    /// least as wide as `column-width` at max-content, and there are `column-count` of them (one
+    /// when only `column-width` is given) with their gaps; e.g. a footer menu with
+    /// `column-width: 300px` in a row flexbox is 300px wide, not as wide as its longest link.
+    /// </summary>
+    private static IntrinsicWidths ApplyColumnIntrinsicWidths(Dictionary<string, string> styleMap, IntrinsicWidths widths, float fontSize)
+    {
+        var count = styleMap.TryGetValue("column-count", out var countValue) &&
+                    int.TryParse(countValue.Trim(), NumberStyles.Integer, CultureInfo.InvariantCulture, out var parsedCount) &&
+                    parsedCount > 0
+            ? parsedCount
+            : 0;
+        var width = styleMap.TryGetValue("column-width", out var widthValue)
+            ? ParseLengthValue(widthValue, float.NaN, allowAuto: true)
+            : float.NaN;
+        var hasWidth = !float.IsNaN(width) && width > 0f;
+
+        if (count == 0 && !hasWidth)
+        {
+            return widths;
+        }
+
+        var min = widths.Min;
+        var max = hasWidth ? Math.Max(widths.Max, width) : widths.Max;
+        var columns = Math.Max(1, count);
+
+        if (columns > 1)
+        {
+            // `column-gap: normal` is 1em for multi-column containers
+            var gap = fontSize;
+
+            if (styleMap.TryGetValue("column-gap", out var gapValue) && !string.Equals(gapValue.Trim(), "normal", StringComparison.OrdinalIgnoreCase))
+            {
+                var parsedGap = ParseLengthValue(gapValue, float.NaN, allowAuto: false);
+                gap = float.IsNaN(parsedGap) ? gap : Math.Max(0f, parsedGap);
+            }
+
+            min = (min * columns) + (gap * (columns - 1));
+            max = (max * columns) + (gap * (columns - 1));
+        }
+
+        return new IntrinsicWidths(min, Math.Max(min, max));
     }
 
     private static IntrinsicWidths ComputeElementContentWidths(ElementRenderNode element, RenderTextStyle textStyle, float percentageBase, LayoutContext context)
