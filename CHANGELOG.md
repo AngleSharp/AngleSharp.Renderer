@@ -6,6 +6,7 @@ Released on Friday, November 13 2026.
 - Fixed an image with a percentage `width` or `max-width` (e.g., `width: 100%`) widening a `1fr` grid track or other intrinsic size to its natural width: its min-content contribution is zero (compressible replaced elements, CSS Sizing 3)
 - Fixed `justify-content` (e.g., `place-content: center`) not placing the column of a grid without `grid-template-columns`, which always filled the container
 - Fixed a frame painted while an image's response was still being processed taking its stream, which left the image without its natural size (it then was laid out as a broken image)
+- Improved deeply nested pages: about 70% more levels are laid out before the stack runs low, e.g. 72 instead of 42 nested blocks on a 1.5 MB stack (#58) @michaelthyregod
 
 # 0.11.2
 
