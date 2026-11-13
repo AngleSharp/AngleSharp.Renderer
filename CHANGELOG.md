@@ -3,8 +3,8 @@
 Released on Friday, November 13 2026.
 
 - Improved deeply nested pages: about 70% more levels are laid out before the stack runs low, e.g. 72 instead of 42 nested blocks on a 1.5 MB stack (#58) @michaelthyregod
-- Fixed a canvas not showing what was drawn into it: with scripting it is a replaced element painting its bitmap (as it is when the frame is rasterized, so drawing needs no layout), instead of its fallback content (e.g. "Your browser does not support the canvas element")
 - Fixed `getContext("2d")` giving a new context with an empty bitmap on every call, and `fill()` only drawing the outline of a path
+- Fixed a canvas not showing what was drawn into it: with scripting it is a replaced element painting its bitmap (as it is when the frame is rasterized, so drawing needs no layout), instead of its fallback content (e.g. "Your browser does not support the canvas element")
 - Fixed a CSS transition started by a change confined to an out-of-flow box (e.g. a fixed side menu sliding in with `transform`) staying at its start value, as the patched frame did not ask for the frames to come; it also starts with the next frame, not at the time of the last full one
 - Fixed a float following text on a line (e.g. a close button with `float: right` at the end of a title) being placed below the line instead of on it when it fits there
 - Fixed an absolutely positioned box with `top` and `bottom`, `margin: auto` and a `max-height` (e.g. a dialog with `inset: 0`) not being centered vertically, as the free space was taken before the height was limited
