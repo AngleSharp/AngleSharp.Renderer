@@ -18,6 +18,10 @@ internal sealed partial class InteractiveHtmlRendererState : IDomHarness
     private readonly CssTransitionTracker _transitionTracker = new();
     private readonly CssAnimationTracker _animationTracker = new();
     private double _clockMs;
+    // if the clock moved since the layout was brought up to date with it (see TryAdvanceAnimations)
+    private bool _hasTimeAdvanced;
+    // if the animations were brought up to date since the last frame was given out
+    private bool _hasAnimatedSinceFrame;
     private IElement? _hoveredElement;
     private IDocument? _frameDocument;
     private bool _isFrameScrollShiftable;
@@ -420,7 +424,10 @@ internal sealed partial class InteractiveHtmlRendererState : IDomHarness
             subframe.AdvanceTime(delta);
         }
 
-        OnPaintInvalidated();
+        // the layout stays, as long as the animations only transform their boxes or change how
+        // they paint (see TryAdvanceAnimations)
+        _hasTimeAdvanced = true;
+        OnPaintInvalidated(keepsMetrics: true);
     }
 
     /// <summary>
@@ -545,6 +552,8 @@ internal sealed partial class InteractiveHtmlRendererState : IDomHarness
         _metrics = null;
         _isPreparingFrame = true;
         _hasChangedSinceFrame = false;
+        _hasTimeAdvanced = false;
+        _hasAnimatedSinceFrame = false;
 
         try
         {
@@ -625,9 +634,17 @@ internal sealed partial class InteractiveHtmlRendererState : IDomHarness
             metrics = null;
         }
 
+        // geometry read by a script follows the time, too
+        if (metrics is not null && _hasTimeAdvanced && !TryAdvanceAnimations(document, metrics))
+        {
+            metrics = null;
+        }
+
         if (metrics is null || _metricsViewport != viewport)
         {
-            metrics = _renderer.CaptureLayout(document, RenderDevice);
+            // a document shown in frames is laid out as the next frame, which that frame then is
+            // (a capture would leave it to be laid out once more, and could not be patched)
+            metrics = TryLayOutNextFrame(document, viewport) ?? _renderer.CaptureLayout(document, RenderDevice);
             _metricsViewport = viewport;
         }
 
@@ -637,6 +654,50 @@ internal sealed partial class InteractiveHtmlRendererState : IDomHarness
         _pendingRestyles.Clear();
         _metrics = metrics;
         return metrics;
+    }
+
+    /// <summary>
+    /// Lays out the document as the next frame (see <see cref="PrepareFrame(int, bool)"/>) for a
+    /// read of its geometry, without telling anyone: the frame is the one <see cref="UpdateFrame"/>
+    /// gives next, and the events of its animations wait for that one. Null if the document is
+    /// not the one shown in frames (e.g. before its first frame).
+    /// </summary>
+    private HtmlRenderer.LayoutSnapshot? TryLayOutNextFrame(IDocument document, (int Width, int Height) viewport)
+    {
+        if (_isPreparingFrame || _lastFrame is not { IsPartial: false } last || !ReferenceEquals(document, _frameDocument) || !ReferenceEquals(document, Context.Active) ||
+            last.Width != viewport.Width || _subframes.Count > 0)
+        {
+            return null;
+        }
+
+        var scrollTop = document.DocumentElement is { } root ? GetScrollTop(root, double.MaxValue) : 0d;
+        _isPreparingFrame = true;
+
+        try
+        {
+            using (_animationTracker.BeginFrame(document))
+            {
+                _transitionTracker.BeginFrame();
+                var frame = _renderer.PrepareFrame(document, RenderDevice, scrollTop, _isFrameScrollShiftable ? last.OverscanTop : 0, out var snapshot, viewportOnly: false);
+                _transitionTracker.EndFrame();
+
+                if (frame.IsScrollShiftable != _isFrameScrollShiftable)
+                {
+                    return null;
+                }
+
+                frame.IsAnimating = _animationTracker.IsAnimating || _transitionTracker.HasRunningTransitions || HasRunningScriptAnimations;
+                _lastFrame = frame;
+                _lastFrameLayout = snapshot;
+                _hasTimeAdvanced = false;
+                _hasAnimatedSinceFrame = false;
+                return snapshot;
+            }
+        }
+        finally
+        {
+            _isPreparingFrame = false;
+        }
     }
 
     public RenderedFrame? UpdateFrame()
@@ -656,8 +717,11 @@ internal sealed partial class InteractiveHtmlRendererState : IDomHarness
 
         if (frame is not null)
         {
-            // an animation or transition started by the changes needs the frames to come
-            frame.IsAnimating |= _animationTracker.HasRunningAnimations || _transitionTracker.HasRunningTransitions;
+            // an animation or transition started by the changes needs the frames to come, one
+            // that ended since does not
+            var isAnimating = _animationTracker.HasRunningAnimations || _transitionTracker.HasRunningTransitions;
+            frame.IsAnimating = _hasAnimatedSinceFrame ? isAnimating || _animationTracker.IsAnimating : isAnimating || frame.IsAnimating;
+            _hasAnimatedSinceFrame = false;
             FrameUpdated?.Invoke(this, EventArgs.Empty);
         }
 
@@ -699,8 +763,47 @@ internal sealed partial class InteractiveHtmlRendererState : IDomHarness
 
         _pendingMutations.Clear();
         _pendingRestyles.Clear();
+
+        if (_hasTimeAdvanced && !TryAdvanceAnimations(document, metrics))
+        {
+            _metrics = null;
+            return null;
+        }
         _lastFrame = _renderer.UpdateFrame(document, _lastFrame, metrics);
         return _lastFrame is { } updated ? ShowSelection(updated) : null;
+    }
+
+    /// <summary>
+    /// Brings the layout to the time now, if that is what changed: the animated boxes are styled
+    /// anew, which only paints them again when just their transform, opacity or decorations
+    /// changed (see LayoutSnapshot.TryAnimate). False if the document is to be laid out again,
+    /// e.g. for an animation of a width, or of anything by script.
+    /// </summary>
+    private bool TryAdvanceAnimations(IDocument document, HtmlRenderer.LayoutSnapshot metrics)
+    {
+        if (document.DefaultView is not { } window || !metrics.IsFrameLayout && !ReferenceEquals(metrics, _lastFrameLayout) || HasRunningScriptAnimations ||
+            _transitionTracker.GetTransitionedElements() is not { } transitioned)
+        {
+            return false;
+        }
+
+        var elements = _animationTracker.GetRunningElements().Concat(transitioned).Distinct().ToList();
+
+        if (elements.Count > 0)
+        {
+            using (_animationTracker.BeginFrame(document))
+            {
+                if (!metrics.TryAnimate(window, elements))
+                {
+                    return false;
+                }
+            }
+
+            _hasAnimatedSinceFrame = true;
+        }
+
+        _hasTimeAdvanced = false;
+        return true;
     }
 
     private void WatchMutations(IDocument document)

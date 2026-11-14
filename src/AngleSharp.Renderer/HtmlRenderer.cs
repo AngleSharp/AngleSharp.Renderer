@@ -2591,13 +2591,17 @@ public sealed partial class HtmlRenderer
                          string.Equals(isolationValue.Trim(), "isolate", StringComparison.OrdinalIgnoreCase);
         var maskLayers = ResolveMaskLayers(styleMap, element, borderBoxX, borderBoxY, borderBoxWidth, borderBoxHeight, border, padding, radii);
         var backdropFunctions = ParseCssFilter(styleMap, "backdrop-filter");
+        // an animated transform or opacity is painted under its scope all along, as in browsers
+        // (where the element is a stacking context while it runs)
+        var state = element.Owner?.Context.TryGetDomHarness(out var harness) == true ? harness as InteractiveHtmlRendererState : null;
         var scopes = new ElementEffectScopes(
-            Transform: !transform.IsIdentity,
+            Transform: !transform.IsIdentity || state is not null && (state.IsAnimatingProperty(element, "transform") || state.IsAnimatingProperty(element, "rotate") ||
+                state.IsAnimatingProperty(element, "scale") || state.IsAnimatingProperty(element, "translate")),
             // isolation only bounds the blend modes inside, so without any it needs no group of its own
             // (which would also hide what is painted behind it from a backdrop-filter inside)
             BlendMode: blendMode != RenderBlendMode.Normal || (isIsolated && blendsInside),
             Isolation: isIsolated,
-            Opacity: opacity < 1f,
+            Opacity: opacity < 1f || state is not null && state.IsAnimatingProperty(element, "opacity"),
             Filter: filterFunctions.Count > 0,
             ClipPath: clipPathShape is not null,
             Mask: maskLayers.Count > 0,
@@ -13093,37 +13097,123 @@ public sealed partial class HtmlRenderer
         (float X, float Y) innerBottomRight = (innerRight - bottomRight.InnerX, innerBottom - bottomRight.InnerY);
         (float X, float Y) innerBottomLeft = (innerLeft + bottomLeft.InnerX, innerBottom - bottomLeft.InnerY);
 
-        var sides = new (float Width, BorderStyleKind Style, RenderColor Color, bool IsTopOrLeft, (float X, float Y)[] Region)[]
+        // A rounded inner edge bends inside the corner of the padding box, so the regions meet
+        // further inwards, on the chord of each inner curve (like in Blink): else the curve of a
+        // ring is cut off by the regions (a circle's sides showed as separate crescents).
+        if (!isSquare)
         {
-            (border.Top, styles.Top, color.Top, true, [outerTopLeft, outerTopRight, innerTopRight, innerTopLeft]),
-            (border.Right, styles.Right, color.Right, false, [outerTopRight, outerBottomRight, innerBottomRight, innerTopRight]),
-            (border.Bottom, styles.Bottom, color.Bottom, false, [outerBottomRight, outerBottomLeft, innerBottomLeft, innerBottomRight]),
-            (border.Left, styles.Left, color.Left, true, [outerBottomLeft, outerTopLeft, innerTopLeft, innerBottomLeft]),
+            var innerRadii = InsetRadii(radii, border, 1f);
+            innerTopLeft = MeetOnInnerChord(outerTopLeft, innerTopLeft, (innerLeft + innerRadii.TopLeftX, innerTop), (innerLeft, innerTop + innerRadii.TopLeftY));
+            innerTopRight = MeetOnInnerChord(outerTopRight, innerTopRight, (innerRight - innerRadii.TopRightX, innerTop), (innerRight, innerTop + innerRadii.TopRightY));
+            innerBottomRight = MeetOnInnerChord(outerBottomRight, innerBottomRight, (innerRight - innerRadii.BottomRightX, innerBottom), (innerRight, innerBottom - innerRadii.BottomRightY));
+            innerBottomLeft = MeetOnInnerChord(outerBottomLeft, innerBottomLeft, (innerLeft + innerRadii.BottomLeftX, innerBottom), (innerLeft, innerBottom - innerRadii.BottomLeftY));
+        }
+
+        // the corners in order (top-left, top-right, bottom-right, bottom-left): side i (top,
+        // right, bottom, left) runs from corner i to corner i + 1
+        (float X, float Y)[] outer = [outerTopLeft, outerTopRight, outerBottomRight, outerBottomLeft];
+        (float X, float Y)[] inner = [innerTopLeft, innerTopRight, innerBottomRight, innerBottomLeft];
+        var sides = new (float Width, BorderStyleKind Style, RenderColor Color, bool IsTopOrLeft)[]
+        {
+            (border.Top, styles.Top, color.Top, true),
+            (border.Right, styles.Right, color.Right, false),
+            (border.Bottom, styles.Bottom, color.Bottom, false),
+            (border.Left, styles.Left, color.Left, true),
         };
 
-        foreach (var side in sides)
+        bool IsPainted(int i) => sides[i].Width > 0f && IsPaintedBorderStyle(sides[i].Style) && sides[i].Color.A > 0;
+
+        // Neighbors painted alike are painted as one: two regions meeting on a diagonal would
+        // anti-alias it twice, a seam through the corner (the bands of the 3D styles depend on
+        // the side, so they stay apart).
+        bool IsSameAsNext(int i)
         {
-            if (side.Width <= 0f || !IsPaintedBorderStyle(side.Style) || side.Color.A == 0)
+            var (side, next) = (sides[i], sides[(i + 1) % 4]);
+            return IsPainted(i) && IsPainted((i + 1) % 4) && side.Style == next.Style && side.Color == next.Color &&
+                side.Style is BorderStyleKind.Solid or BorderStyleKind.Double;
+        }
+
+        var first = Array.FindIndex([0, 1, 2, 3], i => !IsSameAsNext((i + 3) % 4));
+
+        if (first < 0)
+        {
+            // all sides alike: the whole ring
+            PaintBorderBands(displayList, sides[0].Style, sides[0].Color, sides[0].IsTopOrLeft, x, y, width, height, border, radii);
+            return;
+        }
+
+        for (var count = 0; count < 4;)
+        {
+            var from = (first + count) % 4;
+            var length = 1;
+
+            while (count + length < 4 && IsSameAsNext((from + length - 1) % 4))
+            {
+                length++;
+            }
+
+            count += length;
+
+            if (!IsPainted(from))
             {
                 continue;
             }
 
-            displayList.PushClipShape(new RenderClipPolygon(side.Region));
+            // the outer corners of the sides, then back along their inner ones
+            var region = new List<(float X, float Y)>((length + 1) * 2);
 
-            // A border style is a set of bands across the border's thickness, each a fraction of
-            // the full width (from the outer edge inwards) with its own color.
-            foreach (var (from, to, bandColor) in GetBorderBands(side.Style, side.Color, side.IsTopOrLeft))
+            for (var i = 0; i <= length; i++)
             {
-                displayList.FillRing(
-                    InsetBox(x, y, width, height, border, from),
-                    InsetRadii(radii, border, from),
-                    InsetBox(x, y, width, height, border, to),
-                    InsetRadii(radii, border, to),
-                    bandColor);
+                region.Add(outer[(from + i) % 4]);
             }
 
+            for (var i = length; i >= 0; i--)
+            {
+                region.Add(inner[(from + i) % 4]);
+            }
+
+            displayList.PushClipShape(new RenderClipPolygon([.. region]));
+            PaintBorderBands(displayList, sides[from].Style, sides[from].Color, sides[from].IsTopOrLeft, x, y, width, height, border, radii);
             displayList.PopClip();
         }
+    }
+
+    /// <summary>
+    /// A border style is a set of bands across the border's thickness, each a fraction of the
+    /// full width (from the outer edge inwards) with its own color.
+    /// </summary>
+    private static void PaintBorderBands(DisplayList displayList, BorderStyleKind style, RenderColor color, bool isTopOrLeft, float x, float y, float width, float height, EdgeSizes border, RenderCornerRadii radii)
+    {
+        foreach (var (from, to, bandColor) in GetBorderBands(style, color, isTopOrLeft))
+        {
+            displayList.FillRing(
+                InsetBox(x, y, width, height, border, from),
+                InsetRadii(radii, border, from),
+                InsetBox(x, y, width, height, border, to),
+                InsetRadii(radii, border, to),
+                bandColor);
+        }
+    }
+
+    /// <summary>
+    /// Where the line from the outer corner through the inner corner meets the chord between the
+    /// ends of the inner curve of that corner; the inner corner itself if there is no curve there
+    /// or the line does not cross the chord beyond it.
+    /// </summary>
+    private static (float X, float Y) MeetOnInnerChord((float X, float Y) outer, (float X, float Y) inner, (float X, float Y) chordStart, (float X, float Y) chordEnd)
+    {
+        var (dx, dy) = (inner.X - outer.X, inner.Y - outer.Y);
+        var (ex, ey) = (chordEnd.X - chordStart.X, chordEnd.Y - chordStart.Y);
+        var denominator = (dx * ey) - (dy * ex);
+
+        if ((ex == 0f && ey == 0f) || Math.Abs(denominator) < 1e-6f)
+        {
+            return inner;
+        }
+
+        // the line is outer + t * (inner - outer); the chord is start + u * (end - start)
+        var t = (((chordStart.X - outer.X) * ey) - ((chordStart.Y - outer.Y) * ex)) / denominator;
+        return t > 1f && float.IsFinite(t) ? (outer.X + (t * dx), outer.Y + (t * dy)) : inner;
     }
 
     /// <summary>

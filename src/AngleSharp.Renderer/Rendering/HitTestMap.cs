@@ -206,6 +206,37 @@ public sealed class HitTestMap
     /// </summary>
     internal HitTestMap Shift(float deltaY) => new(_entries, _offsetY + deltaY);
 
+    /// <summary>
+    /// Gets the map with the boxes in sticky boxes moved by how far those stick otherwise now
+    /// (see HtmlRenderer.StickyFrame).
+    /// </summary>
+    internal HitTestMap WithStickyMoves(Func<IElement, (float X, float Y)?> getMove)
+    {
+        var entries = (Entry[])_entries.Clone();
+
+        for (var index = 0; index < entries.Length; index++)
+        {
+            var entry = entries[index];
+
+            if (entry.IsViewportAnchored || getMove(entry.Element) is not { } move)
+            {
+                continue;
+            }
+
+            entries[index] = entry with
+            {
+                Box = Move(entry.Box, move),
+                Clip = Move(entry.Clip, move),
+                Viewport = Move(entry.Viewport, move),
+                Fragments = entry.Fragments?.Select(fragment => Move(fragment, move)).ToArray(),
+            };
+        }
+
+        return new HitTestMap(entries, _offsetY);
+
+        static RenderRect Move(RenderRect rect, (float X, float Y) move) => rect with { X = rect.X + move.X, Y = rect.Y + move.Y };
+    }
+
     private static RenderTransform2D? GetTransform(IReadOnlyDictionary<IElement, Dictionary<string, string>> styleMaps, IElement element, HtmlRenderer.ElementLayoutMetrics metrics, float offsetY) =>
         styleMaps.TryGetValue(element, out var style) && HtmlRenderer.HasTransform(style)
             ? HtmlRenderer.ResolveTransform(style, metrics with { BorderBoxY = metrics.BorderBoxY + offsetY }) is { IsIdentity: false } transform ? transform : null

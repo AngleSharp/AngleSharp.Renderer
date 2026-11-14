@@ -109,6 +109,40 @@ internal sealed class CssTransitionTracker
     /// </summary>
     internal bool HasRuns => _activeRuns.Count > 0;
 
+    /// <summary>
+    /// Gets the elements with a transition that was running when it was last asked for (it may
+    /// have ended since), as the host of a pseudo-element (with <c>IsPseudo</c>) for one of those.
+    /// </summary>
+    public IEnumerable<(IElement Element, bool IsPseudo)>? GetTransitionedElements()
+    {
+        var elements = new HashSet<(IElement, bool)>();
+
+        foreach (var (element, _) in _activeRuns.Keys)
+        {
+            if (element is IPseudoElement pseudo)
+            {
+                if (CssAnimationTracker.GetHost(pseudo) is not { } host)
+                {
+                    return null;
+                }
+
+                elements.Add((host, true));
+            }
+            else
+            {
+                elements.Add((element, false));
+            }
+        }
+
+        return elements;
+    }
+
+    /// <summary>
+    /// Gets if the property of the element transitions, i.e. has a run that has not ended.
+    /// </summary>
+    public bool IsTransitioning(IElement element, string property) =>
+        _activeRuns.TryGetValue((element, property), out var run) && _clockMs - run.StartMs - run.Spec.DelayMs < run.Spec.DurationMs;
+
     public bool HasRunningTransitions
     {
         get

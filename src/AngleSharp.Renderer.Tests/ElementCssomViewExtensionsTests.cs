@@ -121,6 +121,35 @@ public sealed class ElementCssomViewExtensionsTests
     }
 
     [Fact]
+    public async Task OffsetParents_EndAtTheBody()
+    {
+        var document = await ParseAsync("""
+            <html>
+              <head><style>html, body { margin: 0; padding: 0; } #outer { margin-top: 30px; }</style></head>
+              <body>
+                <div id="outer"><table><tr><td id="cell"><div id="child" style="height:10px"></div></td></tr></table></div>
+              </body>
+            </html>
+            """);
+
+        var child = document.QuerySelector("#child")!;
+        var chain = new List<string>();
+        var top = 0;
+
+        // the loop of a script finding where an element is on the page
+        for (var element = child; element is not null; element = element.GetOffsetParent())
+        {
+            chain.Add(element.LocalName);
+            top += element.GetOffsetTop();
+        }
+
+        Assert.Equal(new[] { "div", "td", "table", "body" }, chain);
+        Assert.Equal((int)Math.Round(child.GetBoundingClientRect().Top), top);
+        Assert.Null(document.Body!.GetOffsetParent());
+        Assert.Null(document.DocumentElement!.GetOffsetParent());
+    }
+
+    [Fact]
     public async Task OffsetParent_IsNull_ForFixedPositionedElements()
     {
         var document = await ParseAsync("""

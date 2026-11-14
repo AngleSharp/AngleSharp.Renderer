@@ -146,11 +146,14 @@ public sealed class InteractiveFrameTests
     }
 
     [Fact]
-    public async Task Frame_WithStickyBoxCannotReposition()
+    public async Task Frame_WithStickyBoxRepositionsButIsNotShiftable()
     {
         var (_, harness) = await OpenAsync("""<div style="position: sticky; top: 0; height: 10px"></div><div style="height: 1000px"></div>""");
+        var frame = harness.PrepareFrame();
 
-        Assert.False(harness.PrepareFrame().CanReposition);
+        // the sticky box sticks anew (see StickyRepositionTests), a host cannot just shift the frame
+        Assert.True(frame.CanReposition);
+        Assert.False(frame.IsScrollShiftable);
     }
 
     [Fact]

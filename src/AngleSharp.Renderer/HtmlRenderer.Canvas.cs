@@ -63,6 +63,12 @@ public sealed partial class HtmlRenderer
             return null;
         }
 
+        // the frame an animated GIF shows now, as in browsers
+        if (resource.VectorImage is null && resource.Bytes is { } bytes && AnimatedImage.For(bytes) is { } animated)
+        {
+            return animated.GetCurrentFrame();
+        }
+
         var image = s_canvasImages.GetValue(resource, static value =>
         {
             if (value.VectorImage is { } vector)

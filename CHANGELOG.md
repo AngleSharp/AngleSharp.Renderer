@@ -1,3 +1,19 @@
+# 0.11.4
+
+Released on tbd.
+
+- Improved frames of pages animating the `transform`, `opacity` or `filter` of boxes (e.g. a glow turning forever behind the cards of smapiot.com, or a carousel sliding): the last frame is painted with the box under its new values, without a layout (about 3 ms instead of 400 ms per frame there), as long as the box keeps the scopes it was painted in; a box animating its transform or opacity is painted under them all along (at the identity, too), as browsers make it a stacking context; this also holds for CSS transitions and for changes of the style attribute
+- Improved scrolling pages with sticky boxes (e.g. a sticky header): the frame is moved to the scroll position with the sticky boxes stuck anew, also for hit testing, instead of laying out the page again
+- Improved changes of what is never rendered (e.g. WP Rocket changing the type and src of scripts to load them, or scripts added to the head or the body): the frame stays, unless a selector of an attribute or of the siblings may match otherwise
+- Improved reading the geometry of a page shown in frames after a change that cannot be patched: the page is laid out as its next frame, which the next frame then is, instead of being laid out for the read and once more for the frame
+- Fixed `@keyframes` without a `from` or `to` keyframe for a property (e.g. `@keyframes spin { to { transform: rotate(360deg) } }`) staying at the value of the other keyframe instead of animating from or to the element's own value
+- Added `RenderedFrame.HasTextAt(x, y)`, telling a host where to show the cursor of text without touching the DOM
+- Fixed `offsetParent` of the body and the root being the body, so a script summing `offsetTop` up the chain of offset parents (e.g. Elementor finding where a section is) never ended and froze the page; they have none, a table cell or table is the offset parent of a static element in it, and the positions come from the last layout instead of the style of every ancestor computed anew
+- Fixed a rounded border with sides of different colors (e.g. a spinner of two green sides of a circle) losing the curve between the sides: the sides met on the straight corners of the padding box, which cut off the rounded inner edge, so a circle's sides showed as separate crescents and inner corners came out square; adjacent sides painted alike are now painted as one, without a seam on the diagonal of their corner
+- Fixed animations of `::before` and `::after` (e.g. a spinner made of both) never moving: a pseudo-element is a new object for every layout, so its animations started anew with every frame
+- Fixed transforms between angles (`deg`, `rad`, `grad`, `turn`), absolute lengths or times of different units not interpolating, e.g. `rotate(0deg)` to `rotate(1turn)` staying where it was
+- Added animated images: a GIF or WebP of several frames shows the frame its time has come to when a frame is rasterized (also as a background, a border image, or drawn into a canvas), from the moment it is first painted and as often as it loops; `RenderedFrame.GetTimeToNextImageFrame()` tells a host when one in view changes, which needs no layout
+
 # 0.11.3
 
 Released on Friday, November 13 2026.

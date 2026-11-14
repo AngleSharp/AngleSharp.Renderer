@@ -1,7 +1,10 @@
 using AngleSharp.Css.Dom;
 using AngleSharp.Dom;
+using System.Collections.Concurrent;
 using System.Globalization;
 using System.Linq;
+using System.Reflection;
+using System.Runtime.CompilerServices;
 
 namespace AngleSharp.Renderer;
 
@@ -86,6 +89,16 @@ internal sealed class CssAnimationTracker
     private bool _isFirstFrame = true;
     private Dictionary<(IDocument Document, string Name), IReadOnlyList<CssKeyframeStop>?>? _frameKeyframes;
 
+    // A pseudo-element is a new object for every render tree, so its animations are kept for the
+    // first one seen of its host and name: else each layout would start them anew (a spinner made
+    // of ::before and ::after would never turn).
+    private readonly ConditionalWeakTable<IElement, Dictionary<string, IElement>> _pseudoElements = [];
+    private readonly HashSet<IElement> _trackedPseudoElements = [];
+    // the animations of pseudo-elements playing in the frame painted last (they have no events,
+    // so they are only seen when their values are looked up)
+    private HashSet<(IElement Element, string Name)> _playingPseudoAnimations = [];
+    private static readonly ConcurrentDictionary<Type, Func<object, IElement?>?> s_hostGetters = new();
+
     /// <summary>
     /// Caches the animations of elements and the keyframes they refer to until the returned
     /// scope is disposed, i.e. for the duration of painting one frame.
@@ -93,6 +106,7 @@ internal sealed class CssAnimationTracker
     public IDisposable BeginFrame(IDocument? document = null)
     {
         IsAnimating = false;
+        _playingPseudoAnimations = [];
         _frameSpecs = [];
         _frameKeyframes = [];
         _isFirstFrame = document is null || !_paintedDocuments.Contains(document);
@@ -124,6 +138,85 @@ internal sealed class CssAnimationTracker
 
             return false;
         }
+    }
+
+    /// <summary>
+    /// Gets the elements with an animation that has not ended and is not paused, as the host of
+    /// a pseudo-element (with <c>IsPseudo</c>) for an animation of one.
+    /// </summary>
+    public IEnumerable<(IElement Element, bool IsPseudo)> GetRunningElements()
+    {
+        var elements = new HashSet<(IElement, bool)>();
+
+        foreach (var (key, state) in _phases)
+        {
+            if (state.Phase is CssAnimationPhase.Before or CssAnimationPhase.Active && !IsPaused(key))
+            {
+                if (key.Element is IPseudoElement pseudo)
+                {
+                    if (GetHost(pseudo) is not { } host)
+                    {
+                        return [];
+                    }
+
+                    elements.Add((host, true));
+                }
+                else
+                {
+                    elements.Add((key.Element, false));
+                }
+            }
+        }
+
+        foreach (var (pseudo, _) in _playingPseudoAnimations)
+        {
+            if (GetHost((IPseudoElement)pseudo) is not { } host)
+            {
+                return [];
+            }
+
+            elements.Add((host, true));
+        }
+
+        return elements;
+    }
+
+    /// <summary>
+    /// Gets if an animation of the element that has not ended (and is not paused) animates the
+    /// property, i.e., if the element is painted under it for as long as it runs.
+    /// </summary>
+    public bool IsAnimatingProperty(IElement element, string property)
+    {
+        element = GetStableElement(element);
+
+        if (element is IPseudoElement)
+        {
+            foreach (var (pseudo, name) in _playingPseudoAnimations)
+            {
+                if (ReferenceEquals(pseudo, element) && GetKeyframeStops(element, name) is { } pseudoStops && pseudoStops.Any(stop => stop.PropertyValues.ContainsKey(property)))
+                {
+                    return true;
+                }
+            }
+
+            return false;
+        }
+
+        if (!_trackedNames.TryGetValue(element, out var names))
+        {
+            return false;
+        }
+
+        foreach (var name in names)
+        {
+            if (_phases.TryGetValue((element, name), out var state) && state.Phase is CssAnimationPhase.Before or CssAnimationPhase.Active && !IsPaused((element, name)) &&
+                GetKeyframeStops(element, name) is { } stops && stops.Any(stop => stop.PropertyValues.ContainsKey(property)))
+            {
+                return true;
+            }
+        }
+
+        return false;
     }
 
     private bool IsPaused((IElement Element, string Name) key) =>
@@ -293,6 +386,11 @@ internal sealed class CssAnimationTracker
 
     private void ForgetDisconnectedElements()
     {
+        if (_trackedPseudoElements.Count > 0)
+        {
+            ForgetDisconnectedPseudoElements();
+        }
+
         if (_trackedNames.Count == 0)
         {
             return;
@@ -308,6 +406,67 @@ internal sealed class CssAnimationTracker
                 }
 
                 _trackedNames.Remove(element);
+            }
+        }
+    }
+
+    /// <summary>
+    /// The pseudo-element standing for all of the same host and name (see <see cref="_pseudoElements"/>),
+    /// or the element itself.
+    /// </summary>
+    private IElement GetStableElement(IElement element)
+    {
+        if (element is not IPseudoElement pseudo || GetHost(pseudo) is not { } host)
+        {
+            return element;
+        }
+
+        var byName = _pseudoElements.GetOrCreateValue(host);
+
+        if (!byName.TryGetValue(pseudo.PseudoName, out var stable))
+        {
+            byName[pseudo.PseudoName] = stable = pseudo;
+            _trackedPseudoElements.Add(stable);
+        }
+
+        return stable;
+    }
+
+    /// <summary>
+    /// The element a pseudo-element belongs to. AngleSharp.Css keeps it internal (`PseudoElement.Host`),
+    /// so it is read by reflection; without it, the animations of pseudo-elements restart with
+    /// every layout, as before.
+    /// </summary>
+    internal static IElement? GetHost(IPseudoElement pseudo) =>
+        s_hostGetters.GetOrAdd(pseudo.GetType(), static type =>
+            type.GetProperty("Host", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic) is { CanRead: true } property &&
+            typeof(IElement).IsAssignableFrom(property.PropertyType)
+                ? instance => property.GetValue(instance) as IElement
+                : null)?.Invoke(pseudo);
+
+    private void ForgetDisconnectedPseudoElements()
+    {
+        foreach (var pseudo in _trackedPseudoElements.ToArray())
+        {
+            var host = GetHost((IPseudoElement)pseudo);
+
+            if (host is null || !host.IsConnected())
+            {
+                _trackedPseudoElements.Remove(pseudo);
+
+                if (host is not null)
+                {
+                    _pseudoElements.Remove(host);
+                }
+
+                foreach (var key in _startTimesMs.Keys.Where(m => ReferenceEquals(m.Element, pseudo)).ToArray())
+                {
+                    _startTimesMs.Remove(key);
+                    _pausedAccumulatedMs.Remove(key);
+                    _lastObservedClockMs.Remove(key);
+                    _phases.Remove(key);
+                    _pausedNames.Remove(key);
+                }
             }
         }
     }
@@ -336,6 +495,7 @@ internal sealed class CssAnimationTracker
     /// </summary>
     public string? GetAnimatedValue(IElement element, string property, double clockMs, ICssStyleDeclaration? computedStyle = null)
     {
+        element = GetStableElement(element);
         var specs = GetAnimationSpecs(element, computedStyle);
 
         if (specs.Count == 0)
@@ -350,7 +510,7 @@ internal sealed class CssAnimationTracker
 
         foreach (var spec in specs)
         {
-            var value = GetAnimatedValueForSpec(element, spec, property, clockMs);
+            var value = GetAnimatedValueForSpec(element, spec, property, clockMs, computedStyle);
 
             if (value is not null)
             {
@@ -394,7 +554,7 @@ internal sealed class CssAnimationTracker
         return stops;
     }
 
-    private string? GetAnimatedValueForSpec(IElement element, CssAnimationSpec spec, string property, double clockMs)
+    private string? GetAnimatedValueForSpec(IElement element, CssAnimationSpec spec, string property, double clockMs, ICssStyleDeclaration? computedStyle)
     {
         var keyframes = GetKeyframeStops(element, spec.Name);
 
@@ -416,6 +576,11 @@ internal sealed class CssAnimationTracker
         if (!spec.IsPaused && (elapsedMs < totalDurationMs || double.IsPositiveInfinity(totalDurationMs)))
         {
             IsAnimating = true;
+
+            if (element is IPseudoElement)
+            {
+                _playingPseudoAnimations.Add((element, spec.Name));
+            }
         }
 
         if (elapsedMs < 0d)
@@ -453,7 +618,7 @@ internal sealed class CssAnimationTracker
         var progress = iterationRunsBackward ? 1d - rawProgress : rawProgress;
         var eased = spec.TimingFunction.Evaluate(progress);
 
-        return InterpolateAtKeyframes(keyframes, property, eased);
+        return InterpolateAtKeyframes(keyframes, property, eased, () => GetUnderlyingValue(computedStyle ?? element.ComputeCurrentStyle(), property));
     }
 
     /// <summary>
@@ -489,42 +654,81 @@ internal sealed class CssAnimationTracker
         return clockMs - _pausedAccumulatedMs.GetValueOrDefault(key);
     }
 
-    private static string? InterpolateAtKeyframes(IReadOnlyList<CssKeyframeStop> stops, string property, double position)
+    // the element's own value of an animated property, an unset function list (e.g. transform) being none
+    private static string? GetUnderlyingValue(ICssStyleDeclaration? style, string property)
     {
-        if (position <= stops[0].Position)
+        if (style is null)
         {
-            return stops[0].PropertyValues.TryGetValue(property, out var value) ? value : null;
+            return null;
         }
 
-        if (position >= stops[^1].Position)
+        var kind = CssValueInterpolation.KindOf(property);
+        return CssValueInterpolation.ReadNaturalValue(style, property, kind) ?? (kind == CssInterpolationValueKind.FunctionList ? "none" : null);
+    }
+
+    /// <summary>
+    /// The value of the property at the position between the keyframes declaring it. Without a
+    /// keyframe declaring it at 0% or 100%, the element's own value is the one there (CSS
+    /// Animations 1, 3.: e.g. `@keyframes spin { to { transform: rotate(360deg) } }` turns from
+    /// the transform the element has, instead of staying at the end).
+    /// </summary>
+    private static string? InterpolateAtKeyframes(IReadOnlyList<CssKeyframeStop> stops, string property, double position, Func<string?> getUnderlyingValue)
+    {
+        var declaring = new List<(double Position, string Value)>(stops.Count + 2);
+
+        foreach (var stop in stops)
         {
-            return stops[^1].PropertyValues.TryGetValue(property, out var value) ? value : null;
+            if (stop.PropertyValues.TryGetValue(property, out var value))
+            {
+                declaring.Add((stop.Position, value));
+            }
         }
 
-        var upperIndex = 0;
+        if (declaring.Count == 0)
+        {
+            return null;
+        }
 
-        while (upperIndex < stops.Count && stops[upperIndex].Position < position)
+        if (declaring[0].Position > 0d || declaring[^1].Position < 1d)
+        {
+            var underlying = getUnderlyingValue();
+
+            if (!string.IsNullOrWhiteSpace(underlying))
+            {
+                if (declaring[0].Position > 0d)
+                {
+                    declaring.Insert(0, (0d, underlying));
+                }
+
+                if (declaring[^1].Position < 1d)
+                {
+                    declaring.Add((1d, underlying));
+                }
+            }
+        }
+
+        if (position <= declaring[0].Position)
+        {
+            return declaring[0].Value;
+        }
+
+        if (position >= declaring[^1].Position)
+        {
+            return declaring[^1].Value;
+        }
+
+        var upperIndex = 1;
+
+        while (upperIndex < declaring.Count - 1 && declaring[upperIndex].Position < position)
         {
             upperIndex++;
         }
 
-        var lower = stops[upperIndex - 1];
-        var upper = stops[upperIndex];
-        var hasLower = lower.PropertyValues.TryGetValue(property, out var lowerValue);
-        var hasUpper = upper.PropertyValues.TryGetValue(property, out var upperValue);
-
-        if (hasLower && hasUpper)
-        {
-            var span = upper.Position - lower.Position;
-            var subT = span > 0d ? (position - lower.Position) / span : 1d;
-            return CssValueInterpolation.Interpolate(property, lowerValue!, upperValue!, subT);
-        }
-
-        // Only one of the two bracketing keyframes declares this property - a defensible
-        // simplification (rather than searching further afield for the nearest declaring
-        // keyframe on either side, which the spec technically requires): use whichever edge
-        // actually declared a value instead of no override at all.
-        return hasLower ? lowerValue : hasUpper ? upperValue : null;
+        var (lowerPosition, lowerValue) = declaring[upperIndex - 1];
+        var (upperPosition, upperValue) = declaring[upperIndex];
+        var span = upperPosition - lowerPosition;
+        var subT = span > 0d ? (position - lowerPosition) / span : 1d;
+        return CssValueInterpolation.Interpolate(property, lowerValue, upperValue, subT);
     }
 
     private static IReadOnlyList<CssKeyframeStop>? FindKeyframeStops(IElement element, string name)

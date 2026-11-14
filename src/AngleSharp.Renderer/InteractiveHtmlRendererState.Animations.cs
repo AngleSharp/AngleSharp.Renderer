@@ -163,6 +163,14 @@ internal sealed partial class InteractiveHtmlRendererState
     /// Gets if a transition or a script's animation may give an element another value than its
     /// computed style has (CSS animations are told by the style itself).
     /// </summary>
+    /// <summary>
+    /// Gets if an animation or a transition of the element changes the property now, which then
+    /// opens its scope (e.g. a transform at its identity), so that the frames to come only paint
+    /// it under another value (see LayoutSnapshot.TryAnimate).
+    /// </summary>
+    internal bool IsAnimatingProperty(IElement element, string property) =>
+        _animationTracker.IsAnimatingProperty(element, property) || _transitionTracker.IsTransitioning(element, property);
+
     internal bool MayOverrideComputedStyles => _transitionTracker.HasRuns || _scriptAnimations.Count > 0;
 
     private bool HasRunningScriptAnimations

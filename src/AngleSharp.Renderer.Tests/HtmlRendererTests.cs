@@ -4170,6 +4170,35 @@ public sealed class HtmlRendererTests
     }
 
     [Fact]
+    public async Task RenderToPng_PaintsTheWholeCurveOfACircleWithTwoColoredSides()
+    {
+        // a spinner: the right and bottom sides of a circle, which form a half ring
+        var document = await ParseAsync("""
+            <html><body style="margin:0">
+                <div style="width:92px; height:92px; border:4px solid; border-color:transparent #00ff00 #00ff00 transparent; border-radius:50%;"></div>
+            </body></html>
+            """);
+
+        var image = new HtmlRenderer().RenderToPng(document, new DefaultRenderDevice { ViewPortWidth = 100, ViewPortHeight = 100 });
+        using var bitmap = SkiaSharp.SKBitmap.Decode(image.Data);
+
+        // on the middle of the ring (radius 48 around 50, 50) at these angles below the horizontal
+        SkiaSharp.SKColor At(double degrees) => bitmap.GetPixel(
+            (int)Math.Round(50 + (48 * Math.Cos(degrees * Math.PI / 180))),
+            (int)Math.Round(50 + (48 * Math.Sin(degrees * Math.PI / 180))));
+
+        foreach (var degrees in new[] { -30d, 0d, 30d, 45d, 60d, 90d, 120d })
+        {
+            Assert.True(At(degrees).Green > 200 && At(degrees).Red < 60, $"The ring is not painted at {degrees} degrees: {At(degrees)}.");
+        }
+
+        foreach (var degrees in new[] { 180d, 210d, 270d })
+        {
+            Assert.True(At(degrees).Green > 200 && At(degrees).Red > 200, $"The transparent sides are painted at {degrees} degrees: {At(degrees)}.");
+        }
+    }
+
+    [Fact]
     public async Task BuildDisplayList_ParsesEllipticalBorderRadiusPerCornerLonghand()
     {
         var document = await ParseAsync("""
@@ -4321,14 +4350,15 @@ public sealed class HtmlRendererTests
             ViewPortHeight = 200,
         });
 
-        // Mixed edge widths have no single stroke width, so each edge is the ring between the
-        // outer and the inner rounded rectangle, clipped to that edge's own trapezoid.
+        // Mixed edge widths have no single stroke width, so the border is the ring between the
+        // outer and the inner rounded rectangle; edges painted alike are one ring, not clipped
+        // apart (which would leave seams on the corner diagonals).
         Assert.Empty(displayList.Commands.OfType<StrokeRoundedRectCommand>());
-        Assert.Equal(4, displayList.Commands.OfType<PushClipShapeCommand>().Count());
+        Assert.Empty(displayList.Commands.OfType<PushClipShapeCommand>());
 
         var rings = displayList.Commands.OfType<FillRingCommand>().ToArray();
-        Assert.Equal(4, rings.Length);
-        Assert.All(rings, ring => Assert.Equal(new RenderColor(0, 0, 255), ring.Color));
+        Assert.Single(rings);
+        Assert.Equal(new RenderColor(0, 0, 255), rings[0].Color);
 
         // The inner corner follows the outer radius minus the adjacent border widths.
         Assert.Equal(12f, rings[0].OuterRadii.TopRightX);

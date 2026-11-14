@@ -1,5 +1,7 @@
 namespace AngleSharp.Renderer.Rendering;
 
+using AngleSharp.Renderer.Skia;
+
 /// <summary>
 /// A laid out frame of an interactive document (see <see cref="IDomHarness.PrepareFrame"/>). It
 /// no longer refers to the DOM for painting, so it can be rasterized on another thread while the
@@ -16,6 +18,8 @@ public sealed class RenderedFrame
     private readonly DisplayList? _overlay;
     // the display list with the selection painted into it, see WithSelection
     private readonly DisplayList? _selection;
+    // the same as painted into the display list of the frame's sticky boxes as laid out (see Reposition)
+    private readonly DisplayList? _selectionBase;
     private HtmlRenderer.TextMap? _textMap;
     private readonly AngleSharp.Dom.IDocument? _document;
 
@@ -41,8 +45,10 @@ public sealed class RenderedFrame
         IsAnimating = frame.IsAnimating;
         IsPartial = frame.IsPartial;
         Metrics = frame.Metrics;
+        Stickies = frame.Stickies;
         _overlay = overlay;
         _selection = selection;
+        _selectionBase = selection;
         _textMap = frame._textMap;
     }
 
@@ -55,13 +61,28 @@ public sealed class RenderedFrame
     {
         IsAnimating = frame.IsAnimating;
         Metrics = metrics;
+
+        // its sticky boxes, if they are still where they were
+        if (frame.Stickies is { } stickies)
+        {
+            Stickies = frame._shiftY == 0f ? stickies.With(displayList, frame.HitTestMap) : null;
+            CanReposition = Stickies is not null;
+        }
+    }
+
+    private RenderedFrame(DisplayList displayList, RenderedFrame frame, double scrollTop, HitTestMap hitTestMap, float shiftY, DisplayList? stuckSelection)
+        : this(displayList, frame, scrollTop, hitTestMap, shiftY)
+    {
+        _selection = stuckSelection;
     }
 
     private RenderedFrame(DisplayList displayList, RenderedFrame frame, double scrollTop, HitTestMap hitTestMap, float shiftY)
         : this(displayList, frame._backend, frame._surface, frame.ViewportHeight, scrollTop, frame.OverscanTop, frame.ContentHeight, frame.IsScrollShiftable, true, hitTestMap, shiftY, frame._document)
     {
         IsPartial = frame.IsPartial;
+        Stickies = frame.Stickies;
         _selection = frame._selection;
+        _selectionBase = frame._selectionBase;
         _textMap = frame._textMap;
     }
 
@@ -105,7 +126,10 @@ public sealed class RenderedFrame
     /// Gets if the frame can be moved to another scroll position without a layout (see
     /// <see cref="Reposition"/>), which holds unless the page has sticky boxes.
     /// </summary>
-    public bool CanReposition { get; }
+    public bool CanReposition { get; private set; }
+
+    /// <summary>Gets the sticky boxes of the frame, which stick anew when it is repositioned.</summary>
+    internal HtmlRenderer.IStickyFrame? Stickies { get; init; }
 
     /// <summary>
     /// Gets if CSS transitions or animations are running, i.e., the next frame looks different
@@ -149,6 +173,14 @@ public sealed class RenderedFrame
             throw new InvalidOperationException("Frames with sticky boxes cannot be repositioned.");
         }
 
+        // the sticky boxes stick as they do at the position, from where they were laid out
+        if (Stickies is { } stickies)
+        {
+            var (displayList, selection, map) = stickies.StickAt(scrollTop, _selectionBase);
+            var shift = (float)(stickies.ScrollTop - scrollTop);
+            return new RenderedFrame(displayList, this, scrollTop, map.Shift(shift), shift, selection);
+        }
+
         var delta = (float)(ScrollTop - scrollTop);
         return new RenderedFrame(_displayList, this, scrollTop, HitTestMap.Shift(delta), _shiftY + delta);
     }
@@ -175,6 +207,79 @@ public sealed class RenderedFrame
 
     /// <summary>Gets how far a repositioned frame's text map moves with the page.</summary>
     internal float TextMapShiftY => _shiftY;
+
+    /// <summary>
+    /// Gets if text of the page is painted at the point, e.g., for showing the cursor of text
+    /// there. Only a frame of a document whose text can be selected (see
+    /// <see cref="IDomHarness.IsTextSelectionEnabled"/>) knows where its text is. Does not touch
+    /// the DOM, so it is safe to call from any thread.
+    /// </summary>
+    /// <param name="x">The horizontal position in viewport coordinates.</param>
+    /// <param name="y">The vertical position in viewport coordinates.</param>
+    /// <returns>True if a glyph box of the text covers the point.</returns>
+    public bool HasTextAt(double x, double y) =>
+        _document is not null && TextMap.HasTextAt((float)x, (float)y + OverscanTop, -_shiftY);
+
+    /// <summary>
+    /// Gets how long the frame still looks as it does now because of its animated images (e.g.,
+    /// a GIF of several frames in view or in the overscan), i.e., when rasterizing it again shows
+    /// another frame of one of them, which needs no layout. Safe to call from any thread.
+    /// </summary>
+    /// <returns>The time until an animated image changes, or null if none does.</returns>
+    public TimeSpan? GetTimeToNextImageFrame()
+    {
+        TimeSpan? next = null;
+        var transforms = new Stack<RenderTransform2D>();
+        // a repositioned frame is shifted, except for its fixed boxes (see GetPageDisplayList)
+        var transform = RenderTransform2D.Translate(0f, _shiftY);
+        var anchorDepth = 0;
+
+        foreach (var command in (_selection ?? _displayList).Commands)
+        {
+            switch (command)
+            {
+                case PushTransformCommand push:
+                    transforms.Push(transform);
+                    transform = RenderTransform2D.Multiply(transform, push.Transform);
+                    continue;
+                case PopTransformCommand when transforms.Count > 0:
+                    transform = transforms.Pop();
+                    continue;
+                case PushViewportAnchorCommand when anchorDepth++ == 0:
+                    transforms.Push(transform);
+                    transform = RenderTransform2D.Multiply(transform, RenderTransform2D.Translate(0f, -_shiftY));
+                    continue;
+                case PopViewportAnchorCommand when --anchorDepth == 0 && transforms.Count > 0:
+                    transform = transforms.Pop();
+                    continue;
+            }
+
+            var (rect, image) = command switch
+            {
+                DrawImageCommand draw => (draw.Rect, draw.Image),
+                FillRectCommand { Paint: RenderImagePaint paint } fill => (fill.Rect, paint.Image),
+                DrawBorderImageCommand { Image.Source: RenderImagePaint paint } border => (border.Area, paint.Image),
+                _ => (default(RenderRect), null),
+            };
+
+            if (image is null || image.VectorImage is not null || image.Canvas is not null || !IsOnSurface(rect, transform) ||
+                AnimatedImage.For(image.Data) is not { } animated || animated.GetTimeToNextFrame() is not { } remaining)
+            {
+                continue;
+            }
+
+            next = next is { } earlier && earlier <= remaining ? earlier : remaining;
+        }
+
+        return next;
+    }
+
+    // whether any of the rectangle is on the surface, vertically
+    private bool IsOnSurface(RenderRect rect, RenderTransform2D transform)
+    {
+        var bounds = transform.MapBounds(rect);
+        return bounds.Y + bounds.Height >= 0f && bounds.Y <= _surface.Height;
+    }
 
     /// <summary>
     /// Rasterizes the frame into pixels. Safe to call from any thread.
