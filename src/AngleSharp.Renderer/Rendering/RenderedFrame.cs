@@ -222,13 +222,15 @@ public sealed class RenderedFrame
 
     /// <summary>
     /// Gets how long the frame still looks as it does now because of its animated images (e.g.,
-    /// a GIF of several frames in view or in the overscan), i.e., when rasterizing it again shows
-    /// another frame of one of them, which needs no layout. Safe to call from any thread.
+    /// a GIF of several frames in view or in the overscan) or the controls of playing media (their
+    /// time and timeline), i.e., when rasterizing it again shows another frame of one of them,
+    /// which needs no layout. Safe to call from any thread.
     /// </summary>
-    /// <returns>The time until an animated image changes, or null if none does.</returns>
+    /// <returns>The time until an animated image or the controls of playing media change, or null if none does.</returns>
     public TimeSpan? GetTimeToNextImageFrame()
     {
         TimeSpan? next = null;
+        var now = System.Diagnostics.Stopwatch.GetTimestamp();
         var transforms = new Stack<RenderTransform2D>();
         // a repositioned frame is shifted, except for its fixed boxes (see GetPageDisplayList)
         var transform = RenderTransform2D.Translate(0f, _shiftY);
@@ -251,6 +253,20 @@ public sealed class RenderedFrame
                     continue;
                 case PopViewportAnchorCommand when --anchorDepth == 0 && transforms.Count > 0:
                     transform = transforms.Pop();
+                    continue;
+                case MediaTimelineCommand { Timeline: var timeline }:
+                    if (IsOnSurface(timeline.Area, transform) && timeline.GetTimeToNextChange(now) is { } change)
+                    {
+                        next = next is { } sooner && sooner <= change ? sooner : change;
+                    }
+
+                    continue;
+                case DrawSubframeCommand { Frame: { } subframe } draw:
+                    if (IsOnSurface(draw.Viewport, transform) && subframe.GetTimeToNextImageFrame() is { } nested)
+                    {
+                        next = next is { } sooner && sooner <= nested ? sooner : nested;
+                    }
+
                     continue;
             }
 
@@ -320,7 +336,7 @@ public sealed class RenderedFrame
 
     private DisplayList GetPageDisplayList()
     {
-        var displayList = _selection ?? _displayList;
+        var displayList = HtmlRenderer.PaintMediaTimelines(_selection ?? _displayList);
 
         if (_shiftY == 0f)
         {

@@ -2754,7 +2754,7 @@ public sealed partial class HtmlRenderer
     private static float? ResolveControlBaseline(ElementRenderNode element, float borderBoxHeight) =>
         ResolveFormControlKind(element) switch
         {
-            FormControlKind.Checkbox or FormControlKind.Radio or FormControlKind.Range or FormControlKind.Progress or FormControlKind.Meter => borderBoxHeight,
+            FormControlKind.Checkbox or FormControlKind.Radio or FormControlKind.Range or FormControlKind.Progress or FormControlKind.Meter or FormControlKind.Media => borderBoxHeight,
             FormControlKind.Color => Math.Max(0f, borderBoxHeight - 6f),
             FormControlKind.ListBox => Math.Max(0f, borderBoxHeight - 3f),
             FormControlKind.Button when string.Equals(element.Ref.LocalName, "button", StringComparison.OrdinalIgnoreCase) && ResolveFormControlLabel(FormControlKind.Button, element.Ref).Length == 0 => borderBoxHeight / 2f,

@@ -109,9 +109,11 @@ public sealed partial class SkiaRenderBackend : IPixelRenderBackend, ITextMeasur
                 canvas.ClipRect(new SKRect(drawSubframe.Viewport.X, drawSubframe.Viewport.Y, drawSubframe.Viewport.X + drawSubframe.Viewport.Width, drawSubframe.Viewport.Y + drawSubframe.Viewport.Height));
                 canvas.Translate(drawSubframe.Viewport.X, drawSubframe.Viewport.Y);
 
-                foreach (var nested in subframe.DisplayList.Commands)
+                var nestedList = HtmlRenderer.PaintMediaTimelines(subframe.DisplayList);
+
+                foreach (var nested in nestedList.Commands)
                 {
-                    DrawCommand(canvas, nested, subframe.DisplayList.Fonts, state);
+                    DrawCommand(canvas, nested, nestedList.Fonts, state);
                 }
 
                 canvas.Restore();

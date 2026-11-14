@@ -20,12 +20,19 @@ public sealed class DisplayList
     public FontFaceSet Fonts { get; set; } = FontFaceSet.Empty;
 
     /// <summary>
+    /// Gets if the list ever had the timeline of a media element, which is painted when the list
+    /// is rasterized (see <see cref="HtmlRenderer.PaintMediaTimelines"/>).
+    /// </summary>
+    internal bool HasMediaTimelines { get; private set; }
+
+    /// <summary>
     /// Adds a command to the list.
     /// </summary>
     /// <param name="command">The command to add.</param>
     public void Add(RenderCommand command)
     {
         ArgumentNullException.ThrowIfNull(command);
+        HasMediaTimelines |= command is MediaTimelineCommand;
         _commands.Add(command);
     }
 
@@ -41,7 +48,9 @@ public sealed class DisplayList
     public void InsertRange(int index, IEnumerable<RenderCommand> commands)
     {
         ArgumentNullException.ThrowIfNull(commands);
+        var start = _commands.Count;
         _commands.InsertRange(index, commands);
+        NoteMediaTimelines(index, _commands.Count - start);
     }
 
     /// <summary>
@@ -50,7 +59,17 @@ public sealed class DisplayList
     internal void ReplaceRange(int index, int count, IEnumerable<RenderCommand> commands)
     {
         _commands.RemoveRange(index, count);
+        var start = _commands.Count;
         _commands.InsertRange(index, commands);
+        NoteMediaTimelines(index, _commands.Count - start);
+    }
+
+    private void NoteMediaTimelines(int index, int count)
+    {
+        for (var offset = 0; offset < count && !HasMediaTimelines; offset++)
+        {
+            HasMediaTimelines = _commands[index + offset] is MediaTimelineCommand;
+        }
     }
 
     /// <summary>
@@ -72,6 +91,7 @@ public sealed class DisplayList
         {
             if (ReferenceEquals(_commands[index], command))
             {
+                HasMediaTimelines |= replacement is MediaTimelineCommand;
                 _commands[index] = replacement;
                 return true;
             }

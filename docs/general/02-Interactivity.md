@@ -285,6 +285,33 @@ if (frame.GetTimeToNextImageFrame() is { } delay)
 }
 ```
 
+## Media Controls
+
+An `audio` element with the `controls` attribute is painted with the controls of Chrome (300x54 by
+default): a play/pause button, the time, a timeline and a mute button, showing the state of the
+element (`paused`, `currentTime`, `duration`, `muted`). While the media plays, the time and the
+timeline are painted for the moment the frame is rasterized, so they go on without a layout, and
+`GetTimeToNextImageFrame()` also tells when they change next. Without `controls`, an `audio` element
+is not rendered.
+
+The controls are painted, not boxes, so a host finds the part a press is on, in viewport
+coordinates, and acts on the element itself:
+
+```cs
+switch (audio.GetMediaControlAt(x, y))
+{
+    case MediaControlPart.PlayPause:
+        // play() or pause(), depending on audio.IsPaused
+        break;
+    case MediaControlPart.Mute:
+        audio.IsMuted = !audio.IsMuted;
+        break;
+    case MediaControlPart.Timeline:
+        audio.CurrentTime = audio.GetMediaTimelinePosition(x)!.Value * audio.Duration;
+        break;
+}
+```
+
 ## Scrolling
 
 The same harness also tracks per-element scroll position, read and set through the standard

@@ -814,7 +814,7 @@ public sealed partial class HtmlRenderer
         var viewport = new RenderViewport(context.Width, context.Height);
         var displayList = WithSelectionPainted(document, context, BuildDisplayList(document, viewport, context, renderDevice, ResolveRootScrollOffsetY(document)));
 
-        return _backend.RenderToPng(displayList, viewport);
+        return _backend.RenderToPng(PaintMediaTimelines(displayList), viewport);
     }
 
     /// <summary>
@@ -6883,7 +6883,7 @@ public sealed partial class HtmlRenderer
     private static bool GeneratesBoxes(IRenderNode node) =>
         node.Ref.Owner is not null &&
         (node is not ElementRenderNode element ||
-         !string.Equals(element.ComputedStyle.GetDisplay()?.Trim(), "none", StringComparison.OrdinalIgnoreCase));
+         !string.Equals(element.ComputedStyle.GetDisplay()?.Trim(), "none", StringComparison.OrdinalIgnoreCase) && !IsAudioWithoutControls(element.Ref));
 
     private static RenderTextStyle ResolveTextStyle(Dictionary<string, string> styleMap, RenderTextStyle inherited, LayoutContext context)
     {
@@ -10527,6 +10527,9 @@ public sealed partial class HtmlRenderer
 
         /// <summary>`input[type=hidden]` - never laid out or painted; see the type's own remarks.</summary>
         Hidden,
+
+        /// <summary>`audio[controls]` - the panel of its controls, its fallback content not shown.</summary>
+        Media,
     }
 
     /// <summary>
@@ -10649,6 +10652,11 @@ public sealed partial class HtmlRenderer
         if (string.Equals(tagName, "meter", StringComparison.OrdinalIgnoreCase))
         {
             return FormControlKind.Meter;
+        }
+
+        if (ShowsMediaControls(element))
+        {
+            return FormControlKind.Media;
         }
 
         if (string.Equals(tagName, "button", StringComparison.OrdinalIgnoreCase))
@@ -10850,6 +10858,11 @@ public sealed partial class HtmlRenderer
                 SetDefaultHeight(textStyle.FontSize);
                 break;
 
+            case FormControlKind.Media:
+                SetDefaultWidth(MediaControlsWidth);
+                SetDefaultHeight(MediaControlsHeight);
+                break;
+
             case FormControlKind.TextArea:
                 // Only a floor: content that wraps past its rows still grows the box.
                 SetDefaultWidth(ResolveTextControlWidth(kind, element, styleMap, textStyle, context));
@@ -10941,7 +10954,7 @@ public sealed partial class HtmlRenderer
     /// If a control paints what it shows itself, so its children are not laid out.
     /// </summary>
     private static bool PaintsOwnContent(FormControlKind kind) =>
-        kind is FormControlKind.Select or FormControlKind.ListBox or FormControlKind.Button or FormControlKind.Progress or FormControlKind.Meter or FormControlKind.Frame;
+        kind is FormControlKind.Select or FormControlKind.ListBox or FormControlKind.Button or FormControlKind.Progress or FormControlKind.Meter or FormControlKind.Frame or FormControlKind.Media;
 
     /// <summary>
     /// The options a select shows at once (HTML 15.5.10): its `size`, else 4 if it allows selecting
@@ -11499,6 +11512,10 @@ public sealed partial class HtmlRenderer
 
             case FormControlKind.Meter:
                 PaintMeter(displayList, element, contentX, contentY, contentWidth, contentHeight);
+                break;
+
+            case FormControlKind.Media:
+                PaintMediaControls(displayList, element, textStyle, context, contentX, contentY, contentWidth, contentHeight);
                 break;
 
             case FormControlKind.Checkbox:
