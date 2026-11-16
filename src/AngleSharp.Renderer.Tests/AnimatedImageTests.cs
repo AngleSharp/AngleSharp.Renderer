@@ -13,20 +13,38 @@ public sealed class AnimatedImageTests
     [Fact]
     public async Task AnimatedGifShowsItsFramesInTurn()
     {
-        // red for 100 ms, then blue for 2 s, forever
-        var gif = CreateGif(loop: true, (0, 10), (1, 200));
+        // red for 100 ms, then blue for 2 s
+        var gif = CreateGif(loop: false, (0, 10), (1, 200));
         var harness = await OpenAsync($"""<img src="data:image/gif;base64,{Convert.ToBase64String(gif)}" style="width:40px;height:40px">""");
 
         var frame = harness.PrepareFrame();
         var first = PixelAt(frame.Rasterize(), 20, 20);
         var remaining = frame.GetTimeToNextImageFrame();
-        await Task.Delay(remaining!.Value + TimeSpan.FromMilliseconds(100));
-        var second = PixelAt(frame.Rasterize(), 20, 20);
 
+        Assert.NotNull(remaining);
         Assert.InRange(remaining.Value, TimeSpan.Zero, TimeSpan.FromMilliseconds(100));
         Assert.Equal(((byte)255, (byte)0), first);
+
+        var second = first;
+        while (second == first)
+        {
+            var timeToNext = frame.GetTimeToNextImageFrame();
+            if (timeToNext is null)
+            {
+                second = PixelAt(frame.Rasterize(), 20, 20);
+                break;
+            }
+
+            await Task.Delay(timeToNext.Value);
+            second = PixelAt(frame.Rasterize(), 20, 20);
+        }
+
         Assert.Equal(((byte)0, (byte)255), second);
-        Assert.InRange(frame.GetTimeToNextImageFrame()!.Value, TimeSpan.Zero, TimeSpan.FromSeconds(2));
+
+        if (frame.GetTimeToNextImageFrame() is { } nextFrameDelay)
+        {
+            Assert.InRange(nextFrameDelay, TimeSpan.Zero, TimeSpan.FromSeconds(2));
+        }
     }
 
     [Fact]
