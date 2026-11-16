@@ -15,7 +15,8 @@ public sealed class CaseRenderingTests
     {
         var projectRoot = FindProjectRoot();
         var casesPath = Path.Combine(projectRoot, "cases");
-        var outputPath = Path.Combine(projectRoot, "rendered-cases");
+        var targetFramework = new DirectoryInfo(AppContext.BaseDirectory).Name;
+        var outputPath = Path.Combine(projectRoot, "rendered-cases", targetFramework);
         Directory.CreateDirectory(outputPath);
 
         var caseFiles = Directory.GetFiles(casesPath, "*.html")
