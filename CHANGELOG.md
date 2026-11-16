@@ -1,3 +1,13 @@
+# 0.12.0
+
+Released on tbd.
+
+- Improved selecting text on large pages (e.g. the Wikipedia article on CSS, from about 480 ms to 8 ms per frame while dragging): `user-select` is taken from the layout for each run of text instead of being computed from the cascade for every run of the page in every frame, and only for what is selected
+- Improved dragging a selection over a page that changes as it is hovered (e.g. Wikipedia's link previews changing the `title` of links): the pointer is located in the text as the last frame shows it, instead of the page being laid out again for every move; only when that text is no longer in the document it is laid out anew
+- Improved pages changing attributes that render nothing as they are hovered (e.g. Wikipedia's link previews taking the `title` of a link away, and setting a style to the one it has): an attribute set to the value it had for the layout, or one no element renders by (`title`, `data-*`, `aria-*`, `role`, event handlers, ...) keeps the frame, unless a rule selects the element by it or shows it by `attr()`; hovering the links of the Wikipedia article on CSS no longer lays out the page (about 320 ms) on every link entered and left
+- Improved pressing a link whose text is in a box of its own (e.g. Wikipedia's table of contents): text with the lines of an ancestor is painted in its new color (and the lines in that of the box declaring them) instead of the page being laid out
+- Fixed a pseudo-class of state in an argument of `:not()` with combinators (e.g. Codex's `.cdx-radio__input:not(.cdx-radio--status-error .cdx-radio__input:active) + .cdx-radio__icon`) laying out the page whenever any element got into that state, e.g. on every press
+
 # 0.11.4
 
 Released on Monday, November 16 2026.

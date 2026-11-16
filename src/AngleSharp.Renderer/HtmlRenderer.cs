@@ -7908,6 +7908,13 @@ public sealed partial class HtmlRenderer
         AddIfPresent(map, "visibility", style.GetVisibility());
         AddIfPresent(map, "pointer-events", style.GetPropertyValue("pointer-events"));
         AddIfPresent(map, "cursor", style.GetPropertyValue("cursor"));
+
+        // what selecting needs, which it would otherwise compute from the cascade (see CreateTextFragment)
+        if (context is { RecordsTextFragments: true })
+        {
+            AddIfPresent(map, "user-select", style.GetPropertyValue("user-select"));
+        }
+
         AddIfPresent(map, "writing-mode", style.GetPropertyValue("writing-mode"));
         AddIfPresent(map, "text-orientation", style.GetPropertyValue("text-orientation"));
         AddLengthProperty(map, style, "width", explicitDeclarations);

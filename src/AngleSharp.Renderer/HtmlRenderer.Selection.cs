@@ -42,6 +42,12 @@ public sealed partial class HtmlRenderer
         /// <summary>Gets if the text is shaped right to left, its stops then run from the right.</summary>
         public required bool IsRightToLeft { get; init; }
 
+        /// <summary>
+        /// Gets the used value of <c>user-select</c> of the element of the text, as laid out, or
+        /// null if the layout did not know it.
+        /// </summary>
+        public string? UserSelect { get; init; }
+
         /// <summary>Gets the rules of the layout, for what only selecting needs of the cascade.</summary>
         public abstract IStyleCollection? Styles { get; }
 
@@ -257,8 +263,36 @@ public sealed partial class HtmlRenderer
 
     private static TextFragment? CreateTextFragment(LayoutContext context, string text, TextSegment[] segments, float x, float top, float height, RenderTextStyle style, float? fixedWidth = null) =>
         RecordsTextFragments(context) && !style.IsHidden && segments.Length > 0
-            ? new StyledTextFragment(context, style) { Text = text, X = x, Top = top, Height = height, IsRightToLeft = style.IsRightToLeftRun, Segments = segments, FixedWidth = fixedWidth }
+            ? new StyledTextFragment(context, style) { Text = text, X = x, Top = top, Height = height, IsRightToLeft = style.IsRightToLeftRun, Segments = segments, FixedWidth = fixedWidth, UserSelect = GetUsedUserSelect(context, segments[0].Node.ParentElement) }
             : null;
+
+    /// <summary>
+    /// The used value of <c>user-select</c> of an element from the styles of the layout (see
+    /// <see cref="TextMap.GetUserSelect(IElement?)"/>), or null if an ancestor was not laid out.
+    /// Selecting would otherwise compute it from the cascade for each frame it paints.
+    /// </summary>
+    private static string? GetUsedUserSelect(LayoutContext context, IElement? element)
+    {
+        for (var current = element; current is not null; current = current.ParentElement)
+        {
+            if (TextMap.IsUnselectableControl(current))
+            {
+                return "none";
+            }
+
+            if (current is IPseudoElement || !context.StyleMapCache.TryGetValue(current, out var styleMap))
+            {
+                return null;
+            }
+
+            if (styleMap.TryGetValue("user-select", out var value) && value.Trim().ToLowerInvariant() is ("none" or "text" or "all") and var used)
+            {
+                return used;
+            }
+        }
+
+        return "auto";
+    }
 
     private static void DrawTextFragment(LayoutContext context, DisplayList displayList, string text, float x, float y, RenderTextStyle style, TextFragment? fragment)
     {
@@ -652,13 +686,6 @@ public sealed partial class HtmlRenderer
             {
                 var fragment = entry.Fragment;
 
-                if (fragment.Segments.All(segment => !GetTextOrder().ContainsKey(segment.Node)) ||
-                    (scope is not null && !fragment.Segments.Any(segment => IsInside(segment.Node, scope))) ||
-                    GetUserSelect(fragment.Segments[0].Node.ParentElement) == "none")
-                {
-                    continue;
-                }
-
                 var pointY = entry.IsAnchored ? y : y + scrollDelta;
                 var (localX, localY) = Map(entry.Inverse, x, pointY);
                 var distanceY = localY < fragment.Top ? fragment.Top - localY : localY > fragment.Top + fragment.Height ? localY - fragment.Top - fragment.Height : 0f;
@@ -670,8 +697,12 @@ public sealed partial class HtmlRenderer
 
                 var distanceX = localX < fragment.X ? fragment.X - localX : localX > fragment.X + fragment.Width ? localX - fragment.X - fragment.Width : 0f;
 
-                // what paints later is on top, among what contains the point
-                if (distanceY < bestDistanceY || distanceX <= bestDistanceX)
+                // what paints later is on top, among what contains the point; the distance is
+                // cheaper to tell than if the text can be selected (its style)
+                if ((distanceY < bestDistanceY || distanceX <= bestDistanceX) &&
+                    fragment.Segments.Any(segment => GetTextOrder().ContainsKey(segment.Node)) &&
+                    (scope is null || fragment.Segments.Any(segment => IsInside(segment.Node, scope))) &&
+                    GetUserSelect(fragment) != "none")
                 {
                     best = fragment;
                     bestX = localX;
@@ -860,7 +891,8 @@ public sealed partial class HtmlRenderer
         {
             var order = GetTextOrder();
 
-            if (GetUserSelect(fragment.Segments[0].Node.ParentElement) == "none")
+            // most of the page is outside of the selection, which is cheaper to tell than its style
+            if (!IsInSelection(fragment, order, selection) || GetUserSelect(fragment) == "none")
             {
                 return null;
             }
@@ -886,6 +918,19 @@ public sealed partial class HtmlRenderer
             }
 
             return start < 0 ? null : (start, end);
+        }
+
+        private static bool IsInSelection(TextFragment fragment, Dictionary<IText, int> order, TextSelectionRange selection)
+        {
+            foreach (var segment in fragment.Segments)
+            {
+                if (order.TryGetValue(segment.Node, out var node) && node >= selection.Start.Node && node <= selection.End.Node)
+                {
+                    return true;
+                }
+            }
+
+            return false;
         }
 
         private static int Compare((int Node, int Offset) first, (int Node, int Offset) second) =>
@@ -1042,7 +1087,7 @@ public sealed partial class HtmlRenderer
             {
                 var fragment = entry.Fragment;
 
-                if (!fragment.Segments.Any(segment => IsInside(segment.Node, element)) || GetUserSelect(fragment.Segments[0].Node.ParentElement) == "none")
+                if (!fragment.Segments.Any(segment => IsInside(segment.Node, element)) || GetUserSelect(fragment) == "none")
                 {
                     continue;
                 }
@@ -1071,6 +1116,13 @@ public sealed partial class HtmlRenderer
                 : null;
         }
 
+        /// <summary>Gets the used value of `user-select` of the text, as laid out if the layout knew it.</summary>
+        public string GetUserSelect(TextFragment fragment) => fragment.UserSelect ?? GetUserSelect(fragment.Segments[0].Node.ParentElement);
+
+        /// <summary>Gets if the element is a form control, whose text cannot be selected.</summary>
+        public static bool IsUnselectableControl(IElement element) =>
+            element is IHtmlInputElement or IHtmlTextAreaElement or IHtmlSelectElement or IHtmlButtonElement or IHtmlOptionElement;
+
         /// <summary>
         /// Gets the used value of `user-select` of the element: `auto` is what its parent has,
         /// and what form controls show cannot be selected.
@@ -1087,7 +1139,7 @@ public sealed partial class HtmlRenderer
                 return value;
             }
 
-            if (element is IHtmlInputElement or IHtmlTextAreaElement or IHtmlSelectElement or IHtmlButtonElement or IHtmlOptionElement)
+            if (IsUnselectableControl(element))
             {
                 value = "none";
             }

@@ -1575,7 +1575,7 @@ public sealed partial class HtmlRenderer
                         fragmentOwner = null;
                         break;
                     case DrawTextCommand text when fragmentOwner is not null:
-                        if (RestyleText(text, _recolors[fragmentOwner]) is not { } restyledText)
+                        if (RestyleText(text, fragmentOwner, _recolors[fragmentOwner]) is not { } restyledText)
                         {
                             return false;
                         }
@@ -1588,15 +1588,23 @@ public sealed partial class HtmlRenderer
             }
 
             // the text in the new style: its color, and the lines if they are the element's own (as
-            // ResolveTextStyle has them), or null if it has lines of an ancestor
-            static DrawTextCommand? RestyleText(DrawTextCommand text, (Dictionary<string, string> StyleMap, bool HasOwnDecorationsOnly) restyle)
+            // ResolveTextStyle has them), or null if they cannot be told
+            DrawTextCommand? RestyleText(DrawTextCommand text, IElement owner, (Dictionary<string, string> StyleMap, bool HasOwnDecorationsOnly) restyle)
             {
                 var (styleMap, hasOwnDecorationsOnly) = restyle;
                 var color = ParseColor(styleMap.GetValueOrDefault("color"), text.Color);
 
                 if (!hasOwnDecorationsOnly)
                 {
-                    return text.Underline || text.StrikeThrough || text.Overline ? null : text with { Color = color };
+                    if (!text.Underline && !text.StrikeThrough && !text.Overline)
+                    {
+                        return text with { Color = color };
+                    }
+
+                    // lines of an ancestor (e.g. a link's underline across the text of a box in it),
+                    // which stay as they are (see TryRepaint): their color is that of the box
+                    // declaring the nearest of them, as it is styled now
+                    return GetAncestorDecorationColor(owner, color) is { } linesColor ? text with { Color = color, DecorationColor = linesColor } : null;
                 }
 
                 var (underline, overline, strikeThrough) = ParseTextDecoration(styleMap, false, false, false);
@@ -1611,6 +1619,46 @@ public sealed partial class HtmlRenderer
                     DecorationStyle = declares ? ParseTextDecorationStyle(styleMap, RenderTextDecorationStyle.Solid) : text.DecorationStyle,
                     DecorationThickness = declares ? ParseLength(styleMap, "text-decoration-thickness", text.FontSize, float.NaN, allowAuto: true) : text.DecorationThickness,
                 };
+            }
+
+            // the color of the lines across the text of the element (see ResolveTextStyle): of the
+            // nearest element declaring lines, its text-decoration-color or else its color
+            RenderColor? GetAncestorDecorationColor(IElement owner, RenderColor ownColor)
+            {
+                for (var current = owner; current is not null; current = current.ParentElement)
+                {
+                    if (!_context.StyleMapCache.TryGetValue(current, out var map))
+                    {
+                        return null;
+                    }
+
+                    if (HasOwnTextDecorationLines(map))
+                    {
+                        var declaredColor = ReferenceEquals(current, owner) ? ownColor : GetColor(current);
+                        return declaredColor is { } value ? ParseColor(map.TryGetValue("text-decoration-color", out var decoration) ? decoration : null, value) : null;
+                    }
+                }
+
+                return null;
+            }
+
+            // the color of the element as styled now, inherited unless its style map has one
+            RenderColor? GetColor(IElement element)
+            {
+                for (var current = element; current is not null; current = current.ParentElement)
+                {
+                    if (!_context.StyleMapCache.TryGetValue(current, out var map))
+                    {
+                        return null;
+                    }
+
+                    if (map.TryGetValue("color", out var value) && !string.IsNullOrWhiteSpace(value))
+                    {
+                        return ParseColor(value, RenderColor.Black);
+                    }
+                }
+
+                return null;
             }
 
             // a box that is painted nowhere (e.g. in a trial only) is not known to look the same
@@ -1891,10 +1939,13 @@ public sealed partial class HtmlRenderer
             // a changed style attribute may only paint differently (e.g. a sprite showing another
             // frame by its background-position), which is looked at once the roots are known
             var restyledByAttribute = new List<IElement>();
+            var unchanged = GetUnchangedAttributes(records);
 
             foreach (var record in records)
             {
-                if (TryRemoveOutOfFlow(record) || IsChangeOfNothingRendered(record))
+                if (TryRemoveOutOfFlow(record) || IsChangeOfNothingRendered(record) ||
+                    unchanged is not null && record is { Type: "attributes", AttributeName: { } attribute } && unchanged.Contains((record.Target, attribute)) ||
+                    IsInertAttributeChange(record))
                 {
                     continue;
                 }
@@ -2197,6 +2248,185 @@ public sealed partial class HtmlRenderer
                     return null;
             }
         }
+
+        /// <summary>
+        /// Gets the attributes that have the value they had for the layout again (e.g. a script
+        /// setting the same style on every pointer move), or null if there are none: the value
+        /// before the first change of each is compared with its value now.
+        /// </summary>
+        private static HashSet<(INode Target, string Name)>? GetUnchangedAttributes(IReadOnlyList<IMutationRecord> records)
+        {
+            HashSet<(INode, string)>? seen = null;
+            HashSet<(INode, string)>? unchanged = null;
+
+            foreach (var record in records)
+            {
+                if (record is { Type: "attributes", Target: IElement element, AttributeName: { } name } && (seen ??= []).Add((element, name)) &&
+                    string.Equals(record.PreviousValue, element.GetAttribute(name), StringComparison.Ordinal))
+                {
+                    (unchanged ??= []).Add((element, name));
+                }
+            }
+
+            return unchanged;
+        }
+
+        /// <summary>
+        /// Gets if the change is of an attribute that no element renders differently by (e.g. the
+        /// title of a link, which link previews take away while it is hovered), and no style rule
+        /// selects by or shows (with <c>attr()</c> in its content), so it changes nothing.
+        /// </summary>
+        private bool IsInertAttributeChange(IMutationRecord record) =>
+            record is { Type: "attributes", Target: IElement { ShadowRoot: null } element, AttributeName: { } name } &&
+            IsInertAttribute(name) && element.GetRoot() is IDocument && !ChangesStyleSheets(record) && !IsStyledByAttribute(element, name);
+
+        // attributes of no meaning for how elements are rendered (unlike e.g. src, colspan or hidden)
+        private static bool IsInertAttribute(string name) =>
+            name.StartsWith("data-", StringComparison.OrdinalIgnoreCase) || name.StartsWith("aria-", StringComparison.OrdinalIgnoreCase) ||
+            name.Length > 2 && name.StartsWith("on", StringComparison.OrdinalIgnoreCase) && name.Skip(2).All(char.IsAsciiLetterLower) ||
+            name.ToLowerInvariant() is "title" or "role" or "tabindex" or "accesskey" or "draggable" or "spellcheck" or "translate" or
+                "autocomplete" or "autocapitalize" or "enterkeyhint" or "inputmode" or "target" or "download" or "ping" or
+                "referrerpolicy" or "hreflang" or "nonce" or "itemprop" or "itemscope" or "itemtype" or "itemid" or "itemref";
+
+        // by attribute name, the keys of the compounds of the rules of the layout (with the user
+        // agent's) selecting by it (null for one any element may match), and if any shows it by attr()
+        private readonly Dictionary<string, (List<CompoundKeys?> Compounds, bool IsShown)> _attributeRules = new(StringComparer.OrdinalIgnoreCase);
+
+        /// <summary>
+        /// Gets if a rule may style the element differently by the attribute: a compound selecting
+        /// by it (e.g. <c>abbr[title]</c>) whose tag, classes and ids the element has, or content
+        /// showing it. What else the compound asks for is not looked at, so it may only be too many.
+        /// </summary>
+        private bool IsStyledByAttribute(IElement element, string name)
+        {
+            if (!_attributeRules.TryGetValue(name, out var rules))
+            {
+                rules = FindAttributeRules(name);
+                _attributeRules[name] = rules;
+            }
+
+            return rules.IsShown || rules.Compounds.Any(keys => keys is null || keys.Matches(element));
+        }
+
+        /// <summary>The tag, classes and ids a compound selector asks for (outside of any arguments).</summary>
+        private sealed record CompoundKeys(string? Tag, List<string> Classes, List<string> Ids)
+        {
+            public bool Matches(IElement element) =>
+                (Tag is null || string.Equals(Tag, element.LocalName, StringComparison.OrdinalIgnoreCase)) &&
+                Classes.All(element.ClassList.Contains) && Ids.All(id => string.Equals(element.Id, id, StringComparison.Ordinal));
+
+            // null if the keys cannot be told (escapes, namespaces), as for a compound matching anything
+            public static CompoundKeys? Parse(string compound)
+            {
+                if (compound.Contains('\\') || compound.Contains('|'))
+                {
+                    return null;
+                }
+
+                string? tag = null;
+                var classes = new List<string>();
+                var ids = new List<string>();
+                var depth = 0;
+
+                for (var i = 0; i < compound.Length; i++)
+                {
+                    var c = compound[i];
+
+                    if (c is '(' or '[')
+                    {
+                        depth++;
+                    }
+                    else if (c is ')' or ']')
+                    {
+                        depth--;
+                    }
+                    else if (depth == 0 && (c is '.' or '#' || i == 0 && IsNameCharacter(c)))
+                    {
+                        var start = c is '.' or '#' ? i + 1 : i;
+                        var end = start;
+
+                        while (end < compound.Length && IsNameCharacter(compound[end]))
+                        {
+                            end++;
+                        }
+
+                        var key = compound[start..end];
+                        (c == '.' ? classes : c == '#' ? ids : null)?.Add(key);
+                        tag = c is '.' or '#' ? tag : key;
+                        i = end - 1;
+                    }
+                }
+
+                return new CompoundKeys(tag, classes, ids);
+            }
+
+            private static bool IsNameCharacter(char c) => char.IsLetterOrDigit(c) || c is '-' or '_' || c > 127;
+        }
+
+        private (List<CompoundKeys?> Compounds, bool IsShown) FindAttributeRules(string name)
+        {
+            var escaped = Regex.Escape(name);
+            var selector = new Regex(@"\[\s*(?:[^\s\]|]*\|)?" + escaped + @"\s*(?:[~|^$*]?=\s*(?:""[^""]*""|'[^']*'|[^\s\]]*)\s*[is]?\s*)?\]", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
+            var content = new Regex(@"attr\(\s*" + escaped + @"\b", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
+            var compounds = new List<CompoundKeys?>();
+            var isShown = false;
+
+            // the rules of the layout (with the user agent's), or the document's without them
+            if (_context.StyleCollection is { } styles)
+            {
+                Add(styles);
+            }
+            else
+            {
+                foreach (var sheet in _document.StyleSheets.OfType<ICssStyleSheet>())
+                {
+                    Add(sheet.Rules);
+                }
+            }
+
+            return (compounds, isShown);
+
+            void Add(IEnumerable<ICssRule> rules)
+            {
+                foreach (var rule in rules)
+                {
+                    switch (rule)
+                    {
+                        case ICssStyleRule style:
+                            if (style.SelectorText is { } text && text.Contains('['))
+                            {
+                                foreach (var compound in SiblingSelectors.SplitCompounds(text))
+                                {
+                                    var matches = selector.Matches(compound);
+
+                                    if (matches.Count > 0)
+                                    {
+                                        // in an argument (e.g. `:not([title])`) it may style any element
+                                        compounds.Add(matches.Any(match => IsInArgument(compound, match.Index)) ? null : CompoundKeys.Parse(compound));
+                                    }
+                                }
+                            }
+
+                            isShown |= style.Style?.GetPropertyValue("content") is { Length: > 0 } value && content.IsMatch(value);
+
+                            if (style.Rules is { } nested)
+                            {
+                                Add(nested);
+                            }
+
+                            break;
+                        case ICssGroupingRule group:
+                            Add(group.Rules);
+                            break;
+                        case ICssImportRule { Sheet: { } sheet }:
+                            Add(sheet.Rules);
+                            break;
+                    }
+                }
+            }
+        }
+
+        private static bool IsInArgument(string compound, int index) => compound[..index].Count(c => c == '(') > compound[..index].Count(c => c == ')');
 
         private static bool ChangesStyleSheets(IMutationRecord record)
         {
@@ -3300,7 +3530,7 @@ public sealed partial class HtmlRenderer
 
         // the compounds of a selector list, split at the combinators outside of any parentheses,
         // brackets or strings; a pseudo-element is left out (it is matched by its originating element)
-        private static IEnumerable<string> SplitCompounds(string selector)
+        internal static IEnumerable<string> SplitCompounds(string selector)
         {
             var depth = 0;
             var quote = '\0';
@@ -3873,7 +4103,12 @@ public sealed partial class HtmlRenderer
                             continue;
                         }
 
-                        if (name is "is" or "where" or "matches" or "-webkit-any")
+                        // what a state changes is the same for :not() (a match turns into a mismatch): the
+                        // compounds in the state of an argument with combinators (e.g. `.a:not(.b .c:active)`),
+                        // which are of the element itself or of what is around it, as in :is()
+                        if (name is "is" or "where" or "matches" or "-webkit-any" ||
+                            name is "not" && !arguments.Contains(":has(", StringComparison.OrdinalIgnoreCase) &&
+                            SplitTopLevel(arguments).Any(argument => SplitComplex(argument.Trim()).Count > 1))
                         {
                             Analyze(arguments, pseudoClass, next, isSubject && around is not null ? around + " " + text : text, isRelational, isSubject && isOuterSubject, ref result);
                         }

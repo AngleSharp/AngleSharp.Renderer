@@ -204,6 +204,35 @@ public sealed class TextSelectionTests
     }
 
     [Fact]
+    public async Task Drag_AfterTheDocumentChanged_LocatesTheTextWhereTheFrameShowsIt()
+    {
+        // e.g. a script reacting to the element hovered while dragging
+        var (document, harness) = await OpenAsync($"""<div style="{Style}">Hello World</div><div id="other" style="{Style}">other</div>""");
+        harness.PrepareFrame();
+
+        Assert.True(harness.BeginTextSelection(CharWidth * 2, 15));
+        document.GetElementById("other")!.SetAttribute("title", "changed");
+        harness.ExtendTextSelection(CharWidth * 8, 15);
+
+        Assert.Equal("llo Wo", harness.SelectedText);
+    }
+
+    [Fact]
+    public async Task Press_OnTextReplacedSinceTheFrame_SelectsInTheDocumentAsItIs()
+    {
+        var (document, harness) = await OpenAsync($"""<div id="t" style="{Style}">Hello World</div>""");
+        harness.PrepareFrame();
+        var element = document.GetElementById("t")!;
+        element.TextContent = "Jello Moons";
+
+        Assert.True(harness.BeginTextSelection(CharWidth * 2, 15));
+        harness.ExtendTextSelection(CharWidth * 8, 15);
+
+        Assert.Same(element.FirstChild, document.GetSelection().AnchorNode);
+        Assert.Equal("llo Mo", harness.SelectedText);
+    }
+
+    [Fact]
     public async Task UserSelectNone_CannotBeSelected()
     {
         var (_, harness) = await OpenAsync($"""<div style="{Style}">one <span style="user-select: none">two</span> three</div><div style="{Style} user-select: none">four</div>""");

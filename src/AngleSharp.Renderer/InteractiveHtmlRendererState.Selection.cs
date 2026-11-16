@@ -70,7 +70,7 @@ internal sealed partial class InteractiveHtmlRendererState
         }
 
         var selection = Selection.For(document);
-        var (map, hit, listY, scrollDelta) = GetTextMapAt(document, x, y);
+        var (map, hit, caret) = LocateText(document, x, y);
 
         if (hit is not null && map.GetUserSelect(hit) == "none" && !extend)
         {
@@ -78,7 +78,7 @@ internal sealed partial class InteractiveHtmlRendererState
             return false;
         }
 
-        if (map.Locate((float)x, listY, scrollDelta, hit) is not { } located)
+        if (caret is not { } located)
         {
             selection.RemoveAllRanges();
             return false;
@@ -110,9 +110,9 @@ internal sealed partial class InteractiveHtmlRendererState
             return;
         }
 
-        var (map, hit, listY, scrollDelta) = GetTextMapAt(document, x, y);
+        var (map, _, caret) = LocateText(document, x, y);
 
-        if (map.Locate((float)x, listY, scrollDelta, hit) is not { } located)
+        if (caret is not { } located)
         {
             return;
         }
@@ -223,38 +223,86 @@ internal sealed partial class InteractiveHtmlRendererState
         static int GetKind(char c) => char.IsWhiteSpace(c) ? 1 : char.IsLetterOrDigit(c) || c == '_' || char.IsSurrogate(c) || char.GetUnicodeCategory(c) is System.Globalization.UnicodeCategory.NonSpacingMark or System.Globalization.UnicodeCategory.SpacingCombiningMark ? 0 : 2;
     }
 
-    private (HtmlRenderer.TextMap Map, IElement? Hit, float ListY, float ScrollDelta) GetTextMapAt(IDocument document, double x, double y)
+    /// <summary>
+    /// Finds the text the pointer is at, where the last frame shows it (see
+    /// <see cref="GetTextFrame(IDocument, out bool, bool)"/>), unless that text is no longer in the document.
+    /// </summary>
+    private (HtmlRenderer.TextMap Map, IElement? Hit, HtmlRenderer.TextCaret? Caret) LocateText(IDocument document, double x, double y)
     {
-        var frame = GetTextFrame(document);
+        var (map, hit, caret, isCurrent) = LocateText(document, x, y, isShownTextEnough: true);
+
+        if (isCurrent || caret is { } located && IsInDocument(located.Node) && IsInDocument(located.Character.Node))
+        {
+            return (map, hit, caret);
+        }
+
+        var current = LocateText(document, x, y, isShownTextEnough: false);
+        return (current.Map, current.Hit, current.Caret);
+
+        bool IsInDocument(INode node) => ReferenceEquals(node.Owner, document) && document.Contains(node);
+    }
+
+    private (HtmlRenderer.TextMap Map, IElement? Hit, HtmlRenderer.TextCaret? Caret, bool IsCurrent) LocateText(IDocument document, double x, double y, bool isShownTextEnough)
+    {
+        var frame = GetTextFrame(document, out var isCurrent, isShownTextEnough);
         var scrollTop = document.DocumentElement is { } root ? GetScrollTop(root, double.MaxValue) : 0d;
         var scrollDelta = (float)(scrollTop - frame.ScrollTop);
         var hit = (scrollDelta == 0f ? frame : frame.Reposition(scrollTop)).HitTestMap.HitTest(x, y)?.Element;
 
         // what is in an iframe is for the harness of its document
-        return (frame.TextMap, ReferenceEquals(hit?.Owner, document) ? hit : null, (float)y + frame.OverscanTop, scrollDelta);
+        hit = ReferenceEquals(hit?.Owner, document) ? hit : null;
+        var map = frame.TextMap;
+        return (map, hit, map.Locate((float)x, (float)y + frame.OverscanTop, scrollDelta, hit), isCurrent);
     }
 
     /// <summary>
     /// Gets a frame with the text as it is now: the last one, unless something changed the
-    /// layout since. It may be at another scroll position, as long as it can get there.
+    /// layout since. It may be at another scroll position, as long as it can get there. With
+    /// <paramref name="isShownTextEnough"/>, the last one also if the page changed since (e.g.
+    /// the hovered link, or what a script does as it is hovered): it shows the text where the
+    /// user sees it, while laying out the page anew for every element passed would stall the
+    /// gesture.
     /// </summary>
-    private RenderedFrame GetTextFrame(IDocument document)
+    /// <param name="document">The document of the frame.</param>
+    /// <param name="isCurrent">If the frame has the text as it is now.</param>
+    /// <param name="isShownTextEnough">If the last frame is good enough as it is shown.</param>
+    private RenderedFrame GetTextFrame(IDocument document, out bool isCurrent, bool isShownTextEnough = false)
     {
+        isCurrent = true;
+
         if (_lastFrame is { } frame && ReferenceEquals(document, _metricsDocument) && _metricsObserver is { } observer &&
             _metricsViewport == (RenderDevice.ViewPortWidth, RenderDevice.ViewPortHeight))
         {
             KeepMutations(observer.Flush());
             var scrollTop = document.DocumentElement is { } root ? GetScrollTop(root, double.MaxValue) : 0d;
 
-            if (_pendingMutations.Count == 0 && ReferenceEquals(_metrics, _lastFrameLayout) && (frame.CanReposition || scrollTop == frame.ScrollTop))
+            if (frame.CanReposition || scrollTop == frame.ScrollTop)
             {
-                return frame;
+                isCurrent = _pendingMutations.Count == 0 && ReferenceEquals(_metrics, _lastFrameLayout);
+
+                if (isCurrent || isShownTextEnough)
+                {
+                    return frame;
+                }
+            }
+
+            isCurrent = true;
+
+            // the changes may be confined to boxes that are laid out on their own, which patches
+            // the frame (see UpdateFrame)
+            if (UpdateFrame() is not null && _lastFrame is { } updated && ReferenceEquals(_metrics, _lastFrameLayout) &&
+                (updated.CanReposition || scrollTop == updated.ScrollTop))
+            {
+                return updated;
             }
         }
 
         PrepareFrame();
         return _lastFrame!;
     }
+
+    /// <summary>Gets a frame with the text as it is now (see <see cref="GetTextFrame(IDocument, out bool, bool)"/>).</summary>
+    private RenderedFrame GetTextFrame(IDocument document) => GetTextFrame(document, out _);
 
     /// <summary>Gets the frame with the selection shown.</summary>
     private RenderedFrame ShowSelection(RenderedFrame frame)

@@ -186,6 +186,41 @@ public sealed class StateInvalidationTests
         Assert.NotEqual(before.Rasterize().Data, patched.Rasterize().Data);
     }
 
+    [Fact]
+    public async Task AStateInAnArgumentOfNotOnlyConcernsTheElementsItsCompoundMatches()
+    {
+        // as Codex (MediaWiki) has it: the state is of a radio button, not of the field focused
+        var rule = ".radio:enabled:not(.error .radio:active) + .icon { color: rgb(200, 0, 0); } input:focus { background: rgb(0, 0, 200); }";
+        var (document, harness) = await OpenAsync(rule, """<div class="card"><input id="field"></div><div class="error"><input type="radio" class="radio"><span class="icon">icon</span></div>""");
+        harness.PrepareFrame();
+        var field = (IHtmlInputElement)document.GetElementById("field")!;
+
+        field.DoFocus();
+        harness.NotifyStateChanged(field);
+        var patched = harness.UpdateFrame();
+
+        Assert.NotNull(patched);
+        Assert.Equal(harness.PrepareFrame().Rasterize().Data, patched!.Rasterize().Data);
+    }
+
+    [Fact]
+    public async Task FocusingALinkRecolorsTheUnderlineAcrossTheTextOfABoxInIt()
+    {
+        // e.g. the entries of Wikipedia's table of contents: the text is in a box in the link
+        var rule = "a { display: block; color: rgb(0, 0, 200); text-decoration: underline; } a:focus { color: rgb(200, 0, 0); } a div { font-size: 30px; }";
+        var (document, harness) = await OpenAsync(rule, """<a id="link" href="#"><div>Contents</div></a>""");
+        var before = harness.PrepareFrame().Rasterize();
+        var link = (IHtmlAnchorElement)document.GetElementById("link")!;
+
+        link.DoFocus();
+        harness.NotifyStateChanged(link);
+        var patched = harness.UpdateFrame();
+
+        Assert.NotNull(patched);
+        Assert.NotEqual(before.Data, patched!.Rasterize().Data);
+        Assert.Equal(harness.PrepareFrame().Rasterize().Data, patched.Rasterize().Data);
+    }
+
     private static async Task<(IDocument Document, IDomHarness Harness)> OpenAsync(string rule, string body)
     {
         var context = BrowsingContext.New(Configuration.Default.WithCss().WithRenderDevice(new DefaultRenderDevice { ViewPortWidth = 400, ViewPortHeight = 300, FontSize = 16 }));
