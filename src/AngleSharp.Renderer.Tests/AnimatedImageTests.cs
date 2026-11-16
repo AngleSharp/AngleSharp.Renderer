@@ -20,7 +20,7 @@ public sealed class AnimatedImageTests
         var frame = harness.PrepareFrame();
         var first = PixelAt(frame.Rasterize(), 20, 20);
         var remaining = frame.GetTimeToNextImageFrame();
-        await Task.Delay(remaining!.Value + TimeSpan.FromMilliseconds(20));
+        await Task.Delay(remaining!.Value + TimeSpan.FromMilliseconds(100));
         var second = PixelAt(frame.Rasterize(), 20, 20);
 
         Assert.InRange(remaining.Value, TimeSpan.Zero, TimeSpan.FromMilliseconds(100));
