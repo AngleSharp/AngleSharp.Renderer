@@ -183,7 +183,7 @@ public sealed partial class HtmlRenderer
         var metrics = snapshot.LayoutMetrics;
 
         var isScrollShiftable = true;
-        var hasStickyBoxes = false;
+        var stickyCount = 0;
         var contentBottom = 0f;
 
         foreach (var (element, elementMetrics) in metrics)
@@ -197,7 +197,7 @@ public sealed partial class HtmlRenderer
                 string.Equals(position, "sticky", StringComparison.OrdinalIgnoreCase))
             {
                 isScrollShiftable = false;
-                hasStickyBoxes |= string.Equals(position, "sticky", StringComparison.OrdinalIgnoreCase);
+                stickyCount += string.Equals(position, "sticky", StringComparison.OrdinalIgnoreCase) ? 1 : 0;
             }
             // what a box clips (e.g. the content of a scroll container) is no content of the page
             else if (!HitTestMap.IsClipped(element, metrics, styleMaps))
@@ -209,10 +209,12 @@ public sealed partial class HtmlRenderer
         hitTestMap ??= HitTestMap.Create(document, metrics, styleMaps, -overscan, snapshot.Subframes);
         var contentHeight = Math.Max(height, (double)contentBottom);
         recorder.HitTesting += RenderMetricsRecorder.Since(hitTestingStart);
-        // fixed boxes are marked in the display list, sticky ones would have to stick anew
-        return new RenderedFrame(displayList, _backend, surface, height, scrollTop, overscan, contentHeight, isScrollShiftable, !hasStickyBoxes, hitTestMap, document: document)
+        // fixed boxes are marked in the display list, sticky ones stick anew (see StickyFrame)
+        var stickies = stickyCount > 0 ? snapshot.GetStickyFrame(displayList, hitTestMap, scrollTop, stickyCount) : null;
+        return new RenderedFrame(displayList, _backend, surface, height, scrollTop, overscan, contentHeight, isScrollShiftable, stickyCount == 0 || stickies is not null, hitTestMap, document: document)
         {
             Metrics = recorder.Complete(isIncremental, metrics.Count, displayList.Commands.Count, hitTestMap.Count),
+            Stickies = stickies,
         };
     }
 }

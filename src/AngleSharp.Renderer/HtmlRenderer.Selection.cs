@@ -593,6 +593,34 @@ public sealed partial class HtmlRenderer
         }
 
         /// <summary>
+        /// Gets if text is painted at the point (in the list), e.g., for showing the cursor of
+        /// text. Does not touch the DOM.
+        /// </summary>
+        public bool HasTextAt(float x, float y, float scrollDelta)
+        {
+            foreach (var entry in _entries)
+            {
+                var pointY = entry.IsAnchored ? y : y + scrollDelta;
+
+                if (pointY < entry.Bounds.Y || pointY > entry.Bounds.Y + entry.Bounds.Height ||
+                    entry.Clip is { } clip && (x < clip.X || x > clip.X + clip.Width || pointY < clip.Y || pointY > clip.Y + clip.Height))
+                {
+                    continue;
+                }
+
+                var fragment = entry.Fragment;
+                var (localX, localY) = Map(entry.Inverse, x, pointY);
+
+                if (localY >= fragment.Top && localY <= fragment.Top + fragment.Height && localX >= fragment.X && localX <= fragment.X + fragment.Width)
+                {
+                    return true;
+                }
+            }
+
+            return false;
+        }
+
+        /// <summary>
         /// Finds the selectable text nearest to a point, preferring what is inside of
         /// <paramref name="scope"/>, then what is inside of its ancestors: the line nearest to the
         /// point, and on it the nearest character.

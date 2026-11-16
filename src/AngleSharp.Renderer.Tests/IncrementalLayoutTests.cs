@@ -406,7 +406,8 @@ public sealed class IncrementalLayoutTests
 
         var incremental = ids.Select(id => Describe(document.GetElementById(id)!)).ToList();
         var patched = harness.UpdateFrame();
-        Assert.True(isPatched == patched is not null, change);
+        // what cannot be patched is laid out by the read of the geometry, as the next frame
+        Assert.True(isPatched == patched is { Metrics.IsIncremental: true }, change);
         var expected = harness.PrepareFrame();
         Assert.Equal(ids.Select(id => Describe(document.GetElementById(id)!)), incremental);
 
@@ -437,7 +438,7 @@ public sealed class IncrementalLayoutTests
 
         var incremental = ids.Select(id => Describe(document.GetElementById(id)!)).ToList();
         var patched = harness.UpdateFrame();
-        Assert.Equal(isPatched, patched is not null);
+        Assert.Equal(isPatched, patched is { Metrics.IsIncremental: true });
         var expected = harness.PrepareFrame();
         Assert.Equal(ids.Select(id => Describe(document.GetElementById(id)!)), incremental);
 
@@ -471,7 +472,7 @@ public sealed class IncrementalLayoutTests
 
         var incremental = ids.Select(id => Describe(document.GetElementById(id)!)).ToList();
         var patched = harness.UpdateFrame();
-        Assert.Equal(isPatched, patched is not null);
+        Assert.Equal(isPatched, patched is { Metrics.IsIncremental: true });
         var expected = harness.PrepareFrame();
         Assert.Equal(ids.Select(id => Describe(document.GetElementById(id)!)), incremental);
 
@@ -654,7 +655,7 @@ public sealed class IncrementalLayoutTests
         input.Value = "typed";
 
         var patched = harness.UpdateFrame();
-        Assert.Equal(isPatched, patched is not null);
+        Assert.Equal(isPatched, patched is { Metrics.IsIncremental: true });
         var incremental = Describe(document.GetElementById("next")!);
         var expected = harness.PrepareFrame();
         Assert.Equal(Describe(document.GetElementById("next")!), incremental);

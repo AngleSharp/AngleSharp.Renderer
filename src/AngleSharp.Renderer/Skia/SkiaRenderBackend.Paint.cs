@@ -120,6 +120,12 @@ public sealed partial class SkiaRenderBackend
             return null;
         }
 
+        // an animated GIF shows the frame its time has come to
+        if (AnimatedImage.For(bytes) is { } animated)
+        {
+            return animated.GetCurrentFrame();
+        }
+
         return s_decodedImages.GetValue(bytes, static key =>
         {
             using var data = SKData.CreateCopy(key);

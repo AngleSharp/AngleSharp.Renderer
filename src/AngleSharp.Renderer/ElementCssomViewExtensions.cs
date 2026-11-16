@@ -382,25 +382,52 @@ public static class ElementCssomViewExtensions
     {
         ArgumentNullException.ThrowIfNull(element);
 
-        if (IsPositionFixed(element))
+        var owner = element.Owner;
+
+        // the root and the body have none, so a script summing offsetTop up the chain of offset
+        // parents ends (CSSOM View 7)
+        if (owner is null || ReferenceEquals(element, owner.DocumentElement) || ReferenceEquals(element, owner.Body))
         {
             return null;
         }
 
-        var ancestor = element.ParentElement;
+        // the positions of the last layout: computing the style of each ancestor anew (e.g. for a
+        // script reading offsetTop of many elements, as a scroll spy does) took seconds per element
+        var styles = owner.Context.GetDomHarness() is InteractiveHtmlRendererState state
+            ? state.GetLayoutSnapshot(owner).StyleMaps
+            : null;
+        var position = GetPosition(element, styles);
 
-        while (ancestor is not null)
+        if (IsPosition(position, "fixed"))
         {
-            if (!IsPositionStatic(ancestor))
+            return null;
+        }
+
+        var isStatic = string.IsNullOrWhiteSpace(position) || IsPosition(position, "static");
+
+        for (var ancestor = element.ParentElement; ancestor is not null; ancestor = ancestor.ParentElement)
+        {
+            var ancestorPosition = GetPosition(ancestor, styles);
+
+            if (ReferenceEquals(ancestor, owner.Body) ||
+                !string.IsNullOrWhiteSpace(ancestorPosition) && !IsPosition(ancestorPosition, "static") ||
+                isStatic && ancestor.LocalName is "td" or "th" or "table")
             {
                 return ancestor;
             }
-
-            ancestor = ancestor.ParentElement;
         }
 
-        return element.Owner?.Body;
+        return null;
     }
+
+    // what the layout computed for an element with a box (no entry means static), else the cascade
+    private static string? GetPosition(IElement element, IReadOnlyDictionary<IElement, Dictionary<string, string>>? styles) =>
+        styles is not null && styles.TryGetValue(element, out var style)
+            ? style.GetValueOrDefault("position")
+            : element.ComputeCurrentStyle()?.GetPropertyValue("position");
+
+    private static bool IsPosition(string? position, string expected) =>
+        string.Equals(position?.Trim(), expected, StringComparison.OrdinalIgnoreCase);
 
     private static int GetRoundedDimension(IElement element, Func<HtmlRenderer.ElementLayoutMetrics, float> selector)
     {
@@ -639,26 +666,6 @@ public static class ElementCssomViewExtensions
         var extents = GetScrollExtents(element);
         var maxTop = extents.Height - GetClientHeight(element);
         return Math.Max(0d, maxTop);
-    }
-
-    private static bool IsPositionFixed(IElement element)
-    {
-        var style = element.ComputeCurrentStyle();
-        var position = style?.GetPropertyValue("position");
-        return string.Equals(position?.Trim(), "fixed", StringComparison.OrdinalIgnoreCase);
-    }
-
-    private static bool IsPositionStatic(IElement element)
-    {
-        var style = element.ComputeCurrentStyle();
-        var position = style?.GetPropertyValue("position");
-
-        if (string.IsNullOrWhiteSpace(position))
-        {
-            return true;
-        }
-
-        return string.Equals(position.Trim(), "static", StringComparison.OrdinalIgnoreCase);
     }
 
     private static void ScrollElementIntoView(IElement element, ScrollLogicalPosition block, ScrollLogicalPosition inline)

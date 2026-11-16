@@ -22,7 +22,8 @@ public sealed class TransformFilterAnimationTests
             """);
 
         harness.MousePosition = (10, 10);
-        Assert.Null(TryTransform(document));
+        // nothing transformed yet (a box transitioning its transform is painted under it from the start)
+        Assert.True(TryTransform(document) is not { } start || start.IsIdentity);
 
         harness.AdvanceTime(TimeSpan.FromMilliseconds(250));
         Assert.Equal(25f, Transform(document).E, precision: 2);
@@ -40,7 +41,8 @@ public sealed class TransformFilterAnimationTests
             """);
 
         harness.MousePosition = (10, 10);
-        Assert.Null(TryTransform(document));
+        // nothing transformed yet (a box transitioning its transform is painted under it from the start)
+        Assert.True(TryTransform(document) is not { } start || start.IsIdentity);
 
         harness.AdvanceTime(TimeSpan.FromMilliseconds(500));
         var halfway = Transform(document);
@@ -110,6 +112,42 @@ public sealed class TransformFilterAnimationTests
 
         harness.AdvanceTime(TimeSpan.FromMilliseconds(500));
         Assert.Equal(20f, Transform(document).F, precision: 2);
+    }
+
+    [Fact]
+    public async Task TransformAnimation_InterpolatesBetweenAngleUnits()
+    {
+        var (document, harness) = await OpenAsync("""
+            @keyframes spin { 0% { transform: rotate(0deg); } to { transform: rotate(1turn); } }
+            #target { animation: spin 1s linear infinite; }
+            """);
+
+        TryTransform(document);
+        harness.AdvanceTime(TimeSpan.FromMilliseconds(250));
+        var quarter = Transform(document);
+
+        // rotate(90deg): the first column is (cos 90, sin 90)
+        Assert.Equal(0f, quarter.A, precision: 3);
+        Assert.Equal(1f, quarter.B, precision: 3);
+    }
+
+    [Fact]
+    public async Task TransformAnimation_OfAPseudoElementGoesOnAcrossLayouts()
+    {
+        var (document, harness) = await OpenAsync("""
+            @keyframes spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
+            #target::before { content: ""; display: block; width: 10px; height: 10px; animation: spin 1s linear infinite; }
+            """);
+
+        // every display list has a render tree of its own, with new pseudo-elements
+        TryTransform(document);
+        harness.AdvanceTime(TimeSpan.FromMilliseconds(250));
+        var quarter = Transform(document);
+        harness.AdvanceTime(TimeSpan.FromMilliseconds(250));
+        var half = Transform(document);
+
+        Assert.Equal(1f, quarter.B, precision: 3);
+        Assert.Equal(-1f, half.A, precision: 3);
     }
 
     [Fact]

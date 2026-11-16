@@ -276,7 +276,13 @@ internal static class CssFunctionListInterpolation
             if (!string.Equals(fromUnit, toUnit, StringComparison.OrdinalIgnoreCase) &&
                 !(fromUnit.Length == 0 && fromNumber == 0d) && !(toUnit.Length == 0 && toNumber == 0d))
             {
-                return false;
+                // units of one kind (e.g. `0deg` to `1turn`, a spinner's full turn) interpolate in
+                // the canonical unit of that kind
+                if (!TryCanonicalize(ref fromNumber, ref fromUnit) || !TryCanonicalize(ref toNumber, ref toUnit) ||
+                    !string.Equals(fromUnit, toUnit, StringComparison.Ordinal))
+                {
+                    return false;
+                }
             }
 
             var unit = fromUnit.Length > 0 ? fromUnit : toUnit;
@@ -322,6 +328,40 @@ internal static class CssFunctionListInterpolation
 
         unit = text[end..];
         return unit.All(c => char.IsLetter(c) || c == '%');
+    }
+
+    /// <summary>
+    /// Converts an angle to `deg`, an absolute length to `px` and a time to `ms`; other units
+    /// (relative lengths, percentages) have no fixed ratio to another one.
+    /// </summary>
+    private static bool TryCanonicalize(ref double number, ref string unit)
+    {
+        var (factor, canonical) = unit.ToLowerInvariant() switch
+        {
+            "deg" => (1d, "deg"),
+            "rad" => (180d / Math.PI, "deg"),
+            "grad" => (0.9d, "deg"),
+            "turn" => (360d, "deg"),
+            "px" => (1d, "px"),
+            "in" => (96d, "px"),
+            "cm" => (96d / 2.54d, "px"),
+            "mm" => (96d / 25.4d, "px"),
+            "q" => (96d / 101.6d, "px"),
+            "pt" => (96d / 72d, "px"),
+            "pc" => (16d, "px"),
+            "ms" => (1d, "ms"),
+            "s" => (1000d, "ms"),
+            _ => (0d, string.Empty),
+        };
+
+        if (canonical.Length == 0)
+        {
+            return false;
+        }
+
+        number *= factor;
+        unit = canonical;
+        return true;
     }
 
     private static bool IsColor(string text) =>

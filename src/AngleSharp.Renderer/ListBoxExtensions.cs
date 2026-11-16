@@ -77,7 +77,7 @@ public static class ListBoxExtensions
     }
 
     // the rows fill the box inside of the border and padding
-    private static bool TryGetContentBox(IElement select, out (double Left, double Top, double Width, double Height) box)
+    internal static bool TryGetContentBox(IElement select, out (double Left, double Top, double Width, double Height) box)
     {
         box = default;
 

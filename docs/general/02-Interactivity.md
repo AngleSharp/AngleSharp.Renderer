@@ -68,6 +68,8 @@ the same. `selectstart` (cancelable) and `selectionchange` are fired. `user-sele
 (`none`, `text`, `all`), what form controls show cannot be selected, and `::selection` gives the colors
 of the highlight and the text.
 
+A host shows the cursor of text where `frame.HasTextAt(x, y)` is true, which does not touch the DOM.
+
 Selecting is on by default. It can be turned off for a document that has no use for it, in which case
 layouts do not record where their text comes from:
 
@@ -147,6 +149,20 @@ var midFrame = harness.PaintToPng();
 Call `AdvanceTime` with however much time you want a frame to represent, then paint - repeating
 that pair of calls is how you produce a sequence of frames (for example, to assemble a GIF or
 video of an animation) instead of only ever the resting/end states.
+
+An interactive host gets the frames of animations cheaply from `UpdateFrame()` after `AdvanceTime`:
+when the animations and transitions only change the `transform`, `opacity` or `filter` of boxes (or
+what boxes paint of their own, e.g. a background color), the last frame is painted with the new
+values without a layout. Otherwise `UpdateFrame()` returns null, and `PrepareFrame()` lays out the
+document:
+
+```cs
+harness.AdvanceTime(TimeSpan.FromMilliseconds(16));
+var frame = harness.UpdateFrame() ?? harness.PrepareFrame();
+```
+
+A frame with sticky boxes can be moved to another scroll position as well (`CanReposition`): the
+sticky boxes stick there anew, also for its `HitTestMap`.
 
 ## CSS `transition`
 
@@ -250,6 +266,51 @@ Both `transition` and `animation` only ever interpolate a fixed set of propertie
 
 `transition-property: all` and any other property named in a `@keyframes` block are limited to
 this same list; other properties change right away (a transition of one still has its events).
+
+## Animated Images
+
+A GIF or WebP of several frames plays without a layout: rasterizing a frame shows the image's frame
+whose time has come, from the moment the image was first painted, as often as the image loops (the
+wall clock, not the virtual one). `GetTimeToNextImageFrame()` tells when an animated image in or near
+the viewport of the frame changes next, so a host knows when to rasterize it again:
+
+```cs
+var frame = harness.PrepareFrame();
+var pixels = frame.Rasterize();
+
+if (frame.GetTimeToNextImageFrame() is { } delay)
+{
+    await Task.Delay(delay);
+    pixels = frame.Rasterize();                    // the next frame of the GIF
+}
+```
+
+## Media Controls
+
+An `audio` element with the `controls` attribute is painted with the controls of Chrome (300x54 by
+default): a play/pause button, the time, a timeline and a mute button, showing the state of the
+element (`paused`, `currentTime`, `duration`, `muted`). While the media plays, the time and the
+timeline are painted for the moment the frame is rasterized, so they go on without a layout, and
+`GetTimeToNextImageFrame()` also tells when they change next. Without `controls`, an `audio` element
+is not rendered.
+
+The controls are painted, not boxes, so a host finds the part a press is on, in viewport
+coordinates, and acts on the element itself:
+
+```cs
+switch (audio.GetMediaControlAt(x, y))
+{
+    case MediaControlPart.PlayPause:
+        // play() or pause(), depending on audio.IsPaused
+        break;
+    case MediaControlPart.Mute:
+        audio.IsMuted = !audio.IsMuted;
+        break;
+    case MediaControlPart.Timeline:
+        audio.CurrentTime = audio.GetMediaTimelinePosition(x)!.Value * audio.Duration;
+        break;
+}
+```
 
 ## Scrolling
 

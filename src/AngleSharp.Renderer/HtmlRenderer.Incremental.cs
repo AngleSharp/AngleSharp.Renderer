@@ -413,6 +413,14 @@ public sealed partial class HtmlRenderer
         private readonly Dictionary<object, Dictionary<string, string>> _repaints = [];
         // if a repaint changed a cursor or what can be hit (see TryRepaint)
         private bool _repaintsChangeHitTesting;
+        // the boxes whose transform or opacity changed alone (e.g. by an animation), by their paint
+        // key: the box as laid out, the style map the frame shows and the one to show (see TryApplyEffects)
+        private readonly Dictionary<object, (IElement Element, Dictionary<string, string> Before, Dictionary<string, string> After)> _effects = [];
+        // the elements whose boxes (or pseudo-elements) are transformed otherwise since the last patch,
+        // which are hit elsewhere
+        private readonly HashSet<IElement> _transformedSincePatch = new(ReferenceEqualityComparer.Instance);
+        // the pseudo-elements of the layout by their paint key, which later renders create anew
+        private Dictionary<object, IElement>? _laidOutPseudoElements;
         // the boxes moved by their insets since the layout (see TryMove): how far, the transform
         // their commands are wrapped into in the frame, and the ones moved since the last patch
         private readonly Dictionary<IElement, (float X, float Y)> _moves = new(ReferenceEqualityComparer.Instance);
@@ -423,15 +431,15 @@ public sealed partial class HtmlRenderer
         /// Gets if all that changed since the frame is painted again only (see TryRepaint), which
         /// leaves the boxes and what can be hit where they are.
         /// </summary>
-        public bool IsRepaintOnly => _relayouts.Count == 0 && !_repaintsChangeHitTesting && _rendered.Count == 0 && _movedSincePatch.Count == 0;
+        public bool IsRepaintOnly => _relayouts.Count == 0 && !_repaintsChangeHitTesting && _rendered.Count == 0 && _movedSincePatch.Count == 0 && _transformedSincePatch.Count == 0;
 
         /// <summary>
         /// Gets the boxes moved since the frame was patched last (see TryMove) if nothing else
         /// changed where boxes are, else null.
         /// </summary>
         public IReadOnlyCollection<IElement>? GetMovedOnly() =>
-            _movedSincePatch.Count > 0 && _relayouts.Count == 0 && _rendered.Count == 0 && !_repaintsChangeHitTesting
-                ? _movedSincePatch.ToArray()
+            (_movedSincePatch.Count > 0 || _transformedSincePatch.Count > 0) && _relayouts.Count == 0 && _rendered.Count == 0 && !_repaintsChangeHitTesting
+                ? _movedSincePatch.Concat(_transformedSincePatch).Distinct(ReferenceEqualityComparer.Instance).Cast<IElement>().ToArray()
                 : null;
 
         // the elements whose own text is painted again in a new style (see TryRepaint), with their new
@@ -478,7 +486,7 @@ public sealed partial class HtmlRenderer
         /// Gets if this is a frame's layout that still looks the same: all boxes laid out again
         /// since were not rendered in the frame and are not now.
         /// </summary>
-        public bool IsUnchangedSinceFrame => _isFrameLayout && _repaints.Count == 0 && _recolors.Count == 0 && _movedSincePatch.Count == 0 && _rendered.Values.All(rendered => !rendered.Before && !rendered.Now);
+        public bool IsUnchangedSinceFrame => _isFrameLayout && _repaints.Count == 0 && _recolors.Count == 0 && _movedSincePatch.Count == 0 && _effects.Count == 0 && _rendered.Values.All(rendered => !rendered.Before && !rendered.Now);
 
         /// <summary>Gets if this is a frame's layout (see <see cref="TryPatch"/>).</summary>
         public bool IsFrameLayout => _isFrameLayout;
@@ -577,12 +585,19 @@ public sealed partial class HtmlRenderer
                 return false;
             }
 
+            if (!TryApplyEffects(displayList))
+            {
+                return false;
+            }
+
             // the patched display list is the frame from now on
             _rendered.Clear();
             _relayouts.Clear();
             _removals.Clear();
             _repaints.Clear();
             _recolors.Clear();
+            _effects.Clear();
+            _transformedSincePatch.Clear();
             _repaintsChangeHitTesting = false;
             return true;
         }
@@ -1016,6 +1031,12 @@ public sealed partial class HtmlRenderer
             "outline-color", "outline-style", "outline-width", "outline-offset", "box-shadow",
         };
 
+        // the properties a box is painted under as a whole, without changing where anything is
+        private static readonly HashSet<string> s_effectProperties = new(StringComparer.Ordinal)
+        {
+            "transform", "translate", "rotate", "scale", "transform-origin", "opacity", "filter",
+        };
+
         // the properties that change neither the layout nor the paint (but the cursor of the frame's map)
         private static readonly HashSet<string> s_inertProperties = new(StringComparer.Ordinal) { "cursor", "pointer-events" };
 
@@ -1028,8 +1049,9 @@ public sealed partial class HtmlRenderer
         /// <param name="window">The window of the document.</param>
         /// <param name="element">The element whose style may have changed.</param>
         /// <param name="reachesDescendants">If the styles of its descendants may have changed, too (else only by inheriting changed values).</param>
+        /// <param name="pseudoElementsOnly">If only the element and its pseudo-elements are looked at (e.g. for animated pseudo-elements).</param>
         /// <returns>True if nothing but that changed, false if the subtree is to be laid out again.</returns>
-        private bool TryRepaint(IWindow window, IElement element, bool reachesDescendants)
+        private bool TryRepaint(IWindow window, IElement element, bool reachesDescendants, bool pseudoElementsOnly = false)
         {
             if (!_isFrameLayout || !_context.RecordsPaintAnchors || element.ParentElement is not { } parent ||
                 !_pass.Nodes.TryGetValue(parent, out var parentNode) || !_context.StyleMapCache.ContainsKey(element))
@@ -1053,20 +1075,22 @@ public sealed partial class HtmlRenderer
             var styles = new List<(IElement Element, Dictionary<string, string> StyleMap)>();
             var repaints = new List<(object Key, Dictionary<string, string> StyleMap)>();
             var recolors = new List<(IElement Element, (Dictionary<string, string>, bool) Text)>();
+            var effects = new List<(object Key, IElement Previous, Dictionary<string, string> Before, Dictionary<string, string> After, bool IsTransformed)>();
             var changesHitTesting = false;
             // the element may also have moved by its insets (e.g. a sprite showing another frame elsewhere)
             var moveX = 0f;
             var moveY = 0f;
             var hasMoved = false;
 
-            if (!Compare(node, reachesDescendants))
+            if (!Compare(node, reachesDescendants || pseudoElementsOnly))
             {
                 return false;
             }
 
             foreach (var (changed, styleMap) in styles)
             {
-                _context.StyleMapCache[changed] = styleMap;
+                // a pseudo-element rendered again stands for the one laid out (see LaidOut)
+                _context.StyleMapCache[LaidOut(changed)] = styleMap;
                 _pass.PlaceholderStyles.Remove(changed);
             }
 
@@ -1078,6 +1102,17 @@ public sealed partial class HtmlRenderer
             foreach (var (changed, text) in recolors)
             {
                 _recolors[changed] = text;
+            }
+
+            foreach (var (key, previous, before, after, isTransformed) in effects)
+            {
+                // the frame shows what the first change started from
+                _effects[key] = (previous, _effects.TryGetValue(key, out var pending) ? pending.Before : before, after);
+
+                if (isTransformed)
+                {
+                    _transformedSincePatch.Add(previous is IPseudoElement pseudo && CssAnimationTracker.GetHost(pseudo) is { } host ? host : previous);
+                }
             }
 
             _repaintsChangeHitTesting |= changesHitTesting;
@@ -1107,6 +1142,16 @@ public sealed partial class HtmlRenderer
                         ? previousHost.Children.OfType<ElementRenderNode>().FirstOrDefault(child => child.Ref is IPseudoElement other && other.PseudoName == pseudo.PseudoName)?.Ref
                         : target;
 
+                    // a pseudo-element rendered again since the layout is no box of the frame: the
+                    // laid out one is, and what was kept for the one in between goes
+                    if (previous is IPseudoElement && !ReferenceEquals(previous, target) && !_metrics.ContainsKey(previous))
+                    {
+                        _context.SpecifiedStyles.Remove(previous);
+                        _pass.ComputedStyles.Remove(previous);
+                        _pass.Nodes.Remove(previous);
+                        previous = LaidOut(previous);
+                    }
+
                     if (previous is null || !_context.StyleMapCache.TryGetValue(previous, out var before))
                     {
                         // a box that was not laid out (and is not now) paints nothing; any other (e.g. of a
@@ -1122,6 +1167,8 @@ public sealed partial class HtmlRenderer
                     var isDecorated = false;
                     var isRecolored = false;
                     var changesDecorationLines = false;
+                    var hasEffect = false;
+                    var isTransformed = false;
 
                     foreach (var name in before.Keys.Union(after.Keys))
                     {
@@ -1143,6 +1190,14 @@ public sealed partial class HtmlRenderer
                         if (s_inertProperties.Contains(name))
                         {
                             changesHitTesting = true;
+                            continue;
+                        }
+
+                        // composited: the box is painted in its scopes as before (see TryApplyEffects)
+                        if (s_effectProperties.Contains(name))
+                        {
+                            hasEffect = true;
+                            isTransformed |= name is not ("opacity" or "filter");
                             continue;
                         }
 
@@ -1180,6 +1235,11 @@ public sealed partial class HtmlRenderer
                         repaints.Add((GetPaintKey(elementNode), after));
                     }
 
+                    if (hasEffect)
+                    {
+                        effects.Add((GetPaintKey(elementNode), previous!, before, after, isTransformed));
+                    }
+
                     if (isRecolored)
                     {
                         var hasOwnDecorationsOnly = HasNoDecoratingAncestor(target);
@@ -1200,6 +1260,12 @@ public sealed partial class HtmlRenderer
 
                 foreach (var child in current.Children)
                 {
+                    // the pseudo-elements of the element alone (e.g. animated ones), not its subtree
+                    if (pseudoElementsOnly && ReferenceEquals(current, node) && child is not ElementRenderNode { Ref: IPseudoElement })
+                    {
+                        continue;
+                    }
+
                     if (!Compare(child, visitsChildren: reachesDescendants))
                     {
                         return false;
@@ -1254,6 +1320,189 @@ public sealed partial class HtmlRenderer
         {
             "text-decoration", "text-decoration-line", "text-decoration-color", "text-decoration-style", "text-decoration-thickness",
         };
+
+        /// <summary>
+        /// Paints the boxes whose transform or opacity alone changed (see TryRepaint) under their
+        /// new ones: the scopes a box opens right before its own decorations (see
+        /// OpenElementEffectScopes) get the new values. The scopes have to be the ones the frame
+        /// shows, with the values the frame was painted with, else the frame needs a layout (e.g.
+        /// for a box that only gets a transform now, which changes the order of painting).
+        /// </summary>
+        /// <returns>True if all of them were painted so, false if the frame needs a layout.</returns>
+        private bool TryApplyEffects(DisplayList displayList)
+        {
+            if (_effects.Count == 0)
+            {
+                return true;
+            }
+
+            var commands = displayList.Commands;
+            var foundKeys = new HashSet<object>();
+
+            for (var index = 0; index < commands.Count && foundKeys.Count < _effects.Count; index++)
+            {
+                if (commands[index] is not PaintAnchorCommand anchor || !_effects.TryGetValue(anchor.Key, out var effect))
+                {
+                    continue;
+                }
+
+                foundKeys.Add(anchor.Key);
+
+                if (!TryApplyEffect(displayList, index, anchor, effect.Before, effect.After))
+                {
+                    return false;
+                }
+            }
+
+            // a hidden pseudo-element (e.g. a glow shown on hover) paints nothing, so it has no
+            // decorations to find it by, and nothing that changes under its scopes either
+            foreach (var (key, effect) in _effects)
+            {
+                if (!foundKeys.Contains(key) && !(effect.Element is IPseudoElement && IsInvisible(effect.Before) && IsInvisible(effect.After)))
+                {
+                    return false;
+                }
+            }
+
+            return true;
+
+            static bool IsInvisible(Dictionary<string, string> styleMap) =>
+                styleMap.GetValueOrDefault("visibility")?.Trim().ToLowerInvariant() is "hidden" or "collapse";
+        }
+
+        private bool TryApplyEffect(DisplayList displayList, int anchorIndex, PaintAnchorCommand anchor, Dictionary<string, string> before, Dictionary<string, string> after)
+        {
+            var box = anchor.BorderBox;
+            var fontSize = TryParsePixelValue(before.GetValueOrDefault("font-size"), out var size) ? size : 16f;
+            var oldTransform = ParseCssTransform(before, box.X, box.Y, box.Width, box.Height, fontSize);
+            var newTransform = ParseCssTransform(after, box.X, box.Y, box.Width, box.Height, fontSize);
+            var oldOpacity = ParseCssOpacity(before);
+            var newOpacity = ParseCssOpacity(after);
+            // the scopes the box opened, outermost first: transform, blend mode, opacity, filter,
+            // clip path, mask, then its backdrop filter
+            var start = anchorIndex;
+
+            while (start > 0 && displayList.Commands[start - 1] is PushTransformCommand or PushBlendModeCommand or PushOpacityCommand or PushFilterCommand or PushClipShapeCommand or PushMaskCommand or DrawBackdropFilterCommand)
+            {
+                start--;
+            }
+
+            var transformIndex = -1;
+            var opacityIndex = -1;
+            var filterIndex = -1;
+
+            for (var index = start; index < anchorIndex; index++)
+            {
+                switch (displayList.Commands[index])
+                {
+                    // the box's own one has the transform it was painted with (one before it may be
+                    // of the box around it, e.g. the scroll position of its content)
+                    case PushTransformCommand push when IsAlike(push.Transform, oldTransform):
+                        transformIndex = index;
+                        break;
+                    case PushOpacityCommand:
+                        opacityIndex = index;
+                        break;
+                    case PushFilterCommand:
+                        filterIndex = index;
+                        break;
+                }
+            }
+
+            // a filter (e.g. a blur getting stronger) is a scope of its own as well, which the box
+            // has to keep
+            var oldFilters = ParseCssFilter(before);
+            var newFilters = ParseCssFilter(after);
+
+            if (oldFilters.Count > 0 != newFilters.Count > 0 || filterIndex >= 0 != oldFilters.Count > 0 ||
+                filterIndex >= 0 && !((PushFilterCommand)displayList.Commands[filterIndex]).Functions.SequenceEqual(oldFilters))
+            {
+                return false;
+            }
+
+            if (filterIndex >= 0 && !oldFilters.SequenceEqual(newFilters))
+            {
+                Replace(filterIndex, new PushFilterCommand(newFilters));
+            }
+
+            // a scope the box gets now changes how it is painted with the boxes around it (a box
+            // keeps the one it had, e.g. at the identity while it animates)
+            if (transformIndex < 0 && !newTransform.IsIdentity || opacityIndex < 0 && newOpacity < 1f ||
+                transformIndex < 0 && !oldTransform.IsIdentity || opacityIndex < 0 && oldOpacity < 1f ||
+                opacityIndex >= 0 && (transformIndex > opacityIndex || MathF.Abs(((PushOpacityCommand)displayList.Commands[opacityIndex]).Alpha - oldOpacity) > 1e-4f))
+            {
+                return false;
+            }
+
+            if (transformIndex >= 0 && !IsAlike(oldTransform, newTransform))
+            {
+                Replace(transformIndex, new PushTransformCommand(newTransform));
+            }
+
+            if (opacityIndex >= 0 && oldOpacity != newOpacity)
+            {
+                Replace(opacityIndex, new PushOpacityCommand(newOpacity));
+            }
+
+            return true;
+
+            void Replace(int index, RenderCommand replacement)
+            {
+                var replaced = displayList.Commands[index];
+                displayList.ReplaceRange(index, 1, [replacement]);
+                ReplaceRangeStarts(replaced, replacement);
+            }
+
+            static bool IsAlike(RenderTransform2D a, RenderTransform2D b) =>
+                MathF.Abs(a.A - b.A) < 1e-4f && MathF.Abs(a.B - b.B) < 1e-4f && MathF.Abs(a.C - b.C) < 1e-4f &&
+                MathF.Abs(a.D - b.D) < 1e-4f && MathF.Abs(a.E - b.E) < 1e-2f && MathF.Abs(a.F - b.F) < 1e-2f;
+        }
+
+        // the pseudo-element of the layout with the paint key (host and name)
+        private IElement? FindLaidOutPseudoElement(object key)
+        {
+            if (_laidOutPseudoElements is null)
+            {
+                _laidOutPseudoElements = [];
+
+                foreach (var element in _metrics.Keys)
+                {
+                    if (element is IPseudoElement pseudo && CssAnimationTracker.GetHost(pseudo) is { } host)
+                    {
+                        _laidOutPseudoElements[(host, pseudo.PseudoName)] = element;
+                    }
+                }
+            }
+
+            return _laidOutPseudoElements.GetValueOrDefault(key);
+        }
+
+        // the pseudo-element of the layout the one given stands for (the element itself otherwise)
+        private IElement LaidOut(IElement element) =>
+            element is IPseudoElement pseudo && !_metrics.ContainsKey(element) && CssAnimationTracker.GetHost(pseudo) is { } host
+                ? FindLaidOutPseudoElement((host, pseudo.PseudoName)) ?? element
+                : element;
+
+        /// <summary>
+        /// Brings the boxes of animated elements to the time now (see the CSS animation and
+        /// transition trackers), when that only changes their transform or opacity: they are
+        /// painted under the new ones, without a layout (see TryApplyEffects).
+        /// </summary>
+        /// <param name="window">The window of the document.</param>
+        /// <param name="elements">The animated elements, and if one of their pseudo-elements is the one animated.</param>
+        /// <returns>True if nothing else changed, false if the document is to be laid out again.</returns>
+        public bool TryAnimate(IWindow window, IEnumerable<(IElement Element, bool IsPseudo)> elements)
+        {
+            foreach (var (element, isPseudo) in elements)
+            {
+                if (!_metrics.ContainsKey(element) && !isPseudo || !TryRepaint(window, element, reachesDescendants: false, pseudoElementsOnly: isPseudo))
+                {
+                    return false;
+                }
+            }
+
+            return true;
+        }
 
         /// <summary>
         /// Paints the decorations of the boxes kept by <see cref="TryRepaint"/> in their new style,
@@ -1559,6 +1808,13 @@ public sealed partial class HtmlRenderer
         /// the viewport when the page is scrolled by the given offsets: the page moves, boxes in
         /// fixed boxes stay, and sticky boxes (with their content) stick anew.
         /// </summary>
+        /// <summary>
+        /// Gets the sticky boxes of a frame laid out with this layout, to stick anew at another
+        /// scroll position (null if there is a sticky box that cannot).
+        /// </summary>
+        public IStickyFrame? GetStickyFrame(DisplayList displayList, HitTestMap hitTestMap, double scrollTop, int stickyCount) =>
+            _isFrameLayout ? StickyFrame.Create(_stickies, _metrics, stickyCount, GetStickyViewport(_context), scrollTop, displayList, hitTestMap) : null;
+
         public ElementLayoutMetrics ToViewport(ElementLayoutMetrics metrics, double scrollX, double scrollY)
         {
             if (metrics.IsViewportAnchored)
@@ -1638,7 +1894,7 @@ public sealed partial class HtmlRenderer
 
             foreach (var record in records)
             {
-                if (TryRemoveOutOfFlow(record))
+                if (TryRemoveOutOfFlow(record) || IsChangeOfNothingRendered(record))
                 {
                     continue;
                 }
@@ -1980,8 +2236,92 @@ public sealed partial class HtmlRenderer
                     return !s_valueStatePseudoClasses.Any(selectors.Refers) &&
                         (string.IsNullOrEmpty(previousValue) == string.IsNullOrEmpty(value) || !selectors.Refers(":placeholder-shown"));
                 default:
-                    return !selectors.RefersToAttributeState;
+                    // the states an attribute may change (e.g. checked for :checked), none for most
+                    // (e.g. the src or a data- attribute of a script)
+                    return !(s_attributeStates.TryGetValue(name, out var states) ? states : s_unknownAttributeStates).Any(selectors.Refers);
             }
+        }
+
+        // the pseudo-classes whose match depends on an attribute
+        private static readonly Dictionary<string, string[]> s_attributeStates = new(StringComparer.OrdinalIgnoreCase)
+        {
+            ["checked"] = [":checked", ":default", ":indeterminate", ":valid", ":invalid"],
+            ["selected"] = [":checked", ":default", ":valid", ":invalid"],
+            ["disabled"] = [":disabled", ":enabled", ":valid", ":invalid", ":read-only", ":read-write"],
+            ["required"] = [":required", ":optional", ":valid", ":invalid"],
+            ["readonly"] = [":read-only", ":read-write", ":valid", ":invalid"],
+            ["contenteditable"] = [":read-only", ":read-write"],
+            ["placeholder"] = [":placeholder-shown"],
+            ["open"] = [":open"],
+            ["href"] = [":link", ":any-link", ":target"],
+            ["lang"] = [":lang"],
+            ["dir"] = [":dir"],
+            ["name"] = [":target", ":checked", ":valid", ":invalid"],
+            ["type"] = [":checked", ":default", ":indeterminate", ":valid", ":invalid", ":in-range", ":out-of-range", ":placeholder-shown", ":read-only", ":read-write"],
+            ["value"] = [":valid", ":invalid", ":in-range", ":out-of-range", ":placeholder-shown", ":checked"],
+            ["min"] = [":valid", ":invalid", ":in-range", ":out-of-range"],
+            ["max"] = [":valid", ":invalid", ":in-range", ":out-of-range"],
+            ["step"] = [":valid", ":invalid"],
+            ["pattern"] = [":valid", ":invalid"],
+            ["minlength"] = [":valid", ":invalid"],
+            ["maxlength"] = [":valid", ":invalid"],
+            ["multiple"] = [":valid", ":invalid"],
+            ["form"] = [":valid", ":invalid", ":default"],
+        };
+
+        private static readonly string[] s_unknownAttributeStates = [];
+
+        // elements that have no box, nor anything in them (unless a page shows them, e.g. a script
+        // with display: block, which then has a box)
+        private bool IsNeverRendered(IElement element)
+        {
+            for (var current = element; current is not null; current = current.ParentElement)
+            {
+                if (IsUnrenderedKind(current))
+                {
+                    return !_metrics.ContainsKey(current);
+                }
+            }
+
+            return false;
+        }
+
+        private static bool IsUnrenderedKind(IElement element) =>
+            element.LocalName is "head" or "script" or "template" or "meta" or "title" or "base" && element.NamespaceUri == NamespaceNames.HtmlUri;
+
+        // e.g. scripts inserted into the body (only the siblings they have may match otherwise now)
+        private bool AddsOrRemovesUnrenderedOnly(IMutationRecord record, IElement parent)
+        {
+            var nodes = (record.Added?.ToList() ?? []).Concat(record.Removed?.ToList() ?? []).ToList();
+
+            if (nodes.Count == 0 || !nodes.All(node => node is IElement element && IsUnrenderedKind(element) && !_metrics.ContainsKey(element)))
+            {
+                return false;
+            }
+
+            return KeepsRelationalMatches(parent) && KeepsStructuralMatches(parent, record.Removed?.OfType<IElement>().ToList() ?? []);
+        }
+
+        /// <summary>
+        /// Gets if the change is to what never has a box (e.g. a script loaded later, as WP Rocket
+        /// does it, by changing its type and src), and styles nothing else.
+        /// </summary>
+        private bool IsChangeOfNothingRendered(IMutationRecord record)
+        {
+            if (ChangesStyleSheets(record))
+            {
+                return false;
+            }
+
+            return record.Type switch
+            {
+                // the states of an attribute (e.g. :checked by type) are none of such an element
+                "attributes" => record.Target is IElement element && record.AttributeName is { } name && name != "style" && IsNeverRendered(element) &&
+                    (name is "class" or "id" ? IsConfinedAttributeChange(element, name, record.PreviousValue) : GetSiblingSelectors().MatchesAlike(name, record.PreviousValue, element.GetAttribute(name))),
+                "childList" => record.Target is IElement parent && (IsNeverRendered(parent) && KeepsRelationalMatches(parent) || AddsOrRemovesUnrenderedOnly(record, parent)),
+                "characterData" => record.Target.Parent is IElement parent && IsNeverRendered(parent),
+                _ => false,
+            };
         }
 
         private SiblingSelectors GetSiblingSelectors() => _siblingSelectors ??= SiblingSelectors.Create(_document);

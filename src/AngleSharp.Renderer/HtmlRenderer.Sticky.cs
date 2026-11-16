@@ -53,7 +53,7 @@ public sealed partial class HtmlRenderer
     /// A sticky box as resolved against the viewport at the scroll position the layout was made
     /// for: with its containing block it sticks anew for another one (see LayoutSnapshot.ToViewport).
     /// </summary>
-    private sealed record StickyRecord(StickyBox Box, RenderRect ContainingBlock, float OffsetX, float OffsetY);
+    private sealed record StickyRecord(StickyBox Box, RenderRect ContainingBlock, float OffsetX, float OffsetY, PushTransformCommand? Transform = null);
 
     /// <summary>
     /// A sticky box inside a writing-mode system, whose offset waits until the system is placed:
@@ -264,20 +264,28 @@ public sealed partial class HtmlRenderer
             }
 
             var (offsetX, offsetY) = ComputeStickyOffset(sticky, containingBlock, GetStickyViewport(context));
+            var stickies = s_layoutCapture.Value?.Stickies;
+            // a frame keeps the translation even when the box does not stick (yet), so that it
+            // can stick anew at another scroll position without a layout (see StickyFrame)
+            var isFrame = stickies is not null && context.RecordsPaintAnchors && s_trialDepth == 0;
+            PushTransformCommand? transform = null;
 
-            if (s_layoutCapture.Value is { Stickies: { } stickies })
+            if (offsetX != 0f || offsetY != 0f || isFrame)
             {
-                stickies[sticky.Element] = new StickyRecord(sticky, containingBlock, offsetX, offsetY);
+                transform = new PushTransformCommand(RenderTransform2D.Translate(offsetX, offsetY));
+                displayList.InsertRange(displayList.Commands.Count - count, [transform]);
+                displayList.PopTransform();
             }
 
-            if (offsetX == 0f && offsetY == 0f)
+            if (stickies is not null)
             {
-                continue;
+                stickies[sticky.Element] = new StickyRecord(sticky, containingBlock, offsetX, offsetY, isFrame ? transform : null);
             }
 
-            displayList.InsertRange(displayList.Commands.Count - count, [new PushTransformCommand(RenderTransform2D.Translate(offsetX, offsetY))]);
-            displayList.PopTransform();
-            RecordStickyMetrics(sticky, offsetX, offsetY);
+            if (offsetX != 0f || offsetY != 0f)
+            {
+                RecordStickyMetrics(sticky, offsetX, offsetY);
+            }
         }
     }
 
@@ -446,6 +454,179 @@ public sealed partial class HtmlRenderer
             return offset > 0f
                 ? Math.Min(offset, Math.Max(0f, blockEnd - (position + size + marginEnd)))
                 : Math.Max(offset, Math.Min(0f, blockStart - (position - marginStart)));
+        }
+    }
+
+    /// <summary>
+    /// The sticky boxes of a frame, which stick anew at another scroll position without the DOM
+    /// (see <see cref="RenderedFrame.Reposition"/>): the translation each one is painted under
+    /// in the frame is replaced, and what can be hit in it moves along.
+    /// </summary>
+    internal interface IStickyFrame
+    {
+        /// <summary>Gets the scroll position of the layout.</summary>
+        double ScrollTop { get; }
+
+        /// <summary>Gets the same boxes in a display list patched since (null if one is gone).</summary>
+        IStickyFrame? With(DisplayList displayList, HitTestMap hitTestMap);
+
+        /// <summary>
+        /// Gets the display lists (the one laid out, and the given one with the same commands, e.g.
+        /// with a selection painted into it) with the boxes stuck at the scroll position, and the
+        /// map of what can be hit there (before the page is shifted to it).
+        /// </summary>
+        (DisplayList DisplayList, DisplayList? Other, HitTestMap HitTestMap) StickAt(double scrollTop, DisplayList? other);
+    }
+
+    private sealed class StickyFrame : IStickyFrame
+    {
+        private readonly List<(IElement Element, StickyRecord Record)> _stickies;
+        private readonly Dictionary<IElement, StickyRecord> _records;
+        // the innermost sticky box each box in one is in
+        private readonly Dictionary<IElement, IElement> _stuckIn;
+        // the viewport the layout stuck the boxes against, in its coordinates, at its scroll position
+        private readonly RenderRect _viewport;
+        private readonly double _scrollTop;
+
+        private StickyFrame(List<(IElement, StickyRecord)> stickies, Dictionary<IElement, IElement> stuckIn, RenderRect viewport, double scrollTop, DisplayList displayList, HitTestMap hitTestMap)
+        {
+            _stickies = stickies;
+            _stuckIn = stuckIn;
+            _records = new Dictionary<IElement, StickyRecord>(ReferenceEqualityComparer.Instance);
+
+            foreach (var (element, record) in stickies)
+            {
+                _records[element] = record;
+            }
+            _viewport = viewport;
+            _scrollTop = scrollTop;
+            DisplayList = displayList;
+            HitTestMap = hitTestMap;
+        }
+
+        /// <summary>Gets the display list as laid out, with the boxes stuck at its scroll position.</summary>
+        public DisplayList DisplayList { get; }
+
+        /// <summary>Gets the map of what can be hit as laid out.</summary>
+        public HitTestMap HitTestMap { get; }
+
+        /// <summary>Gets the scroll position of the layout.</summary>
+        public double ScrollTop => _scrollTop;
+
+        /// <summary>
+        /// Gets the sticky boxes of the layout, or null if one of them cannot stick anew (e.g.
+        /// inside a writing-mode system, or no longer in the display list).
+        /// </summary>
+        public static StickyFrame? Create(IReadOnlyDictionary<IElement, StickyRecord> records, IReadOnlyDictionary<IElement, ElementLayoutMetrics> metrics, int stickyCount, RenderRect viewport, double scrollTop, DisplayList displayList, HitTestMap hitTestMap)
+        {
+            var stickies = new List<(IElement, StickyRecord)>(records.Count);
+            var stuckIn = new Dictionary<IElement, IElement>(ReferenceEqualityComparer.Instance);
+
+            foreach (var (element, elementMetrics) in metrics)
+            {
+                if (elementMetrics.Sticky is { } sticky)
+                {
+                    if (!records.ContainsKey(sticky))
+                    {
+                        return null;
+                    }
+
+                    stuckIn[element] = sticky;
+                }
+            }
+
+            // every sticky box of the frame has to stick anew
+            if (records.Count < stickyCount)
+            {
+                return null;
+            }
+
+            foreach (var (element, record) in records)
+            {
+                if (record.Transform is null)
+                {
+                    return null;
+                }
+
+                stickies.Add((element, record));
+            }
+
+            return Contains(displayList, stickies) ? new StickyFrame(stickies, stuckIn, viewport, scrollTop, displayList, hitTestMap) : null;
+        }
+
+        /// <summary>Gets the same boxes in a display list patched since (null if one is gone).</summary>
+        public IStickyFrame? With(DisplayList displayList, HitTestMap hitTestMap) =>
+            Contains(displayList, _stickies) ? new StickyFrame(_stickies, _stuckIn, _viewport, _scrollTop, displayList, hitTestMap) : null;
+
+        private static bool Contains(DisplayList displayList, List<(IElement Element, StickyRecord Record)> stickies)
+        {
+            var transforms = new HashSet<RenderCommand>(stickies.Select(static sticky => (RenderCommand)sticky.Record.Transform!), ReferenceEqualityComparer.Instance);
+
+            foreach (var command in displayList.Commands)
+            {
+                if (transforms.Remove(command) && transforms.Count == 0)
+                {
+                    return true;
+                }
+            }
+
+            return transforms.Count == 0;
+        }
+
+        /// <summary>
+        /// Gets the display lists (the one laid out, and the given one with the same commands, e.g.
+        /// with a selection painted into it) with the boxes stuck at the scroll position, and the
+        /// map of what can be hit there (before the page is shifted to it).
+        /// </summary>
+        public (DisplayList DisplayList, DisplayList? Other, HitTestMap HitTestMap) StickAt(double scrollTop, DisplayList? other)
+        {
+            var delta = (float)(scrollTop - _scrollTop);
+            var viewport = new RenderRect(_viewport.X, _viewport.Y + delta, _viewport.Width, _viewport.Height);
+            var replacements = new Dictionary<RenderCommand, RenderCommand>(ReferenceEqualityComparer.Instance);
+            var moves = new Dictionary<IElement, (float X, float Y)>(ReferenceEqualityComparer.Instance);
+
+            foreach (var (element, record) in _stickies)
+            {
+                var (x, y) = ComputeStickyOffset(record.Box, record.ContainingBlock, viewport);
+                replacements[record.Transform!] = new PushTransformCommand(RenderTransform2D.Translate(x, y));
+                moves[element] = (x - record.OffsetX, y - record.OffsetY);
+            }
+
+            return (Replace(DisplayList, replacements), other is null ? null : Replace(other, replacements), HitTestMap.WithStickyMoves(element => _stuckIn.TryGetValue(element, out var sticky) ? GetMove(sticky, moves) : null));
+        }
+
+        // how far a box in sticky boxes moves with them: by each of them it is in
+        private (float X, float Y)? GetMove(IElement? sticky, Dictionary<IElement, (float X, float Y)> moves)
+        {
+            var x = 0f;
+            var y = 0f;
+            var isMoved = false;
+
+            for (; sticky is not null && _records.TryGetValue(sticky, out var record); sticky = record.Box.EnclosingSticky)
+            {
+                if (moves.TryGetValue(sticky, out var move))
+                {
+                    x += move.X;
+                    y += move.Y;
+                    isMoved = true;
+                }
+            }
+
+            return isMoved ? (x, y) : null;
+        }
+
+        private static DisplayList Replace(DisplayList displayList, Dictionary<RenderCommand, RenderCommand> replacements)
+        {
+            var commands = new List<RenderCommand>(displayList.Commands.Count);
+
+            foreach (var command in displayList.Commands)
+            {
+                commands.Add(replacements.TryGetValue(command, out var replacement) ? replacement : command);
+            }
+
+            var result = new DisplayList { Fonts = displayList.Fonts };
+            result.InsertRange(0, commands);
+            return result;
         }
     }
 }
