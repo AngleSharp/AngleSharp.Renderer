@@ -300,6 +300,8 @@ public sealed class BrowserIntegrationTests
     {
         public ManualResetEventSlim Gate { get; } = new(false);
 
+        public ManualResetEventSlim CopyStarted { get; } = new(false);
+
         public override bool SupportsProtocol(string protocol) => true;
 
         protected override Task<IResponse?> PerformRequestAsync(Request request, CancellationToken cancel) =>
@@ -308,11 +310,24 @@ public sealed class BrowserIntegrationTests
                 Address = request.Address,
                 StatusCode = HttpStatusCode.OK,
                 Headers = new Dictionary<string, string> { ["Content-Type"] = "image/png" },
-                Content = new GatedStream(png, Gate),
+                Content = new GatedStream(png, Gate, CopyStarted),
             });
 
-        private sealed class GatedStream(byte[] data, ManualResetEventSlim gate) : MemoryStream(data)
+        private sealed class GatedStream(byte[] data, ManualResetEventSlim gate, ManualResetEventSlim copyStarted) : MemoryStream(data)
         {
+            public override void CopyTo(Stream destination, int bufferSize)
+            {
+                gate.Wait();
+                base.CopyTo(destination, bufferSize);
+            }
+
+            public override async Task CopyToAsync(Stream destination, int bufferSize, CancellationToken cancellationToken)
+            {
+                copyStarted.Set();
+                await Task.Run(() => gate.Wait(cancellationToken), cancellationToken);
+                await base.CopyToAsync(destination, bufferSize, cancellationToken);
+            }
+
             public override int Read(byte[] buffer, int offset, int count)
             {
                 gate.Wait();
@@ -360,6 +375,7 @@ public sealed class BrowserIntegrationTests
         document.Body!.AppendChild(image);
         var download = ((ILoadableElement)image).CurrentDownload!;
         await download.Task.WaitAsync(TimeSpan.FromSeconds(10));
+        Assert.True(await Task.Run(() => requester.CopyStarted.Wait(TimeSpan.FromSeconds(10))));
 
         // the image service waits for the body now; the frame must not read it
         await Task.Run(() => Render(document)).WaitAsync(TimeSpan.FromSeconds(10));
