@@ -130,6 +130,58 @@ public sealed class DocumentFontLoadingTests
         Assert.Equal(new[] { "loading", "loadingerror" }, events);
     }
 
+    [Fact]
+    public async Task Add_UnloadedFace_LoadsItAndRendersOnceReady()
+    {
+        var document = await BrowsingContext.New(Configuration.Default.WithCss())
+            .OpenAsync(request => request.Content("<html><body style='font-family: AddedFace; font-size: 20px'>Handgloves quick brown fox</body></html>"));
+        var original = BuildTextWidth(document);
+        var set = document.Fonts();
+        var face = new DocumentFontFace(document.DefaultView!, "AddedFace", $"url({SerifDataUri})");
+
+        set.Add(face);
+
+        Assert.True(set.Has(face));
+        Assert.Equal("loading", set.Status);
+        Assert.Same(set, await set.Ready);
+        Assert.Equal("loaded", face.Status);
+        Assert.Equal(MeasureWithFamily("serif"), BuildTextWidth(document), tolerance: 0.01f);
+        Assert.True(Math.Abs(original - BuildTextWidth(document)) > 0.01f);
+    }
+
+    [Fact]
+    public async Task Add_FaceFailingToLoad_StaysInTheSetWithoutRendering()
+    {
+        var document = await BrowsingContext.New(Configuration.Default.WithCss())
+            .OpenAsync(request => request.Content("<html><body style='font-family: Missing; font-size: 20px'>Hello</body></html>"));
+        var original = BuildTextWidth(document);
+        var set = document.Fonts();
+        var face = new DocumentFontFace(document.DefaultView!, "Missing", "url(https://example.invalid/missing.woff2)");
+
+        set.Add(face);
+        await set.Ready;
+
+        Assert.Equal("error", face.Status);
+        Assert.True(set.Has(face));
+        Assert.Equal(original, BuildTextWidth(document), tolerance: 0.01f);
+        Assert.Same(set, set.Add(face));
+    }
+
+    [Fact]
+    public async Task Add_FaceOfAFontFaceRule_Throws()
+    {
+        var document = await BrowsingContext.New(Configuration.Default.WithCss())
+            .OpenAsync(request => request.Content($"<html><head><style>@font-face {{ font-family: CssFace; src: url({SerifDataUri}); }}</style></head><body></body></html>"));
+        var set = document.Fonts();
+        var cssFace = set.First();
+
+        var error = Assert.Throws<DomException>(() => set.Add(cssFace));
+
+        Assert.Equal((int)DomError.InvalidModification, error.Code);
+        Assert.False(set.Delete(cssFace));
+        Assert.Equal(1, set.Size);
+    }
+
     private static float BuildTextWidth(AngleSharp.Dom.IDocument document)
     {
         var displayList = new HtmlRenderer().BuildDisplayList(document, new DefaultRenderDevice

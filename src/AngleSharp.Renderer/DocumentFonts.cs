@@ -238,20 +238,39 @@ public sealed class DocumentFontFaceSet : EventTarget, IEnumerable<DocumentFontF
     [DomName("ready")]
     public Task<DocumentFontFaceSet> Ready => _ready.Task;
 
-    /// <summary>Adds a loaded face to the set.</summary>
+    /// <summary>
+    /// Adds a face to the set. A face that is not loaded yet starts loading (browsers wait until
+    /// text needs it, but a face added from code is meant to be used), so <see cref="Ready"/>
+    /// settles once it is there; it renders from then on. A face that failed to load stays in the
+    /// set without rendering.
+    /// </summary>
+    /// <exception cref="DomException">The face comes from an <c>@font-face</c> rule of the document (InvalidModificationError).</exception>
     [DomName("add")]
     public DocumentFontFaceSet Add(DocumentFontFace face)
     {
         ArgumentNullException.ThrowIfNull(face);
-        if (face.Status != "loaded" || face.RenderFace is null)
+        RefreshCssFaces();
+
+        if (_cssFaces.Values.Contains(face))
         {
-            throw new DomException(DomError.InvalidState);
+            throw new DomException(DomError.InvalidModification);
         }
 
-        if (!_faces.Contains(face))
+        if (_faces.Contains(face))
         {
-            _faces.Add(face);
+            return this;
+        }
+
+        _faces.Add(face);
+
+        if (face.RenderFace is not null)
+        {
             InvalidateLayout();
+        }
+        else if (face.Status == "unloaded")
+        {
+            // the set is told when it is loaded (FaceLoaded), and lays out again then
+            _ = face.Load();
         }
 
         return this;

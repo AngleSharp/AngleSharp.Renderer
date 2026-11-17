@@ -24,14 +24,25 @@ The renderer works in three steps:
 
 ```cs
 using AngleSharp;
+using AngleSharp.Css;
 using AngleSharp.Renderer;
 
-var context = BrowsingContext.New(Configuration.Default.WithCss().WithRendering());
+var device = new DefaultRenderDevice { ViewPortWidth = 800, ViewPortHeight = 600 };
+var context = BrowsingContext.New(Configuration.Default.WithCss().WithRenderDevice(device).WithRendering());
 var document = await context.OpenAsync(request => request.Content("<html><body>Hello</body></html>"));
 
-var renderer = new HtmlRenderer();
-var image = renderer.RenderToPng(document);
+var image = document.RenderToPng();
 ```
+
+## The Render Device
+
+The renderer takes the viewport from AngleSharp.Css's `IRenderDevice`, the same object that media queries are evaluated against:
+
+- `ViewPortWidth` and `ViewPortHeight` are the size of the viewport, and so of the image.
+- `FontSize` is the default font size (`medium`, the size `rem` refers to).
+- The other properties (`Resolution`, `ColorBits`, ...) feed media queries; images are always rendered at one device pixel per CSS pixel.
+
+Register it once with `WithRenderDevice(device)`, or pass it to a single call with `new HtmlRenderer().RenderToPng(document, device)`. Without a render device, a document renders in an 800×600 viewport (`HtmlRenderer.FallbackViewportWidth`/`FallbackViewportHeight`). The interactive harness and the geometry APIs (`GetBoundingClientRect`, ...) still need a registered device, since AngleSharp.Css evaluates `window.innerWidth` and the media queries of computed styles against it.
 
 ## Canvas Support
 

@@ -619,12 +619,6 @@ public static class ElementCssomViewExtensions
             return ((int)Math.Round(elementMetrics.BorderBoxWidth - elementMetrics.BorderLeft - elementMetrics.BorderRight), (int)Math.Ceiling(Math.Max(clientBoxHeight, listBoxHeight + verticalInsets)));
         }
 
-        var clientWidth = Math.Max(0d, elementMetrics.BorderBoxWidth - elementMetrics.BorderLeft - elementMetrics.BorderRight);
-        var clientHeight = Math.Max(0d, elementMetrics.BorderBoxHeight - elementMetrics.BorderTop - elementMetrics.BorderBottom);
-        var paddingBoxLeft = elementMetrics.BorderBoxX + elementMetrics.BorderLeft;
-        var paddingBoxTop = elementMetrics.BorderBoxY + elementMetrics.BorderTop;
-        var rightExtent = paddingBoxLeft + clientWidth;
-        var bottomExtent = paddingBoxTop + clientHeight;
         // the content of a scroll container is laid out where its scroll position moved it
         var isPage = ReferenceEquals(element, element.Owner?.DocumentElement);
         var state = isPage ? null : GetInteractiveState(element);
@@ -634,6 +628,37 @@ public static class ElementCssomViewExtensions
         var styleMaps = element.Owner?.Context.GetDomHarness() is InteractiveHtmlRendererState harness
             ? harness.GetLayoutSnapshot(element.Owner).StyleMaps
             : s_noStyleMaps;
+
+        return GetScrollExtents(element, elementMetrics, metricsMap, styleMaps, scrollLeft, scrollTop);
+    }
+
+    /// <summary>
+    /// Measures how far the content of the element extends, from the given layout (also one
+    /// taken without a harness, as the renderer does for a capture of the full page).
+    /// </summary>
+    internal static (int Width, int Height) GetScrollExtents(
+        IElement element,
+        HtmlRenderer.ElementLayoutMetrics elementMetrics,
+        IReadOnlyDictionary<IElement, HtmlRenderer.ElementLayoutMetrics> metricsMap,
+        IReadOnlyDictionary<IElement, Dictionary<string, string>> styleMaps,
+        double scrollLeft,
+        double scrollTop)
+    {
+        var clientWidth = Math.Max(0d, elementMetrics.BorderBoxWidth - elementMetrics.BorderLeft - elementMetrics.BorderRight);
+        var clientHeight = Math.Max(0d, elementMetrics.BorderBoxHeight - elementMetrics.BorderTop - elementMetrics.BorderBottom);
+        var paddingBoxLeft = elementMetrics.BorderBoxX + elementMetrics.BorderLeft;
+        var paddingBoxTop = elementMetrics.BorderBoxY + elementMetrics.BorderTop;
+        var rightExtent = paddingBoxLeft + clientWidth;
+        var bottomExtent = paddingBoxTop + clientHeight;
+
+        // the root's metrics are the viewport's, while the page's scrollable overflow includes the
+        // margin box of the root as laid out (with the body's bottom margin, e.g.)
+        if (ReferenceEquals(element, element.Owner?.DocumentElement) && elementMetrics.OwnBox is not null)
+        {
+            var own = elementMetrics.ReportedBox;
+            rightExtent = Math.Max(rightExtent, own.X + own.Width + elementMetrics.MarginRight);
+            bottomExtent = Math.Max(bottomExtent, own.Y + own.Height + elementMetrics.MarginBottom);
+        }
 
         foreach (var (candidate, candidateMetrics) in metricsMap)
         {

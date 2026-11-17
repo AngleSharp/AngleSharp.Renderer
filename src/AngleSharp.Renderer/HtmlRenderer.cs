@@ -792,11 +792,11 @@ public sealed partial class HtmlRenderer
     /// </summary>
     /// <param name="document">The source document.</param>
     /// <returns>The rendered PNG image.</returns>
+    /// <remarks>The render device is the one of the document's browsing context, or <see cref="FallbackViewportWidth"/> × <see cref="FallbackViewportHeight"/> without one.</remarks>
     public RenderedImage RenderToPng(IDocument document)
     {
         ArgumentNullException.ThrowIfNull(document);
-        var renderDevice = document.Context.GetService<IRenderDevice>();
-        return RenderToPng(document, renderDevice!);
+        return RenderToPng(document, ResolveRenderDevice(document));
     }
 
     /// <summary>
@@ -810,11 +810,7 @@ public sealed partial class HtmlRenderer
         ArgumentNullException.ThrowIfNull(document);
         ArgumentNullException.ThrowIfNull(renderDevice);
 
-        var context = CreateLayoutContext(document, renderDevice, _textMeasurer);
-        var viewport = new RenderViewport(context.Width, context.Height);
-        var displayList = WithSelectionPainted(document, context, BuildDisplayList(document, viewport, context, renderDevice, ResolveRootScrollOffsetY(document)));
-
-        return _backend.RenderToPng(PaintMediaTimelines(displayList), viewport);
+        return RenderToImage(document, renderDevice, RenderOptions.Default);
     }
 
     /// <summary>
@@ -822,11 +818,11 @@ public sealed partial class HtmlRenderer
     /// </summary>
     /// <param name="document">The source document.</param>
     /// <returns>The generated display list.</returns>
+    /// <remarks>The render device is the one of the document's browsing context, or <see cref="FallbackViewportWidth"/> × <see cref="FallbackViewportHeight"/> without one.</remarks>
     public DisplayList BuildDisplayList(IDocument document)
     {
         ArgumentNullException.ThrowIfNull(document);
-        var renderDevice = document.Context.GetService<IRenderDevice>();
-        return BuildDisplayList(document, renderDevice!);
+        return BuildDisplayList(document, ResolveRenderDevice(document));
     }
 
     /// <summary>
@@ -912,7 +908,7 @@ public sealed partial class HtmlRenderer
         return (float)harness.GetScrollTop(scrollingElement, double.MaxValue);
     }
 
-    private static DisplayList BuildDisplayList(IDocument document, RenderViewport viewport, LayoutContext context, IRenderDevice renderDevice, float scrollOffsetY = 0f, bool measureFullExtent = false, float surfaceExtraHeight = 0f, LayoutPass? pass = null)
+    private static DisplayList BuildDisplayList(IDocument document, RenderViewport viewport, LayoutContext context, IRenderDevice renderDevice, float scrollOffsetY = 0f, bool measureFullExtent = false, float surfaceExtraHeight = 0f, LayoutPass? pass = null, bool omitBackground = false)
     {
         var previous = s_layoutPass.Value;
         pass ??= new LayoutPass();
@@ -927,7 +923,7 @@ public sealed partial class HtmlRenderer
 
         try
         {
-            var displayList = BuildDisplayListCore(document, viewport, context, renderDevice, scrollOffsetY, measureFullExtent, surfaceExtraHeight);
+            var displayList = BuildDisplayListCore(document, viewport, context, renderDevice, scrollOffsetY, measureFullExtent, surfaceExtraHeight, omitBackground);
             if (context.Subframes.Count > 0)
             {
                 var subframesStart = RenderMetricsRecorder.Now;
@@ -945,12 +941,14 @@ public sealed partial class HtmlRenderer
 
     // surfaceExtraHeight: the rows the raster surface has below the viewport (an interactive
     // frame's overscan), which are painted like the viewport but play no role in layout
-    private static DisplayList BuildDisplayListCore(IDocument document, RenderViewport viewport, LayoutContext context, IRenderDevice renderDevice, float scrollOffsetY, bool measureFullExtent, float surfaceExtraHeight)
+    private static DisplayList BuildDisplayListCore(IDocument document, RenderViewport viewport, LayoutContext context, IRenderDevice renderDevice, float scrollOffsetY, bool measureFullExtent, float surfaceExtraHeight, bool omitBackground = false)
     {
         var displayList = new DisplayList { Fonts = context.Fonts };
 
-        // what is behind an iframe shows through a document without a background
-        displayList.FillRect(new RenderRect(0f, 0f, viewport.Width, viewport.Height + surfaceExtraHeight), document.Context?.Parent is null ? RenderColor.White : RenderColor.Transparent);
+        // what is behind an iframe shows through a document without a background, and so does
+        // what is behind a page rendered without one (RenderOptions.OmitBackground); the command
+        // stays, as the canvas background is inserted after it
+        displayList.FillRect(new RenderRect(0f, 0f, viewport.Width, viewport.Height + surfaceExtraHeight), document.Context?.Parent is null && !omitBackground ? RenderColor.White : RenderColor.Transparent);
 
         var window = document.DefaultView;
         if (window is null)

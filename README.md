@@ -12,41 +12,48 @@ AngleSharp.Renderer extends the core AngleSharp library with some more powerful 
 
 ## Current Status
 
-The project now contains a first draft implementation with:
+AngleSharp.Renderer lays out and paints HTML, CSS and SVG documents headlessly:
 
-- A backend-agnostic rendering core and display-list model
-- A SkiaSharp backend that renders PNG output
-- A basic DOM-driven text layout pass (block flow, heading scaling, word wrapping)
-- Basic support for HTML canvas via a bitmap-backed 2D rendering context
+- Block, inline, float, flexbox, grid, table and multi-column layout, positioning (including `sticky`), writing modes and bidirectional text
+- Text shaped with HarfBuzz, `@font-face` web fonts (WOFF/WOFF2), bundled fonts for reproducible output
+- Backgrounds, gradients, borders, shadows, transforms, filters, masks, blend modes and clipping
+- Inline and external SVG, images (also animated GIF/WebP), `<canvas>` with a 2D context, form controls
+- An interactive harness for hover, scrolling, text selection, CSS transitions and animations on a virtual clock, plus the CSSOM View geometry APIs (`getBoundingClientRect`, `elementFromPoint`, ...)
+- A backend-agnostic display list, rasterized by a SkiaSharp backend to PNG or raw pixels
 
-This is an initial vertical slice and not a full browser-grade layout engine yet.
+It is not a full browser: there are no 3D transforms and no paged media, and resources are loaded through AngleSharp's own document loader. See the [documentation](./docs) for details.
 
 ## Quick Start
 
 ```csharp
 using AngleSharp;
+using AngleSharp.Css;
 using AngleSharp.Renderer;
 
-var context = BrowsingContext.New(Configuration.Default.WithCss().WithRendering());
+var device = new DefaultRenderDevice { ViewPortWidth = 800, ViewPortHeight = 450 };
+var config = Configuration.Default.WithCss().WithRenderDevice(device).WithRendering();
+var context = BrowsingContext.New(config);
 var document = await context.OpenAsync(req => req.Content(@"
 <html>
 	<body>
 		<h1>Hello Renderer</h1>
-		<p>This is a first draft image render from AngleSharp.Renderer.</p>
+		<p>This page was rendered by AngleSharp.Renderer.</p>
 	</body>
 </html>"));
 
-var renderer = new HtmlRenderer();
-var image = renderer.RenderToPng(document, new HtmlRenderOptions
-{
-		Width = 800,
-		Height = 450,
-});
+var image = document.RenderToPng();
 
 await File.WriteAllBytesAsync("render.png", image.Data);
 ```
 
-Registering the rendering service with `WithRendering()` is also what enables support for `<canvas>` elements and their 2D drawing context. The renderer currently provides a lightweight bitmap-backed implementation for common drawing operations such as rectangles, paths, text, clear operations, and simple state management.
+The render device's viewport is the size of the image; without one, documents render at 800×600. `RenderToImage` takes `RenderOptions` for full-page, clipped, element and HiDPI captures, and for JPEG or WebP:
+
+```csharp
+var page = document.RenderToImage(new RenderOptions { FullPage = true, DeviceScaleFactor = 2f });
+var card = document.QuerySelector(".card")!.RenderToImage();
+```
+
+`WithRendering()` adds support for `<canvas>` elements (with a 2D drawing context) and for `<img>` data.
 
 ## Design Direction
 
