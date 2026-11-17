@@ -10236,6 +10236,22 @@ public sealed class HtmlRendererTests
         Assert.All(dots, dot => Assert.True(dot.Rect.Width <= 4f));
     }
 
+    [Fact]
+    public async Task BuildDisplayList_DottedRoundedBorderPlacesItsDotsOnTheCurve()
+    {
+        // found on the tractor store: its spinner is a circle of solid and dotted sides
+        var document = await ParseAsync("<html><body style=\"margin:0\"><div style=\"width:40px; height:40px; border:4px dotted #ff0000; border-radius:50%\"></div></body></html>");
+
+        var dots = BuildDisplayList(document).Commands.OfType<FillRectCommand>().Where(f => f.Color.Equals(Red)).ToList();
+
+        Assert.True(dots.Count > 8);
+        Assert.All(dots, dot =>
+        {
+            var distance = Math.Sqrt(Math.Pow(dot.Rect.X + (dot.Rect.Width / 2f) - 24f, 2) + Math.Pow(dot.Rect.Y + (dot.Rect.Height / 2f) - 24f, 2));
+            Assert.InRange(distance, 21.25, 22.75);
+        });
+    }
+
     [Theory]
     [InlineData("inset", true)]
     [InlineData("outset", false)]

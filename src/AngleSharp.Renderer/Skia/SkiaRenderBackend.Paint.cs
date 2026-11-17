@@ -92,7 +92,7 @@ public sealed partial class SkiaRenderBackend
 
         if (image is not null)
         {
-            using var imagePaintForTile = new SKPaint { IsAntialias = true, FilterQuality = SKFilterQuality.High };
+            using var imagePaintForTile = new SKPaint { IsAntialias = true, FilterQuality = GetImageFilterQuality(image, tileRect, SKMatrix.Identity) };
             tileCanvas.DrawImage(image, tileRect, imagePaintForTile);
         }
         else if (content is RenderGradientPaint gradientPaint)

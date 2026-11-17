@@ -3,6 +3,7 @@ using System.Linq;
 using System.Runtime.InteropServices;
 
 using SkiaSharp;
+using System.Runtime.CompilerServices;
 
 namespace AngleSharp.Renderer.Skia;
 
@@ -93,11 +94,218 @@ public sealed partial class SkiaRenderBackend : IPixelRenderBackend, ITextMeasur
         canvas.Clear(SKColors.Transparent);
 
         var state = new DrawState(surface);
+        DrawCommands(canvas, displayList.Commands, displayList.Fonts, state);
+    }
 
-        foreach (var command in displayList.Commands)
+    /// <summary>
+    /// Draws the commands, with each layer (of a filter, an opacity or a blend mode) as large as
+    /// what is drawn into it: a layer without bounds covers the whole canvas, so a blurred box far
+    /// below the viewport (e.g. the glows of a long page) was blurred across all of it, in every
+    /// frame; a layer whose content is outside of the canvas is not drawn at all.
+    /// </summary>
+    private static void DrawCommands(SKCanvas canvas, IReadOnlyList<RenderCommand> commands, FontFaceSet fonts, DrawState state)
+    {
+        for (var i = 0; i < commands.Count; i++)
         {
-            DrawCommand(canvas, command, displayList.Fonts, state);
+            var command = commands[i];
+
+            if (command is PushFilterCommand or PushOpacityCommand or PushBlendModeCommand)
+            {
+                var bounds = MeasureLayer(commands, i, out var end);
+
+                if (bounds is { } content)
+                {
+                    var reach = Outset(content, command);
+
+                    if (!canvas.TotalMatrix.MapRect(reach).IntersectsWith(canvas.DeviceClipBounds))
+                    {
+                        // nothing of it shows, its pop included
+                        i = end;
+                        continue;
+                    }
+
+                    PushLayer(canvas, command, content);
+                    continue;
+                }
+            }
+
+            DrawCommand(canvas, command, fonts, state);
         }
+    }
+
+    private static void PushLayer(SKCanvas canvas, RenderCommand command, SKRect bounds)
+    {
+        switch (command)
+        {
+            case PushFilterCommand filter:
+            {
+                using var paint = new SKPaint { ImageFilter = BuildFilterChain(filter.Functions) };
+                canvas.SaveLayer(bounds, paint);
+                break;
+            }
+            case PushOpacityCommand opacity:
+            {
+                var alpha = (byte)Math.Round(Math.Clamp(opacity.Alpha, 0f, 1f) * 255f);
+                using var paint = new SKPaint { Color = new SKColor(255, 255, 255, alpha) };
+                canvas.SaveLayer(bounds, paint);
+                break;
+            }
+            case PushBlendModeCommand blend:
+            {
+                using var paint = new SKPaint { BlendMode = ToSkiaBlendMode(blend.Mode) };
+                canvas.SaveLayer(bounds, paint);
+                break;
+            }
+        }
+    }
+
+    /// <summary>
+    /// Gets the bounds of what the layer pushed at <paramref name="start"/> draws, in the space it
+    /// is pushed in (a superset), and the index of its pop; null if a command draws somewhere
+    /// that is not known here.
+    /// </summary>
+    internal static SKRect? MeasureLayer(IReadOnlyList<RenderCommand> commands, int start, out int end)
+    {
+        var matrix = SKMatrix.Identity;
+        var saved = new Stack<SKMatrix>();
+        var bounds = SKRect.Empty;
+        var isKnown = true;
+
+        for (var i = start + 1; i < commands.Count; i++)
+        {
+            switch (commands[i])
+            {
+                case PopFilterCommand or PopOpacityCommand or PopBlendModeCommand:
+                    end = i;
+                    return isKnown ? bounds : null;
+                case PushFilterCommand or PushOpacityCommand or PushBlendModeCommand:
+                    var inner = MeasureLayer(commands, i, out var innerEnd);
+                    Add(inner is { } innerBounds ? Outset(innerBounds, commands[i]) : null);
+                    i = innerEnd;
+                    break;
+                case PushTransformCommand push:
+                    saved.Push(matrix);
+                    var t = push.Transform;
+                    matrix = matrix.PreConcat(new SKMatrix(t.A, t.C, t.E, t.B, t.D, t.F, 0f, 0f, 1f));
+                    break;
+                case PopTransformCommand:
+                    matrix = saved.Count > 0 ? saved.Pop() : SKMatrix.Identity;
+                    break;
+                case PushClipCommand or PushClipShapeCommand or PopClipCommand or PushMaskCommand or PopMaskCommand or
+                    PushViewportAnchorCommand or PopViewportAnchorCommand or PaintAnchorCommand or PaintAnchorEndCommand or
+                    PushTextFragmentCommand or PopTextFragmentCommand:
+                    // a clip only makes it smaller, a mask is drawn within what it masks
+                    break;
+                case FillRectCommand fill:
+                    Add(ToRect(fill.Rect));
+                    break;
+                case FillRingCommand ring:
+                    Add(ToRect(ring.Outer));
+                    break;
+                case StrokeRoundedRectCommand stroke:
+                    Add(Inflate(ToRect(stroke.Rect), stroke.StrokeWidth));
+                    break;
+                case DrawImageCommand image:
+                    Add(ToRect(image.Rect));
+                    break;
+                case DrawBorderImageCommand borderImage:
+                    Add(ToRect(borderImage.Area));
+                    break;
+                case DrawBackdropFilterCommand backdrop:
+                    Add(ToRect(backdrop.Rect));
+                    break;
+                case DrawSubframeCommand subframe:
+                    Add(ToRect(subframe.Viewport));
+                    break;
+                case DrawBoxShadowCommand { Shadow: var shadow } boxShadow:
+                    var shadowRect = ToRect(boxShadow.BorderBoxRect);
+
+                    if (!shadow.Inset)
+                    {
+                        shadowRect.Offset(shadow.OffsetX, shadow.OffsetY);
+                        shadowRect = Inflate(shadowRect, Math.Max(0f, shadow.SpreadRadius) + (Math.Max(0f, shadow.BlurRadius) * 1.5f));
+                        shadowRect.Union(ToRect(boxShadow.BorderBoxRect));
+                    }
+
+                    Add(shadowRect);
+                    break;
+                case DrawTextCommand text:
+                    Add(EstimateText(text.Text, text.X, text.Y, text.FontSize, text.LetterSpacing, 0f));
+                    break;
+                case DrawTextShadowCommand shadowText:
+                    Add(EstimateText(shadowText.Text, shadowText.X, shadowText.Y, shadowText.FontSize, shadowText.LetterSpacing, shadowText.BlurRadius * 1.5f));
+                    break;
+                default:
+                    isKnown = false;
+                    break;
+            }
+        }
+
+        end = commands.Count - 1;
+        return null;
+
+        void Add(SKRect? rect)
+        {
+            if (rect is not { } value)
+            {
+                isKnown = false;
+                return;
+            }
+
+            var mapped = matrix.MapRect(value);
+
+            if (bounds.IsEmpty)
+            {
+                bounds = mapped;
+            }
+            else
+            {
+                bounds.Union(mapped);
+            }
+        }
+
+        static SKRect ToRect(RenderRect rect) => new(rect.X, rect.Y, rect.X + rect.Width, rect.Y + rect.Height);
+
+        static SKRect Inflate(SKRect rect, float amount) => new(rect.Left - amount, rect.Top - amount, rect.Right + amount, rect.Bottom + amount);
+
+        // a generous box of a run of text at its baseline (its glyphs are not measured here)
+        static SKRect EstimateText(string text, float x, float y, float fontSize, float letterSpacing, float extra)
+        {
+            var width = (text.Length * ((fontSize * 1.5f) + Math.Abs(letterSpacing))) + fontSize;
+            return new SKRect(x - fontSize - width - extra, y - (fontSize * 2f) - extra, x + width + extra, y + fontSize + extra);
+        }
+    }
+
+    /// <summary>
+    /// Gets what a layer's effect reaches beyond its content: a blur and a drop shadow spread it.
+    /// </summary>
+    private static SKRect Outset(SKRect content, RenderCommand command)
+    {
+        if (command is not PushFilterCommand filter)
+        {
+            return content;
+        }
+
+        var result = content;
+
+        foreach (var function in filter.Functions)
+        {
+            var spread = Math.Max(0f, function.Amount) * 1.5f;
+
+            if (function.Kind == RenderFilterFunctionKind.Blur)
+            {
+                result = new SKRect(result.Left - spread, result.Top - spread, result.Right + spread, result.Bottom + spread);
+            }
+            else if (function.Kind == RenderFilterFunctionKind.DropShadow)
+            {
+                var shadow = result;
+                shadow.Offset(function.OffsetX, function.OffsetY);
+                shadow = new SKRect(shadow.Left - spread, shadow.Top - spread, shadow.Right + spread, shadow.Bottom + spread);
+                result.Union(shadow);
+            }
+        }
+
+        return result;
     }
 
     private static void DrawCommand(SKCanvas canvas, RenderCommand command, FontFaceSet fonts, DrawState state)
@@ -110,11 +318,7 @@ public sealed partial class SkiaRenderBackend : IPixelRenderBackend, ITextMeasur
                 canvas.Translate(drawSubframe.Viewport.X, drawSubframe.Viewport.Y);
 
                 var nestedList = HtmlRenderer.PaintMediaTimelines(subframe.DisplayList);
-
-                foreach (var nested in nestedList.Commands)
-                {
-                    DrawCommand(canvas, nested, nestedList.Fonts, state);
-                }
+                DrawCommands(canvas, nestedList.Commands, nestedList.Fonts, state);
 
                 canvas.Restore();
                 break;
@@ -1088,8 +1292,146 @@ public sealed partial class SkiaRenderBackend : IPixelRenderBackend, ITextMeasur
             return;
         }
 
-        using var paint = new SKPaint { IsAntialias = true, FilterQuality = SKFilterQuality.High };
+        if (GetScaledDown(image, rect, canvas.TotalMatrix) is { } scaled)
+        {
+            // drawn about as large as it is now
+            using var scaledPaint = new SKPaint { IsAntialias = true, FilterQuality = SKFilterQuality.Low };
+            canvas.DrawImage(scaled, rect, scaledPaint);
+            return;
+        }
+
+        using var paint = new SKPaint { IsAntialias = true, FilterQuality = GetImageFilterQuality(image, rect, canvas.TotalMatrix) };
         canvas.DrawImage(image, rect, paint);
+    }
+
+    private static readonly ConditionalWeakTable<SKImage, ScaledImages> s_scaledImages = new();
+
+    private sealed class ScaledImages
+    {
+        public readonly List<(int Width, int Height, SKImage Image)> Sizes = [];
+    }
+
+    /// <summary>
+    /// Gets the image scaled down (from mipmaps, see <see cref="GetImageFilterQuality"/>) to the
+    /// pixels it covers, made once for the sizes it is drawn at (rotated or not): Skia builds the
+    /// mipmaps of an image decoded on demand anew for every draw, which took a large background
+    /// drawn smaller (e.g. a slowly spinning one) about 60 ms in every frame. Null if it is not
+    /// drawn smaller, or in perspective.
+    /// </summary>
+    internal static SKImage? GetScaledDown(SKImage image, SKRect destination, SKMatrix matrix)
+    {
+        if (matrix.Persp0 != 0f || matrix.Persp1 != 0f)
+        {
+            return null;
+        }
+
+        // how much an axis of the image is scaled, whatever it is turned by
+        var scaleX = MathF.Sqrt((matrix.ScaleX * matrix.ScaleX) + (matrix.SkewY * matrix.SkewY));
+        var scaleY = MathF.Sqrt((matrix.SkewX * matrix.SkewX) + (matrix.ScaleY * matrix.ScaleY));
+        var width = (int)MathF.Ceiling(destination.Width * scaleX);
+        var height = (int)MathF.Ceiling(destination.Height * scaleY);
+
+        // only what is drawn at most at nine tenths of its size, of a sensible size
+        if (width <= 0 || height <= 0 || width * 10 > image.Width * 9 || height * 10 > image.Height * 9 || (long)width * height > 4096L * 4096L)
+        {
+            return null;
+        }
+
+        var sizes = s_scaledImages.GetValue(image, static _ => new ScaledImages()).Sizes;
+
+        lock (sizes)
+        {
+            foreach (var (w, h, cached) in sizes)
+            {
+                if (w == width && h == height)
+                {
+                    return cached;
+                }
+            }
+
+            using var surface = SKSurface.Create(new SKImageInfo(width, height, SKColorType.Rgba8888, SKAlphaType.Premul));
+
+            if (surface is null)
+            {
+                return null;
+            }
+
+            surface.Canvas.Clear(SKColors.Transparent);
+
+            using (var paint = new SKPaint { IsAntialias = true, FilterQuality = SKFilterQuality.Medium })
+            {
+                surface.Canvas.DrawImage(image, new SKRect(0f, 0f, width, height), paint);
+            }
+
+            var scaled = surface.Snapshot();
+
+            // an image drawn at ever new sizes (e.g. zoomed by an animation) keeps the last two
+            if (sizes.Count == 2)
+            {
+                sizes.RemoveAt(0);
+            }
+
+            sizes.Add((width, height, scaled));
+            return scaled;
+        }
+    }
+
+    /// <summary>
+    /// Gets how an image drawn into <paramref name="destination"/> is sampled: bicubic when it is
+    /// drawn at its size or larger, but from mipmaps when it is drawn smaller, as in Chromium. The
+    /// bicubic filter alone (what <see cref="SKFilterQuality.High"/> is since SkiaSharp 3) only
+    /// looks at the source pixels next to each sample, so thin lines of an image scaled down a lot
+    /// (e.g. a logo of 200 pixels shown at 36) break up into steps.
+    /// </summary>
+    internal static SKFilterQuality GetImageFilterQuality(SKImage image, SKRect destination, SKMatrix matrix)
+    {
+        var scaleX = Math.Sqrt((matrix.ScaleX * matrix.ScaleX) + (matrix.SkewY * matrix.SkewY));
+        var scaleY = Math.Sqrt((matrix.ScaleY * matrix.ScaleY) + (matrix.SkewX * matrix.SkewX));
+        var deviceWidth = destination.Width * scaleX;
+        var deviceHeight = destination.Height * scaleY;
+
+        // drawn at its size, bicubic sampling only costs (and blurs a little): bilinear it is
+        if (Math.Abs(deviceWidth - image.Width) < 1d && Math.Abs(deviceHeight - image.Height) < 1d)
+        {
+            return SKFilterQuality.Low;
+        }
+
+        var isSmaller = deviceWidth < image.Width || deviceHeight < image.Height;
+        return isSmaller ? SKFilterQuality.Medium : SKFilterQuality.High;
+    }
+
+    private const int MaxCachedTextPaints = 256;
+
+    [ThreadStatic]
+    private static Dictionary<(string Family, float Size, float Weight, bool IsItalic, float Stretch, FontFaceSet? Faces), SKPaint>? t_textPaints;
+
+    /// <summary>
+    /// Gets the paint of text in the font for the thread, which only gets its color for a run:
+    /// creating a paint (with a typeface looked up) for each run of text took a fifth of
+    /// rasterizing a page of text.
+    /// </summary>
+    private static SKPaint GetTextPaint(RenderFont font)
+    {
+        var paints = t_textPaints ??= [];
+        var key = (font.FontFamily, font.FontSize, font.FontWeight, font.IsItalic, font.FontStretch, font.Faces);
+
+        if (!paints.TryGetValue(key, out var paint))
+        {
+            if (paints.Count >= MaxCachedTextPaints)
+            {
+                foreach (var cached in paints.Values)
+                {
+                    cached.Dispose();
+                }
+
+                paints.Clear();
+            }
+
+            paint = SkiaTextShaping.CreateTextPaint(font);
+            paints[key] = paint;
+        }
+
+        return paint;
     }
 
     private static void DrawText(SKCanvas canvas, DrawTextCommand command, FontFaceSet fonts)
@@ -1108,7 +1450,7 @@ public sealed partial class SkiaRenderBackend : IPixelRenderBackend, ITextMeasur
             command.ContextBefore,
             command.ContextAfter);
 
-        using var paint = SkiaTextShaping.CreateTextPaint(font);
+        var paint = GetTextPaint(font);
         paint.Color = ToSkColor(command.Color);
 
         SkiaTextShaping.DrawText(canvas, paint, command.Text, command.X, command.Y, command.LetterSpacing, font);

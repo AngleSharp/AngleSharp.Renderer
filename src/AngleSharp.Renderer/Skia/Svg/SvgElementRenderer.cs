@@ -47,6 +47,13 @@ internal static class SvgElementRenderer
             return;
         }
 
+        // an element not displayed renders nothing, nor do its descendants (e.g. the layers of a
+        // Lottie animation that are not in at the current frame)
+        if (string.Equals(SvgPaintState.ReadProperty(element, context, "display"), "none", StringComparison.OrdinalIgnoreCase))
+        {
+            return;
+        }
+
         var state = inheritedState.Resolve(element, context, viewport);
         var transform = SvgTransformParser.Parse(element.GetAttribute("transform"));
         var hasTransform = !transform.IsIdentity;
@@ -109,7 +116,10 @@ internal static class SvgElementRenderer
         ApplyMaskRegionClip(canvas, maskElement, element, viewport, context);
         RenderElementContent(canvas, element, tagName, state, context, viewport);
 
-        using (var maskPaint = new SKPaint { ColorFilter = SKColorFilter.CreateLumaColor(), BlendMode = SKBlendMode.DstIn })
+        // a mask's luminance is its coverage, unless it says its alpha is (mask-type: alpha)
+        var isAlphaMask = string.Equals(SvgPaintState.ReadProperty(maskElement, context, "mask-type"), "alpha", StringComparison.OrdinalIgnoreCase);
+
+        using (var maskPaint = new SKPaint { ColorFilter = isAlphaMask ? null : SKColorFilter.CreateLumaColor(), BlendMode = SKBlendMode.DstIn })
         {
             canvas.SaveLayer(maskPaint);
 
@@ -130,6 +140,83 @@ internal static class SvgElementRenderer
         }
 
         canvas.RestoreToCount(contentLayerCount);
+    }
+
+    /// <summary>
+    /// Paints an <c>image</c> element whose <c>href</c> is a <c>data:</c> URL (e.g. the bitmaps a
+    /// Lottie animation is made of) into its viewport (<c>x</c>, <c>y</c>, <c>width</c>,
+    /// <c>height</c>), fitted per <c>preserveAspectRatio</c>; other images are not painted.
+    /// </summary>
+    private static void RenderImage(SKCanvas canvas, IElement element, SvgPaintState state, SvgRenderContext context, SvgViewport viewport)
+    {
+        if (string.Equals(SvgPaintState.ReadProperty(element, context, "visibility"), "hidden", StringComparison.OrdinalIgnoreCase) ||
+            (element.GetAttribute("href") ?? element.GetAttribute("xlink:href")) is not { } href ||
+            DecodedImages.Get(href) is not { } image)
+        {
+            return;
+        }
+
+        var x = SvgShapeBuilder.ReadX(element, "x", viewport);
+        var y = SvgShapeBuilder.ReadY(element, "y", viewport);
+        // an auto size is the image's own
+        var width = SvgLength.Parse(element.GetAttribute("width"), viewport.Width, image.Width);
+        var height = SvgLength.Parse(element.GetAttribute("height"), viewport.Height, image.Height);
+
+        if (width <= 0f || height <= 0f || state.Opacity <= 0f)
+        {
+            return;
+        }
+
+        var (align, meet) = SvgViewBoxMapping.ParsePreserveAspectRatio(element.GetAttribute("preserveAspectRatio"));
+        var fit = SvgViewBoxMapping.ComputeMatrix((0f, 0f, image.Width, image.Height), width, height, align, meet);
+        var destination = fit.MapRect(SKRect.Create(0f, 0f, image.Width, image.Height));
+        destination.Offset(x, y);
+        // drawn smaller, from a copy scaled down once (see SkiaRenderBackend.GetScaledDown)
+        var scaled = SkiaRenderBackend.GetScaledDown(image, destination, canvas.TotalMatrix);
+        var quality = scaled is not null ? SKFilterQuality.Low : SkiaRenderBackend.GetImageFilterQuality(image, destination, canvas.TotalMatrix);
+        using var paint = new SKPaint { IsAntialias = true, FilterQuality = quality, Color = SKColors.Black.WithAlpha((byte)Math.Round(255f * Math.Clamp(state.Opacity, 0f, 1f))) };
+
+        canvas.Save();
+        // what slices the viewport is cut off
+        canvas.ClipRect(SKRect.Create(x, y, width, height));
+        canvas.DrawImage(scaled ?? image, destination, paint);
+        canvas.Restore();
+    }
+
+    /// <summary>
+    /// The images of <c>data:</c> URLs decoded once: an animation renders the same ones in every
+    /// frame. The cache follows the URL strings (the attribute values), so it goes with them.
+    /// </summary>
+    private static class DecodedImages
+    {
+        private static readonly System.Runtime.CompilerServices.ConditionalWeakTable<string, Holder> Images = new();
+
+        public static SKImage? Get(string href) => Images.GetValue(href, static key => new Holder(Decode(key))).Image;
+
+        private static SKImage? Decode(string href)
+        {
+            var value = href.Trim();
+            var comma = value.IndexOf(',');
+
+            if (!value.StartsWith("data:", StringComparison.OrdinalIgnoreCase) || comma < 0)
+            {
+                return null;
+            }
+
+            try
+            {
+                var data = value[..comma].EndsWith(";base64", StringComparison.OrdinalIgnoreCase)
+                    ? Convert.FromBase64String(value[(comma + 1)..])
+                    : System.Text.Encoding.UTF8.GetBytes(Uri.UnescapeDataString(value[(comma + 1)..]));
+                return SKImage.FromEncodedData(data);
+            }
+            catch (FormatException)
+            {
+                return null;
+            }
+        }
+
+        private sealed record Holder(SKImage? Image);
     }
 
     private static void ApplyMaskRegionClip(SKCanvas canvas, IElement maskElement, IElement maskedElement, SvgViewport viewport, SvgRenderContext context)
@@ -233,6 +320,10 @@ internal static class SvgElementRenderer
 
                 break;
 
+            case "image":
+                RenderImage(canvas, element, state, context, viewport);
+                break;
+
             case "text":
                 var x = SvgShapeBuilder.ReadX(element, "x", viewport);
                 var y = SvgShapeBuilder.ReadY(element, "y", viewport);
@@ -240,7 +331,7 @@ internal static class SvgElementRenderer
                 break;
 
             default:
-                // Unsupported element (image, ...): descend in case it groups further shapes, but
+                // Unsupported element: descend in case it groups further shapes, but
                 // paint nothing for the element itself.
                 foreach (var child in element.Children)
                 {

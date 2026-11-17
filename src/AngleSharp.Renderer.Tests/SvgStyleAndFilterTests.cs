@@ -388,6 +388,40 @@ public sealed class SvgStyleAndFilterTests
         AssertColor(Green, pixel);
     }
 
+    [Fact]
+    public async Task Image_WithDataUrl_IsPainted()
+    {
+        // found on smapiot.com: a Lottie animation is made of images of data: URLs
+        var pixel = await SampleAsync($"""<svg width="20" height="20"><image width="20px" height="20px" preserveAspectRatio="xMidYMid slice" href="{GreenPng()}"/></svg>""", 10, 10);
+
+        AssertColor(Green, pixel);
+    }
+
+    [Fact]
+    public async Task DisplayNone_HidesTheElementAndItsChildren()
+    {
+        var pixel = await SampleAsync("""<svg width="20" height="20"><rect width="20" height="20" fill="rgb(0, 128, 0)"/><g style="display: none"><rect width="20" height="20" fill="red"/></g></svg>""", 10, 10);
+
+        AssertColor(Green, pixel);
+    }
+
+    [Fact]
+    public async Task MaskTypeAlpha_UsesTheCoverageOfTheMask()
+    {
+        // black is no luminance, but full alpha
+        var pixel = await SampleAsync("""<svg width="20" height="20"><defs><mask id="m" mask-type="alpha"><rect width="20" height="20" fill="black"/></mask></defs><rect width="20" height="20" fill="rgb(0, 128, 0)" mask="url(#m)"/></svg>""", 10, 10);
+
+        AssertColor(Green, pixel);
+    }
+
+    private static string GreenPng()
+    {
+        using var bitmap = new SKBitmap(4, 4);
+        bitmap.Erase(Green);
+        using var data = SKImage.FromBitmap(bitmap).Encode(SKEncodedImageFormat.Png, 100);
+        return "data:image/png;base64," + Convert.ToBase64String(data.ToArray());
+    }
+
     private static void AssertColor(SKColor expected, SKColor actual)
     {
         Assert.True(

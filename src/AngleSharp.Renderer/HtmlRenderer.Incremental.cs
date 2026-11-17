@@ -10,6 +10,7 @@ using AngleSharp.Css.Dom;
 using AngleSharp.Css.RenderTree;
 using AngleSharp.Dom;
 using AngleSharp.Renderer.Rendering;
+using AngleSharp.Renderer.Skia;
 
 /// <summary>
 /// Incremental layout metrics. Scripts often change a box and read its geometry right after,
@@ -87,6 +88,9 @@ public sealed partial class HtmlRenderer
 
         /// <summary>The main size an item got by being laid out (see <see cref="FlexItemLayoutInfo.HasDeferredMainSize"/>).</summary>
         public float DeferredMainSize { get; init; } = float.NaN;
+
+        /// <summary>The width the item's percentages of margins, paddings and offsets refer to.</summary>
+        public float PercentageBasisWidth { get; init; } = float.NaN;
     }
 
     /// <summary>
@@ -411,6 +415,15 @@ public sealed partial class HtmlRenderer
         private bool _hasStructuralCompounds;
         // the boxes whose decorations are painted again with their new style map (see TryRepaint)
         private readonly Dictionary<object, Dictionary<string, string>> _repaints = [];
+
+        // the inline SVGs whose content changed since the frame, with the image the frame shows
+        private readonly Dictionary<IElement, SvgVectorImage?> _svgRepaints = new(ReferenceEqualityComparer.Instance);
+
+        // the inline SVGs changed by the records of the current update
+        private readonly HashSet<IElement> _svgRootsChanged = new(ReferenceEqualityComparer.Instance);
+
+        // the selectors of _relationalMatches, parsed once
+        private readonly Dictionary<string, ISelector?> _parsedSelectors = new(StringComparer.Ordinal);
         // if a repaint changed a cursor or what can be hit (see TryRepaint)
         private bool _repaintsChangeHitTesting;
         // the boxes whose transform or opacity changed alone (e.g. by an animation), by their paint
@@ -486,7 +499,7 @@ public sealed partial class HtmlRenderer
         /// Gets if this is a frame's layout that still looks the same: all boxes laid out again
         /// since were not rendered in the frame and are not now.
         /// </summary>
-        public bool IsUnchangedSinceFrame => _isFrameLayout && _repaints.Count == 0 && _recolors.Count == 0 && _movedSincePatch.Count == 0 && _effects.Count == 0 && _rendered.Values.All(rendered => !rendered.Before && !rendered.Now);
+        public bool IsUnchangedSinceFrame => _isFrameLayout && _repaints.Count == 0 && _svgRepaints.Count == 0 && _recolors.Count == 0 && _movedSincePatch.Count == 0 && _effects.Count == 0 && _rendered.Values.All(rendered => !rendered.Before && !rendered.Now);
 
         /// <summary>Gets if this is a frame's layout (see <see cref="TryPatch"/>).</summary>
         public bool IsFrameLayout => _isFrameLayout;
@@ -580,7 +593,7 @@ public sealed partial class HtmlRenderer
                 return false;
             }
 
-            if (!TryApplyRepaints(displayList))
+            if (!TryApplyRepaints(displayList) || !TryApplySvgRepaints(displayList))
             {
                 return false;
             }
@@ -595,6 +608,7 @@ public sealed partial class HtmlRenderer
             _relayouts.Clear();
             _removals.Clear();
             _repaints.Clear();
+            _svgRepaints.Clear();
             _recolors.Clear();
             _effects.Clear();
             _transformedSincePatch.Clear();
@@ -1493,15 +1507,124 @@ public sealed partial class HtmlRenderer
         /// <returns>True if nothing else changed, false if the document is to be laid out again.</returns>
         public bool TryAnimate(IWindow window, IEnumerable<(IElement Element, bool IsPseudo)> elements)
         {
-            foreach (var (element, isPseudo) in elements)
+            // the style maps are created as for a layout of the pass (e.g. with the rules of its
+            // style elements read once, not for every animated element in every frame)
+            var previousPass = s_layoutPass.Value;
+            s_layoutPass.Value = _pass;
+
+            try
             {
-                if (!_metrics.ContainsKey(element) && !isPseudo || !TryRepaint(window, element, reachesDescendants: false, pseudoElementsOnly: isPseudo))
+                foreach (var (element, isPseudo) in elements)
                 {
-                    return false;
+                    if (!_metrics.ContainsKey(element) && !isPseudo || !TryRepaint(window, element, reachesDescendants: false, pseudoElementsOnly: isPseudo))
+                    {
+                        return false;
+                    }
+                }
+
+                return true;
+            }
+            finally
+            {
+                s_layoutPass.Value = previousPass;
+            }
+        }
+
+        /// <summary>
+        /// Keeps a change of the content of an inline SVG (e.g. a Lottie animation setting the
+        /// transforms of its layers in every frame) to paint the SVG again (see
+        /// <see cref="TryApplySvgRepaints"/>): its box is sized by the root's attributes and style
+        /// alone, so nothing has to be laid out.
+        /// </summary>
+        /// <returns>True if the change was kept, false if it is to be looked at otherwise.</returns>
+        private bool TryKeepSvgContentChange(IMutationRecord record)
+        {
+            var target = record.Target as IElement ?? record.Target?.ParentElement;
+
+            if (target is null || !_isFrameLayout || target.NamespaceUri != NamespaceNames.SvgUri)
+            {
+                return false;
+            }
+
+            // the outermost svg, the replaced element of the HTML around it
+            var root = default(IElement);
+
+            for (var current = target; current is not null && current.NamespaceUri == NamespaceNames.SvgUri; current = current.ParentElement)
+            {
+                if (current.LocalName == "svg")
+                {
+                    root = current;
                 }
             }
 
+            // the root's attributes size its box; one that is no box of the frame (e.g. hidden) is left to the rest
+            if (root?.ParentElement is null || (ReferenceEquals(target, root) && record.Type == "attributes") || !_metrics.ContainsKey(root))
+            {
+                return false;
+            }
+
+            // whether a `:has()` outside of it matches otherwise is looked at once for all changes
+            _svgRootsChanged.Add(root);
+
+            if (!_svgRepaints.ContainsKey(root))
+            {
+                _svgRepaints[root] = s_inlineSvgCacheByElement.TryGetValue(root, out var cached) ? cached.Resource.VectorImage : null;
+            }
+
             return true;
+        }
+
+        /// <summary>
+        /// Records the inline SVGs kept by <see cref="TryKeepSvgContentChange"/> anew and draws them
+        /// in place of their images in the frame.
+        /// </summary>
+        /// <returns>True if all of them were found, false if the frame needs a layout.</returns>
+        private bool TryApplySvgRepaints(DisplayList displayList)
+        {
+            if (_svgRepaints.Count == 0)
+            {
+                return true;
+            }
+
+            var replacements = new Dictionary<SvgVectorImage, CachedImageResource>(ReferenceEqualityComparer.Instance);
+            var previousPass = s_layoutPass.Value;
+            s_layoutPass.Value = _pass;
+
+            try
+            {
+                foreach (var (root, previous) in _svgRepaints)
+                {
+                    // the page's styles of its elements are resolved anew, too
+                    _pass.Styles.Remove(root);
+
+                    if (previous is null || !_document.Contains(root) || !TryGetOrLoadInlineSvgResource(root, out var resource) || resource?.VectorImage is null ||
+                        resource.NaturalWidth != previous.NaturalWidth || resource.NaturalHeight != previous.NaturalHeight)
+                    {
+                        return false;
+                    }
+
+                    resource.VectorImage.IsChanging = true;
+                    replacements[previous] = resource;
+                }
+            }
+            finally
+            {
+                s_layoutPass.Value = previousPass;
+            }
+
+            var commands = displayList.Commands;
+            var found = 0;
+
+            for (var i = 0; i < commands.Count; i++)
+            {
+                if (commands[i] is DrawImageCommand { Image.VectorImage: { } vector } draw && replacements.TryGetValue(vector, out var replacement))
+                {
+                    displayList.ReplaceRange(i, 1, [draw with { Image = replacement.CreateImage(draw.Image.Width, draw.Image.Height) }]);
+                    found++;
+                }
+            }
+
+            return found >= replacements.Count;
         }
 
         /// <summary>
@@ -1935,6 +2058,7 @@ public sealed partial class HtmlRenderer
             }
 
             var roots = new List<IElement>();
+            _svgRootsChanged.Clear();
 
             // a changed style attribute may only paint differently (e.g. a sprite showing another
             // frame by its background-position), which is looked at once the roots are known
@@ -1943,7 +2067,7 @@ public sealed partial class HtmlRenderer
 
             foreach (var record in records)
             {
-                if (TryRemoveOutOfFlow(record) || IsChangeOfNothingRendered(record) ||
+                if (TryRemoveOutOfFlow(record) || IsChangeOfNothingRendered(record) || TryKeepSvgContentChange(record) ||
                     unchanged is not null && record is { Type: "attributes", AttributeName: { } attribute } && unchanged.Contains((record.Target, attribute)) ||
                     IsInertAttributeChange(record))
                 {
@@ -1952,6 +2076,7 @@ public sealed partial class HtmlRenderer
 
                 if (GetChangedSubtree(record) is not { } changed)
                 {
+                    _svgRootsChanged.Clear();
                     return false;
                 }
 
@@ -1964,6 +2089,19 @@ public sealed partial class HtmlRenderer
                     return false;
                 }
             }
+
+            // the content of an SVG matched by a `:has()` around it (the elements inside are styled
+            // anew when it is recorded again)
+            foreach (var svgRoot in _svgRootsChanged)
+            {
+                if (!KeepsRelationalMatches(svgRoot))
+                {
+                    _svgRootsChanged.Clear();
+                    return false;
+                }
+            }
+
+            _svgRootsChanged.Clear();
 
             // the style maps of what is painted again are created as for a layout of the pass (e.g.
             // with the rules of its style elements read once)
@@ -2688,16 +2826,21 @@ public sealed partial class HtmlRenderer
             }
         }
 
-        private static bool? TryMatches(IElement element, string selector)
+        private bool? TryMatches(IElement element, string selector)
         {
-            try
+            // parsed once instead of for every element of a root laid out again
+            if (!_parsedSelectors.TryGetValue(selector, out var parsed))
             {
-                return element.Matches(selector);
+                parsed = element.Owner?.Context.GetService<AngleSharp.Css.Parser.ICssSelectorParser>()?.ParseSelector(selector);
+                _parsedSelectors[selector] = parsed;
             }
-            catch (DomException)
+
+            if (parsed is null)
             {
                 return null;
             }
+
+            return parsed.Match(element, element);
         }
 
         // the nearest element whose layout started in the last full layout (out of the flow, not
@@ -2771,7 +2914,6 @@ public sealed partial class HtmlRenderer
 
             Forget(entry.Node);
             var styleStart = RenderMetricsRecorder.Now;
-            PrepareElementsForRendering(root.DescendantsAndSelf<IElement>());
 
             // the rules are the ones of the layout (changing them needs a full layout, see GetChangedSubtree)
             var node = _context.GetStyleCollection(root) is { } styleCollection ? window.RenderPartial(root, parent, styleCollection) : window.Render(root, parent, _renderDevice);
@@ -2885,7 +3027,8 @@ public sealed partial class HtmlRenderer
                     positionedContainingWidth: entry.PositionedContainingWidth,
                     positionedContainingHeight: positionedContainingHeight,
                     mainAxisMarginsPlaced: entry.Item is not null,
-                    crossAxisMarginsPlaced: entry.Item?.CrossMarginsPlaced ?? false);
+                    crossAxisMarginsPlaced: entry.Item?.CrossMarginsPlaced ?? false,
+                    percentageBasisWidth: entry.Item?.PercentageBasisWidth ?? float.NaN);
 
                 if (entry.Item is { } placedItem)
                 {
@@ -3014,7 +3157,7 @@ public sealed partial class HtmlRenderer
             var info = CreateFlexItemLayoutInfo(node, item.IsRowDirection, flex.RelativeTo, flex.HeightRelativeTo, entry.TextStyle, _context, flex.DeferringAlignItems, resolvesMinimum: !flex.Info.DefersMinimum);
 
             return info with { Node = null!, Style = null! } == flex.Info &&
-                (float.IsNaN(flex.EstimatedCrossSize) || EstimateFlexItemCrossSize(node, flex.FinalMainSize, item.IsRowDirection, entry.TextStyle, _context, flex.CrossAvailable) == flex.EstimatedCrossSize);
+                (float.IsNaN(flex.EstimatedCrossSize) || EstimateFlexItemCrossSize(node, flex.FinalMainSize, item.IsRowDirection, entry.TextStyle, _context, flex.CrossAvailable, flex.RelativeTo) == flex.EstimatedCrossSize);
         }
 
         private static bool HasSameBox(ElementLayoutMetrics first, ElementLayoutMetrics second) =>

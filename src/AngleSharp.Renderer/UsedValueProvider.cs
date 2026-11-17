@@ -165,7 +165,9 @@ internal sealed class UsedValueProvider : ICssUsedValueProvider
 
     private static string? GetInsetValue(IElement element, string propertyName)
     {
-        if (GetStyle(element) is not { } style ||
+        // a box in the flow has no inset to find, which needs no layout to know
+        if (IsInFlowByCascade(element) ||
+            GetStyle(element) is not { } style ||
             !style.TryGetValue("position", out var position))
         {
             return null;
@@ -224,7 +226,8 @@ internal sealed class UsedValueProvider : ICssUsedValueProvider
 
     private static string? GetInsetShorthand(IElement element)
     {
-        if (GetStyle(element) is not { } style ||
+        if (IsInFlowByCascade(element) ||
+            GetStyle(element) is not { } style ||
             !style.TryGetValue("position", out var position) ||
             string.Equals(position.Trim(), "static", StringComparison.OrdinalIgnoreCase) ||
             string.Equals(position.Trim(), "sticky", StringComparison.OrdinalIgnoreCase))
@@ -291,13 +294,34 @@ internal sealed class UsedValueProvider : ICssUsedValueProvider
         return $"{values[0]} {values[1]} {values[2]} {values[3]}";
     }
 
+    /// <summary>
+    /// The inherited text properties are what the cascade computed, too, so they are only taken
+    /// from a layout that is there: laying the page out for them (e.g. for every <c>font-size</c>
+    /// or <c>visibility</c> jQuery reads) took a script a whole layout each time.
+    /// </summary>
     private static string? GetStyleValue(IElement element, string propertyName) =>
-        GetStyle(element) is { } style && style.TryGetValue(propertyName, out var value) && !string.IsNullOrEmpty(value) ? value : null;
+        GetStyle(element, canLayOut: false) is { } style && style.TryGetValue(propertyName, out var value) && !string.IsNullOrEmpty(value) ? value : null;
 
-    private static System.Collections.Generic.Dictionary<string, string>? GetStyle(IElement element)
+    /// <summary>
+    /// Gets if the cascade puts the element in the flow (<c>position: static</c>), without a
+    /// layout; a layout that is there answers that as well.
+    /// </summary>
+    private static bool IsInFlowByCascade(IElement element)
+    {
+        if (GetStyle(element, canLayOut: false) is not null)
+        {
+            return false;
+        }
+
+        var position = element.Owner?.DefaultView?.GetComputedStyle(element).GetPropertyValue("position");
+        return string.IsNullOrWhiteSpace(position) || string.Equals(position.Trim(), "static", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static System.Collections.Generic.Dictionary<string, string>? GetStyle(IElement element, bool canLayOut = true)
     {
         if (element.Owner is { } owner && owner.Context.GetDomHarness() is InteractiveHtmlRendererState state &&
-            state.GetLayoutSnapshot(owner).StyleMaps.TryGetValue(element, out var style))
+            (canLayOut ? state.GetLayoutSnapshot(owner) : state.TryGetCurrentLayoutSnapshot(owner)) is { } snapshot &&
+            snapshot.StyleMaps.TryGetValue(element, out var style))
         {
             return style;
         }

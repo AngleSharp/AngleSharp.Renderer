@@ -114,14 +114,33 @@ internal sealed class SvgVectorImage
             return;
         }
 
-        if (TryGetPlacement(canvas.TotalMatrix, destination, out var placement, out var originX, out var originY) &&
-            GetOrCreateRaster(placement) is { } raster)
+        if (TryGetPlacement(canvas.TotalMatrix, destination, out var placement, out var originX, out var originY))
         {
-            canvas.Save();
-            canvas.SetMatrix(SKMatrix.Identity);
-            canvas.DrawImage(raster, originX, originY);
-            canvas.Restore();
-            return;
+            // an SVG whose content changes all the time (e.g. a Lottie animation) is a new image
+            // in every frame, whose raster would be drawn once
+            if (IsChanging)
+            {
+                var first = canvas.Save();
+                canvas.SetMatrix(SKMatrix.Identity);
+                canvas.Translate(originX + (placement.OffsetX / PlacementUnitsPerPixel), originY + (placement.OffsetY / PlacementUnitsPerPixel));
+                var placedWidth = placement.Width / PlacementUnitsPerPixel;
+                var placedHeight = placement.Height / PlacementUnitsPerPixel;
+                canvas.ClipRect(new SKRect(0f, 0f, placedWidth, placedHeight), antialias: true);
+                var placedMapping = MapInto(placedWidth, placedHeight);
+                canvas.Concat(ref placedMapping);
+                canvas.DrawPicture(Picture);
+                canvas.RestoreToCount(first);
+                return;
+            }
+
+            if (GetOrCreateRaster(placement) is { } raster)
+            {
+                canvas.Save();
+                canvas.SetMatrix(SKMatrix.Identity);
+                canvas.DrawImage(raster, originX, originY);
+                canvas.Restore();
+                return;
+            }
         }
 
         var count = canvas.Save();
@@ -202,6 +221,12 @@ internal sealed class SvgVectorImage
 
         return (long)placement.PixelWidth * placement.PixelHeight <= MaxCachedRasterPixels;
     }
+
+    /// <summary>
+    /// Gets or sets if the image is of an SVG whose content was changed since the page was laid
+    /// out (see LayoutSnapshot.TryApplySvgRepaints): its picture is drawn instead of a raster.
+    /// </summary>
+    internal bool IsChanging { get; set; }
 
     private SKImage? GetOrCreateRaster(RasterPlacement placement)
     {

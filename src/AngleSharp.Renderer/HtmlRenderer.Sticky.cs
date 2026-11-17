@@ -144,7 +144,8 @@ public sealed partial class HtmlRenderer
         float forcedBorderBoxHeight,
         float contentOffsetY,
         bool mainAxisMarginsPlaced,
-        bool crossAxisMarginsPlaced)
+        bool crossAxisMarginsPlaced,
+        float percentageBasisWidth = float.NaN)
     {
         var styleMap = GetOrCreateStyleMap(context, node.Ref, node.ComputedStyle);
         var isSticky = IsStickyPositioned(styleMap);
@@ -174,7 +175,7 @@ public sealed partial class HtmlRenderer
 
         try
         {
-            LayoutElement(node, containingX, containingY, containingWidth, ref cursorY, ref previousBlockMarginBottom, ref suppressNextBlockTopMargin, floats, ref textIndentConsumed, inheritedTextStyle, context, displayList, maxY, isFlexItem, isRowDirection, flexMainSize, flexCrossSize, containingHeight, positionedContainingX, positionedContainingY, positionedContainingWidth, positionedContainingHeight, forcedBorderBoxWidth, isAtomicInline, forcedBorderBoxHeight, contentOffsetY, mainAxisMarginsPlaced, crossAxisMarginsPlaced);
+            LayoutElement(node, containingX, containingY, containingWidth, ref cursorY, ref previousBlockMarginBottom, ref suppressNextBlockTopMargin, floats, ref textIndentConsumed, inheritedTextStyle, context, displayList, maxY, isFlexItem, isRowDirection, flexMainSize, flexCrossSize, containingHeight, positionedContainingX, positionedContainingY, positionedContainingWidth, positionedContainingHeight, forcedBorderBoxWidth, isAtomicInline, forcedBorderBoxHeight, contentOffsetY, mainAxisMarginsPlaced, crossAxisMarginsPlaced, percentageBasisWidth);
         }
         finally
         {
