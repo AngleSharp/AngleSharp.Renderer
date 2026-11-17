@@ -313,6 +313,18 @@ public sealed class BrowserIntegrationTests
 
         private sealed class GatedStream(byte[] data, ManualResetEventSlim gate) : MemoryStream(data)
         {
+            public override void CopyTo(Stream destination, int bufferSize)
+            {
+                gate.Wait();
+                base.CopyTo(destination, bufferSize);
+            }
+
+            public override async Task CopyToAsync(Stream destination, int bufferSize, CancellationToken cancellationToken)
+            {
+                await Task.Run(() => gate.Wait(cancellationToken), cancellationToken);
+                await base.CopyToAsync(destination, bufferSize, cancellationToken);
+            }
+
             public override int Read(byte[] buffer, int offset, int count)
             {
                 gate.Wait();
