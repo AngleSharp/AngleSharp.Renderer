@@ -70,7 +70,7 @@ internal static class SvgElementRenderer
 
         if (hasTransform)
         {
-            canvas.Concat(ref transform);
+            canvas.Concat(in transform);
         }
 
         if (clipPathElement is not null)
@@ -173,13 +173,15 @@ internal static class SvgElementRenderer
         destination.Offset(x, y);
         // drawn smaller, from a copy scaled down once (see SkiaRenderBackend.GetScaledDown)
         var scaled = SkiaRenderBackend.GetScaledDown(image, destination, canvas.TotalMatrix);
-        var quality = scaled is not null ? SKFilterQuality.Low : SkiaRenderBackend.GetImageFilterQuality(image, destination, canvas.TotalMatrix);
-        using var paint = new SKPaint { IsAntialias = true, FilterQuality = quality, Color = SKColors.Black.WithAlpha((byte)Math.Round(255f * Math.Clamp(state.Opacity, 0f, 1f))) };
+        var sampling = scaled is not null
+            ? new SKSamplingOptions(SKFilterMode.Linear)
+            : SkiaRenderBackend.GetImageSamplingOptions(image, destination, canvas.TotalMatrix);
+        using var paint = new SKPaint { IsAntialias = true, Color = SKColors.Black.WithAlpha((byte)Math.Round(255f * Math.Clamp(state.Opacity, 0f, 1f))) };
 
         canvas.Save();
         // what slices the viewport is cut off
         canvas.ClipRect(SKRect.Create(x, y, width, height));
-        canvas.DrawImage(scaled ?? image, destination, paint);
+        canvas.DrawImage(scaled ?? image, destination, sampling, paint);
         canvas.Restore();
     }
 
@@ -373,7 +375,7 @@ internal static class SvgElementRenderer
         var viewBox = SvgViewBoxMapping.ParseViewBox(viewportElement.GetAttribute("viewBox"));
         var (align, meet) = SvgViewBoxMapping.ParsePreserveAspectRatio(viewportElement.GetAttribute("preserveAspectRatio"));
         var viewBoxMatrix = SvgViewBoxMapping.ComputeMatrix(viewBox, width, height, align, meet);
-        canvas.Concat(ref viewBoxMatrix);
+        canvas.Concat(in viewBoxMatrix);
 
         var innerViewport = viewBox is { } box ? new SvgViewport(box.Width, box.Height) : new SvgViewport(width, height);
 
@@ -426,7 +428,7 @@ internal static class SvgElementRenderer
                     var viewBox = SvgViewBoxMapping.ParseViewBox(referenced.GetAttribute("viewBox"));
                     var (align, meet) = SvgViewBoxMapping.ParsePreserveAspectRatio(referenced.GetAttribute("preserveAspectRatio"));
                     var viewBoxMatrix = SvgViewBoxMapping.ComputeMatrix(viewBox, useWidth, useHeight, align, meet);
-                    canvas.Concat(ref viewBoxMatrix);
+                    canvas.Concat(in viewBoxMatrix);
 
                     var innerViewport = viewBox is { } box ? new SvgViewport(box.Width, box.Height) : new SvgViewport(useWidth, useHeight);
 
@@ -478,7 +480,7 @@ internal static class SvgElementRenderer
 
     private static SKPath BuildClipPath(IElement clipPathElement, SvgViewport viewport)
     {
-        var combined = new SKPath();
+        using var combined = new SKPathBuilder();
 
         foreach (var child in clipPathElement.Children)
         {
@@ -504,7 +506,7 @@ internal static class SvgElementRenderer
             }
         }
 
-        return combined;
+        return combined.Detach();
     }
 
     private static void RenderPath(SKCanvas canvas, SKPath path, SvgPaintState state, SvgRenderContext context, SvgViewport viewport, bool strokeOnly = false)
@@ -566,18 +568,13 @@ internal static class SvgElementRenderer
 
     private static void DrawTextRun(SKCanvas canvas, string text, SvgPaintState state, SvgRenderContext context, SvgViewport viewport, ref float cursorX, float y)
     {
-        using var measurePaint = new SKPaint
-        {
-            Typeface = SkiaTextShaping.CreateTypeface(state.FontFamily, SkiaTextShaping.CreateFontStyle(state.FontWeight, state.IsItalic)),
-            TextSize = state.FontSize,
-        };
-
         // Shaped like HTML text (kerning, ligatures, joining scripts, font fallback), in visual
         // order with `direction` as the paragraph direction.
         var font = new RenderFont(state.FontFamily, state.FontSize, state.FontWeight, state.IsItalic, 0f, Language: state.Language);
+        using var measurePaint = SkiaTextShaping.CreateTextPaint(font);
         var width = SkiaTextShaping.MeasureParagraph(measurePaint, text, font, state.IsRightToLeft);
-        var ascent = -measurePaint.FontMetrics.Ascent;
-        var descent = measurePaint.FontMetrics.Descent;
+        var ascent = -measurePaint.Font.Metrics.Ascent;
+        var descent = measurePaint.Font.Metrics.Descent;
         var bounds = new SKRect(cursorX, y - ascent, cursorX + width, y + descent);
 
         // `start` and `end` follow the direction: right-to-left text starts at its right edge
@@ -594,18 +591,16 @@ internal static class SvgElementRenderer
 
         if (fillPaint is not null)
         {
-            fillPaint.Typeface = measurePaint.Typeface;
-            fillPaint.TextSize = state.FontSize;
-            SkiaTextShaping.DrawParagraph(canvas, fillPaint, text, drawX, y, font, state.IsRightToLeft);
+            using var fillTextPaint = SkiaTextShaping.CreateTextPaint(font, fillPaint);
+            SkiaTextShaping.DrawParagraph(canvas, fillTextPaint, text, drawX, y, font, state.IsRightToLeft);
         }
 
         using var strokePaint = state.CreateStrokePaint(bounds, context, viewport);
 
         if (strokePaint is not null)
         {
-            strokePaint.Typeface = measurePaint.Typeface;
-            strokePaint.TextSize = state.FontSize;
-            SkiaTextShaping.DrawParagraph(canvas, strokePaint, text, drawX, y, font, state.IsRightToLeft);
+            using var strokeTextPaint = SkiaTextShaping.CreateTextPaint(font, strokePaint);
+            SkiaTextShaping.DrawParagraph(canvas, strokeTextPaint, text, drawX, y, font, state.IsRightToLeft);
         }
 
         cursorX += state.IsRightToLeft ? -width : width;

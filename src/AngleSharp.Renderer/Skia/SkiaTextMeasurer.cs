@@ -17,7 +17,7 @@ public sealed class SkiaTextMeasurer : ITextMeasurer, IFontMetricsMeasurer
     private const int MaxCachedPaints = 256;
 
     [ThreadStatic]
-    private static Dictionary<RenderFont, SKPaint>? t_paints;
+    private static Dictionary<RenderFont, SkiaTextShaping.SkiaTextPaint>? t_paints;
 
     // Shaping a word is far costlier than looking it up, and layout measures the same words over
     // and over (every trial layout of an inline-block measures its content again). A width only
@@ -62,8 +62,7 @@ public sealed class SkiaTextMeasurer : ITextMeasurer, IFontMetricsMeasurer
 
         if (!heights.TryGetValue(font, out var height))
         {
-            using var skFont = new SKFont(GetPaint(font).Typeface, font.FontSize);
-            height = skFont.Metrics.XHeight;
+            height = GetPaint(font).Font.Metrics.XHeight;
 
             // not every font states its x-height
             if (!(height > 0f))
@@ -84,7 +83,7 @@ public sealed class SkiaTextMeasurer : ITextMeasurer, IFontMetricsMeasurer
 
     (float Average, float Maximum) IFontMetricsMeasurer.MeasureCharacterWidths(RenderFont font)
     {
-        var metrics = SkiaTextShaping.GetFontTableMetrics(GetPaint(font).Typeface);
+        var metrics = SkiaTextShaping.GetFontTableMetrics(GetPaint(font).Font.Typeface);
         // not every font states its average
         return (metrics.AverageWidth > 0f ? metrics.AverageWidth * font.FontSize : MeasureWidth("0", font), metrics.MaximumWidth * font.FontSize);
     }
@@ -97,13 +96,13 @@ public sealed class SkiaTextMeasurer : ITextMeasurer, IFontMetricsMeasurer
 
     (float Ascent, float Descent) IFontMetricsMeasurer.MeasureFontHeights(RenderFont font)
     {
-        var metrics = SkiaTextShaping.GetFontTableMetrics(GetPaint(font).Typeface);
+        var metrics = SkiaTextShaping.GetFontTableMetrics(GetPaint(font).Font.Typeface);
 
         // not every font states them
         if (metrics.Ascent <= 0f && metrics.Descent <= 0f)
         {
-            using var skFont = new SKFont(GetPaint(font).Typeface, font.FontSize);
-            return (MathF.Round(-skFont.Metrics.Ascent, MidpointRounding.AwayFromZero), MathF.Round(skFont.Metrics.Descent, MidpointRounding.AwayFromZero));
+            var skFontMetrics = GetPaint(font).Font.Metrics;
+            return (MathF.Round(-skFontMetrics.Ascent, MidpointRounding.AwayFromZero), MathF.Round(skFontMetrics.Descent, MidpointRounding.AwayFromZero));
         }
 
         // each one is rounded on its own, as in Blink
@@ -113,13 +112,12 @@ public sealed class SkiaTextMeasurer : ITextMeasurer, IFontMetricsMeasurer
 
     float IFontMetricsMeasurer.MeasureLineSpacing(RenderFont font)
     {
-        var metrics = SkiaTextShaping.GetFontTableMetrics(GetPaint(font).Typeface);
+        var metrics = SkiaTextShaping.GetFontTableMetrics(GetPaint(font).Font.Typeface);
         var content = ((IFontMetricsMeasurer)this).MeasureContentHeight(font);
 
         if (metrics.Ascent <= 0f && metrics.Descent <= 0f)
         {
-            using var skFont = new SKFont(GetPaint(font).Typeface, font.FontSize);
-            return content + skFont.Metrics.Leading;
+            return content + GetPaint(font).Font.Metrics.Leading;
         }
 
         return content + MathF.Round(metrics.LineGap * font.FontSize, MidpointRounding.AwayFromZero);
@@ -129,7 +127,7 @@ public sealed class SkiaTextMeasurer : ITextMeasurer, IFontMetricsMeasurer
     public IReadOnlyList<int> GetClusterBoundaries(string text, RenderFont font) =>
         string.IsNullOrEmpty(text) ? [0] : SkiaTextShaping.GetClusterBoundaries(GetPaint(font), text, font);
 
-    private static SKPaint GetPaint(RenderFont font)
+    private static SkiaTextShaping.SkiaTextPaint GetPaint(RenderFont font)
     {
         var paints = t_paints ??= [];
 

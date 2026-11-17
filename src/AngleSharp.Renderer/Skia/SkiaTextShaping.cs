@@ -98,7 +98,7 @@ internal static class SkiaTextShaping
     /// Creates the paint used for both measuring and drawing a text run. The caller assigns the
     /// color; everything that influences advance widths is set here.
     /// </summary>
-    public static SKPaint CreateTextPaint(RenderFont font)
+    public static SkiaTextPaint CreateTextPaint(RenderFont font)
     {
         var typeface = CreateTypeface(
             font.FontFamily,
@@ -109,19 +109,33 @@ internal static class SkiaTextShaping
         var paint = new SKPaint
         {
             IsAntialias = true,
-            SubpixelText = false,
-            LcdRenderText = false,
-            HintingLevel = SKPaintHinting.Normal,
-            TextSize = font.FontSize,
-            Typeface = typeface,
-            // Only slant synthetically when the resolved face is upright. A real italic face is
-            // already slanted, and skewing it again doubles the angle.
-            TextSkewX = font.IsItalic && typeface.FontSlant == SKFontStyleSlant.Upright ? -0.25f : 0f,
         };
+        var skFont = CreateSkFont(font, typeface);
 
         ApplySyntheticBold(paint, font, typeface);
-        return paint;
+        return new SkiaTextPaint(paint, skFont);
     }
+
+    internal static SkiaTextPaint CreateTextPaint(RenderFont font, SKPaint paint, bool ownsPaint = false)
+    {
+        var typeface = CreateTypeface(
+            font.FontFamily,
+            CreateFontStyle(font.FontWeight, font.IsItalic, font.FontStretch),
+            font.Faces ?? FontFaceSet.Empty,
+            font.FontWeight);
+        ApplySyntheticBold(paint, font, typeface);
+        return new SkiaTextPaint(paint, CreateSkFont(font, typeface), ownsPaint);
+    }
+
+    private static SKFont CreateSkFont(RenderFont font, SKTypeface typeface) => new(typeface, font.FontSize)
+    {
+        Edging = SKFontEdging.Antialias,
+        Hinting = SKFontHinting.Normal,
+        Subpixel = false,
+        // Only slant synthetically when the resolved face is upright. A real italic face is
+        // already slanted, and skewing it again doubles the angle.
+        SkewX = font.IsItalic && typeface.FontSlant == SKFontStyleSlant.Upright ? -0.25f : 0f,
+    };
 
     /// <summary>
     /// Emboldens the glyphs by stroking their outlines along with filling them (which leaves the
@@ -300,7 +314,11 @@ internal static class SkiaTextShaping
         return null;
     }, LazyThreadSafetyMode.ExecutionAndPublication);
 
-    private static bool HasGlyph(SKTypeface typeface, int codepoint) => typeface.GetGlyph(codepoint) != 0;
+    private static bool HasGlyph(SKTypeface typeface, int codepoint)
+    {
+        using var font = new SKFont(typeface);
+        return font.GetGlyph(codepoint) != 0;
+    }
 
     private static readonly ConcurrentDictionary<SKTypeface, FontTableMetrics> TableMetrics = new();
 
@@ -354,11 +372,18 @@ internal static class SkiaTextShaping
     /// glyphs, a fallback (<see cref="ResolveFallbackTypeface"/>) where it does not. Returns
     /// <see langword="null"/> when the paint's typeface covers the whole text, the common case.
     /// </summary>
-    private static List<(string Text, SKTypeface Typeface)>? SplitFallbackRuns(SKPaint paint, string text, RenderFont? font)
+    private static List<(string Text, SKTypeface Typeface)>? SplitFallbackRuns(SkiaTextPaint paint, string text, RenderFont? font)
     {
-        var primary = paint.Typeface;
+        var primary = paint.Font.Typeface;
 
-        if (font is null || primary is null || (primary.ContainsGlyphs(text) && !EmojiPresentation.MayContainEmoji(text)))
+        if (font is null || primary is null)
+        {
+            return null;
+        }
+
+        using var primaryFont = new SKFont(primary);
+
+        if (primaryFont.ContainsGlyphs(text) && !EmojiPresentation.MayContainEmoji(text))
         {
             return null;
         }
@@ -421,26 +446,25 @@ internal static class SkiaTextShaping
     /// A copy of <paramref name="paint"/> drawing with another typeface, slanted synthetically
     /// when the font asks for italics the typeface does not have.
     /// </summary>
-    private static SKPaint CreateFallbackPaint(SKPaint paint, SKTypeface typeface, RenderFont font)
+    private static SkiaTextPaint CreateFallbackPaint(SkiaTextPaint paint, SKTypeface typeface, RenderFont font)
     {
-        var fallbackPaint = paint.Clone();
-        fallbackPaint.Typeface = typeface;
-        fallbackPaint.TextSkewX = font.IsItalic && typeface.FontSlant == SKFontStyleSlant.Upright ? -0.25f : 0f;
+        var fallbackPaint = paint.Paint.Clone();
+        var fallbackFont = CreateSkFont(font, typeface);
 
         // a stroke paint (SVG `stroke`) outlines the glyphs and has to stay one
-        if (paint.Style != SKPaintStyle.Stroke)
+        if (paint.Paint.Style != SKPaintStyle.Stroke)
         {
             ApplySyntheticBold(fallbackPaint, font, typeface);
         }
 
-        return fallbackPaint;
+        return new SkiaTextPaint(fallbackPaint, fallbackFont);
     }
 
     /// <summary>
     /// Draws text exactly as <see cref="MeasureTextWidth"/> measures it: shaped with HarfBuzz
     /// (see <see cref="ShapeText"/>) and painted as positioned glyphs, one text blob per run.
     /// </summary>
-    public static void DrawText(SKCanvas canvas, SKPaint paint, string text, float x, float y, float letterSpacing, RenderFont? font = null)
+    public static void DrawText(SKCanvas canvas, SkiaTextPaint paint, string text, float x, float y, float letterSpacing, RenderFont? font = null)
     {
         var shaped = ShapeText(paint, text, letterSpacing, font);
 
@@ -451,20 +475,19 @@ internal static class SkiaTextShaping
                 continue;
             }
 
-            var runPaint = ReferenceEquals(run.Typeface, paint.Typeface) || font is null ? paint : CreateFallbackPaint(paint, run.Typeface, font.Value);
+            var runPaint = ReferenceEquals(run.Typeface, paint.Font.Typeface) || font is null ? paint : CreateFallbackPaint(paint, run.Typeface, font.Value);
 
             try
             {
-                using var skFont = runPaint.ToFont();
                 using var builder = new SKTextBlobBuilder();
-                var buffer = builder.AllocatePositionedRun(skFont, run.Glyphs.Length);
+                var buffer = builder.AllocatePositionedRun(runPaint.Font, run.Glyphs.Length);
                 buffer.SetGlyphs(run.Glyphs);
                 buffer.SetPositions(run.Positions);
                 using var blob = builder.Build();
 
                 if (blob is not null)
                 {
-                    canvas.DrawText(blob, x, y, runPaint);
+                    canvas.DrawText(blob, x, y, runPaint.Paint);
                 }
             }
             finally
@@ -582,7 +605,7 @@ internal static class SkiaTextShaping
     /// Measures a line of text that no layout has split into bidi runs (SVG text, Canvas 2D), as
     /// <see cref="DrawParagraph"/> paints it.
     /// </summary>
-    public static float MeasureParagraph(SKPaint paint, string text, RenderFont font, bool isRightToLeft)
+    public static float MeasureParagraph(SkiaTextPaint paint, string text, RenderFont font, bool isRightToLeft)
     {
         if (!BidiAlgorithm.RequiresReordering(text, isRightToLeft))
         {
@@ -604,7 +627,7 @@ internal static class SkiaTextShaping
     /// (UAX #9, with <paramref name="isRightToLeft"/> as the paragraph direction), left to right
     /// from <paramref name="x"/>, each shaped in its own direction.
     /// </summary>
-    public static void DrawParagraph(SKCanvas canvas, SKPaint paint, string text, float x, float y, RenderFont font, bool isRightToLeft)
+    public static void DrawParagraph(SKCanvas canvas, SkiaTextPaint paint, string text, float x, float y, RenderFont font, bool isRightToLeft)
     {
         if (!BidiAlgorithm.RequiresReordering(text, isRightToLeft))
         {
@@ -623,14 +646,14 @@ internal static class SkiaTextShaping
     /// <summary>
     /// Measures the advance width of <paramref name="text"/> as <see cref="DrawText"/> paints it.
     /// </summary>
-    public static float MeasureTextWidth(SKPaint paint, string text, float letterSpacing, RenderFont? font = null) =>
+    public static float MeasureTextWidth(SkiaTextPaint paint, string text, float letterSpacing, RenderFont? font = null) =>
         ShapeText(paint, text, letterSpacing, font).Width;
 
     /// <summary>
     /// The boundaries (UTF-16 offsets, ascending, starting with 0) of the clusters HarfBuzz forms
     /// for <paramref name="text"/>: the units text may be cut into without breaking a glyph.
     /// </summary>
-    public static IReadOnlyList<int> GetClusterBoundaries(SKPaint paint, string text, RenderFont? font = null)
+    public static IReadOnlyList<int> GetClusterBoundaries(SkiaTextPaint paint, string text, RenderFont? font = null)
     {
         var boundaries = new SortedSet<int> { 0 };
 
@@ -661,11 +684,11 @@ internal static class SkiaTextShaping
     /// in visual order, so the first logical run is the rightmost one in right-to-left text.
     /// Letter spacing goes after every cluster but the last and turns optional ligatures off.
     /// </summary>
-    private static ShapedText ShapeText(SKPaint paint, string text, float letterSpacing, RenderFont? font)
+    private static ShapedText ShapeText(SkiaTextPaint paint, string text, float letterSpacing, RenderFont? font)
     {
         var runs = new List<GlyphRun>();
 
-        if (string.IsNullOrEmpty(text) || paint.Typeface is not { } primary)
+        if (string.IsNullOrEmpty(text) || paint.Font.Typeface is not { } primary)
         {
             return new ShapedText(runs, 0f);
         }
@@ -680,7 +703,9 @@ internal static class SkiaTextShaping
         var contextBefore = font?.ContextBefore ?? string.Empty;
         var shapedText = contextBefore.Length == 0 && string.IsNullOrEmpty(font?.ContextAfter) ? text : contextBefore + text + font?.ContextAfter;
 
-        foreach (var (runText, typeface) in SplitFallbackRuns(paint, text, font) ?? [(text, primary)])
+        var fallbackRuns = SplitFallbackRuns(paint, text, font) ?? new List<(string Text, SKTypeface Typeface)> { (text, primary) };
+
+        foreach (var (runText, typeface) in fallbackRuns)
         {
             foreach (var (start, length, script) in SplitScripts(text, offset, runText.Length))
             {
@@ -700,7 +725,7 @@ internal static class SkiaTextShaping
         foreach (var (start, length, typeface, script) in segments)
         {
             var hbFont = GetHarfBuzzFont(typeface);
-            var scale = paint.TextSize / hbFont.UnitsPerEm;
+            var scale = paint.Font.Size / hbFont.UnitsPerEm;
 
             // Strong right-to-left characters always resolve to an odd bidi level (UAX #9 I1/I2),
             // so a right-to-left script is shaped right to left even where the caller has not
@@ -868,6 +893,23 @@ internal static class SkiaTextShaping
             // bold is synthesized.
             ["devanagari"] = new BundledFontFamily(devanagari, devanagari),
         };
+    }
+
+    internal sealed class SkiaTextPaint(SKPaint paint, SKFont font, bool ownsPaint = true) : IDisposable
+    {
+        public SKPaint Paint { get; } = paint;
+
+        public SKFont Font { get; } = font;
+
+        public void Dispose()
+        {
+            Font.Dispose();
+
+            if (ownsPaint)
+            {
+                Paint.Dispose();
+            }
+        }
     }
 
     private static SKTypeface LoadBundledTypeface(string fileName)

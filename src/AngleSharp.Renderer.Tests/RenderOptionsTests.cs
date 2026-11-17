@@ -172,7 +172,7 @@ public sealed class RenderOptionsTests
 
         using var sharp = Decode(document.RenderToImage(new RenderOptions { DeviceScaleFactor = 2f, Clip = new RenderRect(0f, 0f, 120f, 30f) }));
         using var single = Decode(document.RenderToImage(new RenderOptions { Clip = new RenderRect(0f, 0f, 120f, 30f) }));
-        using var upscaled = single.Resize(new SKImageInfo(240, 60), SKFilterQuality.None);
+        using var upscaled = single.Resize(new SKImageInfo(240, 60), new SKSamplingOptions(SKFilterMode.Nearest));
 
         Assert.Equal((240, 60), (sharp.Width, sharp.Height));
         Assert.NotEqual(upscaled.Bytes, sharp.Bytes);

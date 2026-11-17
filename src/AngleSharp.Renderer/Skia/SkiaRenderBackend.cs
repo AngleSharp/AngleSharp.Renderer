@@ -402,7 +402,7 @@ public sealed partial class SkiaRenderBackend : IPixelRenderBackend, ITextMeasur
         // from an a/b/c/d/e/f-style source, not the a/b/c/d/e/f order CSS's own matrix() function
         // (and RenderTransform2D, matching it) uses.
         var matrix = new SKMatrix(t.A, t.C, t.E, t.B, t.D, t.F, 0f, 0f, 1f);
-        canvas.Concat(ref matrix);
+        canvas.Concat(in matrix);
     }
 
     private static void PushOpacity(SKCanvas canvas, PushOpacityCommand command)
@@ -617,12 +617,12 @@ public sealed partial class SkiaRenderBackend : IPixelRenderBackend, ITextMeasur
     {
         canvas.Save();
 
-        using var path = new SKPath();
+        using var pathBuilder = new SKPathBuilder();
 
         switch (command.Shape)
         {
             case RenderClipCircle circle:
-                path.AddOval(new SKRect(
+                pathBuilder.AddOval(new SKRect(
                     circle.CenterX - circle.Radius,
                     circle.CenterY - circle.Radius,
                     circle.CenterX + circle.Radius,
@@ -630,7 +630,7 @@ public sealed partial class SkiaRenderBackend : IPixelRenderBackend, ITextMeasur
                 break;
 
             case RenderClipEllipse ellipse:
-                path.AddOval(new SKRect(
+                pathBuilder.AddOval(new SKRect(
                     ellipse.CenterX - ellipse.RadiusX,
                     ellipse.CenterY - ellipse.RadiusY,
                     ellipse.CenterX + ellipse.RadiusX,
@@ -647,30 +647,31 @@ public sealed partial class SkiaRenderBackend : IPixelRenderBackend, ITextMeasur
 
                 if (inset.Radii.IsZero)
                 {
-                    path.AddRect(rect);
+                    pathBuilder.AddRect(rect);
                 }
                 else
                 {
                     using var roundRect = new SKRoundRect();
                     roundRect.SetRectRadii(rect, ToSkPoints(inset.Radii));
-                    path.AddRoundRect(roundRect);
+                    pathBuilder.AddRoundRect(roundRect);
                 }
 
                 break;
             }
 
             case RenderClipPolygon polygon when polygon.Points.Count > 0:
-                path.MoveTo(polygon.Points[0].X, polygon.Points[0].Y);
+                pathBuilder.MoveTo(polygon.Points[0].X, polygon.Points[0].Y);
 
                 for (var i = 1; i < polygon.Points.Count; i++)
                 {
-                    path.LineTo(polygon.Points[i].X, polygon.Points[i].Y);
+                    pathBuilder.LineTo(polygon.Points[i].X, polygon.Points[i].Y);
                 }
 
-                path.Close();
+                pathBuilder.Close();
                 break;
         }
 
+        using var path = pathBuilder.Detach();
         canvas.ClipPath(path, SKClipOperation.Intersect, antialias: true);
     }
 
@@ -723,9 +724,10 @@ public sealed partial class SkiaRenderBackend : IPixelRenderBackend, ITextMeasur
             var outerPadding = Math.Abs(shadow.OffsetX) + Math.Abs(shadow.OffsetY) + shadow.BlurRadius + Math.Abs(shadow.SpreadRadius) + 32f;
             var outerRect = SKRect.Inflate(borderBoxRect, outerPadding, outerPadding);
 
-            using var path = new SKPath { FillType = SKPathFillType.EvenOdd };
-            path.AddRect(outerRect, SKPathDirection.Clockwise);
-            path.AddRoundRect(innerRRect, SKPathDirection.Clockwise);
+            using var pathBuilder = new SKPathBuilder { FillType = SKPathFillType.EvenOdd };
+            pathBuilder.AddRect(outerRect, SKPathDirection.Clockwise);
+            pathBuilder.AddRoundRect(innerRRect, SKPathDirection.Clockwise);
+            using var path = pathBuilder.Detach();
 
             canvas.DrawPath(path, paint);
         }
@@ -922,12 +924,11 @@ public sealed partial class SkiaRenderBackend : IPixelRenderBackend, ITextMeasur
 
         if (vectorImage is not null)
         {
-            paint.FilterQuality = SKFilterQuality.Low;
             paint.Shader = vectorImage.CreateShader(vectorImage.Width, vectorImage.Height, 0f, 0f, tileX, tileY, CreateTileMatrix(vectorImage.Width, vectorImage.Height));
             return paint;
         }
 
-        paint.Shader = SKShader.CreateImage(image, tileX, tileY, CreateTileMatrix(image!.Width, image.Height));
+        paint.Shader = SKShader.CreateImage(image, tileX, tileY, new SKSamplingOptions(SKFilterMode.Nearest), CreateTileMatrix(image!.Width, image.Height));
         return paint;
 
         SKMatrix CreateTileMatrix(float width, float height) => new(
@@ -1279,8 +1280,8 @@ public sealed partial class SkiaRenderBackend : IPixelRenderBackend, ITextMeasur
                 // a new snapshot each frame (e.g. of a game): mipmaps would be built again for each
                 // one, and anti-aliased edges at a fractional position take Skia ten times as long
                 var matrix = canvas.TotalMatrix;
-                using var bitmapPaint = new SKPaint { IsAntialias = matrix.SkewX != 0f || matrix.SkewY != 0f, FilterQuality = SKFilterQuality.Low };
-                canvas.DrawImage(bitmap, rect, bitmapPaint);
+                using var bitmapPaint = new SKPaint { IsAntialias = matrix.SkewX != 0f || matrix.SkewY != 0f };
+                canvas.DrawImage(bitmap, rect, new SKSamplingOptions(SKFilterMode.Linear), bitmapPaint);
             }
 
             return;
@@ -1295,13 +1296,13 @@ public sealed partial class SkiaRenderBackend : IPixelRenderBackend, ITextMeasur
         if (GetScaledDown(image, rect, canvas.TotalMatrix) is { } scaled)
         {
             // drawn about as large as it is now
-            using var scaledPaint = new SKPaint { IsAntialias = true, FilterQuality = SKFilterQuality.Low };
-            canvas.DrawImage(scaled, rect, scaledPaint);
+            using var scaledPaint = new SKPaint { IsAntialias = true };
+            canvas.DrawImage(scaled, rect, new SKSamplingOptions(SKFilterMode.Linear), scaledPaint);
             return;
         }
 
-        using var paint = new SKPaint { IsAntialias = true, FilterQuality = GetImageFilterQuality(image, rect, canvas.TotalMatrix) };
-        canvas.DrawImage(image, rect, paint);
+        using var paint = new SKPaint { IsAntialias = true };
+        canvas.DrawImage(image, rect, GetImageSamplingOptions(image, rect, canvas.TotalMatrix), paint);
     }
 
     private static readonly ConditionalWeakTable<SKImage, ScaledImages> s_scaledImages = new();
@@ -1312,7 +1313,7 @@ public sealed partial class SkiaRenderBackend : IPixelRenderBackend, ITextMeasur
     }
 
     /// <summary>
-    /// Gets the image scaled down (from mipmaps, see <see cref="GetImageFilterQuality"/>) to the
+    /// Gets the image scaled down (from mipmaps, see <see cref="GetImageSamplingOptions"/>) to the
     /// pixels it covers, made once for the sizes it is drawn at (rotated or not): Skia builds the
     /// mipmaps of an image decoded on demand anew for every draw, which took a large background
     /// drawn smaller (e.g. a slowly spinning one) about 60 ms in every frame. Null if it is not
@@ -1358,9 +1359,9 @@ public sealed partial class SkiaRenderBackend : IPixelRenderBackend, ITextMeasur
 
             surface.Canvas.Clear(SKColors.Transparent);
 
-            using (var paint = new SKPaint { IsAntialias = true, FilterQuality = SKFilterQuality.Medium })
+            using (var paint = new SKPaint { IsAntialias = true })
             {
-                surface.Canvas.DrawImage(image, new SKRect(0f, 0f, width, height), paint);
+                surface.Canvas.DrawImage(image, new SKRect(0f, 0f, width, height), new SKSamplingOptions(SKFilterMode.Linear, SKMipmapMode.Nearest), paint);
             }
 
             var scaled = surface.Snapshot();
@@ -1379,11 +1380,11 @@ public sealed partial class SkiaRenderBackend : IPixelRenderBackend, ITextMeasur
     /// <summary>
     /// Gets how an image drawn into <paramref name="destination"/> is sampled: bicubic when it is
     /// drawn at its size or larger, but from mipmaps when it is drawn smaller, as in Chromium. The
-    /// bicubic filter alone (what <see cref="SKFilterQuality.High"/> is since SkiaSharp 3) only
+    /// bicubic filter alone only
     /// looks at the source pixels next to each sample, so thin lines of an image scaled down a lot
     /// (e.g. a logo of 200 pixels shown at 36) break up into steps.
     /// </summary>
-    internal static SKFilterQuality GetImageFilterQuality(SKImage image, SKRect destination, SKMatrix matrix)
+    internal static SKSamplingOptions GetImageSamplingOptions(SKImage image, SKRect destination, SKMatrix matrix)
     {
         var scaleX = Math.Sqrt((matrix.ScaleX * matrix.ScaleX) + (matrix.SkewY * matrix.SkewY));
         var scaleY = Math.Sqrt((matrix.ScaleY * matrix.ScaleY) + (matrix.SkewX * matrix.SkewX));
@@ -1393,24 +1394,26 @@ public sealed partial class SkiaRenderBackend : IPixelRenderBackend, ITextMeasur
         // drawn at its size, bicubic sampling only costs (and blurs a little): bilinear it is
         if (Math.Abs(deviceWidth - image.Width) < 1d && Math.Abs(deviceHeight - image.Height) < 1d)
         {
-            return SKFilterQuality.Low;
+            return new SKSamplingOptions(SKFilterMode.Linear);
         }
 
         var isSmaller = deviceWidth < image.Width || deviceHeight < image.Height;
-        return isSmaller ? SKFilterQuality.Medium : SKFilterQuality.High;
+        return isSmaller
+            ? new SKSamplingOptions(SKFilterMode.Linear, SKMipmapMode.Nearest)
+            : new SKSamplingOptions(SKFilterMode.Nearest);
     }
 
     private const int MaxCachedTextPaints = 256;
 
     [ThreadStatic]
-    private static Dictionary<(string Family, float Size, float Weight, bool IsItalic, float Stretch, FontFaceSet? Faces), SKPaint>? t_textPaints;
+    private static Dictionary<(string Family, float Size, float Weight, bool IsItalic, float Stretch, FontFaceSet? Faces), SkiaTextShaping.SkiaTextPaint>? t_textPaints;
 
     /// <summary>
     /// Gets the paint of text in the font for the thread, which only gets its color for a run:
     /// creating a paint (with a typeface looked up) for each run of text took a fifth of
     /// rasterizing a page of text.
     /// </summary>
-    private static SKPaint GetTextPaint(RenderFont font)
+    private static SkiaTextShaping.SkiaTextPaint GetTextPaint(RenderFont font)
     {
         var paints = t_textPaints ??= [];
         var key = (font.FontFamily, font.FontSize, font.FontWeight, font.IsItalic, font.FontStretch, font.Faces);
@@ -1451,7 +1454,7 @@ public sealed partial class SkiaRenderBackend : IPixelRenderBackend, ITextMeasur
             command.ContextAfter);
 
         var paint = GetTextPaint(font);
-        paint.Color = ToSkColor(command.Color);
+        paint.Paint.Color = ToSkColor(command.Color);
 
         SkiaTextShaping.DrawText(canvas, paint, command.Text, command.X, command.Y, command.LetterSpacing, font);
 
@@ -1492,7 +1495,7 @@ public sealed partial class SkiaRenderBackend : IPixelRenderBackend, ITextMeasur
 
             if (command.Overline)
             {
-                var overlineY = command.Y + (paint.FontMetrics.Ascent * decorationSize / command.FontSize);
+                var overlineY = command.Y + (paint.Font.Metrics.Ascent * decorationSize / command.FontSize);
 
                 if (hasThickness && command.DecorationStyle == RenderTextDecorationStyle.Wavy)
                 {
@@ -1527,12 +1530,12 @@ public sealed partial class SkiaRenderBackend : IPixelRenderBackend, ITextMeasur
             command.ContextAfter);
 
         using var paint = SkiaTextShaping.CreateTextPaint(font);
-        paint.Color = ToSkColor(command.Color);
+        paint.Paint.Color = ToSkColor(command.Color);
 
         if (command.BlurRadius > 0f)
         {
             // Matches the same CSS-blur-radius-to-Gaussian-sigma approximation used for box-shadow.
-            paint.MaskFilter = SKMaskFilter.CreateBlur(SKBlurStyle.Normal, command.BlurRadius / 2f);
+            paint.Paint.MaskFilter = SKMaskFilter.CreateBlur(SKBlurStyle.Normal, command.BlurRadius / 2f);
         }
 
         SkiaTextShaping.DrawText(canvas, paint, command.Text, command.X, command.Y, command.LetterSpacing, font);
@@ -1561,20 +1564,21 @@ public sealed partial class SkiaRenderBackend : IPixelRenderBackend, ITextMeasur
 
     private static void DrawWavyLine(SKCanvas canvas, SKPaint paint, float x, float y, float width, float scale)
     {
-        using var path = new SKPath();
+        using var pathBuilder = new SKPathBuilder();
         var wavelength = 4f * (1f + scale);
         var amplitude = WaveAmplitude(scale);
         var steps = Math.Max(1, (int)Math.Ceiling(width / 2f));
 
-        path.MoveTo(x, y);
+        pathBuilder.MoveTo(x, y);
 
         for (var index = 1; index <= steps; index++)
         {
             var position = Math.Min(width, index * 2f);
             var phase = position / wavelength * MathF.PI * 2f;
-            path.LineTo(x + position, y + MathF.Sin(phase) * amplitude);
+            pathBuilder.LineTo(x + position, y + MathF.Sin(phase) * amplitude);
         }
 
+        using var path = pathBuilder.Detach();
         canvas.DrawPath(path, paint);
     }
 

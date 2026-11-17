@@ -13,7 +13,7 @@ internal static class SvgPathDataParser
 {
     public static SKPath Parse(string d)
     {
-        var path = new SKPath();
+        using var path = new SKPathBuilder();
         var cursor = new Cursor(d);
 
         var current = new SKPoint(0, 0);
@@ -52,7 +52,7 @@ internal static class SvgPathDataParser
                 {
                     if (!cursor.TryReadNumber(out var x) || !cursor.TryReadNumber(out var y))
                     {
-                        return path;
+                        return path.Detach();
                     }
 
                     var point = isRelative ? Offset(current, x, y) : new SKPoint(x, y);
@@ -67,7 +67,7 @@ internal static class SvgPathDataParser
                 {
                     if (!cursor.TryReadNumber(out var x) || !cursor.TryReadNumber(out var y))
                     {
-                        return path;
+                        return path.Detach();
                     }
 
                     var point = isRelative ? Offset(current, x, y) : new SKPoint(x, y);
@@ -79,7 +79,7 @@ internal static class SvgPathDataParser
                 {
                     if (!cursor.TryReadNumber(out var x))
                     {
-                        return path;
+                        return path.Detach();
                     }
 
                     var point = isRelative ? new SKPoint(current.X + x, current.Y) : new SKPoint(x, current.Y);
@@ -91,7 +91,7 @@ internal static class SvgPathDataParser
                 {
                     if (!cursor.TryReadNumber(out var y))
                     {
-                        return path;
+                        return path.Detach();
                     }
 
                     var point = isRelative ? new SKPoint(current.X, current.Y + y) : new SKPoint(current.X, y);
@@ -105,7 +105,7 @@ internal static class SvgPathDataParser
                         !cursor.TryReadNumber(out var x2) || !cursor.TryReadNumber(out var y2) ||
                         !cursor.TryReadNumber(out var x) || !cursor.TryReadNumber(out var y))
                     {
-                        return path;
+                        return path.Detach();
                     }
 
                     var c1 = isRelative ? Offset(current, x1, y1) : new SKPoint(x1, y1);
@@ -121,7 +121,7 @@ internal static class SvgPathDataParser
                     if (!cursor.TryReadNumber(out var x2) || !cursor.TryReadNumber(out var y2) ||
                         !cursor.TryReadNumber(out var x) || !cursor.TryReadNumber(out var y))
                     {
-                        return path;
+                        return path.Detach();
                     }
 
                     var reflectedControl = char.ToUpperInvariant(previousCommand) is 'C' or 'S'
@@ -139,7 +139,7 @@ internal static class SvgPathDataParser
                     if (!cursor.TryReadNumber(out var x1) || !cursor.TryReadNumber(out var y1) ||
                         !cursor.TryReadNumber(out var x) || !cursor.TryReadNumber(out var y))
                     {
-                        return path;
+                        return path.Detach();
                     }
 
                     var control = isRelative ? Offset(current, x1, y1) : new SKPoint(x1, y1);
@@ -153,7 +153,7 @@ internal static class SvgPathDataParser
                 {
                     if (!cursor.TryReadNumber(out var x) || !cursor.TryReadNumber(out var y))
                     {
-                        return path;
+                        return path.Detach();
                     }
 
                     var reflectedControl = char.ToUpperInvariant(previousCommand) is 'Q' or 'T'
@@ -173,7 +173,7 @@ internal static class SvgPathDataParser
                         !cursor.TryReadFlag(out var sweep) ||
                         !cursor.TryReadNumber(out var x) || !cursor.TryReadNumber(out var y))
                     {
-                        return path;
+                        return path.Detach();
                     }
 
                     var end = isRelative ? Offset(current, x, y) : new SKPoint(x, y);
@@ -194,13 +194,13 @@ internal static class SvgPathDataParser
                     break;
                 default:
                     // Unsupported/unknown command - stop parsing the remainder rather than guess.
-                    return path;
+                    return path.Detach();
             }
 
             previousCommand = command;
         }
 
-        return path;
+        return path.Detach();
     }
 
     private static SKPoint Offset(SKPoint origin, float dx, float dy) => new(origin.X + dx, origin.Y + dy);

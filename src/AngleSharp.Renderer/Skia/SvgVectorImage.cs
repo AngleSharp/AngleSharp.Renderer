@@ -76,8 +76,8 @@ internal sealed class SvgVectorImage
 
     /// <summary>
     /// A shader of the image scaled to a tile, with the given gaps between the tiles. Skia renders
-    /// the tile at the resolution it ends up at. A paint using the shader needs
-    /// <see cref="SKFilterQuality.Low"/>, or a tile at a fractional size or position snaps to pixels.
+    /// the tile at the resolution it ends up at, with bilinear sampling to avoid snapping at
+    /// fractional sizes or positions.
     /// </summary>
     public SKShader CreateShader(float tileWidth, float tileHeight, float gapX, float gapY, SKShaderTileMode tileModeX, SKShaderTileMode tileModeY, SKMatrix localMatrix)
     {
@@ -127,7 +127,7 @@ internal sealed class SvgVectorImage
                 var placedHeight = placement.Height / PlacementUnitsPerPixel;
                 canvas.ClipRect(new SKRect(0f, 0f, placedWidth, placedHeight), antialias: true);
                 var placedMapping = MapInto(placedWidth, placedHeight);
-                canvas.Concat(ref placedMapping);
+                canvas.Concat(in placedMapping);
                 canvas.DrawPicture(Picture);
                 canvas.RestoreToCount(first);
                 return;
@@ -137,7 +137,7 @@ internal sealed class SvgVectorImage
             {
                 canvas.Save();
                 canvas.SetMatrix(SKMatrix.Identity);
-                canvas.DrawImage(raster, originX, originY);
+                canvas.DrawImage(raster, originX, originY, new SKSamplingOptions(SKFilterMode.Linear));
                 canvas.Restore();
                 return;
             }
@@ -147,7 +147,7 @@ internal sealed class SvgVectorImage
         canvas.ClipRect(destination, antialias: true);
         canvas.Translate(destination.Left, destination.Top);
         var mapping = MapInto(destination.Width, destination.Height);
-        canvas.Concat(ref mapping);
+        canvas.Concat(in mapping);
         canvas.DrawPicture(Picture);
         canvas.RestoreToCount(count);
     }
@@ -301,7 +301,7 @@ internal sealed class SvgVectorImage
         var height = placement.Height / PlacementUnitsPerPixel;
         canvas.ClipRect(new SKRect(0f, 0f, width, height), antialias: true);
         var mapping = MapInto(width, height);
-        canvas.Concat(ref mapping);
+        canvas.Concat(in mapping);
         canvas.DrawPicture(Picture);
         canvas.Flush();
         return surface.Snapshot();
@@ -314,10 +314,10 @@ internal sealed class SvgVectorImage
         var canvas = recorder.BeginRecording(cell);
         canvas.ClipRect(new SKRect(0f, 0f, shape.Width, shape.Height));
         var mapping = MapInto(shape.Width, shape.Height);
-        canvas.Concat(ref mapping);
+        canvas.Concat(in mapping);
         canvas.DrawPicture(Picture);
         using var picture = recorder.EndRecording();
-        return picture.ToShader(shape.ModeX, shape.ModeY, cell);
+        return SKShader.CreatePicture(picture, shape.ModeX, shape.ModeY, SKFilterMode.Linear, cell);
     }
 
     private byte[] EncodePng()

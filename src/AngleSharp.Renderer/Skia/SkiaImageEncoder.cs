@@ -29,7 +29,7 @@ internal static class SkiaImageEncoder
                 using var surface = SKSurface.Create(info)
                     ?? throw new InvalidOperationException("Unable to create a Skia surface.");
                 surface.Canvas.Clear(SKColors.White);
-                surface.Canvas.DrawImage(source, 0f, 0f);
+                surface.Canvas.DrawImage(source, 0f, 0f, new SKSamplingOptions(SKFilterMode.Linear));
                 using var opaque = surface.Snapshot();
                 return Encode(opaque, SKEncodedImageFormat.Jpeg, quality, "image/jpeg");
             }
