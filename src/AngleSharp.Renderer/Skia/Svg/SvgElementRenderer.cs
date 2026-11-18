@@ -144,14 +144,15 @@ internal static class SvgElementRenderer
 
     /// <summary>
     /// Paints an <c>image</c> element whose <c>href</c> is a <c>data:</c> URL (e.g. the bitmaps a
-    /// Lottie animation is made of) into its viewport (<c>x</c>, <c>y</c>, <c>width</c>,
-    /// <c>height</c>), fitted per <c>preserveAspectRatio</c>; other images are not painted.
+    /// Lottie animation is made of), or one the page loaded (see <see cref="LoadedImages"/>), into
+    /// its viewport (<c>x</c>, <c>y</c>, <c>width</c>, <c>height</c>), fitted per
+    /// <c>preserveAspectRatio</c>; other images are not painted.
     /// </summary>
     private static void RenderImage(SKCanvas canvas, IElement element, SvgPaintState state, SvgRenderContext context, SvgViewport viewport)
     {
         if (string.Equals(SvgPaintState.ReadProperty(element, context, "visibility"), "hidden", StringComparison.OrdinalIgnoreCase) ||
             (element.GetAttribute("href") ?? element.GetAttribute("xlink:href")) is not { } href ||
-            DecodedImages.Get(href) is not { } image)
+            (DecodedImages.Get(href) ?? LoadedImages.Get(element)) is not { } image)
         {
             return;
         }
@@ -217,6 +218,24 @@ internal static class SvgElementRenderer
                 return null;
             }
         }
+
+        private sealed record Holder(SKImage? Image);
+    }
+
+    /// <summary>
+    /// The images of <c>image</c> elements in a page's inline SVG whose <c>href</c> is not a
+    /// <c>data:</c> URL, as the page loaded them (by the address it resolves), given before the
+    /// SVG is recorded. They are decoded once per loaded data.
+    /// </summary>
+    internal static class LoadedImages
+    {
+        private static readonly System.Runtime.CompilerServices.ConditionalWeakTable<IElement, byte[]> DataByElement = new();
+        private static readonly System.Runtime.CompilerServices.ConditionalWeakTable<byte[], Holder> Images = new();
+
+        public static void Set(IElement element, byte[] data) => DataByElement.AddOrUpdate(element, data);
+
+        public static SKImage? Get(IElement element) =>
+            DataByElement.TryGetValue(element, out var data) ? Images.GetValue(data, static key => new Holder(SKImage.FromEncodedData(key))).Image : null;
 
         private sealed record Holder(SKImage? Image);
     }

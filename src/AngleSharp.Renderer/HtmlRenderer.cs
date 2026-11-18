@@ -1985,6 +1985,7 @@ public sealed partial class HtmlRenderer
         // what is floated takes no room in the flow, whatever it lays out inside
         var cursorBeforeFloat = cursorY;
         var marginBeforeFloat = previousBlockMarginBottom;
+        var suppressBeforeContainer = suppressNextBlockTopMargin;
 
         void PlaceFloatedContainer(ref float cursor, ref float previousMargin)
         {
@@ -1996,6 +1997,14 @@ public sealed partial class HtmlRenderer
                 isLeft: floatSide == "left");
             cursor = cursorBeforeFloat;
             previousMargin = marginBeforeFloat;
+        }
+
+        // what is positioned takes no room in the flow either (as for any positioned box below)
+        void RestoreFlowAfterPositionedContainer(ref float cursor, ref float previousMargin, ref bool suppressTopMargin)
+        {
+            cursor = cursorBeforeFloat;
+            previousMargin = marginBeforeFloat;
+            suppressTopMargin = suppressBeforeContainer;
         }
 
         if (layoutsItems && !startsSystem && IsFlexContainer(styleMap))
@@ -2042,6 +2051,10 @@ public sealed partial class HtmlRenderer
             if (isFloat)
             {
                 PlaceFloatedContainer(ref cursorY, ref previousBlockMarginBottom);
+            }
+            else if (isAbsolute || isFixed)
+            {
+                RestoreFlowAfterPositionedContainer(ref cursorY, ref previousBlockMarginBottom, ref suppressNextBlockTopMargin);
             }
 
             SetUsedMargins(node.Ref, new EdgeSizes(cssMarginTop, marginRight, cssMarginBottom, marginLeft));
@@ -2091,6 +2104,10 @@ public sealed partial class HtmlRenderer
             if (isFloat)
             {
                 PlaceFloatedContainer(ref cursorY, ref previousBlockMarginBottom);
+            }
+            else if (isAbsolute || isFixed)
+            {
+                RestoreFlowAfterPositionedContainer(ref cursorY, ref previousBlockMarginBottom, ref suppressNextBlockTopMargin);
             }
 
             SetUsedMargins(node.Ref, new EdgeSizes(cssMarginTop, marginRight, cssMarginBottom, marginLeft));
@@ -9682,10 +9699,21 @@ public sealed partial class HtmlRenderer
             return false;
         }
 
-        return TryResolveReplacedElementRect(imageResource, styleMap, containingWidth, x, y, out image, out rect, out clipRect, usedSize);
+        return TryResolveReplacedElementRect(imageResource, styleMap, containingWidth, x, y, out image, out rect, out clipRect, usedSize, HasRatioOnly(node.Ref));
     }
 
-    private static bool TryResolveReplacedElementRect(CachedImageResource imageResource, Dictionary<string, string> styleMap, float containingWidth, float x, float y, out RenderedImage? image, out RenderRect rect, out RenderRect? clipRect, (float Width, float Height)? usedSize = null)
+    /// <summary>
+    /// Gets if the element is an inline SVG with only a viewBox: no natural width, just a ratio,
+    /// so an auto width fills the containing block (CSS 2.1 §10.3.2), as the logo of
+    /// an svg element with just a viewBox in a narrow box does, while it adds nothing to a shrink-to-fit width.
+    /// </summary>
+    private static bool HasRatioOnly(IElement element) =>
+        element is not IPseudoElement &&
+        string.Equals(element.LocalName, "svg", StringComparison.OrdinalIgnoreCase) &&
+        !element.HasAttribute("width") && !element.HasAttribute("height") &&
+        SvgViewBoxMapping.ParseViewBox(element.GetAttribute("viewBox")) is { Width: > 0f, Height: > 0f };
+
+    private static bool TryResolveReplacedElementRect(CachedImageResource imageResource, Dictionary<string, string> styleMap, float containingWidth, float x, float y, out RenderedImage? image, out RenderRect rect, out RenderRect? clipRect, (float Width, float Height)? usedSize = null, bool hasRatioOnly = false)
     {
         image = null;
         rect = default;
@@ -9700,7 +9728,14 @@ public sealed partial class HtmlRenderer
         var isHeightAuto = float.IsNaN(height);
         var (minWidth, maxWidth, minHeight, maxHeight) = ResolveReplacedSizeConstraints(styleMap, containingWidth);
 
-        if (isWidthAuto && isHeightAuto)
+        if (isWidthAuto && isHeightAuto && hasRatioOnly && naturalWidth > 0f && float.IsFinite(containingWidth) && containingWidth >= 0f)
+        {
+            width = Math.Clamp(containingWidth, minWidth, Math.Max(minWidth, maxWidth));
+            height = (width / naturalWidth) * naturalHeight;
+            isWidthAuto = false;
+            isHeightAuto = false;
+        }
+        else if (isWidthAuto && isHeightAuto)
         {
             width = naturalWidth;
             height = naturalHeight;
@@ -9716,7 +9751,7 @@ public sealed partial class HtmlRenderer
             height = (width / naturalWidth) * naturalHeight;
         }
 
-        if (float.IsNaN(width) || float.IsNaN(height) || width <= 0f || height <= 0f)
+        if (float.IsNaN(width) || float.IsNaN(height) || ((width <= 0f || height <= 0f) && !hasRatioOnly))
         {
             width = naturalWidth;
             height = naturalHeight;
@@ -9956,6 +9991,7 @@ public sealed partial class HtmlRenderer
         // The already-parsed element is walked directly - AngleSharp parsed this SVG once, as
         // part of the host document, and it is never serialized back to text and re-parsed.
         imageResource = null;
+        LoadSvgImages(element);
 
         if (!SvgRasterizer.TryRecordElement(element, out var vectorImage, pageStyle))
         {
@@ -9965,6 +10001,25 @@ public sealed partial class HtmlRenderer
         imageResource = new CachedImageResource(vectorImage!);
         s_inlineSvgCacheByElement.AddOrUpdate(element, new InlineSvgCacheEntry(fingerprint, imageResource));
         return true;
+    }
+
+    /// <summary>
+    /// Loads the bitmaps of the <c>image</c> elements of an inline SVG that refer to an address
+    /// (like a background image, shared with the rest of the page), for the SVG to paint them, e.g.
+    /// an illustration that is an SVG wrapping a PNG with hotspots around.
+    /// </summary>
+    private static void LoadSvgImages(IElement svgRoot)
+    {
+        foreach (var image in svgRoot.QuerySelectorAll("image"))
+        {
+            var href = (image.GetAttribute("href") ?? image.GetAttribute("xlink:href"))?.Trim();
+
+            if (!string.IsNullOrEmpty(href) && !href.StartsWith("data:", StringComparison.OrdinalIgnoreCase) &&
+                TryGetOrLoadBackgroundImageResource(image, href, out var resource) && resource?.Bytes is { } bytes)
+            {
+                SvgElementRenderer.LoadedImages.Set(image, bytes);
+            }
+        }
     }
 
     /// <summary>

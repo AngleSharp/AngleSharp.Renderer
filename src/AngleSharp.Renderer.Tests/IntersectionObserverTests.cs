@@ -292,7 +292,7 @@ public sealed class IntersectionObserverTests
         Assert.False(probe.Last.IsIntersecting);
     }
 
-    private sealed class TestEventLoop : IEventLoop, IDisposable
+    internal sealed class TestEventLoop : IEventLoop, IDisposable
     {
         private readonly System.Collections.Concurrent.BlockingCollection<Action> _tasks = [];
         private readonly Thread _thread;

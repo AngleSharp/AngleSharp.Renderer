@@ -1,6 +1,7 @@
 namespace AngleSharp.Dom;
 
 using AngleSharp.Attributes;
+using AngleSharp.Browser;
 using AngleSharp.Dom.Events;
 using AngleSharp.Renderer;
 using AngleSharp.Renderer.Rendering;
@@ -160,7 +161,7 @@ public sealed class DocumentFontFace
                 var weight = ParseWeight(Weight);
                 var italic = Style.Contains("italic", StringComparison.OrdinalIgnoreCase) ||
                     Style.Contains("oblique", StringComparison.OrdinalIgnoreCase);
-                _renderFace = new RenderFontFace(
+                var renderFace = new RenderFontFace(
                     Family,
                     weight,
                     italic,
@@ -170,19 +171,40 @@ public sealed class DocumentFontFace
                     Stretch,
                     UnicodeRange,
                     Display);
-                _status = "loaded";
-                _loaded.TrySetResult(this);
-                DocumentFontFaceSet.TryGet(_document)?.FaceLoaded(this);
+                Settle(() =>
+                {
+                    _renderFace = renderFace;
+                    _status = "loaded";
+                    _loaded.TrySetResult(this);
+                    DocumentFontFaceSet.TryGet(_document)?.FaceLoaded(this);
+                });
             }
             catch (Exception exception)
             {
-                _status = "error";
-                _loaded.TrySetException(exception);
-                DocumentFontFaceSet.TryGet(_document)?.FaceFailed(this);
+                Settle(() =>
+                {
+                    _status = "error";
+                    _loaded.TrySetException(exception);
+                    DocumentFontFaceSet.TryGet(_document)?.FaceFailed(this);
+                });
             }
         });
 
         return _loaded.Task;
+    }
+
+    // the face (its status, its promise and the events of the set) changes in a task of the
+    // document's event loop, where scripts and layouts run, not on the thread that loaded it
+    private void Settle(Action apply)
+    {
+        if (_document.Context.GetService<IEventLoop>() is { } loop)
+        {
+            loop.Enqueue(apply, TaskPriority.Normal);
+        }
+        else
+        {
+            apply();
+        }
     }
 
     private static float ParseWeight(string weight) => weight.Trim().ToLowerInvariant() switch

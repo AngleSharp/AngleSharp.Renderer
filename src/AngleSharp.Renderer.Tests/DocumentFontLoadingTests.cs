@@ -133,20 +133,66 @@ public sealed class DocumentFontLoadingTests
     [Fact]
     public async Task Add_UnloadedFace_LoadsItAndRendersOnceReady()
     {
-        var document = await BrowsingContext.New(Configuration.Default.WithCss())
+        // the font arrives once the test lets it, so the face is seen loading
+        var requester = new GatedFontRequester(Convert.FromBase64String(SerifDataUri[(SerifDataUri.IndexOf(',') + 1)..]));
+        var document = await BrowsingContext.New(Configuration.Default
+                .WithCss()
+                .WithDefaultLoader(new AngleSharp.Io.LoaderOptions { IsResourceLoadingEnabled = true })
+                .With(requester))
             .OpenAsync(request => request.Content("<html><body style='font-family: AddedFace; font-size: 20px'>Handgloves quick brown fox</body></html>"));
         var original = BuildTextWidth(document);
         var set = document.Fonts();
-        var face = new DocumentFontFace(document.DefaultView!, "AddedFace", $"url({SerifDataUri})");
+        var face = new DocumentFontFace(document.DefaultView!, "AddedFace", "url(http://localhost/serif.ttf)");
 
         set.Add(face);
 
         Assert.True(set.Has(face));
         Assert.Equal("loading", set.Status);
+        Assert.Equal("loading", face.Status);
+        requester.Release();
         Assert.Same(set, await set.Ready);
         Assert.Equal("loaded", face.Status);
         Assert.Equal(MeasureWithFamily("serif"), BuildTextWidth(document), tolerance: 0.01f);
         Assert.True(Math.Abs(original - BuildTextWidth(document)) > 0.01f);
+    }
+
+    [Fact]
+    public async Task Add_UnloadedFace_SettlesOnTheEventLoop()
+    {
+        using var loop = new IntersectionObserverTests.TestEventLoop();
+        var document = await BrowsingContext.New(Configuration.Default.WithCss().With<AngleSharp.Browser.IEventLoop>(_ => loop))
+            .OpenAsync(request => request.Content("<html><body>Text</body></html>"));
+        var set = document.Fonts();
+        var done = new TaskCompletionSource<(int Thread, string Status)>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var face = new DocumentFontFace(document.DefaultView!, "AddedFace", $"url({SerifDataUri})");
+        set.AddEventListener("loadingdone", (_, _) => done.TrySetResult((Environment.CurrentManagedThreadId, face.Status)));
+
+        await loop.RunAsync(() => set.Add(face));
+        var (thread, status) = await done.Task.WaitAsync(TimeSpan.FromSeconds(10));
+
+        Assert.Equal(loop.ThreadId, thread);
+        Assert.Equal("loaded", status);
+    }
+
+    private sealed class GatedFontRequester(byte[] font) : AngleSharp.Io.BaseRequester
+    {
+        private readonly TaskCompletionSource _gate = new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        public void Release() => _gate.TrySetResult();
+
+        public override bool SupportsProtocol(string protocol) =>
+            string.Equals(protocol, "http", StringComparison.OrdinalIgnoreCase);
+
+        protected override async Task<AngleSharp.Io.IResponse?> PerformRequestAsync(AngleSharp.Io.Request request, CancellationToken cancel)
+        {
+            await _gate.Task.WaitAsync(cancel);
+            return new AngleSharp.Io.DefaultResponse
+            {
+                Address = request.Address,
+                StatusCode = System.Net.HttpStatusCode.OK,
+                Content = new MemoryStream(font),
+            };
+        }
     }
 
     [Fact]

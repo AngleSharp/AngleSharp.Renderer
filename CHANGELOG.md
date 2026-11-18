@@ -1,6 +1,6 @@
 # 0.12.0
 
-Released on tbd.
+Released on Wednesday, November 18 2026.
 
 - Improved frames of pages animating an inline SVG (e.g. a Lottie animation setting the attributes of its layers in every frame, on smapiot.com from about 600 ms to about 100 ms per frame): a change inside the SVG paints the SVG again in the last frame instead of laying out the boxes around it, as its size only depends on its root; such an SVG is drawn from its recording instead of a raster made for one frame, and the `:has()` selectors around it are matched once per update, not for every change
 - Improved rasterizing pages with `filter`, `opacity` or blend mode layers: a layer is as large as what is drawn into it, and not drawn at all when that is outside of the canvas (a blurred box far below the viewport was blurred across the whole canvas in every frame)
@@ -13,6 +13,13 @@ Released on tbd.
 - Improved dragging a selection over a page that changes as it is hovered (e.g. Wikipedia's link previews changing the `title` of links): the pointer is located in the text as the last frame shows it, instead of the page being laid out again for every move; only when that text is no longer in the document it is laid out anew
 - Improved pages changing attributes that render nothing as they are hovered (e.g. Wikipedia's link previews taking the `title` of a link away, and setting a style to the one it has): an attribute set to the value it had for the layout, or one no element renders by (`title`, `data-*`, `aria-*`, `role`, event handlers, ...) keeps the frame, unless a rule selects the element by it or shows it by `attr()`; hovering the links of the Wikipedia article on CSS no longer lays out the page (about 320 ms) on every link entered and left
 - Improved pressing a link whose text is in a box of its own (e.g. Wikipedia's table of contents): text with the lines of an ancestor is painted in its new color (and the lines in that of the box declaring them) instead of the page being laid out
+- Fixed an inline SVG with only a `viewBox` (no `width` or `height`) being as large as its viewBox (a logo of 1943 pixels in a box of 180 made the header of www.skve.de as tall as the page): it fills the width of its containing block, keeping its ratio, and adds nothing to a shrink-to-fit width, as in browsers
+- Fixed a transition of `transform` not starting when the element had no transition before (e.g. Swiper setting `transition-duration: 0ms` and later the duration with a new transform), so `transitionend` never came and the slider stopped after its first slide
+- Fixed transitions of pseudo-elements (e.g. a `::before` overlay changing on `:hover` of its host) jumping to the new values: they are followed by their host and name, as their animations, and their events go to the host
+- Fixed transitions of lengths given as percentages (e.g. `width: 100%` to `90%`) jumping to the new value: they are interpolated as percentages, or in a `calc()` with a length
+- Fixed an absolutely positioned or fixed flex or grid container taking room in the flow (e.g. www.skve.de's cookie bar, fixed and as tall as the viewport, made the page a viewport taller)
+- Fixed a face added to `document.fonts` changing its status, settling its promise and firing the events of the set on the thread that loaded it: this happens in a task of the document's event loop, if it has one (and a face loaded quickly was already `loaded` once `add()` returned)
+- Fixed `@font-face` rules fetching all of their sources (e.g. both the WOFF2 and the WOFF file of every face): the sources after the first one that loads are not fetched, as they are not used
 - Fixed dotted and dashed sides of a rounded border being straight rows clipped by the curve (a dotted circle came out as two lines of dots, and the solid sides of a spinner with dotted ones vanished): the dots and dashes follow the middle of the border along the curve, and the other sides are painted as for any rounded border
 - Fixed rendering moving the `transform` of an element's `style` attribute into a `data-render-transform` attribute (a workaround for a crash of AngleSharp.Css that has long been fixed), which scripts saw as a missing transform and as changes of the page
 - Fixed `scrollHeight` (and `scrollWidth`) of the root element leaving out the margins in the root's box, e.g. the body's bottom margin, so the end of a page could not be scrolled to
@@ -22,6 +29,7 @@ Released on tbd.
 - Updated to use SkiaSharp 4.156.1
 - Added `RenderOptions` for `RenderToImage` (documents and elements) and `RenderToPixels`: the full page (`FullPage`), a part of it (`Clip`, in page coordinates) or an element's border box, at a `DeviceScaleFactor` (text, borders and SVG painted sharp at the higher resolution), without the white page background (`OmitBackground`), and as PNG, JPEG or WebP (`Format`, `Quality`); a capture beyond the viewport is laid out in the viewport and painted below it, as the screenshots of browser automation tools are, and creates no interactive harness
 - Added a fallback viewport of 800×600 (`HtmlRenderer.FallbackViewportWidth`/`FallbackViewportHeight`) for rendering a document whose browsing context has no render device, instead of an `ArgumentNullException`; the harness still needs a registered one
+- Added loading the images of `image` elements of an inline SVG referring to an address (e.g. an illustration wrapping a PNG), like background images
 - Added the `image` element of SVG for images of `data:` URLs (fitted per `preserveAspectRatio`; the bitmaps of a Lottie animation, for example), `display: none` in SVG (hiding the element with its children; Lottie hides the layers that are not in), and `mask-type: alpha`
 
 # 0.11.4

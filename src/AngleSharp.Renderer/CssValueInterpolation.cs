@@ -186,7 +186,7 @@ internal static class CssValueInterpolation
         {
             CssInterpolationValueKind.Color => raw,
             CssInterpolationValueKind.Number => float.TryParse(raw.Trim(), NumberStyles.Float, CultureInfo.InvariantCulture, out _) ? raw.Trim() : null,
-            CssInterpolationValueKind.LengthPixels => float.IsNaN(HtmlRenderer.ParseLengthValue(raw, float.NaN, allowAuto: false)) ? null : raw,
+            CssInterpolationValueKind.LengthPixels => TryParsePercentage(raw, out _) || !float.IsNaN(HtmlRenderer.ParseLengthValue(raw, float.NaN, allowAuto: false)) ? raw : null,
             CssInterpolationValueKind.FunctionList => raw.Trim(),
             _ => null,
         };
@@ -209,6 +209,8 @@ internal static class CssValueInterpolation
         return kind switch
         {
             CssInterpolationValueKind.Color => HtmlRenderer.ParseColor(a, RenderColor.Transparent) == HtmlRenderer.ParseColor(b, RenderColor.Transparent),
+            CssInterpolationValueKind.LengthPixels when TryParsePercentage(a, out var pa) | TryParsePercentage(b, out var pb) =>
+                TryParsePercentage(a, out _) && TryParsePercentage(b, out _) && Math.Abs(pa - pb) < 0.01f,
             CssInterpolationValueKind.Number or CssInterpolationValueKind.LengthPixels =>
                 Math.Abs(HtmlRenderer.ParseLengthValue(a, 0f, allowAuto: false) - HtmlRenderer.ParseLengthValue(b, 0f, allowAuto: false)) < 0.01f,
             CssInterpolationValueKind.FunctionList => CssFunctionListInterpolation.AreEquivalent(a, b),
@@ -230,6 +232,23 @@ internal static class CssValueInterpolation
             return CssFunctionListInterpolation.Interpolate(property, from, to, t);
         }
 
+        // percentages (e.g. an overlay shrinking from 100% to 90%) stay percentages, mixed with
+        // a length in a calc()
+        var fromIsPercentage = TryParsePercentage(from, out var fromPercentage);
+        var toIsPercentage = TryParsePercentage(to, out var toPercentage);
+
+        if (kind == CssInterpolationValueKind.LengthPixels && (fromIsPercentage || toIsPercentage))
+        {
+            var fromLength = fromIsPercentage ? 0f : HtmlRenderer.ParseLengthValue(from, 0f, allowAuto: false);
+            var toLength = toIsPercentage ? 0f : HtmlRenderer.ParseLengthValue(to, 0f, allowAuto: false);
+            var percentage = (fromIsPercentage ? fromPercentage : 0f) + (((toIsPercentage ? toPercentage : 0f) - (fromIsPercentage ? fromPercentage : 0f)) * t);
+            var length = fromLength + ((toLength - fromLength) * t);
+            var percentageText = percentage.ToString("0.####", CultureInfo.InvariantCulture);
+            return fromIsPercentage && toIsPercentage
+                ? $"{percentageText}%"
+                : string.Create(CultureInfo.InvariantCulture, $"calc({percentageText}% + {length.ToString("0.####", CultureInfo.InvariantCulture)}px)");
+        }
+
         var fromNumber = HtmlRenderer.ParseLengthValue(from, 0f, allowAuto: false);
         var toNumber = HtmlRenderer.ParseLengthValue(to, 0f, allowAuto: false);
         var interpolated = fromNumber + ((toNumber - fromNumber) * t);
@@ -237,6 +256,13 @@ internal static class CssValueInterpolation
         return kind == CssInterpolationValueKind.Number
             ? interpolated.ToString("0.####", CultureInfo.InvariantCulture)
             : string.Create(CultureInfo.InvariantCulture, $"{interpolated.ToString("0.####", CultureInfo.InvariantCulture)}px");
+    }
+
+    private static bool TryParsePercentage(string value, out float percentage)
+    {
+        var text = value.Trim();
+        percentage = 0f;
+        return text.EndsWith('%') && float.TryParse(text[..^1], NumberStyles.Float, CultureInfo.InvariantCulture, out percentage);
     }
 
     public static string InterpolateColor(RenderColor from, RenderColor to, double t)

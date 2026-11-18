@@ -1443,13 +1443,48 @@ public sealed class SiteRegressionTests
     public async Task Image_MinWidthGrowsKeepingRatio()
     {
         var document = await OpenAsync("""
-            <svg id="icon" viewBox="0 0 20 10" style="min-width: 40px"><rect width="20" height="10"/></svg>
+            <div style="width: 30px"><svg id="icon" viewBox="0 0 20 10" style="min-width: 40px"><rect width="20" height="10"/></svg></div>
             """);
 
         var icon = document.GetElementById("icon")!.GetBoundingClientRect();
 
         Assert.Equal(40, icon.Width, precision: 0);
         Assert.Equal(20, icon.Height, precision: 0);
+    }
+
+    [Fact]
+    public async Task InlineSvgWithViewBoxOnly_FillsItsBoxButAddsNothingToShrinkToFit()
+    {
+        // the skve.de logo: an svg with just a viewBox in a box with max-width: 180px (Chrome
+        // sizes it 180x42, not as large as its viewBox)
+        var document = await OpenAsync("""
+            <div style="max-width: 180px"><svg id="logo" viewBox="0 0 1942.93 448.95"></svg></div>
+            <div style="display: inline-block"><svg id="icon" viewBox="0 0 20 10"></svg></div>
+            """);
+
+        var logo = document.GetElementById("logo")!.GetBoundingClientRect();
+        var icon = document.GetElementById("icon")!.GetBoundingClientRect();
+
+        Assert.Equal(180, logo.Width, precision: 0);
+        Assert.Equal(42, logo.Height, precision: 0);
+        Assert.Equal(0, icon.Width, precision: 0);
+    }
+
+    [Theory]
+    [InlineData("position: fixed; inset: 0; display: flex")]
+    [InlineData("position: absolute; top: 0; display: flex; height: 50px")]
+    [InlineData("position: absolute; display: grid; height: 50px")]
+    public async Task PositionedFlexOrGridContainer_TakesNoRoomInTheFlow(string style)
+    {
+        // skve.de's cookie bar (fixed, flex, as tall as the viewport) after the page's content
+        // made the page a viewport taller
+        var document = await OpenAsync($"""
+            <div id="page" style="position: relative"><div style="height: 300px"></div><div id="box" style="{style}"><span>Cookies</span></div><div id="after" style="height: 20px"></div></div>
+            """);
+
+        Assert.Equal(320, document.GetElementById("page")!.GetBoundingClientRect().Height, precision: 0);
+        Assert.Equal(300, document.GetElementById("after")!.GetBoundingClientRect().Top, precision: 0);
+        Assert.True(document.GetElementById("box")!.GetBoundingClientRect().Height > 0);
     }
 
     private static async Task<IDocument> ParseDocumentAsync(string html)

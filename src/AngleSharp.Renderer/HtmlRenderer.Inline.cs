@@ -3229,6 +3229,11 @@ public sealed partial class HtmlRenderer
         {
             content = new IntrinsicWidths(authored, authored);
         }
+        else if (HasRatioOnly(element.Ref) && IsReplacedElement(element.Ref))
+        {
+            // its width is the one of its containing block, which is the size being computed
+            content = new IntrinsicWidths(0f, 0f);
+        }
         else if (TryResolveReplacedContentWidth(element, WithoutPercentageWidths(styleMap), percentageBase, out var replacedWidth))
         {
             // with a percentage width or max-width, a replaced element can shrink to nothing,
