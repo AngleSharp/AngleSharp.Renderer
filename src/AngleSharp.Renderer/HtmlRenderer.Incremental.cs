@@ -10,6 +10,7 @@ using AngleSharp.Css.Dom;
 using AngleSharp.Css.RenderTree;
 using AngleSharp.Dom;
 using AngleSharp.Renderer.Rendering;
+using AngleSharp.Renderer.Skia;
 
 /// <summary>
 /// Incremental layout metrics. Scripts often change a box and read its geometry right after,
@@ -87,6 +88,9 @@ public sealed partial class HtmlRenderer
 
         /// <summary>The main size an item got by being laid out (see <see cref="FlexItemLayoutInfo.HasDeferredMainSize"/>).</summary>
         public float DeferredMainSize { get; init; } = float.NaN;
+
+        /// <summary>The width the item's percentages of margins, paddings and offsets refer to.</summary>
+        public float PercentageBasisWidth { get; init; } = float.NaN;
     }
 
     /// <summary>
@@ -411,6 +415,15 @@ public sealed partial class HtmlRenderer
         private bool _hasStructuralCompounds;
         // the boxes whose decorations are painted again with their new style map (see TryRepaint)
         private readonly Dictionary<object, Dictionary<string, string>> _repaints = [];
+
+        // the inline SVGs whose content changed since the frame, with the image the frame shows
+        private readonly Dictionary<IElement, SvgVectorImage?> _svgRepaints = new(ReferenceEqualityComparer.Instance);
+
+        // the inline SVGs changed by the records of the current update
+        private readonly HashSet<IElement> _svgRootsChanged = new(ReferenceEqualityComparer.Instance);
+
+        // the selectors of _relationalMatches, parsed once
+        private readonly Dictionary<string, ISelector?> _parsedSelectors = new(StringComparer.Ordinal);
         // if a repaint changed a cursor or what can be hit (see TryRepaint)
         private bool _repaintsChangeHitTesting;
         // the boxes whose transform or opacity changed alone (e.g. by an animation), by their paint
@@ -486,7 +499,7 @@ public sealed partial class HtmlRenderer
         /// Gets if this is a frame's layout that still looks the same: all boxes laid out again
         /// since were not rendered in the frame and are not now.
         /// </summary>
-        public bool IsUnchangedSinceFrame => _isFrameLayout && _repaints.Count == 0 && _recolors.Count == 0 && _movedSincePatch.Count == 0 && _effects.Count == 0 && _rendered.Values.All(rendered => !rendered.Before && !rendered.Now);
+        public bool IsUnchangedSinceFrame => _isFrameLayout && _repaints.Count == 0 && _svgRepaints.Count == 0 && _recolors.Count == 0 && _movedSincePatch.Count == 0 && _effects.Count == 0 && _rendered.Values.All(rendered => !rendered.Before && !rendered.Now);
 
         /// <summary>Gets if this is a frame's layout (see <see cref="TryPatch"/>).</summary>
         public bool IsFrameLayout => _isFrameLayout;
@@ -580,7 +593,7 @@ public sealed partial class HtmlRenderer
                 return false;
             }
 
-            if (!TryApplyRepaints(displayList))
+            if (!TryApplyRepaints(displayList) || !TryApplySvgRepaints(displayList))
             {
                 return false;
             }
@@ -595,6 +608,7 @@ public sealed partial class HtmlRenderer
             _relayouts.Clear();
             _removals.Clear();
             _repaints.Clear();
+            _svgRepaints.Clear();
             _recolors.Clear();
             _effects.Clear();
             _transformedSincePatch.Clear();
@@ -1493,15 +1507,124 @@ public sealed partial class HtmlRenderer
         /// <returns>True if nothing else changed, false if the document is to be laid out again.</returns>
         public bool TryAnimate(IWindow window, IEnumerable<(IElement Element, bool IsPseudo)> elements)
         {
-            foreach (var (element, isPseudo) in elements)
+            // the style maps are created as for a layout of the pass (e.g. with the rules of its
+            // style elements read once, not for every animated element in every frame)
+            var previousPass = s_layoutPass.Value;
+            s_layoutPass.Value = _pass;
+
+            try
             {
-                if (!_metrics.ContainsKey(element) && !isPseudo || !TryRepaint(window, element, reachesDescendants: false, pseudoElementsOnly: isPseudo))
+                foreach (var (element, isPseudo) in elements)
                 {
-                    return false;
+                    if (!_metrics.ContainsKey(element) && !isPseudo || !TryRepaint(window, element, reachesDescendants: false, pseudoElementsOnly: isPseudo))
+                    {
+                        return false;
+                    }
+                }
+
+                return true;
+            }
+            finally
+            {
+                s_layoutPass.Value = previousPass;
+            }
+        }
+
+        /// <summary>
+        /// Keeps a change of the content of an inline SVG (e.g. a Lottie animation setting the
+        /// transforms of its layers in every frame) to paint the SVG again (see
+        /// <see cref="TryApplySvgRepaints"/>): its box is sized by the root's attributes and style
+        /// alone, so nothing has to be laid out.
+        /// </summary>
+        /// <returns>True if the change was kept, false if it is to be looked at otherwise.</returns>
+        private bool TryKeepSvgContentChange(IMutationRecord record)
+        {
+            var target = record.Target as IElement ?? record.Target?.ParentElement;
+
+            if (target is null || !_isFrameLayout || target.NamespaceUri != NamespaceNames.SvgUri)
+            {
+                return false;
+            }
+
+            // the outermost svg, the replaced element of the HTML around it
+            var root = default(IElement);
+
+            for (var current = target; current is not null && current.NamespaceUri == NamespaceNames.SvgUri; current = current.ParentElement)
+            {
+                if (current.LocalName == "svg")
+                {
+                    root = current;
                 }
             }
 
+            // the root's attributes size its box; one that is no box of the frame (e.g. hidden) is left to the rest
+            if (root?.ParentElement is null || (ReferenceEquals(target, root) && record.Type == "attributes") || !_metrics.ContainsKey(root))
+            {
+                return false;
+            }
+
+            // whether a `:has()` outside of it matches otherwise is looked at once for all changes
+            _svgRootsChanged.Add(root);
+
+            if (!_svgRepaints.ContainsKey(root))
+            {
+                _svgRepaints[root] = s_inlineSvgCacheByElement.TryGetValue(root, out var cached) ? cached.Resource.VectorImage : null;
+            }
+
             return true;
+        }
+
+        /// <summary>
+        /// Records the inline SVGs kept by <see cref="TryKeepSvgContentChange"/> anew and draws them
+        /// in place of their images in the frame.
+        /// </summary>
+        /// <returns>True if all of them were found, false if the frame needs a layout.</returns>
+        private bool TryApplySvgRepaints(DisplayList displayList)
+        {
+            if (_svgRepaints.Count == 0)
+            {
+                return true;
+            }
+
+            var replacements = new Dictionary<SvgVectorImage, CachedImageResource>(ReferenceEqualityComparer.Instance);
+            var previousPass = s_layoutPass.Value;
+            s_layoutPass.Value = _pass;
+
+            try
+            {
+                foreach (var (root, previous) in _svgRepaints)
+                {
+                    // the page's styles of its elements are resolved anew, too
+                    _pass.Styles.Remove(root);
+
+                    if (previous is null || !_document.Contains(root) || !TryGetOrLoadInlineSvgResource(root, out var resource) || resource?.VectorImage is null ||
+                        resource.NaturalWidth != previous.NaturalWidth || resource.NaturalHeight != previous.NaturalHeight)
+                    {
+                        return false;
+                    }
+
+                    resource.VectorImage.IsChanging = true;
+                    replacements[previous] = resource;
+                }
+            }
+            finally
+            {
+                s_layoutPass.Value = previousPass;
+            }
+
+            var commands = displayList.Commands;
+            var found = 0;
+
+            for (var i = 0; i < commands.Count; i++)
+            {
+                if (commands[i] is DrawImageCommand { Image.VectorImage: { } vector } draw && replacements.TryGetValue(vector, out var replacement))
+                {
+                    displayList.ReplaceRange(i, 1, [draw with { Image = replacement.CreateImage(draw.Image.Width, draw.Image.Height) }]);
+                    found++;
+                }
+            }
+
+            return found >= replacements.Count;
         }
 
         /// <summary>
@@ -1575,7 +1698,7 @@ public sealed partial class HtmlRenderer
                         fragmentOwner = null;
                         break;
                     case DrawTextCommand text when fragmentOwner is not null:
-                        if (RestyleText(text, _recolors[fragmentOwner]) is not { } restyledText)
+                        if (RestyleText(text, fragmentOwner, _recolors[fragmentOwner]) is not { } restyledText)
                         {
                             return false;
                         }
@@ -1588,15 +1711,23 @@ public sealed partial class HtmlRenderer
             }
 
             // the text in the new style: its color, and the lines if they are the element's own (as
-            // ResolveTextStyle has them), or null if it has lines of an ancestor
-            static DrawTextCommand? RestyleText(DrawTextCommand text, (Dictionary<string, string> StyleMap, bool HasOwnDecorationsOnly) restyle)
+            // ResolveTextStyle has them), or null if they cannot be told
+            DrawTextCommand? RestyleText(DrawTextCommand text, IElement owner, (Dictionary<string, string> StyleMap, bool HasOwnDecorationsOnly) restyle)
             {
                 var (styleMap, hasOwnDecorationsOnly) = restyle;
                 var color = ParseColor(styleMap.GetValueOrDefault("color"), text.Color);
 
                 if (!hasOwnDecorationsOnly)
                 {
-                    return text.Underline || text.StrikeThrough || text.Overline ? null : text with { Color = color };
+                    if (!text.Underline && !text.StrikeThrough && !text.Overline)
+                    {
+                        return text with { Color = color };
+                    }
+
+                    // lines of an ancestor (e.g. a link's underline across the text of a box in it),
+                    // which stay as they are (see TryRepaint): their color is that of the box
+                    // declaring the nearest of them, as it is styled now
+                    return GetAncestorDecorationColor(owner, color) is { } linesColor ? text with { Color = color, DecorationColor = linesColor } : null;
                 }
 
                 var (underline, overline, strikeThrough) = ParseTextDecoration(styleMap, false, false, false);
@@ -1611,6 +1742,46 @@ public sealed partial class HtmlRenderer
                     DecorationStyle = declares ? ParseTextDecorationStyle(styleMap, RenderTextDecorationStyle.Solid) : text.DecorationStyle,
                     DecorationThickness = declares ? ParseLength(styleMap, "text-decoration-thickness", text.FontSize, float.NaN, allowAuto: true) : text.DecorationThickness,
                 };
+            }
+
+            // the color of the lines across the text of the element (see ResolveTextStyle): of the
+            // nearest element declaring lines, its text-decoration-color or else its color
+            RenderColor? GetAncestorDecorationColor(IElement owner, RenderColor ownColor)
+            {
+                for (var current = owner; current is not null; current = current.ParentElement)
+                {
+                    if (!_context.StyleMapCache.TryGetValue(current, out var map))
+                    {
+                        return null;
+                    }
+
+                    if (HasOwnTextDecorationLines(map))
+                    {
+                        var declaredColor = ReferenceEquals(current, owner) ? ownColor : GetColor(current);
+                        return declaredColor is { } value ? ParseColor(map.TryGetValue("text-decoration-color", out var decoration) ? decoration : null, value) : null;
+                    }
+                }
+
+                return null;
+            }
+
+            // the color of the element as styled now, inherited unless its style map has one
+            RenderColor? GetColor(IElement element)
+            {
+                for (var current = element; current is not null; current = current.ParentElement)
+                {
+                    if (!_context.StyleMapCache.TryGetValue(current, out var map))
+                    {
+                        return null;
+                    }
+
+                    if (map.TryGetValue("color", out var value) && !string.IsNullOrWhiteSpace(value))
+                    {
+                        return ParseColor(value, RenderColor.Black);
+                    }
+                }
+
+                return null;
             }
 
             // a box that is painted nowhere (e.g. in a trial only) is not known to look the same
@@ -1887,20 +2058,25 @@ public sealed partial class HtmlRenderer
             }
 
             var roots = new List<IElement>();
+            _svgRootsChanged.Clear();
 
             // a changed style attribute may only paint differently (e.g. a sprite showing another
             // frame by its background-position), which is looked at once the roots are known
             var restyledByAttribute = new List<IElement>();
+            var unchanged = GetUnchangedAttributes(records);
 
             foreach (var record in records)
             {
-                if (TryRemoveOutOfFlow(record) || IsChangeOfNothingRendered(record))
+                if (TryRemoveOutOfFlow(record) || IsChangeOfNothingRendered(record) || TryKeepSvgContentChange(record) ||
+                    unchanged is not null && record is { Type: "attributes", AttributeName: { } attribute } && unchanged.Contains((record.Target, attribute)) ||
+                    IsInertAttributeChange(record))
                 {
                     continue;
                 }
 
                 if (GetChangedSubtree(record) is not { } changed)
                 {
+                    _svgRootsChanged.Clear();
                     return false;
                 }
 
@@ -1913,6 +2089,19 @@ public sealed partial class HtmlRenderer
                     return false;
                 }
             }
+
+            // the content of an SVG matched by a `:has()` around it (the elements inside are styled
+            // anew when it is recorded again)
+            foreach (var svgRoot in _svgRootsChanged)
+            {
+                if (!KeepsRelationalMatches(svgRoot))
+                {
+                    _svgRootsChanged.Clear();
+                    return false;
+                }
+            }
+
+            _svgRootsChanged.Clear();
 
             // the style maps of what is painted again are created as for a layout of the pass (e.g.
             // with the rules of its style elements read once)
@@ -2198,6 +2387,185 @@ public sealed partial class HtmlRenderer
             }
         }
 
+        /// <summary>
+        /// Gets the attributes that have the value they had for the layout again (e.g. a script
+        /// setting the same style on every pointer move), or null if there are none: the value
+        /// before the first change of each is compared with its value now.
+        /// </summary>
+        private static HashSet<(INode Target, string Name)>? GetUnchangedAttributes(IReadOnlyList<IMutationRecord> records)
+        {
+            HashSet<(INode, string)>? seen = null;
+            HashSet<(INode, string)>? unchanged = null;
+
+            foreach (var record in records)
+            {
+                if (record is { Type: "attributes", Target: IElement element, AttributeName: { } name } && (seen ??= []).Add((element, name)) &&
+                    string.Equals(record.PreviousValue, element.GetAttribute(name), StringComparison.Ordinal))
+                {
+                    (unchanged ??= []).Add((element, name));
+                }
+            }
+
+            return unchanged;
+        }
+
+        /// <summary>
+        /// Gets if the change is of an attribute that no element renders differently by (e.g. the
+        /// title of a link, which link previews take away while it is hovered), and no style rule
+        /// selects by or shows (with <c>attr()</c> in its content), so it changes nothing.
+        /// </summary>
+        private bool IsInertAttributeChange(IMutationRecord record) =>
+            record is { Type: "attributes", Target: IElement { ShadowRoot: null } element, AttributeName: { } name } &&
+            IsInertAttribute(name) && element.GetRoot() is IDocument && !ChangesStyleSheets(record) && !IsStyledByAttribute(element, name);
+
+        // attributes of no meaning for how elements are rendered (unlike e.g. src, colspan or hidden)
+        private static bool IsInertAttribute(string name) =>
+            name.StartsWith("data-", StringComparison.OrdinalIgnoreCase) || name.StartsWith("aria-", StringComparison.OrdinalIgnoreCase) ||
+            name.Length > 2 && name.StartsWith("on", StringComparison.OrdinalIgnoreCase) && name.Skip(2).All(char.IsAsciiLetterLower) ||
+            name.ToLowerInvariant() is "title" or "role" or "tabindex" or "accesskey" or "draggable" or "spellcheck" or "translate" or
+                "autocomplete" or "autocapitalize" or "enterkeyhint" or "inputmode" or "target" or "download" or "ping" or
+                "referrerpolicy" or "hreflang" or "nonce" or "itemprop" or "itemscope" or "itemtype" or "itemid" or "itemref";
+
+        // by attribute name, the keys of the compounds of the rules of the layout (with the user
+        // agent's) selecting by it (null for one any element may match), and if any shows it by attr()
+        private readonly Dictionary<string, (List<CompoundKeys?> Compounds, bool IsShown)> _attributeRules = new(StringComparer.OrdinalIgnoreCase);
+
+        /// <summary>
+        /// Gets if a rule may style the element differently by the attribute: a compound selecting
+        /// by it (e.g. <c>abbr[title]</c>) whose tag, classes and ids the element has, or content
+        /// showing it. What else the compound asks for is not looked at, so it may only be too many.
+        /// </summary>
+        private bool IsStyledByAttribute(IElement element, string name)
+        {
+            if (!_attributeRules.TryGetValue(name, out var rules))
+            {
+                rules = FindAttributeRules(name);
+                _attributeRules[name] = rules;
+            }
+
+            return rules.IsShown || rules.Compounds.Any(keys => keys is null || keys.Matches(element));
+        }
+
+        /// <summary>The tag, classes and ids a compound selector asks for (outside of any arguments).</summary>
+        private sealed record CompoundKeys(string? Tag, List<string> Classes, List<string> Ids)
+        {
+            public bool Matches(IElement element) =>
+                (Tag is null || string.Equals(Tag, element.LocalName, StringComparison.OrdinalIgnoreCase)) &&
+                Classes.All(element.ClassList.Contains) && Ids.All(id => string.Equals(element.Id, id, StringComparison.Ordinal));
+
+            // null if the keys cannot be told (escapes, namespaces), as for a compound matching anything
+            public static CompoundKeys? Parse(string compound)
+            {
+                if (compound.Contains('\\') || compound.Contains('|'))
+                {
+                    return null;
+                }
+
+                string? tag = null;
+                var classes = new List<string>();
+                var ids = new List<string>();
+                var depth = 0;
+
+                for (var i = 0; i < compound.Length; i++)
+                {
+                    var c = compound[i];
+
+                    if (c is '(' or '[')
+                    {
+                        depth++;
+                    }
+                    else if (c is ')' or ']')
+                    {
+                        depth--;
+                    }
+                    else if (depth == 0 && (c is '.' or '#' || i == 0 && IsNameCharacter(c)))
+                    {
+                        var start = c is '.' or '#' ? i + 1 : i;
+                        var end = start;
+
+                        while (end < compound.Length && IsNameCharacter(compound[end]))
+                        {
+                            end++;
+                        }
+
+                        var key = compound[start..end];
+                        (c == '.' ? classes : c == '#' ? ids : null)?.Add(key);
+                        tag = c is '.' or '#' ? tag : key;
+                        i = end - 1;
+                    }
+                }
+
+                return new CompoundKeys(tag, classes, ids);
+            }
+
+            private static bool IsNameCharacter(char c) => char.IsLetterOrDigit(c) || c is '-' or '_' || c > 127;
+        }
+
+        private (List<CompoundKeys?> Compounds, bool IsShown) FindAttributeRules(string name)
+        {
+            var escaped = Regex.Escape(name);
+            var selector = new Regex(@"\[\s*(?:[^\s\]|]*\|)?" + escaped + @"\s*(?:[~|^$*]?=\s*(?:""[^""]*""|'[^']*'|[^\s\]]*)\s*[is]?\s*)?\]", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
+            var content = new Regex(@"attr\(\s*" + escaped + @"\b", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
+            var compounds = new List<CompoundKeys?>();
+            var isShown = false;
+
+            // the rules of the layout (with the user agent's), or the document's without them
+            if (_context.StyleCollection is { } styles)
+            {
+                Add(styles);
+            }
+            else
+            {
+                foreach (var sheet in _document.StyleSheets.OfType<ICssStyleSheet>())
+                {
+                    Add(sheet.Rules);
+                }
+            }
+
+            return (compounds, isShown);
+
+            void Add(IEnumerable<ICssRule> rules)
+            {
+                foreach (var rule in rules)
+                {
+                    switch (rule)
+                    {
+                        case ICssStyleRule style:
+                            if (style.SelectorText is { } text && text.Contains('['))
+                            {
+                                foreach (var compound in SiblingSelectors.SplitCompounds(text))
+                                {
+                                    var matches = selector.Matches(compound);
+
+                                    if (matches.Count > 0)
+                                    {
+                                        // in an argument (e.g. `:not([title])`) it may style any element
+                                        compounds.Add(matches.Any(match => IsInArgument(compound, match.Index)) ? null : CompoundKeys.Parse(compound));
+                                    }
+                                }
+                            }
+
+                            isShown |= style.Style?.GetPropertyValue("content") is { Length: > 0 } value && content.IsMatch(value);
+
+                            if (style.Rules is { } nested)
+                            {
+                                Add(nested);
+                            }
+
+                            break;
+                        case ICssGroupingRule group:
+                            Add(group.Rules);
+                            break;
+                        case ICssImportRule { Sheet: { } sheet }:
+                            Add(sheet.Rules);
+                            break;
+                    }
+                }
+            }
+        }
+
+        private static bool IsInArgument(string compound, int index) => compound[..index].Count(c => c == '(') > compound[..index].Count(c => c == ')');
+
         private static bool ChangesStyleSheets(IMutationRecord record)
         {
             return IsSheetOwner(record.Target as IElement) || IsSheetOwner(record.Target.Parent as IElement) ||
@@ -2458,16 +2826,21 @@ public sealed partial class HtmlRenderer
             }
         }
 
-        private static bool? TryMatches(IElement element, string selector)
+        private bool? TryMatches(IElement element, string selector)
         {
-            try
+            // parsed once instead of for every element of a root laid out again
+            if (!_parsedSelectors.TryGetValue(selector, out var parsed))
             {
-                return element.Matches(selector);
+                parsed = element.Owner?.Context.GetService<AngleSharp.Css.Parser.ICssSelectorParser>()?.ParseSelector(selector);
+                _parsedSelectors[selector] = parsed;
             }
-            catch (DomException)
+
+            if (parsed is null)
             {
                 return null;
             }
+
+            return parsed.Match(element, element);
         }
 
         // the nearest element whose layout started in the last full layout (out of the flow, not
@@ -2541,7 +2914,6 @@ public sealed partial class HtmlRenderer
 
             Forget(entry.Node);
             var styleStart = RenderMetricsRecorder.Now;
-            PrepareElementsForRendering(root.DescendantsAndSelf<IElement>());
 
             // the rules are the ones of the layout (changing them needs a full layout, see GetChangedSubtree)
             var node = _context.GetStyleCollection(root) is { } styleCollection ? window.RenderPartial(root, parent, styleCollection) : window.Render(root, parent, _renderDevice);
@@ -2655,7 +3027,8 @@ public sealed partial class HtmlRenderer
                     positionedContainingWidth: entry.PositionedContainingWidth,
                     positionedContainingHeight: positionedContainingHeight,
                     mainAxisMarginsPlaced: entry.Item is not null,
-                    crossAxisMarginsPlaced: entry.Item?.CrossMarginsPlaced ?? false);
+                    crossAxisMarginsPlaced: entry.Item?.CrossMarginsPlaced ?? false,
+                    percentageBasisWidth: entry.Item?.PercentageBasisWidth ?? float.NaN);
 
                 if (entry.Item is { } placedItem)
                 {
@@ -2784,7 +3157,7 @@ public sealed partial class HtmlRenderer
             var info = CreateFlexItemLayoutInfo(node, item.IsRowDirection, flex.RelativeTo, flex.HeightRelativeTo, entry.TextStyle, _context, flex.DeferringAlignItems, resolvesMinimum: !flex.Info.DefersMinimum);
 
             return info with { Node = null!, Style = null! } == flex.Info &&
-                (float.IsNaN(flex.EstimatedCrossSize) || EstimateFlexItemCrossSize(node, flex.FinalMainSize, item.IsRowDirection, entry.TextStyle, _context, flex.CrossAvailable) == flex.EstimatedCrossSize);
+                (float.IsNaN(flex.EstimatedCrossSize) || EstimateFlexItemCrossSize(node, flex.FinalMainSize, item.IsRowDirection, entry.TextStyle, _context, flex.CrossAvailable, flex.RelativeTo) == flex.EstimatedCrossSize);
         }
 
         private static bool HasSameBox(ElementLayoutMetrics first, ElementLayoutMetrics second) =>
@@ -3300,7 +3673,7 @@ public sealed partial class HtmlRenderer
 
         // the compounds of a selector list, split at the combinators outside of any parentheses,
         // brackets or strings; a pseudo-element is left out (it is matched by its originating element)
-        private static IEnumerable<string> SplitCompounds(string selector)
+        internal static IEnumerable<string> SplitCompounds(string selector)
         {
             var depth = 0;
             var quote = '\0';
@@ -3873,7 +4246,12 @@ public sealed partial class HtmlRenderer
                             continue;
                         }
 
-                        if (name is "is" or "where" or "matches" or "-webkit-any")
+                        // what a state changes is the same for :not() (a match turns into a mismatch): the
+                        // compounds in the state of an argument with combinators (e.g. `.a:not(.b .c:active)`),
+                        // which are of the element itself or of what is around it, as in :is()
+                        if (name is "is" or "where" or "matches" or "-webkit-any" ||
+                            name is "not" && !arguments.Contains(":has(", StringComparison.OrdinalIgnoreCase) &&
+                            SplitTopLevel(arguments).Any(argument => SplitComplex(argument.Trim()).Count > 1))
                         {
                             Analyze(arguments, pseudoClass, next, isSubject && around is not null ? around + " " + text : text, isRelational, isSubject && isOuterSubject, ref result);
                         }

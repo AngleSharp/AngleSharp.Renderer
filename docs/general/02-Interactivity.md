@@ -77,6 +77,45 @@ layouts do not record where their text comes from:
 harness.IsTextSelectionEnabled = false;
 ```
 
+## Selecting Text Headlessly
+
+No pointer is needed to select text, e.g. to highlight search hits in a screenshot or to test what a
+selection covers. Select through the DOM and render; the harness only has to exist, since a document
+without one paints no selection:
+
+```cs
+var device = new DefaultRenderDevice { ViewPortWidth = 400, ViewPortHeight = 200 };
+var context = BrowsingContext.New(Configuration.Default.WithCss().WithRenderDevice(device));
+var document = await context.OpenAsync(request => request.Content("<p id='intro'>Hello World</p>"));
+var harness = document.Context.GetDomHarness();
+
+var text = document.GetElementById("intro")!.FirstChild!;
+var selection = document.GetSelection();
+selection.SetBaseAndExtent(text, 6, text, 11);    // "World"
+
+var image = document.RenderToPng();               // with the highlight
+```
+
+Any way of the Selection API selects: `SelectAllChildren(element)`, `Collapse`/`Extend`, or
+`AddRange` with a range from `document.CreateRange()`. `RemoveAllRanges()` takes the highlight away
+again.
+
+`selection.ToString()` and `harness.SelectedText` are the selected text as it is shown (collapsed
+white space, `text-transform`, line breaks between blocks), i.e., what a browser copies to the
+clipboard. Without a harness, `ToString()` is the text of the selected nodes.
+
+Where it is comes from the range: `selection.GetRangeAt(0).GetClientRects()` gives a rectangle per
+line box, and `GetBoundingClientRect()` the one around them, both in viewport coordinates.
+
+The pointer gestures above work headlessly too, at coordinates of your choosing. For example, a
+double click selects the word under the point:
+
+```cs
+harness.BeginTextSelection(30, 15, clickCount: 2);
+harness.EndTextSelection();
+var word = harness.SelectedText;
+```
+
 ## Frames and Their Metrics
 
 An interactive host lays out a frame with `PrepareFrame()` and rasterizes it on any thread, as it

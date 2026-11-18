@@ -244,6 +244,56 @@ public sealed class IncrementalLayoutTests
         Assert.Equal(expected.HitTestMap.HitTest(330, 250)?.Element, patched.HitTestMap.HitTest(330, 250)?.Element);
     }
 
+    private const string SvgPage = """
+        <html>
+          <head><style>html, body { margin: 0; padding: 0; }</style></head>
+          <body>
+            <p style="margin: 0; height: 20px">Before</p>
+            <svg id="svg" width="100" height="100"><g id="layer"><rect id="shape" width="100" height="100" fill="rgb(255, 0, 0)"/></g></svg>
+            <p style="margin: 0">After</p>
+          </body>
+        </html>
+        """;
+
+    [Fact]
+    public async Task ChangesInsideAnInlineSvgPaintItAgainWithoutALayout()
+    {
+        // found on smapiot.com: a Lottie animation changes the transforms of its layers in every frame
+        var (document, harness) = await ParseAsync(SvgPage);
+        harness.PrepareFrame();
+
+        document.GetElementById("shape")!.SetAttribute("fill", "rgb(0, 128, 0)");
+        document.GetElementById("layer")!.SetAttribute("transform", "translate(0, 0)");
+        _ = document.GetElementById("svg")!.GetBoundingClientRect();
+
+        var patched = harness.UpdateFrame();
+        Assert.NotNull(patched);
+        Assert.True(patched!.Metrics.IsIncremental);
+        var expected = harness.PrepareFrame();
+
+        var patchedPixels = patched.Rasterize();
+        var expectedPixels = expected.Rasterize();
+        Assert.Equal(GetPixel(expectedPixels, 50, 70), GetPixel(patchedPixels, 50, 70));
+        Assert.Equal((0, 128, 0), GetPixel(patchedPixels, 50, 70));
+    }
+
+    [Fact]
+    public async Task AChangedSizeOfAnInlineSvgNeedsALayout()
+    {
+        var (document, harness) = await ParseAsync(SvgPage);
+        harness.PrepareFrame();
+
+        document.GetElementById("svg")!.SetAttribute("width", "200");
+
+        Assert.Null(harness.UpdateFrame());
+    }
+
+    private static (int R, int G, int B) GetPixel(AngleSharp.Renderer.Rendering.RenderedPixels pixels, int x, int y)
+    {
+        var offset = ((y * pixels.Width) + x) * 4;
+        return (pixels.Data[offset], pixels.Data[offset + 1], pixels.Data[offset + 2]);
+    }
+
     [Theory]
     [InlineData(false)]
     [InlineData(true)]

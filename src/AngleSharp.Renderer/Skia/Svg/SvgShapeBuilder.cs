@@ -36,11 +36,11 @@ internal static class SvgShapeBuilder
         var ry = ReadOptionalY(element, "ry", viewport) ?? rx;
         rx ??= ry;
 
-        var path = new SKPath();
+        using var path = new SKPathBuilder();
 
         if (width <= 0f || height <= 0f)
         {
-            return path;
+            return path.Detach();
         }
 
         if (rx is > 0f && ry is > 0f)
@@ -52,7 +52,7 @@ internal static class SvgShapeBuilder
             path.AddRect(new SKRect(x, y, x + width, y + height));
         }
 
-        return path;
+        return path.Detach();
     }
 
     public static SKPath BuildCircle(IElement element, SvgViewport viewport)
@@ -61,14 +61,14 @@ internal static class SvgShapeBuilder
         var cy = ReadY(element, "cy", viewport);
         var r = SvgLength.Parse(element.GetAttribute("r"), viewport.DiagonalReference, 0f);
 
-        var path = new SKPath();
+        using var path = new SKPathBuilder();
 
         if (r > 0f)
         {
             path.AddCircle(cx, cy, r);
         }
 
-        return path;
+        return path.Detach();
     }
 
     public static SKPath BuildEllipse(IElement element, SvgViewport viewport)
@@ -78,32 +78,32 @@ internal static class SvgShapeBuilder
         var rx = ReadX(element, "rx", viewport);
         var ry = ReadY(element, "ry", viewport);
 
-        var path = new SKPath();
+        using var path = new SKPathBuilder();
 
         if (rx > 0f && ry > 0f)
         {
             path.AddOval(new SKRect(cx - rx, cy - ry, cx + rx, cy + ry));
         }
 
-        return path;
+        return path.Detach();
     }
 
     public static SKPath BuildLine(IElement element, SvgViewport viewport)
     {
-        var path = new SKPath();
+        using var path = new SKPathBuilder();
         path.MoveTo(ReadX(element, "x1", viewport), ReadY(element, "y1", viewport));
         path.LineTo(ReadX(element, "x2", viewport), ReadY(element, "y2", viewport));
-        return path;
+        return path.Detach();
     }
 
     private static SKPath BuildPoly(IElement element, bool close)
     {
-        var path = new SKPath();
+        using var path = new SKPathBuilder();
         var points = ParsePoints(element.GetAttribute("points"));
 
         if (points.Count == 0)
         {
-            return path;
+            return path.Detach();
         }
 
         path.MoveTo(points[0]);
@@ -118,7 +118,7 @@ internal static class SvgShapeBuilder
             path.Close();
         }
 
-        return path;
+        return path.Detach();
     }
 
     private static List<SKPoint> ParsePoints(string? value)

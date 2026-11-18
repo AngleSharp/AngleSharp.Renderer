@@ -2791,7 +2791,8 @@ public sealed partial class HtmlRenderer
         bool IsAtomicInline,
         bool IsFlexOrGridItem,
         float MaxY,
-        bool IsHeightOnly);
+        bool IsHeightOnly,
+        float PercentageBasisWidth);
 
     private readonly record struct TrialLayoutResult(
         ElementLayoutMetrics? Metrics,
@@ -2830,6 +2831,7 @@ public sealed partial class HtmlRenderer
         bool isFlexOrGridItem,
         float maxY,
         bool isHeightOnly,
+        float percentageBasisWidth,
         out bool found)
     {
         found = false;
@@ -2840,7 +2842,7 @@ public sealed partial class HtmlRenderer
         }
 
         var key = new TrialLayoutKey(GetOrCreateStyleMap(context, element.Ref, element.ComputedStyle), containingWidth, inheritedStyle,
-            forcedBorderBoxWidth, isAtomicInline, isFlexOrGridItem, maxY, isHeightOnly);
+            forcedBorderBoxWidth, isAtomicInline, isFlexOrGridItem, maxY, isHeightOnly, percentageBasisWidth);
 
         for (var entry = context.TrialLayouts.GetValueOrDefault(element.Ref); entry is not null; entry = entry.Next)
         {
@@ -2870,13 +2872,14 @@ public sealed partial class HtmlRenderer
         bool isAtomicInline,
         bool isFlexOrGridItem = false,
         float maxY = float.MaxValue,
-        bool isHeightOnly = false)
+        bool isHeightOnly = false,
+        float percentageBasisWidth = float.NaN)
     {
         // A trial is laid out on its own (at the origin, with floats, positioned and sticky boxes
         // of its own), so the same inputs give the same result within a render. Without reusing
         // it, nested trials (cells of nested tables, nested inline-blocks) lay out every level
         // again for each level above it (see FindTrialLayout).
-        var entry = FindTrialLayout(element, containingWidth, inheritedStyle, context, forcedBorderBoxWidth, isAtomicInline, isFlexOrGridItem, maxY, isHeightOnly, out var found);
+        var entry = FindTrialLayout(element, containingWidth, inheritedStyle, context, forcedBorderBoxWidth, isAtomicInline, isFlexOrGridItem, maxY, isHeightOnly, percentageBasisWidth, out var found);
 
         if (found)
         {
@@ -2940,7 +2943,8 @@ public sealed partial class HtmlRenderer
                 maxY: maxY,
                 forcedBorderBoxWidth: forcedBorderBoxWidth,
                 isAtomicInline: isAtomicInline,
-                isFlexItem: isFlexOrGridItem);
+                isFlexItem: isFlexOrGridItem,
+                percentageBasisWidth: percentageBasisWidth);
 
             var snapshot = capture.Snapshot();
             var result = new TrialLayoutResult(snapshot.TryGetValue(element.Ref, out var metrics) ? metrics : null, capture.LastBaselineY, capture.FirstBaselineY, snapshot, capture.AutoContentHeights.TryGetValue(element.Ref, out var autoHeight) ? autoHeight : null);
@@ -3224,6 +3228,11 @@ public sealed partial class HtmlRenderer
         if (!float.IsNaN(authored))
         {
             content = new IntrinsicWidths(authored, authored);
+        }
+        else if (HasRatioOnly(element.Ref) && IsReplacedElement(element.Ref))
+        {
+            // its width is the one of its containing block, which is the size being computed
+            content = new IntrinsicWidths(0f, 0f);
         }
         else if (TryResolveReplacedContentWidth(element, WithoutPercentageWidths(styleMap), percentageBase, out var replacedWidth))
         {

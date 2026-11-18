@@ -300,6 +300,8 @@ public sealed class BrowserIntegrationTests
     {
         public ManualResetEventSlim Gate { get; } = new(false);
 
+        public ManualResetEventSlim CopyStarted { get; } = new(false);
+
         public override bool SupportsProtocol(string protocol) => true;
 
         protected override Task<IResponse?> PerformRequestAsync(Request request, CancellationToken cancel) =>
@@ -308,11 +310,24 @@ public sealed class BrowserIntegrationTests
                 Address = request.Address,
                 StatusCode = HttpStatusCode.OK,
                 Headers = new Dictionary<string, string> { ["Content-Type"] = "image/png" },
-                Content = new GatedStream(png, Gate),
+                Content = new GatedStream(png, Gate, CopyStarted),
             });
 
-        private sealed class GatedStream(byte[] data, ManualResetEventSlim gate) : MemoryStream(data)
+        private sealed class GatedStream(byte[] data, ManualResetEventSlim gate, ManualResetEventSlim copyStarted) : MemoryStream(data)
         {
+            public override void CopyTo(Stream destination, int bufferSize)
+            {
+                gate.Wait();
+                base.CopyTo(destination, bufferSize);
+            }
+
+            public override async Task CopyToAsync(Stream destination, int bufferSize, CancellationToken cancellationToken)
+            {
+                copyStarted.Set();
+                await Task.Run(() => gate.Wait(cancellationToken), cancellationToken);
+                await base.CopyToAsync(destination, bufferSize, cancellationToken);
+            }
+
             public override int Read(byte[] buffer, int offset, int count)
             {
                 gate.Wait();
@@ -360,6 +375,7 @@ public sealed class BrowserIntegrationTests
         document.Body!.AppendChild(image);
         var download = ((ILoadableElement)image).CurrentDownload!;
         await download.Task.WaitAsync(TimeSpan.FromSeconds(10));
+        Assert.True(await Task.Run(() => requester.CopyStarted.Wait(TimeSpan.FromSeconds(10))));
 
         // the image service waits for the body now; the frame must not read it
         await Task.Run(() => Render(document)).WaitAsync(TimeSpan.FromSeconds(10));
@@ -729,5 +745,98 @@ public sealed class BrowserIntegrationTests
         Assert.Equal(SKColors.White, rendered.GetPixel(5, 20));
         Assert.Equal(SKColors.Red, rendered.GetPixel(20, 20));
         Assert.Equal(SKColors.White, rendered.GetPixel(35, 20));
+    }
+
+    [Theory]
+    [InlineData("display: flex; flex-direction: column")]
+    [InlineData("display: flex")]
+    [InlineData("display: grid")]
+    public async Task FlexAndGridItemsTakePercentagesFromTheirContainer(string container)
+    {
+        // found on anglesharp.github.io: a full-bleed banner (left: 50%; margin-left: -50vw) in a
+        // column flex container kept a margin, as 50% was taken of the item's own width
+        var document = await LoadAsync($"<style>body {{ margin: 0 }}</style><div style='width: 600px; {container}'><div id=i style='position: relative; left: 50%; width: 200px; padding-left: 10%; height: 20px'></div></div>");
+
+        var rect = document.GetElementById("i")!.GetBoundingClientRect();
+
+        Assert.Equal(300d, rect.Left, 1);
+        Assert.Equal(260d, rect.Width, 1);
+    }
+
+    [Fact]
+    public async Task InheritedTextPropertiesAndStaticInsetsNeedNoLayout()
+    {
+        // found on smapiot.com: jQuery reading font-size or visibility laid the page out each time
+        var document = await LoadAsync("<style>body { margin: 0; font-size: 20px }</style><div id=d>x</div>");
+        var element = document.GetElementById("d")!;
+        _ = element.GetBoundingClientRect();
+        var style = document.CreateElement("style");
+        style.TextContent = "div { padding: 5px }";
+        document.Head!.AppendChild(style);
+
+        var computed = document.DefaultView!.GetComputedStyleOfScript(element);
+
+        Assert.Equal("20px", computed.GetPropertyValue("font-size"));
+        Assert.Equal("visible", computed.GetPropertyValue("visibility"));
+        Assert.Equal("auto", computed.GetPropertyValue("top"));
+        var harness = document.Context.GetDomHarness();
+        var metrics = harness!.GetType().GetField("_metrics", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)!.GetValue(harness);
+        Assert.Null(metrics);
+        // a size still needs the layout
+        Assert.Equal("5px", computed.GetPropertyValue("padding-left"));
+        Assert.NotNull(harness.GetType().GetField("_metrics", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)!.GetValue(harness));
+    }
+
+    [Fact]
+    public async Task RenderingLeavesTheStyleAttributeAsItIs()
+    {
+        // the transform was moved out of it once, which scripts reading el.style.transform saw
+        var document = await LoadAsync("<style>body { margin: 0 }</style><div id=d style='transform: translateX(10px); width: 50px; height: 10px'></div>");
+        var element = document.GetElementById("d")!;
+
+        Assert.NotEmpty(Render(document));
+
+        Assert.Equal("transform: translateX(10px); width: 50px; height: 10px", element.GetAttribute("style"));
+        Assert.Null(element.GetAttribute("data-render-transform"));
+        Assert.Equal(10d, element.GetBoundingClientRect().Left, 1);
+    }
+
+    private static SKBitmap RenderBitmap(IDocument document) => SKBitmap.Decode(Render(document));
+
+    [Fact]
+    public async Task FilteredBoxesOutsideOfTheViewportPaintNothingIntoIt()
+    {
+        const string Visible = "<div style='width: 100px; height: 100px; background: rgb(0, 0, 255)'></div>";
+        var plain = await LoadAsync($"<style>body {{ margin: 0 }}</style>{Visible}");
+        var filtered = await LoadAsync($"<style>body {{ margin: 0 }}</style>{Visible}<div style='margin-top: 1500px; width: 300px; height: 300px; background: rgb(0, 128, 0); filter: blur(20px)'></div>");
+
+        Assert.Equal(Render(plain), Render(filtered));
+    }
+
+    [Fact]
+    public async Task ABlurReachingIntoTheViewportIsPainted()
+    {
+        // the box is just below the viewport (600px), its blur reaches up into it
+        var document = await LoadAsync("<style>body { margin: 0 }</style><div style='margin-top: 610px; width: 300px; height: 300px; background: rgb(0, 128, 0); filter: blur(20px)'></div>");
+        using var bitmap = RenderBitmap(document);
+
+        // white tinted by the green of the blur, but not far above it
+        Assert.True(bitmap.GetPixel(150, 598).Red < 250);
+        Assert.Equal(SKColors.White, bitmap.GetPixel(150, 400));
+    }
+
+    [Fact]
+    public async Task ALargeImageDrawnSmallerAndRotatedIsPainted()
+    {
+        using var source = new SKBitmap(400, 400);
+        source.Erase(new SKColor(0, 128, 0));
+        using var encoded = SKImage.FromBitmap(source).Encode(SKEncodedImageFormat.Png, 100);
+        var url = "data:image/png;base64," + Convert.ToBase64String(encoded.ToArray());
+        var document = await LoadAsync($"<style>body {{ margin: 0 }}</style><img src='{url}' style='display: block; margin: 50px; width: 100px; height: 100px; transform: rotate(30deg)'>");
+        using var bitmap = RenderBitmap(document);
+
+        var center = bitmap.GetPixel(100, 100);
+        Assert.InRange(center.Green, 120, 136);
+        Assert.Equal(0, center.Red);
     }
 }

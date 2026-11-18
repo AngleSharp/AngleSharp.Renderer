@@ -31,10 +31,10 @@
   <ItemGroup>
     <PackageReference Include="AngleSharp" Version="[$(AngleSharpVersion),2.0.0)" />
     <PackageReference Include="AngleSharp.Css" Version="[$(AngleSharpCssVersion),2.0.0)" />
-    <PackageReference Include="SkiaSharp" Version="2.88.9" />
-    <PackageReference Include="SkiaSharp.NativeAssets.Linux.NoDependencies" Version="2.88.9" />
-    <PackageReference Include="SkiaSharp.HarfBuzz" Version="2.88.9" />
-    <PackageReference Include="HarfBuzzSharp.NativeAssets.Linux" Version="7.3.0.3" />
+    <PackageReference Include="SkiaSharp" Version="4.156.1" />
+    <PackageReference Include="SkiaSharp.NativeAssets.Linux.NoDependencies" Version="4.156.1" />
+    <PackageReference Include="SkiaSharp.HarfBuzz" Version="4.156.1" />
+    <PackageReference Include="HarfBuzzSharp.NativeAssets.Linux" Version="14.4.0.101" />
   </ItemGroup>
 
   <ItemGroup>

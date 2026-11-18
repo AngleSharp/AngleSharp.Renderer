@@ -1,6 +1,7 @@
 using AngleSharp.Css.Dom;
 using AngleSharp.Dom;
 using System.Linq;
+using System.Runtime.CompilerServices;
 
 namespace AngleSharp.Renderer;
 
@@ -48,6 +49,10 @@ internal sealed class CssTransitionTracker
     private readonly HashSet<IElement> _observedElements = new(ReferenceEqualityComparer.Instance);
     private List<CssTransitionEventRecord> _pendingEvents = [];
     private double _clockMs;
+
+    // a layout creates the pseudo-elements anew, so the first one of a host and name stands for
+    // all of them (as in CssAnimationTracker)
+    private readonly ConditionalWeakTable<IElement, Dictionary<string, IElement>> _pseudoElements = [];
 
     // Properties that are transitioned by `all` as well, without being interpolated here: their
     // transitions have the events (a page waiting for transitionend of a max-height), while the
@@ -141,7 +146,7 @@ internal sealed class CssTransitionTracker
     /// Gets if the property of the element transitions, i.e. has a run that has not ended.
     /// </summary>
     public bool IsTransitioning(IElement element, string property) =>
-        _activeRuns.TryGetValue((element, property), out var run) && _clockMs - run.StartMs - run.Spec.DelayMs < run.Spec.DurationMs;
+        _activeRuns.TryGetValue((GetStableElement(element), property), out var run) && _clockMs - run.StartMs - run.Spec.DelayMs < run.Spec.DurationMs;
 
     public bool HasRunningTransitions
     {
@@ -168,6 +173,7 @@ internal sealed class CssTransitionTracker
     /// </summary>
     public string? GetTransitioningValue(IElement element, string property)
     {
+        element = GetStableElement(element);
         var key = (element, property);
 
         if (!_activeRuns.TryGetValue(key, out var run) || run.IsEventOnly)
@@ -324,6 +330,7 @@ internal sealed class CssTransitionTracker
     /// </summary>
     public void Observe(IElement element, ICssStyleDeclaration style, ICssStyleDeclaration? previousStyle, string? authoredTransform)
     {
+        element = GetStableElement(element);
         _observedElements.Add(element);
 
         foreach (var (property, spec) in ParseTransitionSpecs(style, withEventOnlyProperties: true))
@@ -348,10 +355,13 @@ internal sealed class CssTransitionTracker
                 continue;
             }
 
-            // a transform is read from the cascade of the element as it is now (see ReadNaturalValue)
+            // a transform is read from the cascade of the element as it is now (see ReadNaturalValue),
+            // so the one before is the computed value of the last frame (e.g. a slider setting its
+            // transform while it had no transition yet, then the duration with the next one)
             var before = _lastKnownValues.TryGetValue(key, out var last) ? last
-                : previousStyle is not null && !property.Equals("transform", StringComparison.OrdinalIgnoreCase) ? ReadValue(previousStyle, property, isInterpolated, kind, element)
-                : null;
+                : previousStyle is null ? null
+                : property.Equals("transform", StringComparison.OrdinalIgnoreCase) ? CssValueInterpolation.ReadNaturalTransform(previousStyle.GetPropertyValue("transform"))
+                : ReadValue(previousStyle, property, isInterpolated, kind, element);
             _lastKnownValues[key] = naturalValue;
 
             if (before is null || AreEquivalent(isInterpolated, kind, before, naturalValue))
@@ -375,7 +385,7 @@ internal sealed class CssTransitionTracker
         {
             foreach (var (key, run) in _activeRuns.ToArray())
             {
-                if (!key.Element.IsConnected())
+                if (!IsConnected(key.Element))
                 {
                     _activeRuns.Remove(key);
                     continue;
@@ -401,6 +411,35 @@ internal sealed class CssTransitionTracker
         _pendingEvents = [];
         return events;
     }
+
+    /// <summary>
+    /// The pseudo-element standing for all of the same host and name, or the element itself.
+    /// </summary>
+    private IElement GetStableElement(IElement element)
+    {
+        if (element is not IPseudoElement pseudo || CssAnimationTracker.GetHost(pseudo) is not { } host)
+        {
+            return element;
+        }
+
+        var byName = _pseudoElements.GetOrCreateValue(host);
+
+        if (!byName.TryGetValue(pseudo.PseudoName, out var stable))
+        {
+            byName[pseudo.PseudoName] = stable = pseudo;
+        }
+
+        return stable;
+    }
+
+    /// <summary>
+    /// The element that gets the events of the transitions of the given one: a pseudo-element's
+    /// go to its host (with the name of the pseudo-element in a browser).
+    /// </summary>
+    internal static IElement? GetEventTarget(IElement element) =>
+        element is IPseudoElement pseudo ? CssAnimationTracker.GetHost(pseudo) : element;
+
+    private static bool IsConnected(IElement element) => GetEventTarget(element)?.IsConnected() == true;
 
     private bool IsOver(CssTransitionRun run) => _clockMs - run.StartMs - run.Spec.DelayMs >= run.Spec.DurationMs;
 

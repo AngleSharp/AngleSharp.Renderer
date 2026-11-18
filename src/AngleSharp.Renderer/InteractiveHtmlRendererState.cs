@@ -619,7 +619,16 @@ internal sealed partial class InteractiveHtmlRendererState : IDomHarness
     /// Gets the layout of the given document (see <see cref="GetLayoutMetrics"/>), which also
     /// maps its boxes into the viewport.
     /// </summary>
-    internal HtmlRenderer.LayoutSnapshot GetLayoutSnapshot(IDocument document)
+    internal HtmlRenderer.LayoutSnapshot GetLayoutSnapshot(IDocument document) => GetLayoutSnapshot(document, canLayOut: true)!;
+
+    /// <summary>
+    /// Gets the layout of the given document if it is there without laying the document out
+    /// (patched by what changed since, if that can be done), e.g. for values a layout knows but
+    /// does not have to find, such as the inherited font of an element.
+    /// </summary>
+    internal HtmlRenderer.LayoutSnapshot? TryGetCurrentLayoutSnapshot(IDocument document) => GetLayoutSnapshot(document, canLayOut: false);
+
+    private HtmlRenderer.LayoutSnapshot? GetLayoutSnapshot(IDocument document, bool canLayOut)
     {
         ArgumentNullException.ThrowIfNull(document);
 
@@ -640,6 +649,17 @@ internal sealed partial class InteractiveHtmlRendererState : IDomHarness
             metrics = null;
         }
 
+        if ((metrics is null || _metricsViewport != viewport) && !canLayOut)
+        {
+            // a layout that could not be patched is not taken again (it may be patched halfway)
+            if (metrics is null)
+            {
+                _metrics = null;
+            }
+
+            return null;
+        }
+
         if (metrics is null || _metricsViewport != viewport)
         {
             // a document shown in frames is laid out as the next frame, which that frame then is
@@ -648,7 +668,7 @@ internal sealed partial class InteractiveHtmlRendererState : IDomHarness
             _metricsViewport = viewport;
         }
 
-        // the changes the layout made itself (see PrepareDocumentForRendering) are in already
+        // what changed before the layout is in it already
         _metricsObserver.Flush();
         _pendingMutations.Clear();
         _pendingRestyles.Clear();

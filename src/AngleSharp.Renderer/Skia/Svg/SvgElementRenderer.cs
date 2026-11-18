@@ -47,6 +47,13 @@ internal static class SvgElementRenderer
             return;
         }
 
+        // an element not displayed renders nothing, nor do its descendants (e.g. the layers of a
+        // Lottie animation that are not in at the current frame)
+        if (string.Equals(SvgPaintState.ReadProperty(element, context, "display"), "none", StringComparison.OrdinalIgnoreCase))
+        {
+            return;
+        }
+
         var state = inheritedState.Resolve(element, context, viewport);
         var transform = SvgTransformParser.Parse(element.GetAttribute("transform"));
         var hasTransform = !transform.IsIdentity;
@@ -63,7 +70,7 @@ internal static class SvgElementRenderer
 
         if (hasTransform)
         {
-            canvas.Concat(ref transform);
+            canvas.Concat(in transform);
         }
 
         if (clipPathElement is not null)
@@ -109,7 +116,10 @@ internal static class SvgElementRenderer
         ApplyMaskRegionClip(canvas, maskElement, element, viewport, context);
         RenderElementContent(canvas, element, tagName, state, context, viewport);
 
-        using (var maskPaint = new SKPaint { ColorFilter = SKColorFilter.CreateLumaColor(), BlendMode = SKBlendMode.DstIn })
+        // a mask's luminance is its coverage, unless it says its alpha is (mask-type: alpha)
+        var isAlphaMask = string.Equals(SvgPaintState.ReadProperty(maskElement, context, "mask-type"), "alpha", StringComparison.OrdinalIgnoreCase);
+
+        using (var maskPaint = new SKPaint { ColorFilter = isAlphaMask ? null : SKColorFilter.CreateLumaColor(), BlendMode = SKBlendMode.DstIn })
         {
             canvas.SaveLayer(maskPaint);
 
@@ -130,6 +140,104 @@ internal static class SvgElementRenderer
         }
 
         canvas.RestoreToCount(contentLayerCount);
+    }
+
+    /// <summary>
+    /// Paints an <c>image</c> element whose <c>href</c> is a <c>data:</c> URL (e.g. the bitmaps a
+    /// Lottie animation is made of), or one the page loaded (see <see cref="LoadedImages"/>), into
+    /// its viewport (<c>x</c>, <c>y</c>, <c>width</c>, <c>height</c>), fitted per
+    /// <c>preserveAspectRatio</c>; other images are not painted.
+    /// </summary>
+    private static void RenderImage(SKCanvas canvas, IElement element, SvgPaintState state, SvgRenderContext context, SvgViewport viewport)
+    {
+        if (string.Equals(SvgPaintState.ReadProperty(element, context, "visibility"), "hidden", StringComparison.OrdinalIgnoreCase) ||
+            (element.GetAttribute("href") ?? element.GetAttribute("xlink:href")) is not { } href ||
+            (DecodedImages.Get(href) ?? LoadedImages.Get(element)) is not { } image)
+        {
+            return;
+        }
+
+        var x = SvgShapeBuilder.ReadX(element, "x", viewport);
+        var y = SvgShapeBuilder.ReadY(element, "y", viewport);
+        // an auto size is the image's own
+        var width = SvgLength.Parse(element.GetAttribute("width"), viewport.Width, image.Width);
+        var height = SvgLength.Parse(element.GetAttribute("height"), viewport.Height, image.Height);
+
+        if (width <= 0f || height <= 0f || state.Opacity <= 0f)
+        {
+            return;
+        }
+
+        var (align, meet) = SvgViewBoxMapping.ParsePreserveAspectRatio(element.GetAttribute("preserveAspectRatio"));
+        var fit = SvgViewBoxMapping.ComputeMatrix((0f, 0f, image.Width, image.Height), width, height, align, meet);
+        var destination = fit.MapRect(SKRect.Create(0f, 0f, image.Width, image.Height));
+        destination.Offset(x, y);
+        // drawn smaller, from a copy scaled down once (see SkiaRenderBackend.GetScaledDown)
+        var scaled = SkiaRenderBackend.GetScaledDown(image, destination, canvas.TotalMatrix);
+        var sampling = scaled is not null
+            ? new SKSamplingOptions(SKFilterMode.Linear)
+            : SkiaRenderBackend.GetImageSamplingOptions(image, destination, canvas.TotalMatrix);
+        using var paint = new SKPaint { IsAntialias = true, Color = SKColors.Black.WithAlpha((byte)Math.Round(255f * Math.Clamp(state.Opacity, 0f, 1f))) };
+
+        canvas.Save();
+        // what slices the viewport is cut off
+        canvas.ClipRect(SKRect.Create(x, y, width, height));
+        canvas.DrawImage(scaled ?? image, destination, sampling, paint);
+        canvas.Restore();
+    }
+
+    /// <summary>
+    /// The images of <c>data:</c> URLs decoded once: an animation renders the same ones in every
+    /// frame. The cache follows the URL strings (the attribute values), so it goes with them.
+    /// </summary>
+    private static class DecodedImages
+    {
+        private static readonly System.Runtime.CompilerServices.ConditionalWeakTable<string, Holder> Images = new();
+
+        public static SKImage? Get(string href) => Images.GetValue(href, static key => new Holder(Decode(key))).Image;
+
+        private static SKImage? Decode(string href)
+        {
+            var value = href.Trim();
+            var comma = value.IndexOf(',');
+
+            if (!value.StartsWith("data:", StringComparison.OrdinalIgnoreCase) || comma < 0)
+            {
+                return null;
+            }
+
+            try
+            {
+                var data = value[..comma].EndsWith(";base64", StringComparison.OrdinalIgnoreCase)
+                    ? Convert.FromBase64String(value[(comma + 1)..])
+                    : System.Text.Encoding.UTF8.GetBytes(Uri.UnescapeDataString(value[(comma + 1)..]));
+                return SKImage.FromEncodedData(data);
+            }
+            catch (FormatException)
+            {
+                return null;
+            }
+        }
+
+        private sealed record Holder(SKImage? Image);
+    }
+
+    /// <summary>
+    /// The images of <c>image</c> elements in a page's inline SVG whose <c>href</c> is not a
+    /// <c>data:</c> URL, as the page loaded them (by the address it resolves), given before the
+    /// SVG is recorded. They are decoded once per loaded data.
+    /// </summary>
+    internal static class LoadedImages
+    {
+        private static readonly System.Runtime.CompilerServices.ConditionalWeakTable<IElement, byte[]> DataByElement = new();
+        private static readonly System.Runtime.CompilerServices.ConditionalWeakTable<byte[], Holder> Images = new();
+
+        public static void Set(IElement element, byte[] data) => DataByElement.AddOrUpdate(element, data);
+
+        public static SKImage? Get(IElement element) =>
+            DataByElement.TryGetValue(element, out var data) ? Images.GetValue(data, static key => new Holder(SKImage.FromEncodedData(key))).Image : null;
+
+        private sealed record Holder(SKImage? Image);
     }
 
     private static void ApplyMaskRegionClip(SKCanvas canvas, IElement maskElement, IElement maskedElement, SvgViewport viewport, SvgRenderContext context)
@@ -233,6 +341,10 @@ internal static class SvgElementRenderer
 
                 break;
 
+            case "image":
+                RenderImage(canvas, element, state, context, viewport);
+                break;
+
             case "text":
                 var x = SvgShapeBuilder.ReadX(element, "x", viewport);
                 var y = SvgShapeBuilder.ReadY(element, "y", viewport);
@@ -240,7 +352,7 @@ internal static class SvgElementRenderer
                 break;
 
             default:
-                // Unsupported element (image, ...): descend in case it groups further shapes, but
+                // Unsupported element: descend in case it groups further shapes, but
                 // paint nothing for the element itself.
                 foreach (var child in element.Children)
                 {
@@ -282,7 +394,7 @@ internal static class SvgElementRenderer
         var viewBox = SvgViewBoxMapping.ParseViewBox(viewportElement.GetAttribute("viewBox"));
         var (align, meet) = SvgViewBoxMapping.ParsePreserveAspectRatio(viewportElement.GetAttribute("preserveAspectRatio"));
         var viewBoxMatrix = SvgViewBoxMapping.ComputeMatrix(viewBox, width, height, align, meet);
-        canvas.Concat(ref viewBoxMatrix);
+        canvas.Concat(in viewBoxMatrix);
 
         var innerViewport = viewBox is { } box ? new SvgViewport(box.Width, box.Height) : new SvgViewport(width, height);
 
@@ -335,7 +447,7 @@ internal static class SvgElementRenderer
                     var viewBox = SvgViewBoxMapping.ParseViewBox(referenced.GetAttribute("viewBox"));
                     var (align, meet) = SvgViewBoxMapping.ParsePreserveAspectRatio(referenced.GetAttribute("preserveAspectRatio"));
                     var viewBoxMatrix = SvgViewBoxMapping.ComputeMatrix(viewBox, useWidth, useHeight, align, meet);
-                    canvas.Concat(ref viewBoxMatrix);
+                    canvas.Concat(in viewBoxMatrix);
 
                     var innerViewport = viewBox is { } box ? new SvgViewport(box.Width, box.Height) : new SvgViewport(useWidth, useHeight);
 
@@ -387,7 +499,7 @@ internal static class SvgElementRenderer
 
     private static SKPath BuildClipPath(IElement clipPathElement, SvgViewport viewport)
     {
-        var combined = new SKPath();
+        using var combined = new SKPathBuilder();
 
         foreach (var child in clipPathElement.Children)
         {
@@ -413,7 +525,7 @@ internal static class SvgElementRenderer
             }
         }
 
-        return combined;
+        return combined.Detach();
     }
 
     private static void RenderPath(SKCanvas canvas, SKPath path, SvgPaintState state, SvgRenderContext context, SvgViewport viewport, bool strokeOnly = false)
@@ -475,18 +587,13 @@ internal static class SvgElementRenderer
 
     private static void DrawTextRun(SKCanvas canvas, string text, SvgPaintState state, SvgRenderContext context, SvgViewport viewport, ref float cursorX, float y)
     {
-        using var measurePaint = new SKPaint
-        {
-            Typeface = SkiaTextShaping.CreateTypeface(state.FontFamily, SkiaTextShaping.CreateFontStyle(state.FontWeight, state.IsItalic)),
-            TextSize = state.FontSize,
-        };
-
         // Shaped like HTML text (kerning, ligatures, joining scripts, font fallback), in visual
         // order with `direction` as the paragraph direction.
         var font = new RenderFont(state.FontFamily, state.FontSize, state.FontWeight, state.IsItalic, 0f, Language: state.Language);
+        using var measurePaint = SkiaTextShaping.CreateTextPaint(font);
         var width = SkiaTextShaping.MeasureParagraph(measurePaint, text, font, state.IsRightToLeft);
-        var ascent = -measurePaint.FontMetrics.Ascent;
-        var descent = measurePaint.FontMetrics.Descent;
+        var ascent = -measurePaint.Font.Metrics.Ascent;
+        var descent = measurePaint.Font.Metrics.Descent;
         var bounds = new SKRect(cursorX, y - ascent, cursorX + width, y + descent);
 
         // `start` and `end` follow the direction: right-to-left text starts at its right edge
@@ -503,18 +610,16 @@ internal static class SvgElementRenderer
 
         if (fillPaint is not null)
         {
-            fillPaint.Typeface = measurePaint.Typeface;
-            fillPaint.TextSize = state.FontSize;
-            SkiaTextShaping.DrawParagraph(canvas, fillPaint, text, drawX, y, font, state.IsRightToLeft);
+            using var fillTextPaint = SkiaTextShaping.CreateTextPaint(font, fillPaint);
+            SkiaTextShaping.DrawParagraph(canvas, fillTextPaint, text, drawX, y, font, state.IsRightToLeft);
         }
 
         using var strokePaint = state.CreateStrokePaint(bounds, context, viewport);
 
         if (strokePaint is not null)
         {
-            strokePaint.Typeface = measurePaint.Typeface;
-            strokePaint.TextSize = state.FontSize;
-            SkiaTextShaping.DrawParagraph(canvas, strokePaint, text, drawX, y, font, state.IsRightToLeft);
+            using var strokeTextPaint = SkiaTextShaping.CreateTextPaint(font, strokePaint);
+            SkiaTextShaping.DrawParagraph(canvas, strokeTextPaint, text, drawX, y, font, state.IsRightToLeft);
         }
 
         cursorX += state.IsRightToLeft ? -width : width;

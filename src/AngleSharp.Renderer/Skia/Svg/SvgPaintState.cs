@@ -365,6 +365,15 @@ internal readonly record struct SvgPaintState(
         "font-family", "font-size", "font-weight", "font-style", "text-anchor", "color", "direction",
     ];
 
+    /// <summary>
+    /// Gets the value of a property that is not inherited and not part of the paint state (e.g.
+    /// <c>display</c> or <c>mask-type</c>), from the element's presentation attribute, the matched
+    /// rules or its <c>style</c>; null if none sets it.
+    /// </summary>
+    public static string? ReadProperty(IElement element, SvgRenderContext context, string name) =>
+        TryGetDeclaration(ReadDeclarations(element, context), name, out var value) ? value.Trim() :
+        element.GetAttribute(name) is { Length: > 0 } attribute ? attribute.Trim() : null;
+
     private static Dictionary<string, string> ReadDeclarations(IElement element, SvgRenderContext context)
     {
         var declarations = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);

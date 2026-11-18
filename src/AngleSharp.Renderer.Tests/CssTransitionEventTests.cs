@@ -199,6 +199,82 @@ public class CssTransitionEventTests
         Assert.Null(harness.GetTransitioningValue(menu, "transform"));
     }
 
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task InlineTransformSetByScript_TransitionsAndEnds(bool patched)
+    {
+        // a slider (Swiper) setting the duration and the transform of its wrapper, waiting for
+        // transitionend before it slides again
+        var (document, harness) = await OpenAsync("""
+            <style>.c { width: 300px; overflow: hidden } .w { display: flex; transition-property: transform } .s { flex-shrink: 0; width: 100px; height: 100px }</style>
+            <div class="c"><div id="w" class="w"><div class="s"></div><div class="s"></div><div class="s"></div><div class="s"></div></div></div>
+            """);
+        var wrapper = (AngleSharp.Html.Dom.IHtmlElement)document.GetElementById("w")!;
+        var events = Listen(wrapper);
+        wrapper.SetAttribute("style", "transform: translate3d(0px, 0, 0); transition-duration: 0ms");
+        harness.PrepareFrame();
+
+        wrapper.SetAttribute("style", "transform: translate3d(-110px, 0, 0); transition-duration: 500ms");
+
+        if (patched)
+        {
+            harness.UpdateFrame();
+        }
+
+        harness.AdvanceTime(TimeSpan.FromMilliseconds(100));
+        harness.PrepareFrame();
+        harness.AdvanceTime(TimeSpan.FromMilliseconds(600));
+        harness.PrepareFrame();
+
+        Assert.Equal(["transitionrun transform 0", "transitionstart transform 0", "transitionend transform 0.5"], events);
+    }
+
+    [Fact]
+    public async Task HoverChangingAPseudoElement_TransitionsIt()
+    {
+        // the skve.de link boxes: their ::before overlay shrinks and darkens on hover
+        var (document, harness) = await OpenAsync("""
+            <style>
+              .box { position: relative; width: 200px; height: 100px; z-index: 1 }
+              .box::before { content: ""; position: absolute; top: 0; right: 0; width: 100%; height: 100%; background: rgba(10, 107, 148, 0.5); z-index: -1; transition: all 1s linear }
+              .box:hover::before { background-color: #0a6b94; width: 50% }
+            </style>
+            <div id="box" class="box">Text</div>
+            """);
+        var box = document.GetElementById("box")!;
+        harness.PrepareFrame();
+
+        harness.SetHoveredElement(box);
+        var frame = harness.PrepareFrame();
+
+        Assert.True(frame.IsAnimating);
+        // at the start the overlay still covers the box, light
+        Assert.True(IsCovered(frame, 75));
+
+        harness.AdvanceTime(TimeSpan.FromMilliseconds(500));
+        frame = harness.PrepareFrame();
+
+        // halfway it is 150px wide (from the right edge), so x = 75 is still covered
+        Assert.True(frame.IsAnimating);
+        Assert.True(IsCovered(frame, 75));
+
+        harness.AdvanceTime(TimeSpan.FromMilliseconds(600));
+        frame = harness.PrepareFrame();
+
+        Assert.False(frame.IsAnimating);
+        Assert.False(IsCovered(frame, 75));
+        Assert.True(IsCovered(frame, 150));
+
+        // below the text, a pixel the overlay tints is not white
+        static bool IsCovered(AngleSharp.Renderer.Rendering.RenderedFrame frame, int x)
+        {
+            var pixels = frame.Rasterize();
+            var offset = (90 * pixels.Width + x) * 4;
+            return pixels.Data[offset] < 200;
+        }
+    }
+
     private static double Opacity(IDomHarness harness, IElement element) =>
         double.Parse(harness.GetTransitioningValue(element, "opacity")!, CultureInfo.InvariantCulture);
 

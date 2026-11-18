@@ -1,6 +1,7 @@
 namespace AngleSharp.Dom;
 
 using AngleSharp.Attributes;
+using AngleSharp.Browser;
 using AngleSharp.Dom.Events;
 using AngleSharp.Renderer;
 using AngleSharp.Renderer.Rendering;
@@ -160,7 +161,7 @@ public sealed class DocumentFontFace
                 var weight = ParseWeight(Weight);
                 var italic = Style.Contains("italic", StringComparison.OrdinalIgnoreCase) ||
                     Style.Contains("oblique", StringComparison.OrdinalIgnoreCase);
-                _renderFace = new RenderFontFace(
+                var renderFace = new RenderFontFace(
                     Family,
                     weight,
                     italic,
@@ -170,19 +171,40 @@ public sealed class DocumentFontFace
                     Stretch,
                     UnicodeRange,
                     Display);
-                _status = "loaded";
-                _loaded.TrySetResult(this);
-                DocumentFontFaceSet.TryGet(_document)?.FaceLoaded(this);
+                Settle(() =>
+                {
+                    _renderFace = renderFace;
+                    _status = "loaded";
+                    _loaded.TrySetResult(this);
+                    DocumentFontFaceSet.TryGet(_document)?.FaceLoaded(this);
+                });
             }
             catch (Exception exception)
             {
-                _status = "error";
-                _loaded.TrySetException(exception);
-                DocumentFontFaceSet.TryGet(_document)?.FaceFailed(this);
+                Settle(() =>
+                {
+                    _status = "error";
+                    _loaded.TrySetException(exception);
+                    DocumentFontFaceSet.TryGet(_document)?.FaceFailed(this);
+                });
             }
         });
 
         return _loaded.Task;
+    }
+
+    // the face (its status, its promise and the events of the set) changes in a task of the
+    // document's event loop, where scripts and layouts run, not on the thread that loaded it
+    private void Settle(Action apply)
+    {
+        if (_document.Context.GetService<IEventLoop>() is { } loop)
+        {
+            loop.Enqueue(apply, TaskPriority.Normal);
+        }
+        else
+        {
+            apply();
+        }
     }
 
     private static float ParseWeight(string weight) => weight.Trim().ToLowerInvariant() switch
@@ -238,20 +260,39 @@ public sealed class DocumentFontFaceSet : EventTarget, IEnumerable<DocumentFontF
     [DomName("ready")]
     public Task<DocumentFontFaceSet> Ready => _ready.Task;
 
-    /// <summary>Adds a loaded face to the set.</summary>
+    /// <summary>
+    /// Adds a face to the set. A face that is not loaded yet starts loading (browsers wait until
+    /// text needs it, but a face added from code is meant to be used), so <see cref="Ready"/>
+    /// settles once it is there; it renders from then on. A face that failed to load stays in the
+    /// set without rendering.
+    /// </summary>
+    /// <exception cref="DomException">The face comes from an <c>@font-face</c> rule of the document (InvalidModificationError).</exception>
     [DomName("add")]
     public DocumentFontFaceSet Add(DocumentFontFace face)
     {
         ArgumentNullException.ThrowIfNull(face);
-        if (face.Status != "loaded" || face.RenderFace is null)
+        RefreshCssFaces();
+
+        if (_cssFaces.Values.Contains(face))
         {
-            throw new DomException(DomError.InvalidState);
+            throw new DomException(DomError.InvalidModification);
         }
 
-        if (!_faces.Contains(face))
+        if (_faces.Contains(face))
         {
-            _faces.Add(face);
+            return this;
+        }
+
+        _faces.Add(face);
+
+        if (face.RenderFace is not null)
+        {
             InvalidateLayout();
+        }
+        else if (face.Status == "unloaded")
+        {
+            // the set is told when it is loaded (FaceLoaded), and lays out again then
+            _ = face.Load();
         }
 
         return this;

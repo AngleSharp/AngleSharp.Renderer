@@ -80,7 +80,6 @@ public sealed partial class SkiaRenderBackend
 
         if (vectorImage is not null)
         {
-            paint.FilterQuality = SKFilterQuality.Low;
             paint.Shader = vectorImage.CreateShader(tileWidth, tileHeight, gapX, gapY, modeX, modeY, SKMatrix.CreateTranslation(originX, originY));
             return paint;
         }
@@ -92,8 +91,8 @@ public sealed partial class SkiaRenderBackend
 
         if (image is not null)
         {
-            using var imagePaintForTile = new SKPaint { IsAntialias = true, FilterQuality = SKFilterQuality.High };
-            tileCanvas.DrawImage(image, tileRect, imagePaintForTile);
+            using var imagePaintForTile = new SKPaint { IsAntialias = true };
+            tileCanvas.DrawImage(image, tileRect, GetImageSamplingOptions(image, tileRect, SKMatrix.Identity), imagePaintForTile);
         }
         else if (content is RenderGradientPaint gradientPaint)
         {
@@ -241,7 +240,7 @@ public sealed partial class SkiaRenderBackend
         var scaleLeft = sliceLeft > 0f ? widthLeft / sliceLeft : 1f;
         var scaleRight = sliceRight > 0f ? widthRight / sliceRight : 1f;
 
-        using var paint = new SKPaint { IsAntialias = true, FilterQuality = SKFilterQuality.High };
+        using var paint = new SKPaint { IsAntialias = true };
 
         for (var row = 0; row < 3; row++)
         {
@@ -325,7 +324,7 @@ public sealed partial class SkiaRenderBackend
                 }
                 else
                 {
-                    canvas.DrawImage(image, source, tile, paint);
+                    canvas.DrawImage(image, source, tile, new SKSamplingOptions(SKCubicResampler.Mitchell), paint);
                 }
             }
         }
@@ -480,7 +479,7 @@ public sealed partial class SkiaRenderBackend
         // The clip stays in place, but the snapshot is in device pixels.
         canvas.ResetMatrix();
         using var paint = new SKPaint { ImageFilter = filter };
-        canvas.DrawImage(snapshot, bounds.Left, bounds.Top, paint);
+        canvas.DrawImage(snapshot, bounds.Left, bounds.Top, new SKSamplingOptions(SKFilterMode.Linear), paint);
         canvas.Restore();
     }
 }

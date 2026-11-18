@@ -191,6 +191,20 @@ public sealed class ElementCssomViewExtensionsTests
     }
 
     [Fact]
+    public async Task DocumentScrollHeight_IncludesTheMarginsInTheRootBox()
+    {
+        // the body's bottom margin (8px from the UA sheet) and the root's own margin are part of the page
+        var context = BrowsingContext.New(CreateConfiguration(160, 400));
+        var document = await context.OpenAsync(request => request.Content("<!doctype html><html style='margin-bottom: 4px'><body><div style='height: 1000px'></div></body></html>"));
+        var root = document.DocumentElement!;
+
+        Assert.Equal(1020, root.GetScrollHeight());
+
+        root.SetScrollTop(5000);
+        Assert.Equal(620d, root.GetScrollTop());
+    }
+
+    [Fact]
     public async Task ScrollPositions_AreMutable_AndClamped()
     {
         var document = await ParseAsync("""

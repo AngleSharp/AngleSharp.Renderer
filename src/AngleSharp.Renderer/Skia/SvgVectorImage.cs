@@ -76,8 +76,8 @@ internal sealed class SvgVectorImage
 
     /// <summary>
     /// A shader of the image scaled to a tile, with the given gaps between the tiles. Skia renders
-    /// the tile at the resolution it ends up at. A paint using the shader needs
-    /// <see cref="SKFilterQuality.Low"/>, or a tile at a fractional size or position snaps to pixels.
+    /// the tile at the resolution it ends up at, with bilinear sampling to avoid snapping at
+    /// fractional sizes or positions.
     /// </summary>
     public SKShader CreateShader(float tileWidth, float tileHeight, float gapX, float gapY, SKShaderTileMode tileModeX, SKShaderTileMode tileModeY, SKMatrix localMatrix)
     {
@@ -114,21 +114,40 @@ internal sealed class SvgVectorImage
             return;
         }
 
-        if (TryGetPlacement(canvas.TotalMatrix, destination, out var placement, out var originX, out var originY) &&
-            GetOrCreateRaster(placement) is { } raster)
+        if (TryGetPlacement(canvas.TotalMatrix, destination, out var placement, out var originX, out var originY))
         {
-            canvas.Save();
-            canvas.SetMatrix(SKMatrix.Identity);
-            canvas.DrawImage(raster, originX, originY);
-            canvas.Restore();
-            return;
+            // an SVG whose content changes all the time (e.g. a Lottie animation) is a new image
+            // in every frame, whose raster would be drawn once
+            if (IsChanging)
+            {
+                var first = canvas.Save();
+                canvas.SetMatrix(SKMatrix.Identity);
+                canvas.Translate(originX + (placement.OffsetX / PlacementUnitsPerPixel), originY + (placement.OffsetY / PlacementUnitsPerPixel));
+                var placedWidth = placement.Width / PlacementUnitsPerPixel;
+                var placedHeight = placement.Height / PlacementUnitsPerPixel;
+                canvas.ClipRect(new SKRect(0f, 0f, placedWidth, placedHeight), antialias: true);
+                var placedMapping = MapInto(placedWidth, placedHeight);
+                canvas.Concat(in placedMapping);
+                canvas.DrawPicture(Picture);
+                canvas.RestoreToCount(first);
+                return;
+            }
+
+            if (GetOrCreateRaster(placement) is { } raster)
+            {
+                canvas.Save();
+                canvas.SetMatrix(SKMatrix.Identity);
+                canvas.DrawImage(raster, originX, originY, new SKSamplingOptions(SKFilterMode.Linear));
+                canvas.Restore();
+                return;
+            }
         }
 
         var count = canvas.Save();
         canvas.ClipRect(destination, antialias: true);
         canvas.Translate(destination.Left, destination.Top);
         var mapping = MapInto(destination.Width, destination.Height);
-        canvas.Concat(ref mapping);
+        canvas.Concat(in mapping);
         canvas.DrawPicture(Picture);
         canvas.RestoreToCount(count);
     }
@@ -203,6 +222,12 @@ internal sealed class SvgVectorImage
         return (long)placement.PixelWidth * placement.PixelHeight <= MaxCachedRasterPixels;
     }
 
+    /// <summary>
+    /// Gets or sets if the image is of an SVG whose content was changed since the page was laid
+    /// out (see LayoutSnapshot.TryApplySvgRepaints): its picture is drawn instead of a raster.
+    /// </summary>
+    internal bool IsChanging { get; set; }
+
     private SKImage? GetOrCreateRaster(RasterPlacement placement)
     {
         SKImage? raster;
@@ -276,7 +301,7 @@ internal sealed class SvgVectorImage
         var height = placement.Height / PlacementUnitsPerPixel;
         canvas.ClipRect(new SKRect(0f, 0f, width, height), antialias: true);
         var mapping = MapInto(width, height);
-        canvas.Concat(ref mapping);
+        canvas.Concat(in mapping);
         canvas.DrawPicture(Picture);
         canvas.Flush();
         return surface.Snapshot();
@@ -289,10 +314,10 @@ internal sealed class SvgVectorImage
         var canvas = recorder.BeginRecording(cell);
         canvas.ClipRect(new SKRect(0f, 0f, shape.Width, shape.Height));
         var mapping = MapInto(shape.Width, shape.Height);
-        canvas.Concat(ref mapping);
+        canvas.Concat(in mapping);
         canvas.DrawPicture(Picture);
         using var picture = recorder.EndRecording();
-        return picture.ToShader(shape.ModeX, shape.ModeY, cell);
+        return SKShader.CreatePicture(picture, shape.ModeX, shape.ModeY, SKFilterMode.Linear, cell);
     }
 
     private byte[] EncodePng()

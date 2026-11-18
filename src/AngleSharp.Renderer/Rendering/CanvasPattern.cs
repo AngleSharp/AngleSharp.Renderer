@@ -34,10 +34,10 @@ public sealed class CanvasPattern
         Persp2 = 1f,
     };
 
-    internal SKShader CreateShader(SKMatrix localMatrix)
+    internal SKShader CreateShader(SKMatrix localMatrix, SKSamplingOptions sampling)
     {
         var tileX = _repetition is "repeat" or "repeat-x" ? SKShaderTileMode.Repeat : SKShaderTileMode.Decal;
         var tileY = _repetition is "repeat" or "repeat-y" ? SKShaderTileMode.Repeat : SKShaderTileMode.Decal;
-        return SKShader.CreateImage(Image, tileX, tileY, SKMatrix.Concat(localMatrix, _transform));
+        return SKShader.CreateImage(Image, tileX, tileY, sampling, SKMatrix.Concat(localMatrix, _transform));
     }
 }

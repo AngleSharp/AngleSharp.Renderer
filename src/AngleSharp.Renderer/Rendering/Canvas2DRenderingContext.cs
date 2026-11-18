@@ -31,8 +31,10 @@ public sealed class Canvas2DRenderingContext : ICanvasRenderingContext2D
     private SKCanvas _canvas;
     private DrawingState _state = new();
     private readonly Stack<DrawingState> _stateStack = new();
-    private SKPath _path = new();
+    private SKPathBuilder _path = new();
     private bool _hasCurrentPoint;
+    private SKPoint _lastPoint;
+    private SKPoint _subpathStart;
     private SKImage? _snapshot;
     // what frames show, see Present
     private SKImage? _presented;
@@ -527,7 +529,9 @@ public sealed class Canvas2DRenderingContext : ICanvasRenderingContext2D
     {
         if (AreFinite(x, y))
         {
-            _path.MoveTo(Map(x, y));
+            _lastPoint = Map(x, y);
+            _subpathStart = _lastPoint;
+            _path.MoveTo(_lastPoint);
             _hasCurrentPoint = true;
         }
     }
@@ -549,7 +553,8 @@ public sealed class Canvas2DRenderingContext : ICanvasRenderingContext2D
 
         if (_hasCurrentPoint)
         {
-            _path.LineTo(Map(x, y));
+            _lastPoint = Map(x, y);
+            _path.LineTo(_lastPoint);
         }
         else
         {
@@ -568,7 +573,8 @@ public sealed class Canvas2DRenderingContext : ICanvasRenderingContext2D
         }
 
         EnsureCurrentPoint(cpx, cpy);
-        _path.QuadTo(Map(cpx, cpy), Map(x, y));
+        _lastPoint = Map(x, y);
+        _path.QuadTo(Map(cpx, cpy), _lastPoint);
     }
 
     /// <summary>
@@ -582,7 +588,8 @@ public sealed class Canvas2DRenderingContext : ICanvasRenderingContext2D
         }
 
         EnsureCurrentPoint(cp1x, cp1y);
-        _path.CubicTo(Map(cp1x, cp1y), Map(cp2x, cp2y), Map(x, y));
+        _lastPoint = Map(x, y);
+        _path.CubicTo(Map(cp1x, cp1y), Map(cp2x, cp2y), _lastPoint);
     }
 
     /// <summary>
@@ -639,20 +646,21 @@ public sealed class Canvas2DRenderingContext : ICanvasRenderingContext2D
             transform = SKMatrix.Concat(transform, SKMatrix.CreateRotation((float)rotation, (float)x, (float)y));
         }
 
-        using var arc = new SKPath();
+        using var arcBuilder = new SKPathBuilder();
 
         // Skia leaves out an oval's sweep of 360 degrees, which is two halves then
         if (Math.Abs(sweepDegrees) >= 360f)
         {
             var half = sweepDegrees / 2f;
-            arc.ArcTo(oval, start, half, true);
-            arc.ArcTo(oval, start + half, half, false);
+            arcBuilder.ArcTo(oval, start, half, true);
+            arcBuilder.ArcTo(oval, start + half, half, false);
         }
         else
         {
-            arc.ArcTo(oval, start, sweepDegrees, true);
+            arcBuilder.ArcTo(oval, start, sweepDegrees, true);
         }
 
+        using var arc = arcBuilder.Detach();
         arc.Transform(transform);
         AppendConnected(arc);
     }
@@ -680,12 +688,14 @@ public sealed class Canvas2DRenderingContext : ICanvasRenderingContext2D
             return;
         }
 
-        var last = inverse.MapPoint(_path.LastPoint);
-        using var corner = new SKPath();
-        corner.MoveTo(last);
-        corner.ArcTo(new SKPoint((float)x1, (float)y1), new SKPoint((float)x2, (float)y2), (float)radius);
+        var last = inverse.MapPoint(_lastPoint);
+        using var cornerBuilder = new SKPathBuilder();
+        cornerBuilder.MoveTo(last);
+        cornerBuilder.ArcTo(new SKPoint((float)x1, (float)y1), new SKPoint((float)x2, (float)y2), (float)radius);
+        using var corner = cornerBuilder.Detach();
         corner.Transform(_state.Transform);
         _path.AddPath(corner, SKPathAddMode.Extend);
+        _lastPoint = corner.LastPoint;
     }
 
     /// <summary>
@@ -703,7 +713,9 @@ public sealed class Canvas2DRenderingContext : ICanvasRenderingContext2D
         _path.LineTo(Map(x + width, y + height));
         _path.LineTo(Map(x, y + height));
         _path.Close();
-        _path.MoveTo(Map(x, y));
+        _lastPoint = Map(x, y);
+        _subpathStart = _lastPoint;
+        _path.MoveTo(_lastPoint);
         _hasCurrentPoint = true;
     }
 
@@ -723,11 +735,14 @@ public sealed class Canvas2DRenderingContext : ICanvasRenderingContext2D
         }
 
         var rect = SKRect.Create((float)Math.Min(x, x + width), (float)Math.Min(y, y + height), (float)Math.Abs(width), (float)Math.Abs(height));
-        using var rounded = new SKPath();
-        rounded.AddRoundRect(rect, (float)radius, (float)radius);
+        using var roundedBuilder = new SKPathBuilder();
+        roundedBuilder.AddRoundRect(rect, (float)radius, (float)radius);
+        using var rounded = roundedBuilder.Detach();
         rounded.Transform(_state.Transform);
         _path.AddPath(rounded);
-        _path.MoveTo(Map(x, y));
+        _lastPoint = Map(x, y);
+        _subpathStart = _lastPoint;
+        _path.MoveTo(_lastPoint);
         _hasCurrentPoint = true;
     }
 
@@ -739,6 +754,7 @@ public sealed class Canvas2DRenderingContext : ICanvasRenderingContext2D
         if (_hasCurrentPoint)
         {
             _path.Close();
+            _lastPoint = _subpathStart;
         }
     }
 
@@ -752,21 +768,27 @@ public sealed class Canvas2DRenderingContext : ICanvasRenderingContext2D
     /// </summary>
     public void Fill(string fillRule)
     {
-        _path.FillType = ToFillType(fillRule);
-        Draw(_path, isStroke: false);
+        using var path = CreatePathSnapshot();
+        path.FillType = ToFillType(fillRule);
+        Draw(path, isStroke: false);
     }
 
     /// <summary>
     /// Strokes the current path with the stroke style.
     /// </summary>
-    public void Stroke() => Draw(_path, isStroke: true);
+    public void Stroke()
+    {
+        using var path = CreatePathSnapshot();
+        Draw(path, isStroke: true);
+    }
 
     /// <summary>
     /// Restricts what is drawn from now on to the current path (until the state is restored).
     /// </summary>
     public void Clip(string fillRule = "nonzero")
     {
-        using var clip = new SKPath(_path) { FillType = ToFillType(fillRule) };
+        using var clip = CreatePathSnapshot();
+        clip.FillType = ToFillType(fillRule);
 
         lock (_sync)
         {
@@ -786,7 +808,8 @@ public sealed class Canvas2DRenderingContext : ICanvasRenderingContext2D
             return false;
         }
 
-        using var path = new SKPath(_path) { FillType = ToFillType(fillRule) };
+        using var path = CreatePathSnapshot();
+        path.FillType = ToFillType(fillRule);
         return path.Contains((float)x, (float)y);
     }
 
@@ -800,7 +823,7 @@ public sealed class Canvas2DRenderingContext : ICanvasRenderingContext2D
             return false;
         }
 
-        using var userPath = new SKPath(_path);
+        using var userPath = CreatePathSnapshot();
         userPath.Transform(inverse);
         using var paint = CreateStrokeOutlinePaint();
         using var outline = paint.GetFillPath(userPath);
@@ -903,13 +926,13 @@ public sealed class Canvas2DRenderingContext : ICanvasRenderingContext2D
         var font = CreateFont();
         using var paint = SkiaTextShaping.CreateTextPaint(font);
         var width = value.Length == 0 ? 0f : SkiaTextShaping.MeasureParagraph(paint, value, font, IsRightToLeft());
-        var metrics = paint.FontMetrics;
+        var metrics = paint.Font.Metrics;
         var baselineShift = GetBaselineShift(metrics);
         var bounds = new SKRect();
 
         if (value.Length > 0)
         {
-            paint.MeasureText(value, ref bounds);
+            paint.Font.MeasureText(value, out bounds);
         }
 
         var left = GetAlignmentOffset(width);
@@ -1120,19 +1143,19 @@ public sealed class Canvas2DRenderingContext : ICanvasRenderingContext2D
         var isRightToLeft = IsRightToLeft();
         using var paint = CreatePaint(isStroke ? _state.Stroke : _state.Fill, isStroke);
         using var textPaint = SkiaTextShaping.CreateTextPaint(font);
-        textPaint.Shader = paint.Shader;
-        textPaint.Color = paint.Color;
-        textPaint.BlendMode = paint.BlendMode;
-        textPaint.ImageFilter = paint.ImageFilter;
-        textPaint.Style = paint.Style;
-        textPaint.StrokeWidth = paint.StrokeWidth;
-        textPaint.StrokeJoin = paint.StrokeJoin;
-        textPaint.StrokeMiter = paint.StrokeMiter;
-        textPaint.PathEffect = paint.PathEffect;
+        textPaint.Paint.Shader = paint.Shader;
+        textPaint.Paint.Color = paint.Color;
+        textPaint.Paint.BlendMode = paint.BlendMode;
+        textPaint.Paint.ImageFilter = paint.ImageFilter;
+        textPaint.Paint.Style = paint.Style;
+        textPaint.Paint.StrokeWidth = paint.StrokeWidth;
+        textPaint.Paint.StrokeJoin = paint.StrokeJoin;
+        textPaint.Paint.StrokeMiter = paint.StrokeMiter;
+        textPaint.Paint.PathEffect = paint.PathEffect;
         var width = SkiaTextShaping.MeasureParagraph(textPaint, value, font, isRightToLeft);
         var scaleX = !double.IsNaN(maxWidth) && width > maxWidth ? (float)(maxWidth / width) : 1f;
         var left = (float)x + (GetAlignmentOffset(width) * scaleX);
-        var baseline = (float)y + GetBaselineShift(textPaint.FontMetrics);
+        var baseline = (float)y + GetBaselineShift(textPaint.Font.Metrics);
 
         lock (_sync)
         {
@@ -1187,19 +1210,17 @@ public sealed class Canvas2DRenderingContext : ICanvasRenderingContext2D
             // like Chromium, only the edges of a rotated or skewed image are anti-aliased: those of one
             // at a fractional offset made Skia draw it about ten times slower (4 ms for 512x512 pixels)
             IsAntialias = _state.Transform.SkewX != 0f || _state.Transform.SkewY != 0f,
-            // the quality of imageSmoothingQuality's default ("low"): bilinear, as Chromium does, while
-            // mipmaps made a scaled or rotated draw of 512x512 pixels take about 10 ms
-            FilterQuality = _state.ImageSmoothingEnabled ? SKFilterQuality.Low : SKFilterQuality.None,
             Color = SKColors.White.WithAlpha(ToAlpha(_state.GlobalAlpha)),
             BlendMode = _state.BlendMode,
             ImageFilter = CreateShadowFilter(),
         };
+        var sampling = new SKSamplingOptions(_state.ImageSmoothingEnabled ? SKFilterMode.Linear : SKFilterMode.Nearest);
 
         lock (_sync)
         {
             EnsureBitmapSizeLocked();
             _canvas.SetMatrix(_state.Transform);
-            _canvas.DrawImage(image, source, destination, paint);
+            _canvas.DrawImage(image, source, destination, sampling, paint);
             Changed();
         }
 
@@ -1231,9 +1252,9 @@ public sealed class Canvas2DRenderingContext : ICanvasRenderingContext2D
         }
         else if (style.Pattern is { } pattern)
         {
-            paint.Shader = pattern.CreateShader(isStroke ? SKMatrix.Identity : _state.Transform);
+            var sampling = new SKSamplingOptions(_state.ImageSmoothingEnabled ? SKFilterMode.Linear : SKFilterMode.Nearest);
+            paint.Shader = pattern.CreateShader(isStroke ? SKMatrix.Identity : _state.Transform, sampling);
             paint.Color = SKColors.White.WithAlpha(ToAlpha(alpha));
-            paint.FilterQuality = _state.ImageSmoothingEnabled ? SKFilterQuality.Low : SKFilterQuality.None;
         }
         else
         {
@@ -1341,13 +1362,13 @@ public sealed class Canvas2DRenderingContext : ICanvasRenderingContext2D
 
     private SKPath CreateRectPath(double x, double y, double width, double height)
     {
-        var path = new SKPath();
-        path.MoveTo(Map(x, y));
-        path.LineTo(Map(x + width, y));
-        path.LineTo(Map(x + width, y + height));
-        path.LineTo(Map(x, y + height));
-        path.Close();
-        return path;
+        using var builder = new SKPathBuilder();
+        builder.MoveTo(Map(x, y));
+        builder.LineTo(Map(x + width, y));
+        builder.LineTo(Map(x + width, y + height));
+        builder.LineTo(Map(x, y + height));
+        builder.Close();
+        return builder.Detach();
     }
 
     private void EnsureCurrentPoint(double x, double y)
@@ -1368,7 +1389,23 @@ public sealed class Canvas2DRenderingContext : ICanvasRenderingContext2D
         {
             _path.AddPath(subpath, SKPathAddMode.Append);
             _hasCurrentPoint = subpath.PointCount > 0;
+            if (_hasCurrentPoint)
+            {
+                _subpathStart = subpath.GetPoint(0);
+            }
         }
+
+        if (subpath.PointCount > 0)
+        {
+            _lastPoint = subpath.LastPoint;
+        }
+    }
+
+    private SKPath CreatePathSnapshot()
+    {
+        var path = _path.Detach();
+        _path.AddPath(path);
+        return path;
     }
 
     private static SKMatrix CreateMatrix(double a, double b, double c, double d, double e, double f) => new()

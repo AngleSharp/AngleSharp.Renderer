@@ -103,7 +103,9 @@ internal static class FontFaceLoader
 
                 if (TryLoadFontData(document, url, out var data))
                 {
+                    // a font that was fetched and decoded is used, so the later sources aren't
                     sources.Add(FontFaceSource.FromData(data));
+                    break;
                 }
             }
         }

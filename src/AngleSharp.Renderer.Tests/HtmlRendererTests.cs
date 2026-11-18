@@ -363,6 +363,30 @@ public sealed class HtmlRendererTests
     }
 
     [Fact]
+    public async Task InlineSvgImageWithAnAddress_IsLoadedAndPainted()
+    {
+        // skve.de's illustration: an svg with a viewBox wrapping a PNG by its address
+        using var bitmap = new SkiaSharp.SKBitmap(2, 2);
+        bitmap.Erase(SkiaSharp.SKColors.Red);
+        using var png = SkiaSharp.SKImage.FromBitmap(bitmap).Encode(SkiaSharp.SKEncodedImageFormat.Png, 100);
+        var configuration = Configuration.Default
+            .WithCss()
+            .With(new ImageOnlyRequester(png.ToArray()))
+            .WithDefaultLoader(new LoaderOptions { IsResourceLoadingEnabled = true })
+            .WithRenderDevice(new DefaultRenderDevice { ViewPortWidth = 100, ViewPortHeight = 100 });
+        var document = await ParseAsync("""
+            <html><body>
+                <div style="width: 80px"><svg viewBox="0 0 200 100" xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink"><image width="200" height="100" xlink:href="/files/plant.png"/></svg></div>
+            </body></html>
+            """, configuration, "http://example.test/");
+
+        var pixels = document.Context.GetDomHarness().PrepareFrame().Rasterize();
+        var offset = ((20 * pixels.Width) + 40) * 4;
+
+        Assert.Equal(new byte[] { 255, 0, 0, 255 }, pixels.Data[offset..(offset + 4)]);
+    }
+
+    [Fact]
     public async Task BuildDisplayList_FetchesAndCachesHttpBackgroundImagePerDocument()
     {
         var requester = new SingleResponseImageRequester(Convert.FromBase64String("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAACklEQVR4nGMAAQABAA4A4cQTmwAAAABJRU5ErkJggg=="));
@@ -10234,6 +10258,22 @@ public sealed class HtmlRendererTests
         Assert.True(dots.Count > 3);
         Assert.All(dots, dot => Assert.Equal(2f, dot.Radii.TopLeftX));
         Assert.All(dots, dot => Assert.True(dot.Rect.Width <= 4f));
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_DottedRoundedBorderPlacesItsDotsOnTheCurve()
+    {
+        // found on the tractor store: its spinner is a circle of solid and dotted sides
+        var document = await ParseAsync("<html><body style=\"margin:0\"><div style=\"width:40px; height:40px; border:4px dotted #ff0000; border-radius:50%\"></div></body></html>");
+
+        var dots = BuildDisplayList(document).Commands.OfType<FillRectCommand>().Where(f => f.Color.Equals(Red)).ToList();
+
+        Assert.True(dots.Count > 8);
+        Assert.All(dots, dot =>
+        {
+            var distance = Math.Sqrt(Math.Pow(dot.Rect.X + (dot.Rect.Width / 2f) - 24f, 2) + Math.Pow(dot.Rect.Y + (dot.Rect.Height / 2f) - 24f, 2));
+            Assert.InRange(distance, 21.25, 22.75);
+        });
     }
 
     [Theory]

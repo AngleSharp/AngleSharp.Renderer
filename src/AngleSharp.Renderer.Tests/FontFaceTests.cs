@@ -175,6 +175,52 @@ public sealed class FontFaceTests
     }
 
     [Fact]
+    public async Task NetworkSources_AfterTheFirstUsableOne_AreNotFetched()
+    {
+        var requester = new FontRequester(Convert.FromBase64String(SerifDataUri[(SerifDataUri.IndexOf(',') + 1)..]));
+        var context = BrowsingContext.New(Configuration.Default
+            .WithCss()
+            .WithDefaultLoader(new AngleSharp.Io.LoaderOptions { IsResourceLoadingEnabled = true })
+            .With(requester));
+        var document = await context.OpenAsync(request => request.Content("""
+            <html>
+              <head><style>@font-face { font-family: 'Web'; src: url(http://localhost/missing.woff2) format('woff2'), url(http://localhost/font.ttf) format('truetype'), url(http://localhost/font.woff) format('woff'); }</style></head>
+              <body><p style="font-family: 'Web', monospace">Text</p></body>
+            </html>
+            """));
+
+        new HtmlRenderer().BuildDisplayList(document, Device());
+
+        Assert.Equal(["/missing.woff2", "/font.ttf"], requester.Paths);
+    }
+
+    private sealed class FontRequester(byte[] font) : AngleSharp.Io.BaseRequester
+    {
+        public List<string> Paths { get; } = [];
+
+        public override bool SupportsProtocol(string protocol) =>
+            string.Equals(protocol, "http", StringComparison.OrdinalIgnoreCase);
+
+        protected override Task<AngleSharp.Io.IResponse?> PerformRequestAsync(AngleSharp.Io.Request request, CancellationToken cancel)
+        {
+            var path = request.Address.Path.Length > 0 && request.Address.Path[0] == '/' ? request.Address.Path : "/" + request.Address.Path;
+
+            lock (Paths)
+            {
+                Paths.Add(path);
+            }
+
+            var isFound = path == "/font.ttf";
+            return Task.FromResult<AngleSharp.Io.IResponse?>(new AngleSharp.Io.DefaultResponse
+            {
+                Address = request.Address,
+                StatusCode = isFound ? System.Net.HttpStatusCode.OK : System.Net.HttpStatusCode.NotFound,
+                Content = new MemoryStream(isFound ? font : []),
+            });
+        }
+    }
+
+    [Fact]
     public async Task Weight_SelectsTheMatchingFace()
     {
         // Two faces under one family, deliberately different files so the choice is observable.

@@ -239,7 +239,8 @@ internal static class SvgFilterBuilder
             .Select(node => input(node.GetAttribute("in")))
             .ToArray();
 
-        return nodes.Length > 0 ? SKImageFilter.CreateMerge(nodes, crop) : Transparent(crop);
+        var filters = nodes.OfType<SKImageFilter>().ToArray();
+        return filters.Length > 0 ? SKImageFilter.CreateMerge(filters, crop) : Transparent(crop);
     }
 
     private static SKImageFilter BuildColorMatrix(IElement primitive, SKImageFilter? input, SKRect crop)
@@ -271,14 +272,14 @@ internal static class SvgFilterBuilder
     /// <summary>`feFlood` fills its whole subregion with `flood-color`/`flood-opacity`.</summary>
     private static SKImageFilter BuildFlood(IElement primitive, SKRect crop, bool linear)
     {
-        using var paint = new SKPaint { Color = ToSpace(ParseFloodColor(primitive), linear) };
-        return SKImageFilter.CreatePaint(paint, crop);
+        using var shader = SKShader.CreateColor(ToSpace(ParseFloodColor(primitive), linear));
+        return SKImageFilter.CreateShader(shader, dither: false, crop);
     }
 
     private static SKImageFilter Transparent(SKRect crop)
     {
-        using var paint = new SKPaint { Color = SKColors.Transparent };
-        return SKImageFilter.CreatePaint(paint, crop);
+        using var shader = SKShader.CreateColor(SKColors.Transparent);
+        return SKImageFilter.CreateShader(shader, dither: false, crop);
     }
 
     private static SKColor ParseFloodColor(IElement primitive)
@@ -548,7 +549,7 @@ internal static class SvgFilterBuilder
             Channel(primitive.GetAttribute("xChannelSelector")),
             Channel(primitive.GetAttribute("yChannelSelector")),
             ParseFloat(primitive.GetAttribute("scale"), 0f),
-            displacement,
+            displacement ?? Transparent(crop),
             input,
             crop);
     }
@@ -563,8 +564,7 @@ internal static class SvgFilterBuilder
         using var shader = fractal
             ? SKShader.CreatePerlinNoiseFractalNoise(frequencyX, frequencyY, octaves, seed)
             : SKShader.CreatePerlinNoiseTurbulence(frequencyX, frequencyY, octaves, seed);
-        using var paint = new SKPaint { Shader = shader };
-        return SKImageFilter.CreatePaint(paint, crop);
+        return SKImageFilter.CreateShader(shader, dither: false, crop);
     }
 
     /// <summary>
@@ -595,7 +595,7 @@ internal static class SvgFilterBuilder
                 var fit = SvgViewBoxMapping.ComputeMatrix((0f, 0f, image.Width, image.Height), subregion.Width, subregion.Height, align, meet);
                 var destination = fit.MapRect(source);
                 destination.Offset(subregion.Left, subregion.Top);
-                return SKImageFilter.CreateImage(image, source, destination, SKFilterQuality.High);
+                return SKImageFilter.CreateImage(image, source, destination, new SKSamplingOptions(SKCubicResampler.Mitchell));
             }
         }
 

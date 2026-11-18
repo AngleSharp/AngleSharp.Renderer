@@ -81,7 +81,7 @@ internal static class SvgPatternBuilder
                 {
                     var (align, meet) = SvgViewBoxMapping.ParsePreserveAspectRatio(GetInheritedAttribute(patternElement, "preserveAspectRatio", context.ElementsById));
                     var viewBoxMatrix = SvgViewBoxMapping.ComputeMatrix(viewBox, width, height, align, meet);
-                    tileCanvas.Concat(ref viewBoxMatrix);
+                    tileCanvas.Concat(in viewBoxMatrix);
                     contentViewport = new SvgViewport(box.Width, box.Height);
                 }
                 else if (contentUnitsIsObjectBoundingBox)

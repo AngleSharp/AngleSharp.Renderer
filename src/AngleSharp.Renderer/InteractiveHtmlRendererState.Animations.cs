@@ -72,9 +72,11 @@ internal sealed partial class InteractiveHtmlRendererState
     internal void ObserveTransitions(IElement element, ICssStyleDeclaration computedStyle, string? authoredTransform)
     {
         // what is not rendered has no transition, before or after (its values are forgotten)
-        if (element is not IPseudoElement && CssTransitionTracker.HasTransition(computedStyle) && !IsNotRendered(computedStyle))
+        if (CssTransitionTracker.HasTransition(computedStyle) && !IsNotRendered(computedStyle))
         {
-            var previousStyle = _lastFrameLayout?.GetComputedStyle(element);
+            // a pseudo-element is created anew by every layout (its values are followed by its
+            // host and name, see CssTransitionTracker)
+            var previousStyle = element is IPseudoElement ? null : _lastFrameLayout?.GetComputedStyle(element);
             _transitionTracker.Observe(element, computedStyle, previousStyle is not null && !IsNotRendered(previousStyle) ? previousStyle : null, authoredTransform);
         }
 
@@ -97,9 +99,9 @@ internal sealed partial class InteractiveHtmlRendererState
         {
             foreach (var record in transitionEvents)
             {
-                if (record.Target.IsConnected())
+                if (CssTransitionTracker.GetEventTarget(record.Target) is { } target && target.IsConnected())
                 {
-                    record.Target.Dispatch(new TransitionEvent(record.Type, bubbles: true, cancelable: false, record.PropertyName, record.ElapsedSeconds));
+                    target.Dispatch(new TransitionEvent(record.Type, bubbles: true, cancelable: false, record.PropertyName, record.ElapsedSeconds));
                 }
             }
 

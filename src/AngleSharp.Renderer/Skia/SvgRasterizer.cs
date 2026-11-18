@@ -104,7 +104,7 @@ internal static class SvgRasterizer
 
             using var recorder = new SKPictureRecorder();
             var recording = recorder.BeginRecording(new SKRect(0f, 0f, width, height));
-            recording.Concat(ref viewBoxMatrix);
+            recording.Concat(in viewBoxMatrix);
             SvgElementRenderer.Render(recording, svgRoot, initialState, renderContext, contentViewport);
             vectorImage = fit is { } viewBoxFit
                 ? new SvgVectorImage(recorder.EndRecording(), width, height, viewBoxFit.ViewBox, viewBoxFit.Align, viewBoxFit.Meet)
