@@ -28,8 +28,13 @@ public static class RenderingConfigurationExtensions
         ArgumentNullException.ThrowIfNull(factory);
         configuration = configuration.WithOnly(factory);
 
-        return configuration.Services.OfType<ImageResourceService>().Any()
+        configuration = configuration.Services.OfType<ImageResourceService>().Any()
             ? configuration
             : configuration.With(ImageResourceService.Instance);
+
+        // an object showing a document hides its fallback
+        return configuration.Services.OfType<ObjectDocumentService>().Any()
+            ? configuration
+            : configuration.With(ObjectDocumentService.Instance);
     }
 }

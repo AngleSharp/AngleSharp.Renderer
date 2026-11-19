@@ -39,22 +39,28 @@ public sealed partial class HtmlRenderer
     /// </summary>
     private static void PaintSubframe(DisplayList displayList, IElement element, LayoutContext context, float x, float y, float width, float height)
     {
-        if (s_trialDepth > 0 || width <= 0f || height <= 0f)
+        if (s_trialDepth > 0)
         {
             return;
         }
 
-        var viewport = new RenderRect(x, y, width, height);
-        var command = new DrawSubframeCommand(viewport);
-        displayList.Add(command);
+        var viewport = new RenderRect(x, y, Math.Max(0f, width), Math.Max(0f, height));
 
         if (!context.Subframes.TryGetValue(element, out var entry))
         {
             context.Subframes[element] = entry = new SubframeEntry();
         }
 
-        entry.Commands.Add(command);
         entry.Viewport = viewport;
+
+        // an empty iframe shows nothing, but its document still has that viewport (e.g. for
+        // its media queries)
+        if (width > 0f && height > 0f)
+        {
+            var command = new DrawSubframeCommand(viewport);
+            displayList.Add(command);
+            entry.Commands.Add(command);
+        }
     }
 
     private static void ResolveSubframes(IDocument document, LayoutContext context)
@@ -83,7 +89,11 @@ public sealed partial class HtmlRenderer
                 {
                     parent?.AttachSubframe(state);
                     state.SetViewport((int)Math.Round(entry.Viewport.Width), (int)Math.Round(entry.Viewport.Height));
-                    entry.Frame = state.PrepareFrame();
+
+                    if (entry.Commands.Count > 0)
+                    {
+                        entry.Frame = state.PrepareFrame();
+                    }
                 }
 
                 foreach (var command in entry.Commands)
