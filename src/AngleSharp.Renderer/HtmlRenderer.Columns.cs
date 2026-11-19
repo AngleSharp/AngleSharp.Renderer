@@ -278,7 +278,7 @@ public sealed partial class HtmlRenderer
             cursorY += LayoutColumnSet(set, columns, styleMap, contentX, cursorY, float.NaN, float.NaN, specifiedContentHeight, ref textIndentConsumed, textStyle, context, displayList, positionedContainingX, positionedContainingY, positionedContainingWidth, positionedContainingHeight);
             set = [];
 
-            var previousMarginBottom = 0f;
+            var previousMarginBottom = MarginStrut.Zero;
             var suppressTopMargin = false;
 
             LayoutNode(
@@ -370,7 +370,7 @@ public sealed partial class HtmlRenderer
 
         try
         {
-            var previousBlockMarginBottom = 0f;
+            var previousBlockMarginBottom = MarginStrut.Zero;
             var suppressNextBlockTopMargin = false;
             var floats = new FloatArea();
 

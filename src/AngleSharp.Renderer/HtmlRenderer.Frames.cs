@@ -192,7 +192,12 @@ public sealed partial class HtmlRenderer
                 ? styleMap.GetValueOrDefault("position")?.Trim()
                 : null;
 
-            // boxes attached to the viewport do not move with the page
+            // boxes attached to the viewport do not move with the page, nor do fixed backgrounds
+            if (styleMap is not null && styleMap.TryGetValue("background-attachment", out var attachment) && attachment.Contains("fixed", StringComparison.OrdinalIgnoreCase))
+            {
+                isScrollShiftable = false;
+            }
+
             if (string.Equals(position, "fixed", StringComparison.OrdinalIgnoreCase) ||
                 string.Equals(position, "sticky", StringComparison.OrdinalIgnoreCase))
             {

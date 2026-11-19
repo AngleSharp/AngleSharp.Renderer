@@ -145,9 +145,9 @@ public sealed partial class HtmlRenderer
             inlineSize = Math.Min(Math.Max(intrinsic.Min, available), intrinsic.Max);
         }
 
-        inlineSize = Math.Max(inlineSize, ResolveAuthoredDimension(styleMap, "min-height", heightReference, 0f, verticalBorderAndPadding));
         var maximum = ResolveAuthoredDimension(styleMap, "max-height", heightReference, float.NaN, verticalBorderAndPadding);
-        return float.IsNaN(maximum) ? inlineSize : Math.Min(inlineSize, maximum);
+        inlineSize = float.IsNaN(maximum) ? inlineSize : Math.Min(inlineSize, maximum);
+        return Math.Max(inlineSize, ResolveAuthoredDimension(styleMap, "min-height", heightReference, 0f, verticalBorderAndPadding));
     }
 
     /// <summary>
@@ -158,7 +158,7 @@ public sealed partial class HtmlRenderer
     private static float LayoutOrthogonalFlowContent(IReadOnlyList<IRenderNode> children, RenderTextStyle flowStyle, float inlineSize, LayoutContext context, DisplayList displayList, out List<DeferredStickyBox> stickyBoxes)
     {
         var cursorY = 0f;
-        var previousMarginBottom = 0f;
+        var previousMarginBottom = MarginStrut.Zero;
         var suppressTopMargin = false;
         var textIndentConsumed = false;
         var floats = new FloatArea();
@@ -225,7 +225,7 @@ public sealed partial class HtmlRenderer
         try
         {
             var cursorY = 0f;
-            var previousMarginBottom = 0f;
+            var previousMarginBottom = MarginStrut.Zero;
             var suppressTopMargin = false;
             var textIndentConsumed = false;
 

@@ -70,7 +70,7 @@ public sealed partial class HtmlRenderer
         bool HasBox,
         bool HasStaticPosition = true,
         bool IsInFlow = false,
-        float PreviousBlockMarginBottom = 0f,
+        MarginStrut PreviousBlockMarginBottom = default,
         bool SuppressNextBlockTopMargin = false,
         FlowResult? Result = null,
         ItemLayout? Item = null,
@@ -112,7 +112,7 @@ public sealed partial class HtmlRenderer
 
         return box.BorderWidth.Top <= 0f && paddingTop <= 0f && !EstablishesBlockFormattingContext(styleMap, false, false, false, false) &&
             TryGetFirstCollapsibleChildTopMargin(node, containingWidth, context, out var firstChildTopMargin)
-            ? CollapseMargins(marginTop, firstChildTopMargin)
+            ? MarginStrut.From(marginTop).Append(firstChildTopMargin).Value
             : marginTop;
     }
 
@@ -202,7 +202,7 @@ public sealed partial class HtmlRenderer
     /// What an in-flow block left for the boxes after it: where they start, the margin they
     /// collapse with, and if it left no floats reaching down to them.
     /// </summary>
-    private sealed record FlowResult(float CursorY, float PreviousBlockMarginBottom, bool SuppressNextBlockTopMargin, bool TextIndentConsumed, bool LeftNoFloats);
+    private sealed record FlowResult(float CursorY, MarginStrut PreviousBlockMarginBottom, bool SuppressNextBlockTopMargin, bool TextIndentConsumed, bool LeftNoFloats);
 
     /// <summary>A child of a flow painted after its in-flow content (positioned or z-indexed).</summary>
     private sealed record RaisedChild(IElement Element, int ZIndex, RenderCommand First, int Count);
@@ -1040,7 +1040,7 @@ public sealed partial class HtmlRenderer
         // the properties that change what a box paints of its own, but not where anything is
         private static readonly HashSet<string> s_decorationProperties = new(StringComparer.Ordinal)
         {
-            "background-color", "background-image", "background-position", "background-size", "background-repeat", "background-origin",
+            "background-color", "background-image", "background-position", "background-size", "background-repeat", "background-origin", "background-attachment",
             "background-blend-mode", "background-clip", "border-top-color", "border-right-color", "border-bottom-color", "border-left-color",
             "outline-color", "outline-style", "outline-width", "outline-offset", "box-shadow",
         };
@@ -3061,7 +3061,8 @@ public sealed partial class HtmlRenderer
             // would in a full layout if it is no stacking context or clip (a new one, as the root
             // of one there was not laid out on its own)
             if (!IsRaisedInFlow(styleMap) && !IsStickyPositioned(styleMap) &&
-                _context.HoistCandidates.Any(candidate => ReferenceEquals(candidate.DisplayList, displayList) && root.Contains(candidate.Element) &&
+                // (inline content lifted above a float leaves no entry to start from, see PaintOrder)
+                _context.HoistCandidates.Any(candidate => candidate.Z != InlineContentLayer && ReferenceEquals(candidate.DisplayList, displayList) && root.Contains(candidate.Element) &&
                     displayList.Commands.IndexOf(candidate.First) is >= 0 and var position && !HasOpenScopeBefore(displayList, position)))
             {
                 _context.HoistCandidates.Clear();

@@ -1,3 +1,17 @@
+# 0.12.1
+
+Released on tbd.
+
+- Fixed adjoining vertical margins collapsing pairwise instead of all together, e.g. those of an empty block with a negative margin inside (75px and -72px with 48px before them are 3px, not 48px)
+- Fixed the bottom margin of a block being left out before inline content following it, and before a float or an absolutely positioned box placed after it
+- Fixed `min-height` not winning over `max-height`
+- Fixed `position: relative` with only `bottom` or `right` not moving the box
+- Fixed `background-attachment: fixed` being ignored: such a background is positioned in the viewport, where it stays while the page scrolls
+- Fixed atomic inlines (e.g. an image overflowing a block of no height) being painted below the floats they overlap, as all inline content paints above the floats
+- Fixed the background showing through where two border sides of different colors meet on a diagonal
+- Fixed `data:` images whose base64 is percent-encoded (e.g. `%2F` for `/`) not being shown
+- Added `object` elements showing an image instead of their fallback content
+
 # 0.12.0
 
 Released on Wednesday, November 18 2026.

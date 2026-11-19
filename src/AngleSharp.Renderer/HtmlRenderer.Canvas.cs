@@ -30,7 +30,7 @@ public sealed partial class HtmlRenderer
     /// </summary>
     private static bool HidesChildren(IElement element) =>
         element is not IPseudoElement &&
-        (string.Equals(element.LocalName, "svg", StringComparison.OrdinalIgnoreCase) || IsCanvas(element));
+        (string.Equals(element.LocalName, "svg", StringComparison.OrdinalIgnoreCase) || IsCanvas(element) || IsImageObject(element));
 
     private static bool TryResolveCanvas(ElementRenderNode node, Dictionary<string, string> styleMap, float containingWidth, float x, float y, out RenderedImage? image, out RenderRect rect, out RenderRect? clipRect, (float Width, float Height)? usedSize = null)
     {

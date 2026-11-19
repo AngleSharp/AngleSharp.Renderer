@@ -34,7 +34,7 @@ public sealed partial class HtmlRenderer
         float contentY,
         float contentWidth,
         ref float cursorY,
-        ref float previousBlockMarginBottom,
+        ref MarginStrut previousBlockMarginBottom,
         ref bool suppressNextBlockTopMargin,
         FloatArea floats,
         ref bool textIndentConsumed,
@@ -53,7 +53,7 @@ public sealed partial class HtmlRenderer
         var runHasInlineContent = false;
         var paintOrder = new PaintOrder();
 
-        void FlushRun(ref float cursorY, ref float previousBlockMarginBottom, ref bool suppressNextBlockTopMargin, FloatArea floats, ref bool textIndentConsumed)
+        void FlushRun(ref float cursorY, ref MarginStrut previousBlockMarginBottom, ref bool suppressNextBlockTopMargin, FloatArea floats, ref bool textIndentConsumed)
         {
             if (run.Count == 0)
             {
@@ -903,7 +903,7 @@ public sealed partial class HtmlRenderer
         float contentX,
         float contentWidth,
         ref float cursorY,
-        ref float previousBlockMarginBottom,
+        ref MarginStrut previousBlockMarginBottom,
         ref bool suppressNextBlockTopMargin,
         FloatArea floats,
         ref bool textIndentConsumed,
@@ -929,7 +929,9 @@ public sealed partial class HtmlRenderer
         }
 
         var pieces = collector.Pieces;
-        var pendingBlockMargin = 0f;
+        // the bottom margin of the block before is still to come: the first line box (or a float
+        // or a block before it) is below it
+        var pendingBlockMargin = previousBlockMarginBottom;
 
         if (pieces.Count == 0)
         {
@@ -991,7 +993,7 @@ public sealed partial class HtmlRenderer
         void PlaceFloat(InlinePiece piece)
         {
             var floatCursorY = lineTop + pendingBlockMargin;
-            var floatPreviousMarginBottom = 0f;
+            var floatPreviousMarginBottom = MarginStrut.Zero;
             var floatSuppressTopMargin = false;
             var floatTextIndentConsumed = false;
             var rangeStart = displayList.Commands.Count;
@@ -1127,12 +1129,12 @@ public sealed partial class HtmlRenderer
 
             if (!hasLineBox)
             {
-                LayoutOutOfFlowPieces(linePieces, false, 0f, contentX, lineTop, contentWidth, context, displayList, maxY, containingHeight, positionedContainingX, positionedContainingY, positionedContainingWidth, positionedContainingHeight, paintOrder);
+                LayoutOutOfFlowPieces(linePieces, false, 0f, contentX, lineTop + pendingBlockMargin, contentWidth, context, displayList, maxY, containingHeight, positionedContainingX, positionedContainingY, positionedContainingWidth, positionedContainingHeight, paintOrder);
                 continue;
             }
 
             lineTop += pendingBlockMargin;
-            pendingBlockMargin = 0f;
+            pendingBlockMargin = MarginStrut.Zero;
 
             var lineHeight = EmitLine(
                 linePieces,
@@ -1986,7 +1988,7 @@ public sealed partial class HtmlRenderer
                 } + (piece.Box?.RelativeY ?? 0f);
 
                 var atomicCursorY = marginBoxTop;
-                var atomicPreviousMarginBottom = 0f;
+                var atomicPreviousMarginBottom = MarginStrut.Zero;
                 var atomicSuppressTopMargin = false;
                 var atomicFloats = new FloatArea();
                 var atomicTextIndentConsumed = false;
@@ -2017,6 +2019,12 @@ public sealed partial class HtmlRenderer
                 if (IsNegativeZIndexChild(piece.Element!, context))
                 {
                     negativeZIndexRanges.Add((rangeStart, displayList.Commands.Count - rangeStart));
+                }
+                else if (displayList.Commands.Count > rangeStart)
+                {
+                    // painted above the floats of the flow it is in, where it overlaps one of them
+                    context.HoistCandidates.Add(new HoistCandidate(displayList, InlineContentLayer, displayList.Commands[rangeStart], displayList.Commands.Count - rangeStart, piece.Element!.Ref,
+                        new RenderRect(piece.X, marginBoxTop, measurement.BorderBoxWidth, measurement.OuterHeight)));
                 }
             }
 
@@ -2590,7 +2598,7 @@ public sealed partial class HtmlRenderer
 
             var rangeStart = displayList.Commands.Count;
             var staticCursorY = lineTop;
-            var previousMarginBottom = 0f;
+            var previousMarginBottom = MarginStrut.Zero;
             var suppressTopMargin = false;
             var localFloats = new FloatArea();
             var textIndentConsumed = false;
@@ -2922,7 +2930,7 @@ public sealed partial class HtmlRenderer
         try
         {
             var cursorY = 0f;
-            var previousMarginBottom = 0f;
+            var previousMarginBottom = MarginStrut.Zero;
             var suppressTopMargin = false;
             var localFloats = new FloatArea();
             var textIndentConsumed = false;
@@ -3135,9 +3143,10 @@ public sealed partial class HtmlRenderer
     /// </summary>
     private static float ClampToMinMaxHeight(Dictionary<string, string> styleMap, float contentHeight, float heightReference, float verticalExtras)
     {
-        contentHeight = Math.Max(contentHeight, ResolveAuthoredDimension(styleMap, "min-height", heightReference, 0f, verticalExtras));
+        // max-height first, then min-height, which wins over it (CSS 2.1, 10.7)
         var maxHeight = ResolveAuthoredDimension(styleMap, "max-height", heightReference, float.NaN, verticalExtras);
-        return float.IsNaN(maxHeight) ? contentHeight : Math.Min(contentHeight, maxHeight);
+        contentHeight = float.IsNaN(maxHeight) ? contentHeight : Math.Min(contentHeight, maxHeight);
+        return Math.Max(contentHeight, ResolveAuthoredDimension(styleMap, "min-height", heightReference, 0f, verticalExtras));
     }
 
     private static float ClampToMinMaxWidth(Dictionary<string, string> styleMap, float contentWidth, float containingWidth, float horizontalExtras)
