@@ -341,6 +341,26 @@ public sealed class InteractiveFrameTests
         return trials;
     }
 
+    [Fact]
+    public async Task HitTestMap_HitsGeneratedContentAsItsElement()
+    {
+        // a card link: the `::after` of the link is stretched over the whole card
+        var (document, harness) = await OpenAsync("""
+            <style>#link::after { content: ""; position: absolute; inset: 0; cursor: pointer }</style>
+            <div id="card" style="position: relative; width: 200px; height: 100px">
+                <h3 style="margin: 0"><a id="link" href="#x">Card</a></h3>
+            </div>
+            """);
+
+        var map = harness.PrepareFrame().HitTestMap;
+
+        Assert.Same(document.GetElementById("link"), map.HitTest(150, 80)?.Element);
+        Assert.Equal("pointer", map.HitTest(150, 80)?.Cursor);
+        Assert.Contains(document.GetElementById("link")!, map.Elements);
+        Assert.DoesNotContain(map.Elements, element => element is IPseudoElement);
+        Assert.Same(document.GetElementById("link"), document.ElementFromPoint(150, 80));
+    }
+
     private static async Task<(IDocument Document, IDomHarness Harness)> OpenAsync(string body)
     {
         var configuration = Configuration.Default.WithCss().WithRenderDevice(Device);

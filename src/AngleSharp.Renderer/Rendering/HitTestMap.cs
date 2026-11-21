@@ -167,7 +167,7 @@ public sealed class HitTestMap
     /// <summary>
     /// Gets the elements that can be hit, top-most first.
     /// </summary>
-    public IEnumerable<IElement> Elements => _entries.SelectMany(static m => m.Subframe is { } frame ? frame.HitTestMap.Elements.Prepend(m.Element) : [m.Element]);
+    public IEnumerable<IElement> Elements => _entries.SelectMany(static m => m.Subframe is { } frame ? frame.HitTestMap.Elements.Prepend(m.Element) : [HitTesting.GetOriginatingElement(m.Element)]);
 
     /// <summary>
     /// Finds the element painted top-most at the given point.
@@ -191,7 +191,8 @@ public sealed class HitTestMap
                     return inner with { FrameOrigin = (inner.FrameOrigin.X + entry.Viewport.X, inner.FrameOrigin.Y + entry.Viewport.Y + (y - entryY)), IsInScrollContainer = true };
                 }
 
-                return new HitTestResult(entry.Element, entry.Cursor, entry.IsInScrollContainer);
+                // generated content is hit as the element it belongs to (its cursor is its own)
+                return new HitTestResult(HitTesting.GetOriginatingElement(entry.Element), entry.Cursor, entry.IsInScrollContainer);
             }
         }
 
@@ -302,7 +303,7 @@ public sealed class HitTestMap
 
         static bool IsInAny(IReadOnlyCollection<IElement> roots, IElement element)
         {
-            var host = element is IPseudoElement ? element.ParentElement : element;
+            var host = HitTesting.GetOriginatingElement(element);
 
             foreach (var root in roots)
             {
@@ -466,7 +467,7 @@ public sealed class HitTestMap
 
             // generated content paints with its originating element: ::before ahead of the
             // element's children, ::after (and anything else) behind them
-            if (element is IPseudoElement pseudo && element.ParentElement is { } host && order.TryGetValue(host, out var hostIndex))
+            if (element is IPseudoElement pseudo && CssAnimationTracker.GetHost(pseudo) is { } host && order.TryGetValue(host, out var hostIndex))
             {
                 return pseudo.PseudoName.Contains("before", StringComparison.OrdinalIgnoreCase) || pseudo.PseudoName.Contains("marker", StringComparison.OrdinalIgnoreCase)
                     ? hostIndex.Start + 0.5

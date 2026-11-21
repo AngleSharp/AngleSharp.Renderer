@@ -1014,7 +1014,7 @@ public sealed partial class HtmlRenderer
 
         private static bool IsInSubtree(IElement root, IElement element) =>
             ReferenceEquals(root, element) || root.Contains(element) ||
-            (element is IPseudoElement && element.ParentElement is { } host && (ReferenceEquals(root, host) || root.Contains(host)));
+            (element is IPseudoElement && HitTesting.GetOriginatingElement(element) is var host && (ReferenceEquals(root, host) || root.Contains(host)));
 
         // how far the boxes around one were moved since the layout, which its own layout does not know of
         private (float X, float Y) GetMovedOffset(IElement element)

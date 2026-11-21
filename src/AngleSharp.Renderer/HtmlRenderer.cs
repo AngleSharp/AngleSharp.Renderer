@@ -3095,6 +3095,36 @@ public sealed partial class HtmlRenderer
             return estimate;
         }
 
+        // The baselines of a line's items aligned by them (without auto margins on the cross
+        // axis), from the top of their margin boxes, with the outer cross size of each; null if none is.
+        Dictionary<int, (float Baseline, float OuterSize)>? ResolveFlexLineBaselines(List<(FlexItemLayoutInfo Item, float FinalMainSize)> lineItems)
+        {
+            Dictionary<int, (float Baseline, float OuterSize)>? baselines = null;
+
+            for (var index = 0; index < lineItems.Count; index++)
+            {
+                var (item, mainSize) = lineItems[index];
+                var alignment = string.Equals(item.AlignSelf, "auto", StringComparison.OrdinalIgnoreCase) ? alignItems : item.AlignSelf;
+
+                if (!alignment.Contains("baseline", StringComparison.OrdinalIgnoreCase) || float.IsNaN(item.CrossMarginStart) || float.IsNaN(item.CrossMarginEnd))
+                {
+                    continue;
+                }
+
+                var crossSize = item.HasDefiniteCrossSize ? item.CrossSize : Math.Max(item.CrossSize, EstimateCrossSize(item, mainSize));
+                var baseline = item.Node switch
+                {
+                    TextRenderNode => ResolveLineHeightBox(inheritedTextStyle, context).Above,
+                    ElementRenderNode element => ResolveFlexItemBaseline(element, mainSize, crossSize, inheritedTextStyle, context, containingWidth),
+                    _ => crossSize,
+                };
+                baselines ??= [];
+                baselines[index] = (item.CrossMarginStart + baseline, item.CrossMargins + crossSize);
+            }
+
+            return baselines;
+        }
+
         // a line's cross size follows from its items' final main sizes (CSS Flexbox §9.4): text
         // that wraps once shrunk is taller than at the hypothetical size, leaving less free space;
         // a container without a cross size has none to share, so the lines are only sized as they
@@ -3223,6 +3253,25 @@ public sealed partial class HtmlRenderer
                         ? entry.Item.CrossSize
                         : Math.Max(entry.Item.CrossSize, EstimateCrossSize(entry.Item, entry.FinalMainSize))))
                     : 0f;
+
+                // Items aligned by their baselines (CSS Flexbox §8.3, rows only) share the line's:
+                // where each one's is below the top of its margin box, the line as tall as needed.
+                var itemBaselines = isRowDirection ? ResolveFlexLineBaselines(lineItems) : null;
+                var lineBaseline = 0f;
+
+                if (itemBaselines is not null)
+                {
+                    var below = 0f;
+
+                    foreach (var (_, (baseline, outerSize)) in itemBaselines)
+                    {
+                        lineBaseline = Math.Max(lineBaseline, baseline);
+                        below = Math.Max(below, outerSize - baseline);
+                    }
+
+                    lineCrossSize = Math.Max(lineCrossSize, lineBaseline + below);
+                }
+
                 finalLineCrossSizes.Add(lineCrossSize);
                 var lineCrossPosition = currentCrossOffset;
                 // a line takes its share of the free space, the only line of a container that can't wrap all of it
@@ -3278,6 +3327,10 @@ public sealed partial class HtmlRenderer
                         itemCrossInLine = !float.IsNaN(item.CrossMarginStart) ? crossMarginStart
                             : float.IsNaN(item.CrossMarginEnd) ? freeForMargins / 2f
                             : freeForMargins;
+                    }
+                    else if (itemBaselines is not null && itemBaselines.TryGetValue(itemIndex, out var itemBaseline))
+                    {
+                        itemCrossInLine = lineBaseline - itemBaseline.Baseline + crossMarginStart;
                     }
                     else if (effectiveAlignment.Equals("center", StringComparison.OrdinalIgnoreCase))
                     {
@@ -3746,8 +3799,9 @@ public sealed partial class HtmlRenderer
         var rowGap = ResolveRowGap(styleMap, ResolveGapHeightReference(styleMap, containingWidth, paddingTop + paddingBottom + borderTop + borderBottom));
         var resolvedColumnGap = columnGap ?? 0f;
         var resolvedRowGap = rowGap ?? 0f;
+        // a run of text is an anonymous grid item (e.g. the "A1" of an icon centered by place-items)
         var gridItems = FlattenDisplayContents(node.Children, context)
-            .Where(child => child is ElementRenderNode || (child is TextRenderNode textNode && NormalizeWhitespace(textNode.Ref.Data).Length > 0))
+            .Where(child => child is ElementRenderNode || (child is TextRenderNode textNode && !ContinuesTextRun(textNode.Ref) && NormalizeWhitespace(GetTextRunData(textNode.Ref)).Length > 0))
             .ToList();
         CreateStyleMapsInParallel(gridItems.OfType<ElementRenderNode>().ToList(), context);
         // absolutely positioned children take no cell; they are laid out once the grid's size is known
@@ -3807,6 +3861,7 @@ public sealed partial class HtmlRenderer
         // time around), collect the intrinsic width contributions of items in Auto columns and
         // grow Auto rows to their items' authored heights (content heights are measured below).
         var itemPlacements = new List<(ElementRenderNode Element, GridPlacement Column, GridPlacement Row)>();
+        var textPlacements = new Dictionary<TextRenderNode, (string Text, GridPlacement Column, GridPlacement Row)>();
         var columnContributions = new List<(GridPlacement Column, IntrinsicWidths Widths)>();
         // items spanning several rows grow them once all single-span items did, by increasing span
         // (CSS Grid 1, 11.5.3), or a tall item spread itself over rows a later item fills anyway
@@ -3915,6 +3970,51 @@ public sealed partial class HtmlRenderer
 
         foreach (var child in placementItems)
         {
+            if (child is TextRenderNode textChild)
+            {
+                // an anonymous item has no placement of its own: the next free cell takes it
+                var textColumn = 0;
+                var textRow = styleMap.TryGetValue("grid-auto-flow", out var textFlow) && textFlow.Contains("dense", StringComparison.OrdinalIgnoreCase) ? 0 : currentRow;
+
+                while (!CanPlace(textColumn, textRow, 1, 1))
+                {
+                    textColumn++;
+
+                    if (textColumn + 1 > columns.Count)
+                    {
+                        textColumn = 0;
+                        textRow++;
+                    }
+                }
+
+                var text = PrepareFlexItemText(textChild, inheritedTextStyle, context);
+                var textPlacementColumn = new GridPlacement(textColumn, 1);
+                var textPlacementRow = new GridPlacement(textRow, 1);
+                textPlacements[textChild] = (text, textPlacementColumn, textPlacementRow);
+                MarkPlaced(textPlacementColumn, textPlacementRow);
+
+                while (rows.Count < textRow + 1)
+                {
+                    rows.Add(autoRowDefinitions.Count > 0 ? CloneGridTrackSize(autoRowDefinitions[rows.Count % autoRowDefinitions.Count]) : GridTrackSize.Auto());
+                }
+
+                if (columns[textColumn].Kind == GridTrackSizeKind.Auto)
+                {
+                    columnContributions.Add((textPlacementColumn, ComputeTextIntrinsicWidths(text, inheritedTextStyle, context, out _)));
+                }
+
+                currentRow = textRow;
+                currentColumn = textColumn + 1;
+
+                if (currentColumn >= columns.Count)
+                {
+                    currentColumn = 0;
+                    currentRow++;
+                }
+
+                continue;
+            }
+
             if (child is not ElementRenderNode elementChild)
             {
                 continue;
@@ -4086,7 +4186,7 @@ public sealed partial class HtmlRenderer
             }
 
             var itemStyle = GetOrCreateStyleMap(context, element.Ref, element.ComputedStyle);
-            if (!isFractionRow && !float.IsNaN(ParseLength(itemStyle, "height", containingWidth, float.NaN, allowAuto: true)))
+            if (!isFractionRow && !IsPercentageValue(itemStyle.GetValueOrDefault("height")) && !float.IsNaN(ParseLength(itemStyle, "height", containingWidth, float.NaN, allowAuto: true)))
             {
                 continue;
             }
@@ -4100,6 +4200,28 @@ public sealed partial class HtmlRenderer
             var measuredHeight = MeasureGridItemHeight(element, cellWidth, inheritedTextStyle, context, maxY);
 
             if (isFractionRow)
+            {
+                fractionRowContent[placementRow.LineIndex] = Math.Max(fractionRowContent.GetValueOrDefault(placementRow.LineIndex), measuredHeight);
+            }
+            else
+            {
+                GrowGridRowsOrDefer(rows, spanningRowGrowths, placementRow, measuredHeight, resolvedRowGap);
+            }
+        }
+
+        foreach (var (text, placementColumn, placementRow) in textPlacements.Values)
+        {
+            var rowKind = rows[placementRow.LineIndex].Kind;
+
+            if (rowKind == GridTrackSizeKind.Fixed || (rowKind == GridTrackSizeKind.Fraction && !float.IsNaN(containerHeight)))
+            {
+                continue;
+            }
+
+            var cellWidth = GetGridTrackSpanSize(resolvedColumnSizes, placementColumn.LineIndex, placementColumn.Span, resolvedColumnGap, containingWidth);
+            var measuredHeight = MeasureFlexItemTextHeight(text, cellWidth, inheritedTextStyle, context);
+
+            if (rowKind == GridTrackSizeKind.Fraction)
             {
                 fractionRowContent[placementRow.LineIndex] = Math.Max(fractionRowContent.GetValueOrDefault(placementRow.LineIndex), measuredHeight);
             }
@@ -4141,20 +4263,35 @@ public sealed partial class HtmlRenderer
         // Pass 2: lay out every item for real, against the now-fully-resolved track sizes.
         foreach (var child in gridItems)
         {
+            // only the height of the grid is asked for, which is its rows': the items would be laid
+            // out (with all the grids and flex containers in them) for nothing
+            if (s_measuringHeightOnly)
+            {
+                continue;
+            }
+
             if (child is TextRenderNode textNode)
             {
-                LayoutTextNode(textNode.Ref, containingX, containingWidth, ref cursorY, ref previousBlockMarginBottom, ref suppressNextBlockTopMargin, floats, ref textIndentConsumed, inheritedTextStyle, context, displayList, maxY);
+                // an anonymous item is aligned by the container's justify-items and align-items
+                var (text, textColumn, textRow) = textPlacements[textNode];
+                var textCellX = borderBoxX + borderLeft + paddingLeft + columnAlignment.Offset + GetGridTrackOffset(columnSizes, textColumn.LineIndex, resolvedColumnGap + columnAlignment.Spacing);
+                var textCellY = borderBoxY + borderTop + paddingTop + rowAlignment.Offset + GetGridTrackOffset(rowSizes, textRow.LineIndex, resolvedRowGap + rowAlignment.Spacing);
+                var textCellWidth = GetGridTrackSpanSize(columnSizes, textColumn.LineIndex, textColumn.Span, resolvedColumnGap + columnAlignment.Spacing, containingWidth);
+                var textCellHeight = GetGridTrackSpanSize(rowSizes, textRow.LineIndex, textRow.Span, resolvedRowGap + rowAlignment.Spacing, containingWidth);
+                var anonymousStyle = new Dictionary<string, string>(StringComparer.Ordinal);
+                var textJustify = ResolveGridSelfAlignment(anonymousStyle, "justify-self", styleMap, "justify-items");
+                var textAlign = ResolveGridSelfAlignment(anonymousStyle, "align-self", styleMap, "align-items");
+                var textWidth = textJustify == GridSelfAlignment.Stretch
+                    ? textCellWidth
+                    : Math.Min(textCellWidth, ComputeTextIntrinsicWidths(text, inheritedTextStyle, context, out _).Max);
+                var textHeight = MeasureFlexItemTextHeight(text, textWidth, inheritedTextStyle, context);
+                var textX = textCellX + PlaceInGridArea(textJustify, 0f, 0f, textCellWidth, textWidth);
+                var textCursorY = textCellY + (textAlign == GridSelfAlignment.Stretch ? 0f : PlaceInGridArea(textAlign, 0f, 0f, textCellHeight, textHeight));
+                LayoutWrappedText(text, textX, textWidth, ref textCursorY, inheritedTextStyle, context, displayList, maxY, 0f, textSource: textNode.Ref, isTextRun: true);
                 continue;
             }
 
             if (child is not ElementRenderNode elementChild)
-            {
-                continue;
-            }
-
-            // only the height of the grid is asked for, which is its rows': the items would be laid
-            // out (with all the grids and flex containers in them) for nothing
-            if (s_measuringHeightOnly)
             {
                 continue;
             }
@@ -5455,7 +5592,9 @@ public sealed partial class HtmlRenderer
     /// </summary>
     private static float ResolveGridItemAuthoredHeight(Dictionary<string, string> styleMap, float fallbackSize)
     {
-        var height = styleMap.TryGetValue("height", out var value) && !string.IsNullOrWhiteSpace(value)
+        // A percentage refers to the grid area, which is what is being sized: it contributes like
+        // `auto` (the content, measured later), e.g. `height: 100%` cards fill their row.
+        var height = styleMap.TryGetValue("height", out var value) && !string.IsNullOrWhiteSpace(value) && !IsPercentageValue(value)
             ? ParseLengthValue(value, fallbackSize, allowAuto: false)
             : float.NaN;
         var authored = float.IsNaN(height) ? 0f : Math.Max(0f, height);
@@ -5463,7 +5602,8 @@ public sealed partial class HtmlRenderer
         var margins = ZeroIfNaN(ParseLength(styleMap, "margin-top", fallbackSize, 0f, allowAuto: true)) +
                       ZeroIfNaN(ParseLength(styleMap, "margin-bottom", fallbackSize, 0f, allowAuto: true));
 
-        return Math.Max(authored, ParseLength(styleMap, "min-height", fallbackSize, 0f, allowAuto: false)) + margins;
+        var minimum = IsPercentageValue(styleMap.GetValueOrDefault("min-height")) ? 0f : ParseLength(styleMap, "min-height", fallbackSize, 0f, allowAuto: false);
+        return Math.Max(authored, minimum) + margins;
     }
 
     private static float MeasureGridItemHeight(ElementRenderNode element, float containingWidth, RenderTextStyle inheritedTextStyle, LayoutContext context, float maxY)
@@ -6257,6 +6397,21 @@ public sealed partial class HtmlRenderer
         return styleMap.TryGetValue("justify-content", out var value) && !string.IsNullOrWhiteSpace(value)
             ? NormalizeFlexAlignment(value, "flex-start")
             : "flex-start";
+    }
+
+    /// <summary>
+    /// The baseline of a flex item in a row, from the top of its border box: that of its first
+    /// line of text, else the bottom edge of its border box (CSS Flexbox §8.5).
+    /// </summary>
+    private static float ResolveFlexItemBaseline(ElementRenderNode element, float borderBoxWidth, float borderBoxHeight, RenderTextStyle inheritedTextStyle, LayoutContext context, float containingWidth)
+    {
+        if (IsReplacedElement(element.Ref) || !HoldsLineContent(element, context))
+        {
+            return borderBoxHeight;
+        }
+
+        var trial = TrialLayout(element, borderBoxWidth, inheritedTextStyle, context, borderBoxWidth, isAtomicInline: false, isFlexOrGridItem: true, percentageBasisWidth: containingWidth);
+        return trial is { FirstBaselineY: { } baseline, Metrics: { } metrics } ? baseline - metrics.BorderBoxY : borderBoxHeight;
     }
 
     private static string GetAlignItems(Dictionary<string, string> styleMap)

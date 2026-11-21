@@ -33,8 +33,17 @@ internal static class HitTesting
             }
         }
 
-        return best;
+        // generated content is hit as the element it belongs to (CSSOM View: pseudo-elements are
+        // never the result), e.g. a link's `::after` stretched over a whole card is the link
+        return best is null ? null : GetOriginatingElement(best);
     }
+
+    /// <summary>
+    /// The element itself, or the one a pseudo-element belongs to (its <c>ParentElement</c> is
+    /// the parent of that element).
+    /// </summary>
+    internal static IElement GetOriginatingElement(IElement element) =>
+        element is IPseudoElement pseudo && CssAnimationTracker.GetHost(pseudo) is { } host ? host : element;
 
     // an inline box on several lines is hit on them, not in the box around them
     private static bool Contains(HtmlRenderer.ElementLayoutMetrics metrics, double x, double y) =>
