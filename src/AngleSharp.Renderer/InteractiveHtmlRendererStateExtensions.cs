@@ -30,13 +30,16 @@ public static class InteractiveHtmlRendererStateExtensions
                 throw new InvalidOperationException("No IRenderDevice service is registered in the browsing context. Register a render device service in IConfiguration before creating the context.");
             }
 
-            // the document of an iframe has a viewport of its own
-            if (browsingContext.Parent is not null)
+            // the document of an iframe has a viewport of its own, which is the device of its
+            // context if the host registered one per context (so its media queries see it too)
+            if (browsingContext.Parent is { } parentContext &&
+                (renderDevice is not DefaultRenderDevice || ReferenceEquals(renderDevice, parentContext.GetServices<IRenderDevice>().FirstOrDefault())))
             {
                 renderDevice = new DefaultRenderDevice
                 {
                     Category = renderDevice.Category,
                     ColorBits = renderDevice.ColorBits,
+                    MonochromeBits = renderDevice.MonochromeBits,
                     Frequency = renderDevice.Frequency,
                     IsInterlaced = renderDevice.IsInterlaced,
                     IsScripting = renderDevice.IsScripting,

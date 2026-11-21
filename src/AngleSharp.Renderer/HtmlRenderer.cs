@@ -9699,9 +9699,47 @@ public sealed partial class HtmlRenderer
     private static bool TryGetObjectImage(IElement element, out CachedImageResource? imageResource)
     {
         imageResource = null;
+        // an error (e.g. a 404 with an image) shows the fallback (HTML 4.8.6)
         return element is not ILoadableElement { CurrentDownload.Task.IsCompleted: false } &&
+            (GetObjectResponse(element) is not { } response || IsSuccessful(response)) &&
             TryGetOrLoadImageResource(element, element.GetAttribute("data"), out imageResource) && imageResource is not null;
     }
+
+    /// <summary>
+    /// An <c>object</c> showing a document (e.g. a page of HTML) rather than an image, which
+    /// hides its fallback like an iframe. The document itself isn't shown (Acid3 has a
+    /// transparent one), so the object is an empty box of the size of an iframe.
+    /// </summary>
+    private static bool ShowsObjectDocument(IElement element)
+    {
+        if (element is IPseudoElement || !string.Equals(element.LocalName, "object", StringComparison.OrdinalIgnoreCase) ||
+            GetObjectResponse(element) is not { } response || !IsSuccessful(response))
+        {
+            return false;
+        }
+
+        return ObjectDocumentService.IsDocument(response);
+    }
+
+    // the completed response of the data of an object, if any (one a request failed for is none)
+    private static IResponse? GetObjectResponse(IElement element)
+    {
+        if (element is not ILoadableElement { CurrentDownload.Task: { IsCompleted: true } task })
+        {
+            return null;
+        }
+
+        try
+        {
+            return task.Status == TaskStatus.RanToCompletion ? task.Result : null;
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    private static bool IsSuccessful(IResponse response) => (int)response.StatusCode is >= 200 and < 300;
 
     private static bool HasLoadableImageSource(IElement element) =>
         TryGetOrLoadImageResource(element, element.GetAttribute("src"), out var imageResource) && imageResource is not null;
@@ -10699,7 +10737,7 @@ public sealed partial class HtmlRenderer
             return FormControlKind.Progress;
         }
 
-        if (string.Equals(tagName, "iframe", StringComparison.OrdinalIgnoreCase))
+        if (string.Equals(tagName, "iframe", StringComparison.OrdinalIgnoreCase) || ShowsObjectDocument(element))
         {
             return FormControlKind.Frame;
         }
@@ -11557,7 +11595,7 @@ public sealed partial class HtmlRenderer
                 PaintListBox(displayList, element, textStyle, context, contentX, contentY, contentWidth, contentHeight);
                 break;
 
-            case FormControlKind.Frame:
+            case FormControlKind.Frame when string.Equals(element.LocalName, "iframe", StringComparison.OrdinalIgnoreCase):
                 PaintSubframe(displayList, element, context, contentX, contentY, contentWidth, contentHeight);
                 break;
 

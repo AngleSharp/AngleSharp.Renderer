@@ -11,6 +11,10 @@ Released on tbd.
 - Fixed the background showing through where two border sides of different colors meet on a diagonal
 - Fixed `data:` images whose base64 is percent-encoded (e.g. `%2F` for `/`) not being shown
 - Added `object` elements showing an image instead of their fallback content
+- Fixed an `object` with data that failed to load (e.g. a 404) showing it instead of its fallback content
+- Fixed an `object` showing a page (e.g. `text/html`) showing its fallback content; it is an empty box of the size of an iframe
+- Fixed the document of an empty iframe (e.g. 0 by 0) keeping the viewport of 300 by 150
+- Updated the document of an iframe to keep the render device of its browsing context, if it has one of its own
 
 # 0.12.0
 
