@@ -24,12 +24,13 @@ Released on tbd.
 - Fixed an absolutely positioned box with `height: fit-content` (e.g. a popover) being stretched between `top` and `bottom`, and centering one of an automatic height with `margin: auto`
 - Fixed `scrollWidth` and `scrollHeight` leaving out text extending beyond its box (e.g. cut off by an ellipsis)
 - Updated the document of an iframe to keep the render device of its browsing context, if it has one of its own
+- Updated to use a minimum of AngleSharp.Css 1.5.0
 - Added color hints and color interpolation methods (e.g. `in oklch`, `in hsl longer hue`) of gradients
 - Added `background-clip: text`
 - Added `object` elements showing an image instead of their fallback content
 - Added `align-items: baseline` (and `align-self`) for flex items in a row: an item without text sits on the baseline with the bottom of its border box (e.g. a rule after a heading's text), where it was at the top of the line
 - Added `getImageData()`, `putImageData()` and `createImageData()` of the canvas (`ImageData`)
-- Added `paint()` background images of the CSS Painting API (painted by AngleSharp.Css's paint worklets); requires AngleSharp.Css 1.5.0
+- Added `paint()` background images of the CSS Painting API
 
 # 0.12.0
 
