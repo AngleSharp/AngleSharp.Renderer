@@ -10,7 +10,7 @@ namespace AngleSharp.Renderer;
 /// <summary>
 /// Stores interactive renderer state (scroll positions, hover state, and render device) per browsing context.
 /// </summary>
-internal sealed partial class InteractiveHtmlRendererState : IDomHarness
+internal sealed partial class InteractiveHtmlRendererState : IDomHarness, AngleSharp.Css.IAnimatedValueProvider
 {
     private readonly ConditionalWeakTable<IElement, ElementInteractionState> _elementStates = new();
     private readonly HtmlRenderer _renderer;
@@ -55,6 +55,8 @@ internal sealed partial class InteractiveHtmlRendererState : IDomHarness
         Context = context;
         RenderDevice = renderDevice;
         _renderer = new HtmlRenderer();
+        // the animated custom properties are part of the cascade (see GetAnimatedValues)
+        AngleSharp.Css.BrowsingContextExtensions.SetAnimatedValueProvider(context, this);
     }
 
     private readonly HashSet<InteractiveHtmlRendererState> _subframes = [];

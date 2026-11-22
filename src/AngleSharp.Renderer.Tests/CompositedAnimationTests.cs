@@ -119,6 +119,61 @@ public sealed class CompositedAnimationTests
         Assert.Equal(0, Differences(frame.Rasterize(), full.Rasterize()));
     }
 
+    private const string RegisteredColor = "@property --c { syntax: '<color>'; inherits: false; initial-value: rgb(255, 0, 0) }";
+
+    [Fact]
+    public async Task AnAnimationOfARegisteredCustomPropertyChangesWhatUsesIt()
+    {
+        var (document, harness) = await OpenAsync(RegisteredColor + " @keyframes k { from { --c: rgb(255, 0, 0) } to { --c: rgb(0, 0, 255) } } #box { animation: k 1s linear forwards; background: var(--c) }");
+        var box = document.GetElementById("box")!;
+        harness.PrepareFrame();
+        var y = (int)box.GetBoundingClientRect().Top + 30;
+
+        harness.AdvanceTime(TimeSpan.FromMilliseconds(500));
+        var (r, _, b) = Color((harness.UpdateFrame() ?? harness.PrepareFrame()).Rasterize(), 30, y);
+
+        Assert.InRange(r, 100, 155);
+        Assert.InRange(b, 100, 155);
+    }
+
+    [Fact]
+    public async Task ATransitionOfARegisteredCustomPropertyChangesWhatUsesIt()
+    {
+        var (document, harness) = await OpenAsync(RegisteredColor + " #box { --c: rgb(255, 0, 0); background: var(--c); transition: --c 1s linear } #box.on { --c: rgb(0, 0, 255) }");
+        var box = document.GetElementById("box")!;
+        harness.PrepareFrame();
+        var y = (int)box.GetBoundingClientRect().Top + 30;
+
+        box.ClassList.Add("on");
+        harness.UpdateFrame();
+        // a run found between frames starts with the next one
+        harness.AdvanceTime(TimeSpan.FromMilliseconds(16));
+        harness.UpdateFrame();
+        harness.AdvanceTime(TimeSpan.FromMilliseconds(500));
+        var (r, _, b) = Color((harness.UpdateFrame() ?? harness.PrepareFrame()).Rasterize(), 30, y);
+        harness.AdvanceTime(TimeSpan.FromMilliseconds(1000));
+        var end = Color((harness.UpdateFrame() ?? harness.PrepareFrame()).Rasterize(), 30, y);
+
+        Assert.InRange(r, 30, 225);
+        Assert.InRange(b, 30, 225);
+        Assert.Equal(((byte)0, (byte)0, (byte)255), end);
+    }
+
+    [Fact]
+    public async Task ACustomPropertyThatIsNotRegisteredHasNoTransition()
+    {
+        var (document, harness) = await OpenAsync("#box { --c: rgb(255, 0, 0); background: var(--c); transition: --c 1s linear } #box.on { --c: rgb(0, 0, 255) }");
+        var box = document.GetElementById("box")!;
+        harness.PrepareFrame();
+        var y = (int)box.GetBoundingClientRect().Top + 30;
+
+        box.ClassList.Add("on");
+        harness.UpdateFrame();
+        harness.AdvanceTime(TimeSpan.FromMilliseconds(300));
+
+        Assert.Equal(((byte)0, (byte)0, (byte)255), Color((harness.UpdateFrame() ?? harness.PrepareFrame()).Rasterize(), 30, y));
+    }
+
     private static int Differences(RenderedPixels a, RenderedPixels b)
     {
         var count = 0;

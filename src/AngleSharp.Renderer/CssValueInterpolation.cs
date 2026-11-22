@@ -258,6 +258,92 @@ internal static class CssValueInterpolation
             : string.Create(CultureInfo.InvariantCulture, $"{interpolated.ToString("0.####", CultureInfo.InvariantCulture)}px");
     }
 
+    /// <summary>
+    /// The value of a custom property between two of its values. Only a registered one has a type
+    /// (CSS Properties and Values API 1, 2.6): its numbers of the same unit (e.g. 0deg and 180deg,
+    /// or 5% and 95%) and its colors are interpolated; anything else, like the value of a property
+    /// that is not registered, flips halfway.
+    /// </summary>
+    public static string InterpolateCustom(AngleSharp.Css.Dom.ICssPropertyRegistration? registration, string from, string to, double t)
+    {
+        if (registration is { IsUniversal: false, IsList: false })
+        {
+            var syntax = registration.Syntax;
+
+            if (syntax.Contains("<color>", StringComparison.Ordinal) && !TrySplitDimension(from, out _, out _) && !TrySplitDimension(to, out _, out _))
+            {
+                return InterpolateColor(HtmlRenderer.ParseColor(from, RenderColor.Transparent), HtmlRenderer.ParseColor(to, RenderColor.Transparent), t);
+            }
+
+            if (TrySplitDimension(from, out var a, out var unit) && TrySplitDimension(to, out var b, out var otherUnit) &&
+                (unit.Equals(otherUnit, StringComparison.OrdinalIgnoreCase) || a == 0d || b == 0d))
+            {
+                var value = a + ((b - a) * t);
+                var text = syntax.Contains("<integer>", StringComparison.Ordinal) && unit.Length == 0
+                    ? Math.Round(value, MidpointRounding.AwayFromZero).ToString(CultureInfo.InvariantCulture)
+                    : value.ToString("0.####", CultureInfo.InvariantCulture);
+                return text + (unit.Length > 0 ? unit : otherUnit);
+            }
+        }
+
+        return t < 0.5d ? from : to;
+    }
+
+    // a number with its unit, if any, e.g. 37.5deg, 5% or 2
+    private static bool TrySplitDimension(string value, out double number, out string unit)
+    {
+        var text = value.Trim();
+        var end = 0;
+
+        while (end < text.Length && (char.IsDigit(text[end]) || text[end] is '.' or '-' or '+' || (end > 0 && text[end] is 'e' or 'E' && end + 1 < text.Length && (char.IsDigit(text[end + 1]) || text[end + 1] is '-' or '+'))))
+        {
+            end++;
+        }
+
+        unit = text[end..];
+
+        if (!double.TryParse(text[..end], NumberStyles.Float, CultureInfo.InvariantCulture, out number) ||
+            !(unit.Length == 0 || unit == "%" || System.Linq.Enumerable.All(unit, char.IsLetter)))
+        {
+            return false;
+        }
+
+        // an angle in deg, however written (e.g. as computed or as declared)
+        switch (unit.ToLowerInvariant())
+        {
+            case "rad": number *= 180d / Math.PI; unit = "deg"; break;
+            case "grad": number *= 0.9d; unit = "deg"; break;
+            case "turn": number *= 360d; unit = "deg"; break;
+        }
+
+        return true;
+    }
+
+    /// <summary>
+    /// Gets if two values of a custom property are the same, e.g. 180deg and 0.5turn.
+    /// </summary>
+    public static bool CustomValuesAreEquivalent(string a, string b)
+    {
+        if (string.Equals(a.Trim(), b.Trim(), StringComparison.Ordinal))
+        {
+            return true;
+        }
+        else if (TrySplitDimension(a, out var x, out var unit) && TrySplitDimension(b, out var y, out var otherUnit))
+        {
+            return unit.Equals(otherUnit, StringComparison.OrdinalIgnoreCase) && Math.Abs(x - y) < 1e-6;
+        }
+
+        // e.g. rgb(0, 0, 255) as declared and rgba(0, 0, 255, 1) as computed
+        return TryParseColor(a, out var first) && TryParseColor(b, out var second) && first == second;
+    }
+
+    // a color is what parses the same with two different fallbacks
+    private static bool TryParseColor(string value, out RenderColor color)
+    {
+        color = HtmlRenderer.ParseColor(value, RenderColor.Transparent);
+        return color == HtmlRenderer.ParseColor(value, new RenderColor(1, 2, 3));
+    }
+
     private static bool TryParsePercentage(string value, out float percentage)
     {
         var text = value.Trim();

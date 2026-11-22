@@ -1230,6 +1230,14 @@ public sealed partial class HtmlRenderer
                         }
                     }
 
+                    // a paint() image is drawn from custom properties of the box (e.g. animated ones),
+                    // which the style map doesn't have
+                    if (!isDecorated && HasPaintImage(after) && previousNodes.TryGetValue(target, out var previousNode) &&
+                        !HaveSameCustomProperties(previousNode.ComputedStyle, elementNode.ComputedStyle))
+                    {
+                        isDecorated = true;
+                    }
+
                     // the lines of a box are painted across the text of its descendants, too
                     if (changesDecorationLines && elementNode.Children.OfType<ElementRenderNode>().Any(GeneratesBoxes))
                     {
@@ -1281,6 +1289,24 @@ public sealed partial class HtmlRenderer
                     }
 
                     if (!Compare(child, visitsChildren: reachesDescendants))
+                    {
+                        return false;
+                    }
+                }
+
+                return true;
+            }
+
+            static bool HasPaintImage(Dictionary<string, string> styleMap) =>
+                styleMap.GetValueOrDefault("background-image")?.Contains("paint(", StringComparison.OrdinalIgnoreCase) == true ||
+                styleMap.GetValueOrDefault("border-image-source")?.Contains("paint(", StringComparison.OrdinalIgnoreCase) == true;
+
+            static bool HaveSameCustomProperties(ICssStyleDeclaration before, ICssStyleDeclaration after)
+            {
+                foreach (var property in before.Concat(after))
+                {
+                    if (property.Name.StartsWith("--", StringComparison.Ordinal) &&
+                        !string.Equals(before.GetPropertyValue(property.Name), after.GetPropertyValue(property.Name), StringComparison.Ordinal))
                     {
                         return false;
                     }
@@ -1667,10 +1693,21 @@ public sealed partial class HtmlRenderer
                         var box = ResolveBoxStyle(styleMap, anchor.Element);
                         box = box with { BorderRadius = ResolveBorderRadii(styleMap, bounds.Width, bounds.Height) };
                         var context = _context with { RecordsPaintAnchors = false };
-                        PaintBoxDecorations(buffer, context, styleMap, anchor.Element, anchor.Key, box, bounds,
-                            new EdgeSizes(anchor.Border.Y, anchor.Border.Width, anchor.Border.Height, anchor.Border.X),
-                            new EdgeSizes(anchor.Padding.Y, anchor.Padding.Width, anchor.Padding.Height, anchor.Padding.X),
-                            anchor.FillsTransparentBackground);
+                        // the paint() images of the background are drawn with the style of the box now
+                        var outerPaintedNode = s_paintedNode;
+                        s_paintedNode = _pass.Nodes.TryGetValue(anchor.Element, out var paintedNode) ? paintedNode : null;
+
+                        try
+                        {
+                            PaintBoxDecorations(buffer, context, styleMap, anchor.Element, anchor.Key, box, bounds,
+                                new EdgeSizes(anchor.Border.Y, anchor.Border.Width, anchor.Border.Height, anchor.Border.X),
+                                new EdgeSizes(anchor.Padding.Y, anchor.Padding.Width, anchor.Padding.Height, anchor.Padding.X),
+                                anchor.FillsTransparentBackground);
+                        }
+                        finally
+                        {
+                            s_paintedNode = outerPaintedNode;
+                        }
                         replacements.Add((i + 1, end - i - 1, buffer.Commands.ToList()));
                         repainted.Add(anchor.Key);
                         i = end;

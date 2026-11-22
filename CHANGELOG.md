@@ -25,6 +25,7 @@ Released on tbd.
 - Fixed an absolutely positioned box with `height: fit-content` (e.g. a popover) being stretched between `top` and `bottom`, and centering one of an automatic height with `margin: auto`
 - Fixed `scrollWidth` and `scrollHeight` leaving out text extending beyond its box (e.g. cut off by an ellipsis)
 - Fixed text before and after a relatively positioned inline box (e.g. a `strong` with `position: relative`) being painted as one, where the box was
+- Fixed a `paint()` image not being drawn anew when only the custom properties it uses changed, and not at all when its box was only painted again
 - Updated the document of an iframe to keep the render device of its browsing context, if it has one of its own
 - Updated to use a minimum of AngleSharp.Css 1.5.0
 - Added color hints and color interpolation methods (e.g. `in oklch`, `in hsl longer hue`) of gradients
@@ -37,6 +38,7 @@ Released on tbd.
 - Added `IInputControl` for showing inputs in other ways: a control sizes an input whose `width` or `height` is `auto`, paints its content and creates its picker, and is registered per input type with `WithInputControl` (the built-in ones are `ColorInputControl` and `DateTimeInputControl`)
 - Added the `disclosure-open` and `disclosure-closed` list markers (e.g. of `summary`)
 - Added `drawFocusIfNeeded()` of the canvas
+- Added animations and transitions of registered custom properties (`@property`, `CSS.registerProperty`), which are part of the cascade, so what uses them follows, e.g. a `var()` in a gradient or the input properties of a paint worklet
 
 # 0.12.0
 

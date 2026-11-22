@@ -5768,16 +5768,17 @@ public sealed class HtmlRendererTests
         Assert.Equal(1f, CurrentAlpha(), precision: 2);
     }
 
+    // a number input only keeps a number as its value (HTML 4.10.5.1.12)
     [Theory]
-    [InlineData("text")]
-    [InlineData("number")]
-    [InlineData("url")]
-    [InlineData("email")]
-    [InlineData("search")]
-    [InlineData("tel")]
-    public async Task BuildDisplayList_TextLikeInputGetsDefaultChromeAndShowsItsValue(string type)
+    [InlineData("text", "Hello")]
+    [InlineData("number", "42")]
+    [InlineData("url", "Hello")]
+    [InlineData("email", "Hello")]
+    [InlineData("search", "Hello")]
+    [InlineData("tel", "Hello")]
+    public async Task BuildDisplayList_TextLikeInputGetsDefaultChromeAndShowsItsValue(string type, string value)
     {
-        var document = await ParseAsync($"""<html><body><input type="{type}" value="Hello" /></body></html>""");
+        var document = await ParseAsync($"""<html><body><input type="{type}" value="{value}" /></body></html>""");
 
         var renderer = new HtmlRenderer();
         var displayList = renderer.BuildDisplayList(document, new DefaultRenderDevice
@@ -5797,7 +5798,7 @@ public sealed class HtmlRendererTests
         var borderEdges = displayList.Commands.OfType<FillRectCommand>().Where(f => f.Color.Equals(new RenderColor(118, 118, 118))).ToList();
         Assert.NotEmpty(borderEdges);
 
-        var valueText = Assert.Single(displayList.Commands.OfType<DrawTextCommand>().Where(t => t.Text == "Hello"));
+        var valueText = Assert.Single(displayList.Commands.OfType<DrawTextCommand>().Where(t => t.Text == value));
         // Left-aligned at the content box's own left edge (border + padding in from the box), not
         // centered - matching how a browser shows typed input text.
         Assert.Equal(background.Rect.X + 1f + 2f, valueText.X, precision: 3);

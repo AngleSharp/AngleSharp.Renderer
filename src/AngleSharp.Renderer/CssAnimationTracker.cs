@@ -521,6 +521,36 @@ internal sealed class CssAnimationTracker
         return result;
     }
 
+    /// <summary>
+    /// Adds the values the CSS animations of the element give its custom properties now, which
+    /// are part of the cascade (see <see cref="AngleSharp.Css.IAnimatedValueProvider"/>), as what
+    /// uses them (a var(), a paint worklet) is computed from them. The declared style (without
+    /// these values) tells the animations of the element, as the computed one is being made.
+    /// </summary>
+    public void AddAnimatedCustomValues(IElement element, ICssStyleDeclaration declared, double clockMs, ref Dictionary<string, string>? values)
+    {
+        element = GetStableElement(element);
+
+        foreach (var spec in ParseAnimationSpecs(declared))
+        {
+            if (GetKeyframeStops(element, spec.Name) is not { Count: > 0 } stops)
+            {
+                continue;
+            }
+
+            foreach (var property in stops.SelectMany(stop => stop.PropertyValues.Keys).Where(IsCustomProperty).Distinct(StringComparer.Ordinal))
+            {
+                // a later animation wins, as in GetAnimatedValue
+                if (GetAnimatedValueForSpec(element, spec, property, clockMs, declared) is { } value)
+                {
+                    (values ??= new(StringComparer.Ordinal))[property] = value;
+                }
+            }
+        }
+    }
+
+    private static bool IsCustomProperty(string property) => property.StartsWith("--", StringComparison.Ordinal);
+
     // the computed style, when the caller has it, saves running the element's cascade again
     private List<CssAnimationSpec> GetAnimationSpecs(IElement element, ICssStyleDeclaration? computedStyle)
     {
@@ -618,6 +648,15 @@ internal sealed class CssAnimationTracker
         var progress = iterationRunsBackward ? 1d - rawProgress : rawProgress;
         var eased = spec.TimingFunction.Evaluate(progress);
 
+        if (IsCustomProperty(property))
+        {
+            // the declared style (see AddAnimatedCustomValues) has the element's own value, if any
+            var registration = element.Owner?.GetRegisteredProperty(property);
+            return InterpolateAtKeyframes(keyframes, property, eased,
+                () => computedStyle?.GetPropertyValue(property) is { Length: > 0 } own ? own.Trim() : registration?.InitialValue,
+                (from, to, t) => CssValueInterpolation.InterpolateCustom(registration, from, to, t));
+        }
+
         return InterpolateAtKeyframes(keyframes, property, eased, () => GetUnderlyingValue(computedStyle ?? element.ComputeCurrentStyle(), property));
     }
 
@@ -672,7 +711,7 @@ internal sealed class CssAnimationTracker
     /// Animations 1, 3.: e.g. `@keyframes spin { to { transform: rotate(360deg) } }` turns from
     /// the transform the element has, instead of staying at the end).
     /// </summary>
-    private static string? InterpolateAtKeyframes(IReadOnlyList<CssKeyframeStop> stops, string property, double position, Func<string?> getUnderlyingValue)
+    private static string? InterpolateAtKeyframes(IReadOnlyList<CssKeyframeStop> stops, string property, double position, Func<string?> getUnderlyingValue, Func<string, string, double, string>? interpolate = null)
     {
         var declaring = new List<(double Position, string Value)>(stops.Count + 2);
 
@@ -728,7 +767,7 @@ internal sealed class CssAnimationTracker
         var (upperPosition, upperValue) = declaring[upperIndex];
         var span = upperPosition - lowerPosition;
         var subT = span > 0d ? (position - lowerPosition) / span : 1d;
-        return CssValueInterpolation.Interpolate(property, lowerValue, upperValue, subT);
+        return interpolate is not null ? interpolate(lowerValue, upperValue, subT) : CssValueInterpolation.Interpolate(property, lowerValue, upperValue, subT);
     }
 
     private static IReadOnlyList<CssKeyframeStop>? FindKeyframeStops(IElement element, string name)
@@ -758,6 +797,15 @@ internal sealed class CssAnimationTracker
                 if (value is not null)
                 {
                     propertyValues[property] = value;
+                }
+            }
+
+            // custom properties as declared, which the cascade gets (see GetAnimatedCustomValues)
+            foreach (var property in keyframe.Style)
+            {
+                if (property.Name.StartsWith("--", StringComparison.Ordinal) && !string.IsNullOrWhiteSpace(property.Value))
+                {
+                    propertyValues[property.Name] = property.Value.Trim();
                 }
             }
 
