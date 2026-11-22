@@ -1,4 +1,4 @@
-# 0.12.1
+# 0.13.0
 
 Released on tbd.
 
@@ -16,9 +16,20 @@ Released on tbd.
 - Fixed generated content being hit as the pseudo-element (in the hit-test map, `elementFromPoint` and for `:hover`) instead of its element, e.g. a link's `::after` stretched over a whole card did not act as the link
 - Fixed grid items with a percentage `height` (e.g. `height: 100%` cards) in an auto row being as tall as the grid is wide; such a height contributes as `auto` to the row and then fills it
 - Fixed text right in a grid container (e.g. the label of an icon with `display: grid; place-items: center`) not being an anonymous grid item: it stayed at the top left instead of being placed in a cell and aligned
+- Fixed `row-reverse` and `column-reverse` packing the items at the end without reversing their order
+- Fixed `grid-auto-columns` being ignored for implicit columns
+- Added `subgrid` for `grid-template-columns` and `grid-template-rows` (tracks, gaps and line names of the parent grid, row sizes from the subgrid's items)
+- Fixed the edges of a gradient `border-image` of a box with a fractional size being drawn with seams and a washed out side
+- Fixed `::marker` and `::first-line` colors being ignored
+- Fixed an absolutely positioned box with `height: fit-content` (e.g. a popover) being stretched between `top` and `bottom`, and centering one of an automatic height with `margin: auto`
+- Fixed `scrollWidth` and `scrollHeight` leaving out text extending beyond its box (e.g. cut off by an ellipsis)
 - Updated the document of an iframe to keep the render device of its browsing context, if it has one of its own
-- Added `align-items: baseline` (and `align-self`) for flex items in a row: an item without text sits on the baseline with the bottom of its border box (e.g. a rule after a heading's text), where it was at the top of the line
+- Added color hints and color interpolation methods (e.g. `in oklch`, `in hsl longer hue`) of gradients
+- Added `background-clip: text`
 - Added `object` elements showing an image instead of their fallback content
+- Added `align-items: baseline` (and `align-self`) for flex items in a row: an item without text sits on the baseline with the bottom of its border box (e.g. a rule after a heading's text), where it was at the top of the line
+- Added `getImageData()`, `putImageData()` and `createImageData()` of the canvas (`ImageData`)
+- Added `paint()` background images of the CSS Painting API (painted by AngleSharp.Css's paint worklets); requires AngleSharp.Css 1.5.0
 
 # 0.12.0
 
