@@ -240,7 +240,8 @@ public sealed partial class SkiaRenderBackend
         var scaleLeft = sliceLeft > 0f ? widthLeft / sliceLeft : 1f;
         var scaleRight = sliceRight > 0f ? widthRight / sliceRight : 1f;
 
-        using var paint = new SKPaint { IsAntialias = true };
+        // the parts meet at fractional positions, where antialiased edges would leave seams
+        using var paint = new SKPaint { IsAntialias = false };
 
         for (var row = 0; row < 3; row++)
         {
@@ -286,6 +287,8 @@ public sealed partial class SkiaRenderBackend
 
         using var paint = CreateGradientPaint(gradient, new RenderRect(0f, 0f, width, height));
         surface.Canvas.Clear(SKColors.Transparent);
+        // the gradient fills all of the image's whole pixels (a part of one would be transparent)
+        surface.Canvas.Scale(pixelWidth / width, pixelHeight / height);
         surface.Canvas.DrawRect(new SKRect(0f, 0f, width, height), paint);
         return surface.Snapshot();
     }
@@ -399,7 +402,7 @@ public sealed partial class SkiaRenderBackend
     /// Ends a mask scope: the group painted since <see cref="PushMaskCommand"/> keeps only what
     /// the mask layers cover, by drawing them with destination-in onto it.
     /// </summary>
-    private static void ApplyMask(SKCanvas canvas, PushMaskCommand command)
+    private static void ApplyMask(SKCanvas canvas, PushMaskCommand command, FontFaceSet fonts)
     {
         using var destinationIn = new SKPaint { BlendMode = SKBlendMode.DstIn };
         canvas.SaveLayer(destinationIn);
@@ -409,6 +412,21 @@ public sealed partial class SkiaRenderBackend
         for (var index = command.Layers.Count - 1; index >= 0; index--)
         {
             var layer = command.Layers[index];
+
+            if (layer.Paint is RenderTextMaskPaint textMask)
+            {
+                canvas.Save();
+                canvas.ClipRect(ToSkRect(layer.Area));
+
+                foreach (var text in textMask.Texts)
+                {
+                    DrawText(canvas, text with { Color = new RenderColor(0, 0, 0), DecorationColor = new RenderColor(0, 0, 0) }, fonts);
+                }
+
+                canvas.Restore();
+                continue;
+            }
+
             using var paint = CreateFillPaint(layer.Paint, layer.PaintArea);
 
             if (layer.UseLuminance)

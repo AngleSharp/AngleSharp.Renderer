@@ -412,7 +412,8 @@ public sealed partial class HtmlRenderer
 
         public string Text { get; init; } = string.Empty;
 
-        public RenderTextStyle Style { get; init; }
+        // set again for the first line, which ::first-line styles
+        public RenderTextStyle Style { get; set; }
 
         /// <summary>Identifies pieces that share one resolved text style, so they can be painted as one run.</summary>
         public int StyleId { get; init; }
@@ -1124,6 +1125,8 @@ public sealed partial class HtmlRenderer
 
             if (clamped || (hasLineBox && textStyle.TextOverflow == TextOverflowMode.Ellipsis && MeasureLinePieces(linePieces) > available + 0.01f))
             {
+                // what the ellipsis cuts off still overflows the box (scrollWidth)
+                NoteTextExtent(lineLeft + indent + MeasureLinePieces(linePieces), lineTop + pendingBlockMargin);
                 TruncateLineWithEllipsis(linePieces, available, textStyle, context, forceEllipsis: clamped);
             }
 
@@ -1135,6 +1138,11 @@ public sealed partial class HtmlRenderer
 
             lineTop += pendingBlockMargin;
             pendingBlockMargin = MarginStrut.Zero;
+
+            if (lineCount == 0 && textStyle.FirstLineColor is { } firstLineColor)
+            {
+                ApplyFirstLineColor(linePieces, textStyle.Color, firstLineColor);
+            }
 
             var lineHeight = EmitLine(
                 linePieces,
@@ -1722,6 +1730,25 @@ public sealed partial class HtmlRenderer
     /// <summary>
     /// Positions and paints one line box and returns its height.
     /// </summary>
+    /// <summary>
+    /// The color of `::first-line` for the text of the first line, which inherits it (CSS
+    /// Pseudo-Elements 4 §2.1); what has a color of its own keeps it.
+    /// </summary>
+    private static void ApplyFirstLineColor(List<InlinePiece> linePieces, RenderColor blockColor, RenderColor color)
+    {
+        foreach (var piece in linePieces)
+        {
+            if (piece.Style.Color == blockColor)
+            {
+                piece.Style = piece.Style with
+                {
+                    Color = color,
+                    DecorationColor = piece.Style.DecorationColor == blockColor ? color : piece.Style.DecorationColor,
+                };
+            }
+        }
+    }
+
     private static float EmitLine(
         List<InlinePiece> linePieces,
         float lineLeft,
@@ -1766,6 +1793,8 @@ public sealed partial class HtmlRenderer
                 x += piece.Width;
             }
         }
+
+        var lineRight = x;
 
         // Vertical metrics: the block's own strut, the line-height box of every inline box and of
         // its text, and every atomic inline's margin box, all aligned on one baseline, each shifted
@@ -2034,6 +2063,7 @@ public sealed partial class HtmlRenderer
         // Recorded after the atomic children so it is this line's baseline - not one they recorded
         // while being laid out - that an enclosing inline-block aligns with.
         RecordTextBaseline(baselineY);
+        NoteTextExtent(lineRight, lineTop + lineHeight);
         return lineHeight;
     }
 

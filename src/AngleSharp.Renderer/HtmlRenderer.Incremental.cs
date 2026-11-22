@@ -3161,8 +3161,9 @@ public sealed partial class HtmlRenderer
                 (float.IsNaN(flex.EstimatedCrossSize) || EstimateFlexItemCrossSize(node, flex.FinalMainSize, item.IsRowDirection, entry.TextStyle, _context, flex.CrossAvailable, flex.RelativeTo) == flex.EstimatedCrossSize);
         }
 
+        // (what its text extends to is in it, as its box is laid out again)
         private static bool HasSameBox(ElementLayoutMetrics first, ElementLayoutMetrics second) =>
-            first with { Layer = default, Sticky = null } == second with { Layer = default, Sticky = null };
+            first with { Layer = default, Sticky = null, TextRight = 0f, TextBottom = 0f } == second with { Layer = default, Sticky = null, TextRight = 0f, TextBottom = 0f };
 
         // The nearest sticky ancestor, which is what the metrics of a box in it name.
         private IElement? FindStickyAncestor(IElement element)
