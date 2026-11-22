@@ -1509,6 +1509,12 @@ public sealed partial class HtmlRenderer
     /// separators (the untrimmed space pieces), widening them in place. Returns false when the
     /// line has no separator or no free space, in which case it stays start-aligned.
     /// </summary>
+    private static bool AreAdjacent(List<InlinePiece> lineOrder, InlinePiece previous, InlinePiece next)
+    {
+        var index = lineOrder.IndexOf(previous);
+        return index >= 0 && index + 1 < lineOrder.Count && ReferenceEquals(lineOrder[index + 1], next);
+    }
+
     private static bool JustifySpaces(List<InlinePiece> visualOrder, float freeSpace)
     {
         if (freeSpace <= 0f)
@@ -1900,11 +1906,16 @@ public sealed partial class HtmlRenderer
 
         PaintInlineBoxFragments(visualOrder, baselineY, context, displayList, positioned: false);
 
-        // what is positioned goes above the rest of the line
+        // what is positioned goes above the rest of the line; the pieces around it, which then
+        // follow each other, are still painted where they are (not as one run)
+        var lineOrder = visualOrder;
+
         if (boxesOnLine.Exists(static box => box.IsPositioned))
         {
             visualOrder = visualOrder.OrderBy(static piece => piece.Box?.IsPositioned == true ? 1 : 0).ToList();
         }
+
+        var isReordered = !ReferenceEquals(lineOrder, visualOrder);
 
         var firstPositioned = visualOrder.FindIndex(static piece => piece.Box?.IsPositioned == true);
         var index = 0;
@@ -1927,6 +1938,7 @@ public sealed partial class HtmlRenderer
                 var splitAtSpaces = justified || piece.Style.WordSpacing != 0f;
 
                 while (runEnd < visualOrder.Count &&
+                       (!isReordered || AreAdjacent(lineOrder, visualOrder[runEnd - 1], visualOrder[runEnd])) &&
                        visualOrder[runEnd].Kind is InlinePieceKind.Text or InlinePieceKind.Space &&
                        visualOrder[runEnd].StyleId == piece.StyleId &&
                        visualOrder[runEnd].Style.IsRightToLeftRun == piece.Style.IsRightToLeftRun &&

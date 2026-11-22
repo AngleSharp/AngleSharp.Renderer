@@ -12510,6 +12510,20 @@ public sealed partial class HtmlRenderer
             return isInside ? textStyle with { MarkerIndent = markerSize + MarkerGap } : textStyle;
         }
 
+        if (listStyleType is "disclosure-open" or "disclosure-closed")
+        {
+            // a triangle pointing down (open) or to the inline end (closed), like the ones of a details' summary
+            var triangleSize = textStyle.FontSize * 0.55f;
+            var triangleLeft = isInside ? contentX : borderBoxX - MarkerGap - triangleSize;
+            var triangleBottom = markerBaselineY;
+            var triangleTop = triangleBottom - triangleSize;
+            (float X, float Y)[] points = listStyleType == "disclosure-open"
+                ? [(triangleLeft, triangleTop + (triangleSize * 0.15f)), (triangleLeft + triangleSize, triangleTop + (triangleSize * 0.15f)), (triangleLeft + (triangleSize / 2f), triangleBottom - (triangleSize * 0.05f))]
+                : [(triangleLeft + (triangleSize * 0.1f), triangleTop), (triangleLeft + (triangleSize * 0.95f), triangleTop + (triangleSize / 2f)), (triangleLeft + (triangleSize * 0.1f), triangleBottom)];
+            PaintPolygon(displayList, points, markerColor);
+            return isInside ? textStyle with { MarkerIndent = triangleSize + MarkerGap } : textStyle;
+        }
+
         var markerText = FormatListMarkerText(ResolveListItemOrdinal(element), listStyleType);
         var markerWidth = MeasureTextWidth(context, markerText, textStyle);
         var markerX = isInside ? contentX : borderBoxX - MarkerGap - markerWidth;

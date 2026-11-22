@@ -24,6 +24,7 @@ Released on tbd.
 - Fixed `::marker` and `::first-line` colors being ignored
 - Fixed an absolutely positioned box with `height: fit-content` (e.g. a popover) being stretched between `top` and `bottom`, and centering one of an automatic height with `margin: auto`
 - Fixed `scrollWidth` and `scrollHeight` leaving out text extending beyond its box (e.g. cut off by an ellipsis)
+- Fixed text before and after a relatively positioned inline box (e.g. a `strong` with `position: relative`) being painted as one, where the box was
 - Updated the document of an iframe to keep the render device of its browsing context, if it has one of its own
 - Updated to use a minimum of AngleSharp.Css 1.5.0
 - Added color hints and color interpolation methods (e.g. `in oklch`, `in hsl longer hue`) of gradients
@@ -34,6 +35,8 @@ Released on tbd.
 - Added `paint()` background images of the CSS Painting API
 - Added pickers of `color`, `date`, `datetime-local`, `month`, `time` and `week` inputs (`OpenInputPicker`): a color picker, a calendar of days, weeks or months, and columns of hours and minutes, which a host shows on top of a frame like the list of a dropdown, setting the value with `input` and `change` events; `min`, `max` and `step` disable the days, weeks, months and times they don't allow (`InputValueConstraints`)
 - Added `IInputControl` for showing inputs in other ways: a control sizes an input whose `width` or `height` is `auto`, paints its content and creates its picker, and is registered per input type with `WithInputControl` (the built-in ones are `ColorInputControl` and `DateTimeInputControl`)
+- Added the `disclosure-open` and `disclosure-closed` list markers (e.g. of `summary`)
+- Added `drawFocusIfNeeded()` of the canvas
 
 # 0.12.0
 

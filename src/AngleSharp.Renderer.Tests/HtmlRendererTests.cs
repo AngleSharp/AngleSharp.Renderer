@@ -2908,6 +2908,50 @@ public sealed class HtmlRendererTests
     }
 
     [Fact]
+    public async Task BuildDisplayList_DisclosureMarkersAreTrianglesNotNumbers()
+    {
+        var document = await ParseAsync("""
+            <html><body><div style="display: list-item; list-style: disclosure-closed inside">Closed</div><div style="display: list-item; list-style: disclosure-open inside">Open</div></body></html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, new DefaultRenderDevice
+        {
+            ViewPortWidth = 300,
+            ViewPortHeight = 120,
+            FontSize = 16f,
+        });
+
+        var texts = displayList.Commands.OfType<DrawTextCommand>().Select(t => t.Text).ToList();
+        Assert.Equal(new[] { "Closed", "Open" }, texts);
+        Assert.Equal(2, displayList.Commands.OfType<PushClipShapeCommand>().Count(c => c.Shape is RenderClipPolygon { Points.Count: 3 }));
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_TextAroundARelativelyPositionedInlineKeepsItsPlace()
+    {
+        var document = await ParseAsync("""
+            <html><body><p>HTML<span style="position: relative; top: 7px">5</span>test</p></body></html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, new DefaultRenderDevice
+        {
+            ViewPortWidth = 300,
+            ViewPortHeight = 120,
+            FontSize = 16f,
+        });
+
+        // the text before and after the positioned box is painted before it, but not as one run
+        var texts = displayList.Commands.OfType<DrawTextCommand>().ToList();
+        var before = Assert.Single(texts.Where(t => t.Text == "HTML"));
+        var five = Assert.Single(texts.Where(t => t.Text == "5"));
+        var after = Assert.Single(texts.Where(t => t.Text == "test"));
+        Assert.True(five.X > before.X);
+        Assert.True(after.X > five.X);
+    }
+
+    [Fact]
     public async Task BuildDisplayList_PreHtmlElementDefaultsToPreservingWhitespace()
     {
         // <pre> gets `white-space: pre` from AngleSharp.Css's own UA stylesheet, the same way <ol>/

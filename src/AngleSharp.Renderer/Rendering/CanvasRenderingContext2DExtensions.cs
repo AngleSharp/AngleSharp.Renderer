@@ -2,6 +2,7 @@ namespace AngleSharp.Media.Dom;
 
 using System;
 using AngleSharp.Attributes;
+using AngleSharp.Dom;
 using AngleSharp.Renderer;
 
 /// <summary>
@@ -607,6 +608,19 @@ public static class CanvasRenderingContext2DExtensions
         if (context is Canvas2DRenderingContext canvas)
         {
             canvas.Stroke();
+        }
+    }
+
+    /// <summary>
+    /// Draws a focus ring along the current path if the given element (a fallback element of
+    /// the canvas) is focused.
+    /// </summary>
+    [DomName("drawFocusIfNeeded")]
+    public static void DrawFocusIfNeeded(this ICanvasRenderingContext2D context, IElement element)
+    {
+        if (context is Canvas2DRenderingContext canvas)
+        {
+            canvas.DrawFocusIfNeeded(element);
         }
     }
 

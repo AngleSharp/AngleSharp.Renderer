@@ -783,6 +783,27 @@ public sealed class Canvas2DRenderingContext : ICanvasRenderingContext2D
     }
 
     /// <summary>
+    /// Draws a focus ring along the current path if the given element, a fallback element of
+    /// the canvas, is focused.
+    /// </summary>
+    public void DrawFocusIfNeeded(IElement element)
+    {
+        if (element is null || element.Owner?.ActiveElement != element || !element.IsDescendantOf(Host))
+        {
+            return;
+        }
+
+        // the ring of the platform: a solid line, not affected by the shadow or the dashes of the state
+        Save();
+        SetLineDash(null);
+        StrokeStyle = "#005fcc";
+        LineWidth = 2;
+        ShadowColor = "transparent";
+        Stroke();
+        Restore();
+    }
+
+    /// <summary>
     /// Restricts what is drawn from now on to the current path (until the state is restored).
     /// </summary>
     public void Clip(string fillRule = "nonzero")
