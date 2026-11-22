@@ -18,6 +18,7 @@ using AngleSharp.Dom;
 using AngleSharp.Html.Dom;
 using AngleSharp.Io;
 using AngleSharp.Media;
+using AngleSharp.Renderer.Controls;
 using AngleSharp.Renderer.Rendering;
 using AngleSharp.Renderer.Skia;
 using AngleSharp.Renderer.Skia.Svg;
@@ -11329,6 +11330,60 @@ public sealed partial class HtmlRenderer
         // separate matter (see FormControlTextAscentRatio/DescentRatio in PaintFormControl).
         var lineHeight = textStyle.FontSize * textStyle.LineHeightMultiplier;
 
+        // An input with a control gets the size it asks for; what it leaves open is the built-in
+        // control's, else the size below (SetDefault keeps what is set first).
+        if (element is IHtmlInputElement input && kind != FormControlKind.Hidden && InputControlRegistry.Resolve(input) is { } control)
+        {
+            var sizeContext = new InputControlSizeContext(input, ToRenderFont(textStyle, context.Fonts), lineHeight, text => MeasureTextWidth(context, text, textStyle));
+            var size = control.GetIntrinsicSize(sizeContext);
+
+            ApplyInputControlSize(size);
+
+            // a side left open is the built-in control's (each side in its own box)
+            if ((size?.Width is null || size?.Height is null) && InputControlRegistry.Default.GetControl(input) is { } builtIn && !ReferenceEquals(builtIn, control))
+            {
+                ApplyInputControlSize(builtIn.GetIntrinsicSize(sizeContext));
+            }
+        }
+
+        void ApplyInputControlSize(InputControlSize? size)
+        {
+            if (size is not { } value)
+            {
+                return;
+            }
+
+            if (value.Box == InputControlSizeBox.BorderBox)
+            {
+                var box = ResolveBoxStyle(styleMap, element);
+                var isBorderBox = IsBorderBox(styleMap);
+                var horizontal = isBorderBox ? 0f : box.BorderWidth.Left + box.BorderWidth.Right + box.Padding.Left + box.Padding.Right;
+                var vertical = isBorderBox ? 0f : box.BorderWidth.Top + box.BorderWidth.Bottom + box.Padding.Top + box.Padding.Bottom;
+
+                if (value.Width is { } outerWidth)
+                {
+                    SetDefault("width", FormatPixelValue(Math.Max(0f, outerWidth - horizontal)));
+                }
+
+                if (value.Height is { } outerHeight)
+                {
+                    SetDefault("height", FormatPixelValue(Math.Max(0f, outerHeight - vertical)));
+                }
+
+                return;
+            }
+
+            if (value.Width is { } width)
+            {
+                SetDefaultWidth(Math.Max(0f, width));
+            }
+
+            if (value.Height is { } height)
+            {
+                SetDefaultHeight(Math.Max(0f, height));
+            }
+        }
+
         switch (kind)
         {
             case FormControlKind.TextLike:
@@ -11390,36 +11445,10 @@ public sealed partial class HtmlRenderer
                 SetDefaultHeight(lineHeight * ParsePositiveAttribute(element, "rows", 2));
                 break;
 
-            case FormControlKind.Color:
-                SetDefaultOuterSize(50f, 27f);
-                break;
-
             case FormControlKind.Range:
                 SetDefaultWidth(129f);
                 SetDefaultHeight(16f);
                 break;
-
-            case FormControlKind.DateTime:
-            {
-                // Wide enough for the widest value of its fields (or the value, if longer), the
-                // padding of those fields and the picker icon with its margin.
-                var type = element.GetAttribute("type")?.Trim().ToLowerInvariant() ?? "date";
-                var (widestValue, fieldCount) = type switch
-                {
-                    "time" => ("--:-- AM", 3),
-                    "datetime-local" => ("mm/dd/yyyy, --:-- AM", 6),
-                    "month" => ("September ------", 2),
-                    "week" => ("Week --, ------", 2),
-                    _ => ("mm/dd/yyyy", 3),
-                };
-                var textWidth = Math.Max(
-                    MeasureTextWidth(context, widestValue, textStyle),
-                    MeasureTextWidth(context, ResolveFormControlLabel(kind, element), textStyle));
-                SetDefaultWidth(textWidth + (fieldCount * 2f) + FormControlPickerIconMargin + (textStyle.FontSize * 1.2f));
-                // the clock icon of a time input is a bit taller than a line
-                SetDefaultHeight(type == "time" ? Math.Max(lineHeight, (textStyle.FontSize * 1.2f) + 4f) : lineHeight + 2f);
-                break;
-            }
 
             case FormControlKind.File:
                 // room for 34 digits (as in Blink) with a line and its button's padding and border
@@ -11463,7 +11492,7 @@ public sealed partial class HtmlRenderer
     private const float FormControlOptionGroupIndent = 20f;
 
     /// <summary>The margin between the fields of a date/time input and its picker icon.</summary>
-    private const float FormControlPickerIconMargin = 24f;
+    internal const float FormControlPickerIconMargin = 24f;
 
     /// <summary>
     /// If `appearance: none` makes a control an ordinary box.
@@ -11526,14 +11555,14 @@ public sealed partial class HtmlRenderer
         option.GetAttribute("label") is { Length: > 0 } label ? label : NormalizeWhitespace(option.TextContent ?? string.Empty);
 
     /// <summary>The picker icon of a date/time input, as a fraction of the font size.</summary>
-    private const float FormControlPickerIconScale = 0.9f;
+    internal const float FormControlPickerIconScale = 0.9f;
 
     /// <summary>
     /// A date/time input's displayed text: its value in en-US form (`05/03/2024`, `01:05 PM`,
     /// `May 2024`, `Week 18, 2024`), or the segmented placeholder when the value is missing or
     /// invalid, as browsers do.
     /// </summary>
-    private static string FormatDateTimeInputValue(string type, string? value)
+    internal static string FormatDateTimeInputValue(string type, string? value)
     {
         const string DatePlaceholder = "mm/dd/yyyy";
         const string TimePlaceholder = "--:-- --";
@@ -11586,7 +11615,7 @@ public sealed partial class HtmlRenderer
     /// A date/time input's picker icon in the text color: a calendar (an outlined page with a
     /// filled header) or, for `time`, a clock (a circle with two hands).
     /// </summary>
-    private static void PaintPickerIcon(DisplayList displayList, RenderRect rect, RenderColor color, bool isClock)
+    internal static void PaintPickerIcon(DisplayList displayList, RenderRect rect, RenderColor color, bool isClock)
     {
         var stroke = Math.Max(1f, rect.Width / 10f);
         var none = new RenderCornerRadii(0f, 0f, 0f, 0f, 0f, 0f, 0f, 0f);
@@ -11944,13 +11973,18 @@ public sealed partial class HtmlRenderer
         float contentWidth,
         float contentHeight)
     {
+        if (element is IHtmlInputElement input && kind != FormControlKind.Hidden && InputControlRegistry.Resolve(input) is { } control)
+        {
+            PaintInputControl(displayList, input, control, kind, textStyle, accentColor, context, new RenderRect(contentX, contentY, contentWidth, contentHeight));
+            return;
+        }
+
         switch (kind)
         {
             case FormControlKind.TextLike:
             case FormControlKind.Select:
             case FormControlKind.PlainSelect:
             case FormControlKind.Button:
-            case FormControlKind.DateTime:
             {
                 var label = ResolveFormControlLabel(kind, element);
 
@@ -11975,6 +12009,8 @@ public sealed partial class HtmlRenderer
                 var labelWidth = label.Length > 0 ? MeasureTextWidth(context, label, textStyle) : 0f;
                 var labelInset = kind == FormControlKind.Select ? FormControlSelectLabelInset : 0f;
 
+                var selection = kind == FormControlKind.TextLike && element.IsFocused ? ResolveTextSelection(element, label.Length) : default;
+
                 if (label.Length > 0)
                 {
                     // A text input's typed value and a select's selected option are both
@@ -11983,6 +12019,11 @@ public sealed partial class HtmlRenderer
                     var labelX = kind == FormControlKind.Button
                         ? contentX + Math.Max(0f, (contentWidth - labelWidth) / 2f)
                         : contentX + labelInset;
+
+                    if (selection.Start < selection.End)
+                    {
+                        PaintTextControlSelection(displayList, context, label, selection.Start, selection.End, labelX, baselineY, textStyle);
+                    }
 
                     DrawStyledText(context, displayList, label, labelX, baselineY, textStyle, decorate: false);
                 }
@@ -12001,15 +12042,8 @@ public sealed partial class HtmlRenderer
 
                 if (kind == FormControlKind.TextLike)
                 {
-                    PaintFormControlCaret(displayList, element, textStyle, contentX + labelWidth, baselineY);
-                }
-
-                if (kind == FormControlKind.DateTime)
-                {
-                    var iconSize = Math.Min(contentHeight, textStyle.FontSize * FormControlPickerIconScale);
-                    var iconRect = new RenderRect(contentX + contentWidth - iconSize, contentY + ((contentHeight - iconSize) / 2f), iconSize, iconSize);
-                    var isClock = string.Equals(element.GetAttribute("type")?.Trim(), "time", StringComparison.OrdinalIgnoreCase);
-                    PaintPickerIcon(displayList, iconRect, textStyle.Color, isClock);
+                    var caretX = selection.Caret < label.Length ? MeasureTextWidth(context, label[..selection.Caret], textStyle) : labelWidth;
+                    PaintFormControlCaret(displayList, element, textStyle, contentX + caretX, baselineY);
                 }
 
                 break;
@@ -12073,20 +12107,6 @@ public sealed partial class HtmlRenderer
                 break;
             }
 
-            case FormControlKind.Color:
-            {
-                // The swatch is painted as its own fill, independent of the box's own
-                // background-color (already defaulted to white above, as the swatch's "frame") -
-                // deliberately not overridable via CSS background-color, matching how a real
-                // browser's native color swatch ignores it too; only the frame around it (border,
-                // padding, size) goes through the ordinarily-overridable box model. It fills the
-                // entire content box (rather than a fixed line-height-tall rect within it) so it is
-                // always centered regardless of how tall the box's own content height ends up being.
-                var color = ParseColor(ResolveInputValue(element), RenderColor.Black);
-                displayList.FillRect(new RenderRect(contentX, contentY, contentWidth, contentHeight), color);
-                break;
-            }
-
             case FormControlKind.Range:
             {
                 // `min`/`max`/`value` default to 0/100/(min+max)/2 per the HTML spec's own
@@ -12128,9 +12148,8 @@ public sealed partial class HtmlRenderer
             {
                 // A <textarea>'s real child text node flows through the ordinary block
                 // child-layout path (see this method's own remarks) - only its focused caret is
-                // painted here, at the end of its own text, on whichever wrapped line that text
-                // ends up ending on. Reproduces the exact same wrapping the real content is laid
-                // out with (same text, same `white-space`-aware splitting, same content width) so
+                // painted here, at its cursor, on whichever wrapped line that is on. Reproduces
+                // the exact same wrapping the real content is laid out with (same text, same `white-space`-aware splitting, same content width) so
                 // the caret never drifts out of sync with what is actually painted.
                 // A value changed by script or input no longer matches the child text, so it is
                 // painted here instead (its children are not laid out, see LayoutElement).
@@ -12177,12 +12196,10 @@ public sealed partial class HtmlRenderer
                     break;
                 }
 
-                var lastLineIndex = Math.Max(0, lines.Count - 1);
-                var lastLine = lines.Count > 0 ? lines[^1] : string.Empty;
-                var lastLineWidth = lastLine.Length > 0 ? MeasureTextWidth(context, lastLine, textStyle) : 0f;
-
-                var caretBaselineY = contentY + (lastLineIndex * lineHeight) + ResolveTextBaselineOffset(lineHeight, textStyle.FontSize) + textStyle.VerticalAlignOffset;
-                PaintFormControlCaret(displayList, element, textStyle, contentX + lastLineWidth, caretBaselineY);
+                var areaSelection = ResolveTextSelection(element, normalizedText.Length);
+                var (caretLine, caretWidth) = LocateTextAreaOffset(context, normalizedText, lines, areaSelection.Caret, textStyle);
+                var caretBaselineY = contentY + (caretLine * lineHeight) + ResolveTextBaselineOffset(lineHeight, textStyle.FontSize) + textStyle.VerticalAlignOffset;
+                PaintFormControlCaret(displayList, element, textStyle, contentX + caretWidth, caretBaselineY);
                 break;
             }
         }
@@ -12269,11 +12286,117 @@ public sealed partial class HtmlRenderer
     }
 
     /// <summary>
+    /// Paints an input through its <see cref="IInputControl"/> (see <see cref="InputControlRegistry"/>),
+    /// with the text measured and painted as any other text of the control. Controls showing text
+    /// give the line its baseline, centered on the ink as for the built-in text controls.
+    /// </summary>
+    private static void PaintInputControl(DisplayList displayList, IHtmlInputElement input, IInputControl control, FormControlKind kind, RenderTextStyle textStyle, RenderColor accentColor, LayoutContext context, RenderRect contentBox)
+    {
+        var baselineY = ResolveControlTextBaseline(textStyle, contentBox.Y, contentBox.Height) + textStyle.VerticalAlignOffset;
+
+        if (kind is FormControlKind.TextLike or FormControlKind.DateTime or FormControlKind.Button or FormControlKind.File)
+        {
+            RecordTextBaseline(baselineY - textStyle.VerticalAlignOffset);
+        }
+
+        control.Paint(new InputControlPaintContext(
+            input,
+            displayList,
+            contentBox,
+            ToRenderFont(textStyle, context.Fonts),
+            textStyle.Color,
+            accentColor,
+            baselineY,
+            text => MeasureTextWidth(context, text, textStyle),
+            (text, x, y) => DrawStyledText(context, displayList, text, x, y, textStyle, decorate: false)));
+    }
+
+    /// <summary>
+    /// The selection of a text input or textarea (<c>selectionStart</c>/<c>selectionEnd</c>),
+    /// clamped to the length of the text shown, and the offset the caret is at: the end the
+    /// selection was extended to (its start, for a backward one).
+    /// </summary>
+    private static (int Start, int End, int Caret) ResolveTextSelection(IElement element, int length)
+    {
+        var (start, end, direction) = element switch
+        {
+            IHtmlInputElement input => (input.SelectionStart, input.SelectionEnd, input.SelectionDirection),
+            IHtmlTextAreaElement area => (area.SelectionStart, area.SelectionEnd, area.SelectionDirection),
+            _ => (length, length, null),
+        };
+
+        // before AngleSharp 1.11 the cursor of a control no selection was made in (its
+        // direction is "none" then) is at the start, though it is at the end of its value
+        if (end == 0 && string.Equals(direction, "none", StringComparison.Ordinal))
+        {
+            start = end = length;
+        }
+
+        start = Math.Clamp(start, 0, length);
+        end = Math.Clamp(end, start, length);
+        return (start, end, string.Equals(direction, "backward", StringComparison.Ordinal) ? start : end);
+    }
+
+    /// <summary>
+    /// Paints the highlight of the selected part of a text input's value, below its text.
+    /// </summary>
+    private static void PaintTextControlSelection(DisplayList displayList, LayoutContext context, string label, int start, int end, float labelX, float baselineY, RenderTextStyle textStyle)
+    {
+        var left = start > 0 ? MeasureTextWidth(context, label[..start], textStyle) : 0f;
+        var right = MeasureTextWidth(context, label[..end], textStyle);
+        var top = baselineY - (textStyle.FontSize * FormControlTextAscentRatio);
+        var bottom = baselineY + (textStyle.FontSize * FormControlTextDescentRatio);
+        displayList.FillRect(new RenderRect(labelX + left, top, right - left, bottom - top), s_selectionBackground);
+    }
+
+    /// <summary>
+    /// Finds the wrapped line of a textarea's text an offset into it is on, and how far into
+    /// that line it is: a line ending in a break holds the offsets up to the break, the next
+    /// line starts after it (and after the space a soft wrap swallowed).
+    /// </summary>
+    private static (int Line, float Width) LocateTextAreaOffset(LayoutContext context, string text, IReadOnlyList<string> lines, int offset, RenderTextStyle textStyle)
+    {
+        var position = 0;
+
+        for (var i = 0; i < lines.Count; i++)
+        {
+            var line = lines[i];
+            var found = line.Length > 0 ? text.IndexOf(line, position, StringComparison.Ordinal) : -1;
+            var lineStart = found >= 0 ? found : position;
+            var lineEnd = lineStart + line.Length;
+            var isLast = i == lines.Count - 1;
+
+            // what lies between this line and the next (a break or a swallowed space) still
+            // belongs to this line
+            var nextStart = isLast ? text.Length : NextLineStart(text, lines[i + 1], lineEnd);
+
+            if (offset < nextStart || isLast)
+            {
+                var column = Math.Clamp(offset - lineStart, 0, line.Length);
+                return (i, column > 0 ? MeasureTextWidth(context, line[..column], textStyle) : 0f);
+            }
+
+            position = nextStart;
+        }
+
+        return (0, 0f);
+    }
+
+    private static int NextLineStart(string text, string nextLine, int position)
+    {
+        if (position < text.Length && text[position] == '\n')
+        {
+            return position + 1;
+        }
+
+        var found = nextLine.Length > 0 ? text.IndexOf(nextLine, position, StringComparison.Ordinal) : -1;
+        return found >= 0 ? found : position;
+    }
+
+    /// <summary>
     /// Paints a text-insertion caret for a focused <see cref="FormControlKind.TextLike"/> input,
-    /// right after its current value (or at the content edge, for an empty one) - this renderer
-    /// has no concept of a selection/cursor offset within an input's own value (AngleSharp does
-    /// not track one either), so the caret always sits at the end of the text, matching by far the
-    /// most common "user is appending" case a static render would want to depict. Real focus comes
+    /// at the given position: where its cursor is (see <see cref="ResolveTextSelection"/>), right
+    /// after its value when it was just set (which moves the cursor to its end). Real focus comes
     /// straight from the DOM (<see cref="IElement.IsFocused"/>) rather than being tracked
     /// separately by this renderer - AngleSharp.Css's own `:focus` pseudo-class forcing already
     /// delegates to it (see AGENTS.md's `:hover` section for the equivalent story with
@@ -12283,7 +12406,7 @@ public sealed partial class HtmlRenderer
     /// <see cref="FormControlKind.TextArea"/> case in <see cref="PaintFormControl"/>) - its own
     /// caret position is computed by re-wrapping its text the same way its real content is laid
     /// out, since unlike a single-line input's fixed baseline, a textarea's caret depends on
-    /// whichever wrapped line its text currently ends on.
+    /// whichever wrapped line its cursor is on.
     /// </summary>
     private static void PaintFormControlCaret(
         DisplayList displayList,

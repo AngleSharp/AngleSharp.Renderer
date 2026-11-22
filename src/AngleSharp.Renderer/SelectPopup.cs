@@ -258,7 +258,7 @@ public sealed class SelectPopup
     /// If an element uses the dark color scheme (CSS Color Adjustment 1 §2): when it (or else the
     /// page's `color-scheme` meta element) supports it, and also light only if that's not preferred.
     /// </summary>
-    private static bool UsesDarkColorScheme(ICssStyleDeclaration? style, IRenderDevice device, IDocument document)
+    internal static bool UsesDarkColorScheme(ICssStyleDeclaration? style, IRenderDevice device, IDocument document)
     {
         var value = style?.GetPropertyValue("color-scheme")?.Trim();
 

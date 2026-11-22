@@ -5902,6 +5902,61 @@ public sealed class HtmlRendererTests
     }
 
     [Fact]
+    public async Task BuildDisplayList_FocusedTextInputPaintsTheCaretAtItsCursor()
+    {
+        var document = await ParseAsync("""<html><body><input id="target" type="text" value="Hello" /></body></html>""");
+        var target = (IHtmlInputElement)document.GetElementById("target")!;
+        target.DoFocus();
+        var device = new DefaultRenderDevice { ViewPortWidth = 300, ViewPortHeight = 100, FontSize = 16f };
+        var renderer = new HtmlRenderer();
+
+        var atEnd = Assert.Single(renderer.BuildDisplayList(document, device).Commands.OfType<FillRectCommand>().Where(f => f.Rect.Width == 1.5f));
+        target.Select(0, 0);
+        var atStart = Assert.Single(renderer.BuildDisplayList(document, device).Commands.OfType<FillRectCommand>().Where(f => f.Rect.Width == 1.5f));
+        target.Select(2, 2);
+        var inBetween = Assert.Single(renderer.BuildDisplayList(document, device).Commands.OfType<FillRectCommand>().Where(f => f.Rect.Width == 1.5f));
+
+        Assert.True(atStart.Rect.X < inBetween.Rect.X);
+        Assert.True(inBetween.Rect.X < atEnd.Rect.X);
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_FocusedTextInputHighlightsItsSelectedText()
+    {
+        var document = await ParseAsync("""<html><body><input id="target" type="text" value="Hello" /></body></html>""");
+        var target = (IHtmlInputElement)document.GetElementById("target")!;
+        target.DoFocus();
+        target.Select(1, 4, "backward");
+
+        var displayList = new HtmlRenderer().BuildDisplayList(document, new DefaultRenderDevice { ViewPortWidth = 300, ViewPortHeight = 100, FontSize = 16f });
+        var commands = displayList.Commands.ToList();
+        var highlight = Assert.Single(commands.OfType<FillRectCommand>().Where(f => f.Color.Equals(new RenderColor(0xB4, 0xD5, 0xFE))));
+        var text = Assert.Single(commands.OfType<DrawTextCommand>().Where(t => t.Text == "Hello"));
+        var caret = Assert.Single(commands.OfType<FillRectCommand>().Where(f => f.Rect.Width == 1.5f));
+
+        // below the text, from the second to the fourth character, the caret at its start
+        Assert.True(commands.IndexOf(highlight) < commands.IndexOf(text));
+        Assert.True(highlight.Rect.X > text.X);
+        Assert.Equal(highlight.Rect.X, caret.Rect.X, precision: 3);
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_FocusedTextAreaPaintsTheCaretOnTheLineOfItsCursor()
+    {
+        var document = await ParseAsync("<html><body><textarea id=\"target\" style=\"width:200px;\">one\ntwo</textarea></body></html>");
+        var target = (IHtmlTextAreaElement)document.GetElementById("target")!;
+        target.DoFocus();
+        var device = new DefaultRenderDevice { ViewPortWidth = 300, ViewPortHeight = 100, FontSize = 16f };
+        var renderer = new HtmlRenderer();
+
+        var atEnd = Assert.Single(renderer.BuildDisplayList(document, device).Commands.OfType<FillRectCommand>().Where(f => f.Rect.Width == 1.5f));
+        target.Select(2, 2);
+        var onFirstLine = Assert.Single(renderer.BuildDisplayList(document, device).Commands.OfType<FillRectCommand>().Where(f => f.Rect.Width == 1.5f));
+
+        Assert.True(onFirstLine.Rect.Y < atEnd.Rect.Y);
+    }
+
+    [Fact]
     public async Task BuildDisplayList_UnfocusedTextAreaPaintsNoCaret()
     {
         var document = await ParseAsync("""<html><body><textarea>Hello</textarea></body></html>""");
