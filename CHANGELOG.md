@@ -2,6 +2,7 @@
 
 Released on tbd.
 
+- Fixed the caret of a focused text input or textarea always being painted at the end of its text instead of at its cursor (`selectionStart`/`selectionEnd`), and the selected text of one not being highlighted
 - Fixed adjoining vertical margins collapsing pairwise instead of all together, e.g. those of an empty block with a negative margin inside (75px and -72px with 48px before them are 3px, not 48px)
 - Fixed the bottom margin of a block being left out before inline content following it, and before a float or an absolutely positioned box placed after it
 - Fixed `min-height` not winning over `max-height`
@@ -31,6 +32,8 @@ Released on tbd.
 - Added `align-items: baseline` (and `align-self`) for flex items in a row: an item without text sits on the baseline with the bottom of its border box (e.g. a rule after a heading's text), where it was at the top of the line
 - Added `getImageData()`, `putImageData()` and `createImageData()` of the canvas (`ImageData`)
 - Added `paint()` background images of the CSS Painting API
+- Added pickers of `color`, `date`, `datetime-local`, `month`, `time` and `week` inputs (`OpenInputPicker`): a color picker, a calendar of days, weeks or months, and columns of hours and minutes, which a host shows on top of a frame like the list of a dropdown, setting the value with `input` and `change` events; `min`, `max` and `step` disable the days, weeks, months and times they don't allow (`InputValueConstraints`)
+- Added `IInputControl` for showing inputs in other ways: a control sizes an input whose `width` or `height` is `auto`, paints its content and creates its picker, and is registered per input type with `WithInputControl` (the built-in ones are `ColorInputControl` and `DateTimeInputControl`)
 
 # 0.12.0
 
