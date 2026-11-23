@@ -20,8 +20,8 @@
     <EmbedUntrackedSources>true</EmbedUntrackedSources>
     <IncludeSymbols>true</IncludeSymbols>
     <SymbolPackageFormat>snupkg</SymbolPackageFormat>
-    <AngleSharpVersion Condition=" '$(AngleSharpVersion)' == '' ">1.10.0</AngleSharpVersion>
-    <AngleSharpCssVersion Condition=" '$(AngleSharpCssVersion)' == '' ">1.6.0-beta.464</AngleSharpCssVersion>
+    <AngleSharpVersion Condition=" '$(AngleSharpVersion)' == '' ">1.11.0-beta.981</AngleSharpVersion>
+    <AngleSharpCssVersion Condition=" '$(AngleSharpCssVersion)' == '' ">1.6.0-beta.466</AngleSharpCssVersion>
   </PropertyGroup>
 
   <ItemGroup>
