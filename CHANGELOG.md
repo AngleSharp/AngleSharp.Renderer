@@ -1,7 +1,8 @@
 # 0.13.0
 
-Released on tbd.
+Released on Monday, November 23 2026.
 
+- Fixed images picked from a `srcset` being as large as their pixels; they are divided by their density
 - Fixed the caret of a focused text input or textarea always being painted at the end of its text instead of at its cursor (`selectionStart`/`selectionEnd`), and the selected text of one not being highlighted
 - Fixed adjoining vertical margins collapsing pairwise instead of all together, e.g. those of an empty block with a negative margin inside (75px and -72px with 48px before them are 3px, not 48px)
 - Fixed the bottom margin of a block being left out before inline content following it, and before a float or an absolutely positioned box placed after it
@@ -19,16 +20,20 @@ Released on tbd.
 - Fixed text right in a grid container (e.g. the label of an icon with `display: grid; place-items: center`) not being an anonymous grid item: it stayed at the top left instead of being placed in a cell and aligned
 - Fixed `row-reverse` and `column-reverse` packing the items at the end without reversing their order
 - Fixed `grid-auto-columns` being ignored for implicit columns
-- Added `subgrid` for `grid-template-columns` and `grid-template-rows` (tracks, gaps and line names of the parent grid, row sizes from the subgrid's items)
 - Fixed the edges of a gradient `border-image` of a box with a fractional size being drawn with seams and a washed out side
 - Fixed `::marker` and `::first-line` colors being ignored
 - Fixed an absolutely positioned box with `height: fit-content` (e.g. a popover) being stretched between `top` and `bottom`, and centering one of an automatic height with `margin: auto`
 - Fixed `scrollWidth` and `scrollHeight` leaving out text extending beyond its box (e.g. cut off by an ellipsis)
 - Fixed text before and after a relatively positioned inline box (e.g. a `strong` with `position: relative`) being painted as one, where the box was
 - Fixed a `paint()` image not being drawn anew when only the custom properties it uses changed, and not at all when its box was only painted again
-- Updated the document of an iframe to keep the render device of its browsing context, if it has one of its own
+- Fixed opaque shadow colors (e.g. `box-shadow: 0 2px 3px #fff`) being painted black while AngleSharp.Css serializes colors as the spec says (`rgb(255, 255, 255)`)
+- Fixed an absolutely positioned `::before` of a positioned box painting above the positioned content after it in frames of the interactive harness
 - Updated to use a minimum of AngleSharp.Css 1.6.0
+- Updated the document of an iframe to keep the render device of its browsing context, if it has one of its own
+- Updated loading the image of an `img`: the renderer loads the source its render node picked (`srcset`, `sizes`, `picture`) once it lays the image out
 - Added color hints and color interpolation methods (e.g. `in oklch`, `in hsl longer hue`) of gradients
+- Added `loading=lazy` for images: a frame loads one once it is within 1250px of the viewport and of every scroll container around it
+- Added `subgrid` for `grid-template-columns` and `grid-template-rows` (tracks, gaps and line names of the parent grid, row sizes from the subgrid's items)
 - Added `background-clip: text`
 - Added `object` elements showing an image instead of their fallback content
 - Added `align-items: baseline` (and `align-self`) for flex items in a row: an item without text sits on the baseline with the bottom of its border box (e.g. a rule after a heading's text), where it was at the top of the line

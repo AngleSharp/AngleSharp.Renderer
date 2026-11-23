@@ -1980,6 +1980,13 @@ public sealed partial class HtmlRenderer
             var pass = new LayoutPass();
             var setupStart = RenderMetricsRecorder.Now;
             var context = CreateLayoutContext(document, renderDevice, textMeasurer) with { RecordsPaintAnchors = isFrame };
+
+            // the lazy images of a frame load once near its viewport (see TakeNearImages)
+            if (isFrame)
+            {
+                pass.CollectsLazyImages = true;
+                pass.LazyLoadScrollY = scrollOffsetY;
+            }
             pass.Metrics.Setup += RenderMetricsRecorder.Since(setupStart);
             var viewport = new RenderViewport(context.Width, context.Height);
             var capture = new LayoutCapture
@@ -2007,6 +2014,82 @@ public sealed partial class HtmlRenderer
                 s_layoutCapture.Value = previous;
             }
         }
+
+        /// <summary>
+        /// Takes the lazy images laid out (see <see cref="DefersLazyImage"/>) that are near the
+        /// given area of the page now (the viewport, grown by the margin): within the margin of
+        /// the box of every scroll container around them, too (e.g. not the far end of a
+        /// carousel), as browsers do. The others stay until the page is scrolled (scrolling a
+        /// container lays it out anew).
+        /// </summary>
+        internal List<DeferredImage> TakeNearImages(RenderRect area)
+        {
+            var near = new List<DeferredImage>();
+
+            foreach (var entry in _pass.DeferredImages.Values)
+            {
+                if (IsNear(entry, area))
+                {
+                    near.Add(entry);
+                }
+            }
+
+            foreach (var entry in near)
+            {
+                _pass.DeferredImages.Remove(entry.Image);
+            }
+
+            return near;
+        }
+
+        // the content of a scroll container is laid out unscrolled and moved when painted, so
+        // the box of the image is moved by the scroll offsets of the containers around it, each
+        // checked with what is inside of it moved
+        private bool IsNear(DeferredImage entry, RenderRect area)
+        {
+            var root = entry.Image.Owner?.DocumentElement;
+            var body = entry.Image.Owner?.Body;
+            var box = entry.Box;
+
+            for (var ancestor = entry.Image.ParentElement; ancestor is not null; ancestor = ancestor.ParentElement)
+            {
+                // the overflow of these is the viewport's
+                if (ReferenceEquals(ancestor, root) || ReferenceEquals(ancestor, body) ||
+                    !_context.StyleMapCache.TryGetValue(ancestor, out var styleMap) ||
+                    !_pageMetrics.TryGetValue(ancestor, out var metrics) || metrics.IsViewportAnchored)
+                {
+                    continue;
+                }
+
+                var clipsX = Clips(styleMap, "overflow-x");
+                var clipsY = Clips(styleMap, "overflow-y");
+
+                if (!clipsX && !clipsY)
+                {
+                    continue;
+                }
+
+                var (scrollX, scrollY) = GetContentScrollOffset(ancestor);
+                box = box with { X = box.X - scrollX, Y = box.Y - scrollY };
+
+                if (!Overlaps(new RenderRect(metrics.BorderBoxX - LazyLoadMargin, metrics.BorderBoxY - LazyLoadMargin, metrics.BorderBoxWidth + 2f * LazyLoadMargin, metrics.BorderBoxHeight + 2f * LazyLoadMargin),
+                    box, clipsX, clipsY))
+                {
+                    return false;
+                }
+            }
+
+            return Overlaps(area, box, horizontally: true, vertically: true);
+
+            static bool Clips(Dictionary<string, string> styleMap, string property) =>
+                (styleMap.TryGetValue(property, out var value) || styleMap.TryGetValue("overflow", out value)) &&
+                !string.IsNullOrWhiteSpace(value) && !value.Trim().Equals("visible", StringComparison.OrdinalIgnoreCase);
+        }
+
+        // a box of no size (an image before it loaded) at the edge counts as overlapping
+        private static bool Overlaps(RenderRect area, RenderRect box, bool horizontally, bool vertically) =>
+            (!horizontally || (box.X <= area.X + area.Width && box.X + box.Width >= area.X)) &&
+            (!vertically || (box.Y <= area.Y + area.Height && box.Y + box.Height >= area.Y));
 
         private ElementLayoutMetrics ToPage(ElementLayoutMetrics metrics) =>
             metrics.IsViewportAnchored ? metrics : metrics with { BorderBoxY = metrics.BorderBoxY + _layoutScrollY };
@@ -3099,7 +3182,7 @@ public sealed partial class HtmlRenderer
             // of one there was not laid out on its own)
             if (!IsRaisedInFlow(styleMap) && !IsStickyPositioned(styleMap) &&
                 // (inline content lifted above a float leaves no entry to start from, see PaintOrder)
-                _context.HoistCandidates.Any(candidate => candidate.Z != InlineContentLayer && ReferenceEquals(candidate.DisplayList, displayList) && root.Contains(candidate.Element) &&
+                _context.HoistCandidates.Any(candidate => candidate.Z != InlineContentLayer && ReferenceEquals(candidate.DisplayList, displayList) && root.Contains(HitTesting.GetOriginatingElement(candidate.Element)) &&
                     displayList.Commands.IndexOf(candidate.First) is >= 0 and var position && !HasOpenScopeBefore(displayList, position)))
             {
                 _context.HoistCandidates.Clear();

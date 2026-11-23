@@ -2330,9 +2330,12 @@ public sealed partial class HtmlRenderer
         return string.IsNullOrWhiteSpace(styleMap.GetValueOrDefault("width")) || styleMap.GetValueOrDefault("width")!.Trim() == "auto" ? string.Empty : null;
     }
 
+    // one without a source, or whose image could not be loaded (not one still loading, nor a
+    // lazy one that is to load later)
     private static bool IsBrokenImage(IElement element) =>
         element is IHtmlImageElement image && element is not IPseudoElement &&
-        (string.IsNullOrEmpty(element.GetAttribute("src")) || image.IsCompleted) && !HasLoadableImageSource(element);
+        image.GetImageSource() is var source && !DefersLazyImage(image, source) &&
+        GetElementImage(image, source, out _) == ElementImageState.Missing;
 
     // a plain outline where browsers show their icon of a broken image
     private static void PaintBrokenImageMark(DisplayList displayList, float x, float y, float width, float height)
@@ -3170,7 +3173,7 @@ public sealed partial class HtmlRenderer
         width = 0f;
 
         if (!IsReplacedElement(element.Ref) ||
-            !TryResolveReplacedElementImage(element, styleMap, containingWidth, 0f, 0f, out _, out var imageRect, out var objectFitClip))
+            !TryResolveReplacedElementImage(element, styleMap, containingWidth, 0f, 0f, out _, out var imageRect, out var objectFitClip, isPlaced: false))
         {
             return false;
         }

@@ -51,6 +51,19 @@ public sealed partial class HtmlRenderer
     private sealed class LayoutPass
     {
         /// <summary>
+        /// Whether the layout is one of a frame, which leaves its lazy images (<c>loading=lazy</c>)
+        /// to the harness (see <see cref="DefersLazyImage"/>); other layouts load every image
+        /// they lay out.
+        /// </summary>
+        public bool CollectsLazyImages { get; set; }
+
+        /// <summary>The scroll offset of the frame, which page coordinates are offset by.</summary>
+        public float LazyLoadScrollY { get; set; }
+
+        /// <summary>The lazy images laid out and not loaded yet, with their boxes in page coordinates.</summary>
+        public Dictionary<IHtmlImageElement, DeferredImage> DeferredImages { get; } = new(ReferenceEqualityComparer.Instance);
+
+        /// <summary>
         /// The contribution of each element to the size of its parent, as the layout asked for it
         /// last. What the contribution was can't be asked for later on: text is read from the DOM,
         /// which has changed by then (see <see cref="LayoutSnapshot.TryLayOutAgain"/>).
@@ -1873,7 +1886,7 @@ public sealed partial class HtmlRenderer
 
         // A replaced element without an authored height is as tall as its (scaled) image.
         if (float.IsNaN(resolvedContentHeight) && IsReplacedElement(element) &&
-            TryResolveReplacedElementImage(node, styleMap, flowContainingWidth, 0f, 0f, out _, out var replacedRect, out var replacedClip))
+            TryResolveReplacedElementImage(node, styleMap, flowContainingWidth, 0f, 0f, out _, out var replacedRect, out var replacedClip, isPlaced: false))
         {
             resolvedContentHeight = replacedClip?.Height ?? replacedRect.Height;
         }
@@ -9347,7 +9360,9 @@ public sealed partial class HtmlRenderer
             {
                 var candidate = candidates[index];
 
-                if (!ReferenceEquals(candidate.Element, box) && box.Contains(candidate.Element))
+                // a pseudo-element's ParentElement is its host's parent, so the box holding it
+                // is found from its host (an absolute ::before was left to paint above the box)
+                if (!ReferenceEquals(candidate.Element, box) && box.Contains(HitTesting.GetOriginatingElement(candidate.Element)))
                 {
                     candidates.RemoveAt(index);
 
@@ -9684,7 +9699,7 @@ public sealed partial class HtmlRenderer
     /// Parses a `box-shadow` value into its comma-separated layers, in CSS authoring order
     /// (first-listed shadow paints topmost among shadows). AngleSharp.Css's computed style
     /// normalizes every layer's color to `rgba(r, g, b, a)` regardless of how it was authored
-    /// (`red`, `#f00`, ...), which <see cref="ExtractColorToken"/> relies on to split a layer's
+    /// (`red`, `#f00`, ...), or `rgb(r, g, b)` in spec serialization mode, which <see cref="ExtractColorToken"/> relies on to split a layer's
     /// color from its lengths without being confused by the commas inside `rgba(...)`.
     /// </summary>
     private static IReadOnlyList<RenderBoxShadow> ParseBoxShadows(string? value)
@@ -9792,17 +9807,20 @@ public sealed partial class HtmlRenderer
 
     /// <summary>
     /// Splits a shadow layer's color from its offset/blur/spread lengths. AngleSharp.Css always
-    /// normalizes a shadow's color to `rgba(r, g, b, a)`, so the color is located by its
-    /// parenthesized function call rather than by naive whitespace splitting, which would
-    /// otherwise be misled by the spaces after the commas inside `rgba(...)`. Falls back to
+    /// normalizes a shadow's color to `rgba(r, g, b, a)` (`rgb(r, g, b)` for opaque colors in
+    /// spec serialization mode), so the color is located by its parenthesized function call
+    /// rather than by naive whitespace splitting, which would otherwise be misled by the spaces
+    /// after the commas inside it. Falls back to
     /// treating the last whitespace-separated token as the color for any value that reaches this
     /// parser without going through AngleSharp.Css's own normalization.
     /// </summary>
     private static (string? ColorToken, string Remainder) ExtractColorToken(string value)
     {
-        var functionStart = value.IndexOf("rgba(", StringComparison.OrdinalIgnoreCase);
+        // the color is the only function of a layer: `rgba(...)` by default, `rgb(...)` in
+        // spec serialization mode, or any other color function
+        var parenthesis = value.IndexOf('(');
 
-        if (functionStart < 0)
+        if (parenthesis < 0)
         {
             var lastSpace = value.TrimEnd().LastIndexOf(' ');
             return lastSpace < 0
@@ -9810,15 +9828,34 @@ public sealed partial class HtmlRenderer
                 : (value[(lastSpace + 1)..].Trim(), value[..lastSpace]);
         }
 
-        var functionEnd = value.IndexOf(')', functionStart);
+        var functionStart = parenthesis;
 
-        if (functionEnd < 0)
+        while (functionStart > 0 && (char.IsLetterOrDigit(value[functionStart - 1]) || value[functionStart - 1] == '-'))
+        {
+            functionStart--;
+        }
+
+        var functionEnd = parenthesis;
+
+        for (var depth = 0; functionEnd < value.Length; functionEnd++)
+        {
+            if (value[functionEnd] == '(')
+            {
+                depth++;
+            }
+            else if (value[functionEnd] == ')' && --depth == 0)
+            {
+                break;
+            }
+        }
+
+        if (functionEnd >= value.Length)
         {
             return (value[functionStart..].Trim(), value[..functionStart]);
         }
 
         var colorToken = value[functionStart..(functionEnd + 1)];
-        var remainder = value[..functionStart] + value[(functionEnd + 1)..];
+        var remainder = value[..functionStart] + " " + value[(functionEnd + 1)..];
         return (colorToken, remainder);
     }
 
@@ -10173,17 +10210,142 @@ public sealed partial class HtmlRenderer
     private static bool HasLoadableImageSource(IElement element) =>
         TryGetOrLoadImageResource(element, element.GetAttribute("src"), out var imageResource) && imageResource is not null;
 
+    /// <summary>
+    /// The image with the natural size of its density: a candidate picked as 2x (or a 800w one
+    /// shown at 400px) is half as large as its pixels, which are all painted (the cached image
+    /// keeps them, and any img showing it at another density gets a copy of its own).
+    /// </summary>
+    private static CachedImageResource WithDensity(CachedImageResource imageResource, double density)
+    {
+        if (density == 1d || density <= 0d || !double.IsFinite(density))
+        {
+            return imageResource;
+        }
+
+        var width = (int)Math.Max(1, Math.Round(imageResource.NaturalWidth / density));
+        var height = (int)Math.Max(1, Math.Round(imageResource.NaturalHeight / density));
+        return width == imageResource.NaturalWidth && height == imageResource.NaturalHeight
+            ? imageResource
+            : imageResource with { NaturalWidth = width, NaturalHeight = height };
+    }
+
+    /// <summary>
+    /// How far from the viewport (and from the box of a scroll container around it) a lazy
+    /// image starts loading, in CSS pixels, like browsers do, so it is there once scrolled to.
+    /// </summary>
+    internal const float LazyLoadMargin = 1250f;
+
+    /// <summary>A lazy image laid out by a frame, with its box in page coordinates.</summary>
+    internal readonly record struct DeferredImage(IHtmlImageElement Image, ImageSourceSelection Source, RenderRect Box);
+
+    /// <summary>
+    /// Whether an image is not to load now, as it is lazy (<c>loading=lazy</c>, which needs
+    /// scripting) and not requested yet: a frame keeps it with its box, and the harness loads it
+    /// once it is near the viewport (see <see cref="LayoutSnapshot.TakeNearImages"/>), also after
+    /// the page was scrolled; a layout that isn't a frame (e.g. for a geometry read, or one
+    /// measuring the image at a made-up position) leaves it to the frames. An image that was
+    /// requested already, or one of a document without an interactive harness (e.g. a render),
+    /// loads as any other.
+    /// </summary>
+    private static bool DefersLazyImage(IHtmlImageElement image, ImageSourceSelection? selection, RenderRect? box = null)
+    {
+        if (selection is null || !IsLazyImage(image) ||
+            image is ILoadableElement { CurrentDownload: { } download } && download.Target.Equals(selection.Url))
+        {
+            return false;
+        }
+
+        if (s_layoutPass.Value is not { CollectsLazyImages: true } pass)
+        {
+            return image.Owner?.Context?.TryGetDomHarness(out var harness) == true && harness is InteractiveHtmlRendererState;
+        }
+
+        if (box is { } rect)
+        {
+            pass.DeferredImages[image] = new DeferredImage(image, selection, rect with { Y = rect.Y + pass.LazyLoadScrollY });
+        }
+
+        return true;
+    }
+
+    private static bool IsLazyImage(IHtmlImageElement image) =>
+        string.Equals(image.GetAttribute("loading")?.Trim(), "lazy", StringComparison.OrdinalIgnoreCase) &&
+        image.Owner?.Context?.IsScripting() == true;
+
+    private enum ElementImageState
+    {
+        Missing,
+        Pending,
+        Loaded,
+    }
+
+    /// <summary>
+    /// The image an <c>img</c> shows: the source its render node picked for the device (see
+    /// <see cref="ElementRenderNode.ImageSource"/>), which the renderer loads, as AngleSharp's
+    /// image element requests nothing by itself. A frame of an interactive document goes on
+    /// without an image still loading, and is laid out again once it has (its load or error
+    /// event, see <see cref="InteractiveHtmlRendererState.WatchImageLoad"/>); other renders
+    /// wait for it.
+    /// </summary>
+    private static ElementImageState GetElementImage(IHtmlImageElement image, ImageSourceSelection? selection, out CachedImageResource? imageResource)
+    {
+        imageResource = null;
+
+        if (selection is not { Url: var source })
+        {
+            return ElementImageState.Missing;
+        }
+
+        var task = image.LoadAsync(source, selection.Density);
+        var state = image.Owner?.Context?.TryGetDomHarness(out var harness) == true ? harness as InteractiveHtmlRendererState : null;
+        state?.WatchImageLoad(image);
+
+        if (!task.IsCompleted || image is ILoadableElement { CurrentDownload: { IsCompleted: false } })
+        {
+            if (state is not null)
+            {
+                return ElementImageState.Pending;
+            }
+
+            try
+            {
+                task.Wait();
+                (image as ILoadableElement)?.CurrentDownload?.Task.Wait();
+            }
+            catch (AggregateException)
+            {
+                // a failed load is a missing image
+            }
+        }
+
+        // without a download (no resource loader) only the data of a data URL is there; nothing
+        // is remembered for a URL that wasn't loaded, as it may still be
+        if (image is not ILoadableElement { CurrentDownload: not null } && !source.Href.StartsWith("data:", StringComparison.OrdinalIgnoreCase))
+        {
+            return ElementImageState.Missing;
+        }
+
+        if (TryGetOrLoadImageResource(image, source.Href, out imageResource) && imageResource is not null)
+        {
+            imageResource = WithDensity(imageResource, selection.Density);
+            return ElementImageState.Loaded;
+        }
+
+        return s_imagePending ? ElementImageState.Pending : ElementImageState.Missing;
+    }
+
     private static bool IsImageInput(IElement element) =>
         element is not IPseudoElement &&
         string.Equals(element.LocalName, "input", StringComparison.OrdinalIgnoreCase) &&
         string.Equals(element.GetAttribute("type")?.Trim(), "image", StringComparison.OrdinalIgnoreCase);
 
-    private static bool TryResolveReplacedElementImage(ElementRenderNode node, Dictionary<string, string> styleMap, float containingWidth, float x, float y, out RenderedImage? image, out RenderRect rect, out RenderRect? clipRect, (float Width, float Height)? usedSize = null) =>
-        TryResolveImage(node, styleMap, containingWidth, x, y, out image, out rect, out clipRect, usedSize) ||
+    // isPlaced: false for measuring the image (at a made-up position), which loads no lazy image
+    private static bool TryResolveReplacedElementImage(ElementRenderNode node, Dictionary<string, string> styleMap, float containingWidth, float x, float y, out RenderedImage? image, out RenderRect rect, out RenderRect? clipRect, (float Width, float Height)? usedSize = null, bool isPlaced = true) =>
+        TryResolveImage(node, styleMap, containingWidth, x, y, out image, out rect, out clipRect, usedSize, isPlaced) ||
         TryResolveInlineSvg(node, styleMap, containingWidth, x, y, out image, out rect, out clipRect, usedSize) ||
         TryResolveCanvas(node, styleMap, containingWidth, x, y, out image, out rect, out clipRect, usedSize);
 
-    private static bool TryResolveImage(ElementRenderNode node, Dictionary<string, string> styleMap, float containingWidth, float x, float y, out RenderedImage? image, out RenderRect rect, out RenderRect? clipRect, (float Width, float Height)? usedSize = null)
+    private static bool TryResolveImage(ElementRenderNode node, Dictionary<string, string> styleMap, float containingWidth, float x, float y, out RenderedImage? image, out RenderRect rect, out RenderRect? clipRect, (float Width, float Height)? usedSize = null, bool isPlaced = true)
     {
         image = null;
         rect = default;
@@ -10209,7 +10371,20 @@ public sealed partial class HtmlRenderer
                 return false;
             }
         }
-        else if (!string.Equals(node.Ref.LocalName, "img", StringComparison.OrdinalIgnoreCase) && !IsImageInput(node.Ref))
+        else if (node.Ref is IHtmlImageElement img)
+        {
+            // its size is not known before it has loaded, but may be given
+            var source = node.ImageSource;
+            var width = ParseLength(styleMap, "width", containingWidth, float.NaN, allowAuto: true);
+            var height = ParseLength(styleMap, "height", containingWidth, float.NaN, allowAuto: true);
+            var box = new RenderRect(x, y, float.IsFinite(width) ? Math.Max(0f, width) : 0f, float.IsFinite(height) ? Math.Max(0f, height) : 0f);
+
+            if (DefersLazyImage(img, source, isPlaced ? box : null) || GetElementImage(img, source, out imageResource) != ElementImageState.Loaded || imageResource is null)
+            {
+                return false;
+            }
+        }
+        else if (!IsImageInput(node.Ref))
         {
             return false;
         }

@@ -32,9 +32,16 @@ public static class RenderingConfigurationExtensions
             ? configuration
             : configuration.With(ImageResourceService.Instance);
 
+        // images not in a document load once they have a source (those in it once laid out)
+        configuration = configuration.Services.OfType<DetachedImageLoader>().Any()
+            ? configuration
+            : configuration.With(DetachedImageLoader.Instance);
+
         // an object showing a document hides its fallback
-        return configuration.Services.OfType<ObjectDocumentService>().Any()
+        configuration = configuration.Services.OfType<ObjectDocumentService>().Any()
             ? configuration
             : configuration.With(ObjectDocumentService.Instance);
+
+        return configuration;
     }
 }

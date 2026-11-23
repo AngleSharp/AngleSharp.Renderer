@@ -1517,6 +1517,28 @@ public sealed class SiteRegressionTests
     }
 
     [Fact]
+    public async Task RelativeBox_PaintsAboveEarlierAbsoluteSiblingInAFrame()
+    {
+        // the tractor store's buttons in the browser: the frame of a harness found the ::before
+        // outside of its host (the parent of a pseudo-element is the parent of its host), so it
+        // was left to paint with the flow around the button, above the button's content
+        var document = await OpenAsync("""
+            <style>
+              body { margin: 0 }
+              .button { position: relative; width: 60px; height: 60px }
+              .button::before { content: ""; position: absolute; inset: 0; background: #ffffff }
+              .inner { position: relative; height: 40px; background: #ff0000 }
+            </style>
+            <div class="button"><div class="inner"></div></div>
+            """);
+
+        var pixels = document.Context.GetDomHarness().PrepareFrame().Rasterize();
+        var index = (20 * pixels.Width + 30) * 4;
+
+        Assert.Equal((0xff, 0x00, 0x00), (pixels.Data[index], pixels.Data[index + 1], pixels.Data[index + 2]));
+    }
+
+    [Fact]
     public async Task Image_WithPercentageWidth_DoesNotWidenGridTrack()
     {
         // the tractor store's home page: an image with width: 100% in a 1fr track can shrink

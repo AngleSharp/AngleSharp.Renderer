@@ -1,6 +1,7 @@
 using AngleSharp.Css;
 using AngleSharp.Css.Dom;
 using AngleSharp.Dom;
+using AngleSharp.Html.Dom;
 using AngleSharp.Renderer.Rendering;
 using System.Linq;
 using System.Runtime.CompilerServices;
@@ -61,6 +62,8 @@ internal sealed partial class InteractiveHtmlRendererState : IDomHarness, AngleS
 
     private readonly HashSet<InteractiveHtmlRendererState> _subframes = [];
     private readonly HashSet<IElement> _watchedFrames = new(ReferenceEqualityComparer.Instance);
+    // weakly: games create (and drop) many images
+    private readonly ConditionalWeakTable<IElement, object> _watchedImages = new();
     private bool _isPreparingFrame;
     private bool _hasChangedSinceFrame;
 
@@ -136,6 +139,7 @@ internal sealed partial class InteractiveHtmlRendererState : IDomHarness, AngleS
 
         state.ScrollLeft = next;
         OnPaintInvalidated(keepsMetrics: IsPage(element));
+        LoadDeferredImages();
     }
 
     /// <summary>
@@ -166,6 +170,8 @@ internal sealed partial class InteractiveHtmlRendererState : IDomHarness, AngleS
 
         state.ScrollTop = next;
         OnPaintInvalidated(keepsMetrics: IsPage(element));
+        // a frame of a scrolled page needs no layout, so the lazy images coming near load now
+        LoadDeferredImages();
     }
 
     public void SetHoveredElement(IElement? element)
@@ -465,6 +471,42 @@ internal sealed partial class InteractiveHtmlRendererState : IDomHarness, AngleS
     }
 
     /// <summary>
+    /// Loads the lazy images of the last frame that are near the viewport now (it was scrolled,
+    /// or they were laid out away from it), which lays out the page anew once they have loaded.
+    /// </summary>
+    internal void LoadDeferredImages()
+    {
+        if (_lastFrameLayout is not { } layout || _frameDocument is not { DocumentElement: { } root })
+        {
+            return;
+        }
+
+        var scrollTop = (float)GetScrollTop(root, double.MaxValue);
+        var margin = HtmlRenderer.LazyLoadMargin;
+        var area = new RenderRect(-margin, scrollTop - margin, RenderDevice.ViewPortWidth + 2f * margin, RenderDevice.ViewPortHeight + 2f * margin);
+
+        foreach (var entry in layout.TakeNearImages(area))
+        {
+            WatchImageLoad(entry.Image);
+            _ = entry.Image.LoadAsync(entry.Source.Url, entry.Source.Density);
+        }
+    }
+
+    /// <summary>
+    /// Has the page laid out again once an image it shows has loaded (or failed to).
+    /// </summary>
+    internal void WatchImageLoad(IElement element)
+    {
+        if (!_watchedImages.TryAdd(element, element))
+        {
+            return;
+        }
+
+        element.AddEventListener("load", (_, _) => OnPaintInvalidated());
+        element.AddEventListener("error", (_, _) => OnPaintInvalidated());
+    }
+
+    /// <summary>
     /// Sets the size of the viewport of the document of an iframe.
     /// </summary>
     internal void SetViewport(int width, int height)
@@ -590,6 +632,8 @@ internal sealed partial class InteractiveHtmlRendererState : IDomHarness, AngleS
                 FrameUpdated?.Invoke(this, EventArgs.Empty);
             }
 
+            // the page may have been scrolled while it was laid out
+            LoadDeferredImages();
             return ShowSelection(frame);
         }
         }
@@ -792,6 +836,7 @@ internal sealed partial class InteractiveHtmlRendererState : IDomHarness, AngleS
             return null;
         }
         _lastFrame = _renderer.UpdateFrame(document, _lastFrame, metrics);
+        LoadDeferredImages();
         return _lastFrame is { } updated ? ShowSelection(updated) : null;
     }
 

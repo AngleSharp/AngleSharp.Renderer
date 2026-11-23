@@ -296,6 +296,337 @@ public sealed class BrowserIntegrationTests
     /// Serves an image whose body arrives only once the gate opens, as a slow network does
     /// after the headers.
     /// </summary>
+    [Fact]
+    public async Task ImageRequestsOnlyTheCandidateItShows()
+    {
+        // the tractor store's machines: an image of 300px showed its 200w candidate, scaled up
+        var requester = new RecordingPngRequester();
+        var configuration = Configuration.Default
+            .WithCss()
+            .WithRendering()
+            .WithRenderDevice(CreateDevice())
+            .WithDefaultLoader(new LoaderOptions { IsResourceLoadingEnabled = true })
+            .With(requester);
+        var document = await LoadAsync("""
+            <style>body { margin: 0 }</style>
+            <img srcset="http://localhost/a-200.png 200w, http://localhost/a-400.png 400w, http://localhost/a-800.png 800w" sizes="300px">
+            <img src="http://localhost/hidden.png" style="display: none">
+            """, configuration);
+
+        // the image element requests nothing by itself
+        Assert.Empty(requester.Addresses);
+
+        using var rendered = SKBitmap.Decode(Render(document));
+
+        Assert.Equal(["http://localhost/a-400.png"], requester.Addresses);
+        Assert.Equal(SKColors.Red, rendered.GetPixel(10, 10));
+    }
+
+    [Theory]
+    [InlineData("srcset='http://localhost/red.png 2x'", 20, 10)]
+    [InlineData("srcset='http://localhost/red.png 400w' sizes='100px'", 10, 5)]
+    [InlineData("srcset='http://localhost/red.png 0.5x'", 80, 40)]
+    [InlineData("src='http://localhost/red.png'", 40, 20)]
+    public async Task ImageIsAsLargeAsItsPixelsAtTheirDensity(string sources, double width, double height)
+    {
+        var configuration = Configuration.Default
+            .WithCss()
+            .WithRendering()
+            .WithRenderDevice(CreateDevice())
+            .WithDefaultLoader(new LoaderOptions { IsResourceLoadingEnabled = true })
+            .With(new RecordingPngRequester());
+        var document = await LoadAsync($"<style>body {{ margin: 0 }}</style><img {sources}>", configuration);
+
+        using var rendered = SKBitmap.Decode(Render(document));
+        var rect = document.QuerySelector("img")!.GetBoundingClientRect();
+
+        Assert.Equal((width, height), (rect.Width, rect.Height));
+        Assert.Equal(SKColors.Red, rendered.GetPixel((int)width - 1, (int)height - 1));
+        Assert.Equal(SKColors.White, rendered.GetPixel((int)width + 1, (int)height + 1));
+    }
+
+    [Fact]
+    public async Task LazyImageLoadsOnceScrolledNearTheViewport()
+    {
+        var requester = new RecordingPngRequester();
+        var configuration = Configuration.Default
+            .WithCss()
+            .WithRendering()
+            .WithRenderDevice(CreateDevice())
+            .WithDefaultLoader(new LoaderOptions { IsResourceLoadingEnabled = true })
+            .With(requester)
+            .With(new NoScripts());
+        var document = await LoadAsync("""
+            <style>body { margin: 0 } img { display: block; width: 40px; height: 20px }</style>
+            <img loading=lazy src="http://localhost/near.png">
+            <div style="height: 1700px"></div>
+            <img loading=lazy src="http://localhost/below.png">
+            <div style="height: 3000px"></div>
+            <img loading=lazy src="http://localhost/far.png">
+            <div style="height: 3000px"></div>
+            """, configuration);
+        var harness = document.Context.GetDomHarness();
+
+        harness.PrepareFrame();
+
+        // the one in view and the one within the margin below it, not the far one
+        Assert.Equal(["http://localhost/near.png", "http://localhost/below.png"], requester.Addresses);
+
+        // scrolling needs no layout, but the lazy images coming near load
+        harness.SetScrollTop(document.DocumentElement!, 4000, double.MaxValue);
+
+        Assert.Equal(["http://localhost/near.png", "http://localhost/below.png", "http://localhost/far.png"], requester.Addresses);
+    }
+
+    [Fact]
+    public async Task LazyImageInAScrollContainerLoadsOnceNearItsVisibleArea()
+    {
+        var requester = new RecordingPngRequester();
+        var configuration = Configuration.Default
+            .WithCss()
+            .WithRendering()
+            .WithRenderDevice(CreateDevice())
+            .WithDefaultLoader(new LoaderOptions { IsResourceLoadingEnabled = true })
+            .With(requester)
+            .With(new NoScripts());
+        // a carousel, and a list of its own height: their far ends are within the margin of the
+        // viewport, but not of the scroll containers showing them
+        var document = await LoadAsync("""
+            <style>body { margin: 0 } img { display: block; width: 40px; height: 20px }</style>
+            <div style="width: 200px; overflow-x: auto; white-space: nowrap; display: flex">
+              <img loading=lazy src="http://localhost/first.png">
+              <div style="flex: none; width: 1700px"></div>
+              <img loading=lazy src="http://localhost/last.png">
+            </div>
+            <div id=list style="height: 100px; overflow-y: auto">
+              <img loading=lazy src="http://localhost/top.png">
+              <div style="height: 1500px"></div>
+              <img loading=lazy src="http://localhost/bottom.png">
+            </div>
+            """, configuration);
+        var harness = document.Context.GetDomHarness();
+
+        harness.PrepareFrame();
+
+        Assert.Equal(["http://localhost/first.png", "http://localhost/top.png"], requester.Addresses);
+
+        // scrolling the list lays it out anew, with the bottom one near
+        harness.SetScrollTop(document.GetElementById("list")!, 600, double.MaxValue);
+        harness.PrepareFrame();
+
+        Assert.Equal(["http://localhost/first.png", "http://localhost/top.png", "http://localhost/bottom.png"], requester.Addresses);
+
+        // scrolling the carousel brings its last one near, before any frame
+        harness.SetScrollLeft(document.QuerySelector("div")!, 1000, double.MaxValue);
+
+        Assert.Equal(["http://localhost/first.png", "http://localhost/top.png", "http://localhost/bottom.png", "http://localhost/last.png"], requester.Addresses);
+    }
+
+    [Fact]
+    public async Task NaturalSizeOfAPickedImageIsDividedByItsDensity()
+    {
+        var configuration = Configuration.Default
+            .WithCss()
+            .WithRendering()
+            .WithRenderDevice(CreateDevice())
+            .WithDefaultLoader(new LoaderOptions { IsResourceLoadingEnabled = true })
+            .With(new RecordingPngRequester());
+        var document = await LoadAsync("<img srcset='http://localhost/red.png 2x'>", configuration);
+        var image = (IHtmlImageElement)document.QuerySelector("img")!;
+
+        Render(document);
+
+        Assert.Equal((20, 10), (image.OriginalWidth, image.OriginalHeight));
+    }
+
+    [Fact]
+    public async Task LazyImageLoadsAsAnyOtherWithoutScripting()
+    {
+        var requester = new RecordingPngRequester();
+        var configuration = Configuration.Default
+            .WithCss()
+            .WithRendering()
+            .WithRenderDevice(CreateDevice())
+            .WithDefaultLoader(new LoaderOptions { IsResourceLoadingEnabled = true })
+            .With(requester);
+        var document = await LoadAsync("""
+            <style>body { margin: 0 } img { display: block; width: 40px; height: 20px }</style>
+            <div style="height: 5000px"></div>
+            <img loading=lazy src="http://localhost/far.png">
+            """, configuration);
+
+        document.Context.GetDomHarness().PrepareFrame();
+
+        Assert.Equal(["http://localhost/far.png"], requester.Addresses);
+    }
+
+    [Fact]
+    public async Task LazyImageLoadsInARender()
+    {
+        var requester = new RecordingPngRequester();
+        var configuration = Configuration.Default
+            .WithCss()
+            .WithRendering()
+            .WithRenderDevice(CreateDevice())
+            .WithDefaultLoader(new LoaderOptions { IsResourceLoadingEnabled = true })
+            .With(requester)
+            .With(new NoScripts());
+        var document = await LoadAsync("<style>body { margin: 0 }</style><img loading=lazy src='http://localhost/red.png'>", configuration);
+
+        using var rendered = SKBitmap.Decode(Render(document));
+
+        Assert.Equal(["http://localhost/red.png"], requester.Addresses);
+        Assert.Equal(SKColors.Red, rendered.GetPixel(10, 10));
+    }
+
+    // makes a context one of scripting (lazy images need it), without running anything
+    private sealed class NoScripts : AngleSharp.Scripting.IScriptingService
+    {
+        public bool SupportsType(string mimeType) => false;
+
+        public Task EvaluateScriptAsync(IResponse response, AngleSharp.Scripting.ScriptOptions options, CancellationToken cancel) => Task.CompletedTask;
+    }
+
+    [Fact]
+    public async Task FrameShowsAnImageOnceItHasLoaded()
+    {
+        var requester = new GatedPngRequester(Png(SKColors.Red));
+        var configuration = Configuration.Default
+            .WithCss()
+            .WithRendering()
+            .WithRenderDevice(CreateDevice())
+            .WithDefaultLoader(new LoaderOptions { IsResourceLoadingEnabled = true })
+            .With(requester);
+        var document = await LoadAsync("<style>body { margin: 0 }</style><img src='http://localhost/red.png' width=40 height=20>", configuration);
+        var harness = document.Context.GetDomHarness();
+        var invalidated = 0;
+        harness.PaintInvalidated += (_, _) => Interlocked.Increment(ref invalidated);
+
+        // the frame goes on without the image, which it requested
+        var first = harness.PrepareFrame().Rasterize();
+        Assert.NotEqual(SKColors.Red, PixelOf(first, 10, 10));
+        Assert.NotNull(((ILoadableElement)document.QuerySelector("img")!).CurrentDownload);
+
+        requester.Gate.Set();
+        var watch = Stopwatch.StartNew();
+
+        while (Volatile.Read(ref invalidated) == 0 && watch.Elapsed < TimeSpan.FromSeconds(10))
+        {
+            await Task.Delay(10);
+        }
+
+        Assert.True(invalidated > 0);
+        Assert.Equal(SKColors.Red, PixelOf(harness.PrepareFrame().Rasterize(), 10, 10));
+    }
+
+    [Fact]
+    public async Task ImageNotInTheDocumentLoadsOnceItHasASource()
+    {
+        // Spaceshoot preloads its sprites like this, and starts once all of them fired load
+        var requester = new RecordingPngRequester();
+        var loop = new ManualEventLoop();
+        var configuration = Configuration.Default
+            .WithCss()
+            .WithRendering()
+            .WithRenderDevice(CreateDevice())
+            .WithDefaultLoader(new LoaderOptions { IsResourceLoadingEnabled = true })
+            .With(requester)
+            .WithOnly<AngleSharp.Browser.IEventLoop>(loop);
+        var document = await LoadAsync("<img src='http://localhost/parsed.png'>", configuration);
+        var sprite = (IHtmlImageElement)document.CreateElement("img");
+        var loaded = new TaskCompletionSource();
+        sprite.AddEventListener("load", (_, _) => loaded.TrySetResult());
+        sprite.Source = "http://localhost/sprite.png";
+
+        loop.RunAll();
+        await ((ILoadableElement)sprite).CurrentDownload!.Task.WaitAsync(TimeSpan.FromSeconds(10));
+        var watch = Stopwatch.StartNew();
+
+        while (!loaded.Task.IsCompleted && watch.Elapsed < TimeSpan.FromSeconds(10))
+        {
+            loop.RunAll();
+            await Task.Delay(10);
+        }
+
+        // the parsed one waits for a layout
+        Assert.Equal(["http://localhost/sprite.png"], requester.Addresses);
+        Assert.True(loaded.Task.IsCompleted);
+        Assert.Equal(40, sprite.OriginalWidth);
+    }
+
+    private static byte[] Png(SKColor color)
+    {
+        using var bitmap = new SKBitmap(40, 20);
+        bitmap.Erase(color);
+        return bitmap.Encode(SKEncodedImageFormat.Png, 100).ToArray();
+    }
+
+    private static SKColor PixelOf(RenderedPixels pixels, int x, int y)
+    {
+        var index = (y * pixels.Width + x) * 4;
+        return new SKColor(pixels.Data[index], pixels.Data[index + 1], pixels.Data[index + 2], pixels.Data[index + 3]);
+    }
+
+    private sealed class RecordingPngRequester : BaseRequester
+    {
+        private readonly byte[] _png = Png(SKColors.Red);
+
+        public List<string> Addresses { get; } = [];
+
+        public override bool SupportsProtocol(string protocol) => true;
+
+        protected override Task<IResponse?> PerformRequestAsync(Request request, CancellationToken cancel)
+        {
+            lock (Addresses)
+            {
+                Addresses.Add(request.Address.Href);
+            }
+
+            return Task.FromResult<IResponse?>(new DefaultResponse
+            {
+                Address = request.Address,
+                StatusCode = HttpStatusCode.OK,
+                Headers = new Dictionary<string, string> { ["Content-Type"] = "image/png" },
+                Content = new MemoryStream(_png),
+            });
+        }
+    }
+
+    // runs what was queued when asked, as the event loop of a browser runs it after the parser
+    private sealed class ManualEventLoop : AngleSharp.Browser.IEventLoop
+    {
+        private readonly System.Collections.Concurrent.ConcurrentQueue<Action<CancellationToken>> _queue = new();
+
+        public AngleSharp.Common.ICancellable Enqueue(Action<CancellationToken> action, AngleSharp.Browser.TaskPriority priority)
+        {
+            _queue.Enqueue(action);
+            return new Done();
+        }
+
+        public void RunAll()
+        {
+            while (_queue.TryDequeue(out var action))
+            {
+                action(CancellationToken.None);
+            }
+        }
+
+        public void Spin() => RunAll();
+
+        public void CancelAll() => _queue.Clear();
+
+        private sealed class Done : AngleSharp.Common.ICancellable
+        {
+            public bool IsCompleted => true;
+
+            public bool IsRunning => false;
+
+            public void Cancel()
+            {
+            }
+        }
+    }
+
     private sealed class GatedPngRequester(byte[] png) : BaseRequester
     {
         public ManualResetEventSlim Gate { get; } = new(false);
@@ -373,19 +704,16 @@ public sealed class BrowserIntegrationTests
         var image = (IHtmlImageElement)document.CreateElement("img");
         image.Source = "http://localhost/red.png";
         document.Body!.AppendChild(image);
+        // what a layout of the image does (an image requests nothing by itself)
+        _ = image.LoadAsync(image.GetImageSource()!.Url);
         var download = ((ILoadableElement)image).CurrentDownload!;
         await download.Task.WaitAsync(TimeSpan.FromSeconds(10));
         Assert.True(await Task.Run(() => requester.CopyStarted.Wait(TimeSpan.FromSeconds(10))));
 
-        // the image service waits for the body now; the frame must not read it
-        await Task.Run(() => Render(document)).WaitAsync(TimeSpan.FromSeconds(10));
+        // the image service waits for the body now; the render must not read it, but wait
+        var render = Task.Run(() => Render(document));
         requester.Gate.Set();
-        var watch = Stopwatch.StartNew();
-
-        while (image.OriginalWidth == 0 && watch.Elapsed < TimeSpan.FromSeconds(10))
-        {
-            await Task.Delay(10);
-        }
+        await render.WaitAsync(TimeSpan.FromSeconds(10));
 
         Assert.Equal(40, image.OriginalWidth);
         using var rendered = SKBitmap.Decode(Render(document));

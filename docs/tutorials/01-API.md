@@ -6,7 +6,7 @@ section: "AngleSharp.Renderer"
 
 ## Configuration
 
-A browsing context needs AngleSharp.Css and a render device. `WithRendering()` adds the services for `<canvas>` (its 2D context) and for `<img>` data:
+A browsing context needs AngleSharp.Css and a render device. `WithRendering()` adds the services for `<canvas>` (its 2D context) and for `<img>` data. The renderer loads the image of an `<img>` it lays out (the source its render node picked for the device from `srcset`, `sizes` and the sources of a `<picture>`, see `ElementRenderNode.ImageSource`), as AngleSharp's image element requests nothing by itself; a render waits for it, while a frame of an interactive harness paints it once it has loaded, and loads a lazy one (`loading=lazy`, with scripting) only once it is within 1250px of the viewport and of the scroll containers around it. Its natural size (also `naturalWidth` and `naturalHeight`) is divided by the density of the picked candidate (e.g. `2x`). An image not in a document (e.g. `new Image()` of a script) is loaded once it has a source:
 
 ```cs
 using AngleSharp;
