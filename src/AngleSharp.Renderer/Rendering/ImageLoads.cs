@@ -7,9 +7,7 @@ using AngleSharp.Html.Dom;
 
 /// <summary>
 /// Starts the loads of images (AngleSharp's <c>LoadAsync</c>), remembering the one in flight
-/// per image: asked again for the same source, AngleSharp 1.11.0-beta.981 answers with a
-/// completed task while the image service is still processing the response, so a render
-/// asking anew would not wait for the image.
+/// per image.
 /// </summary>
 internal static class ImageLoads
 {
