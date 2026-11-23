@@ -27,7 +27,7 @@ Released on tbd.
 - Fixed text before and after a relatively positioned inline box (e.g. a `strong` with `position: relative`) being painted as one, where the box was
 - Fixed a `paint()` image not being drawn anew when only the custom properties it uses changed, and not at all when its box was only painted again
 - Updated the document of an iframe to keep the render device of its browsing context, if it has one of its own
-- Updated to use a minimum of AngleSharp.Css 1.5.0
+- Updated to use a minimum of AngleSharp.Css 1.6.0
 - Added color hints and color interpolation methods (e.g. `in oklch`, `in hsl longer hue`) of gradients
 - Added `background-clip: text`
 - Added `object` elements showing an image instead of their fallback content
