@@ -10296,7 +10296,7 @@ public sealed partial class HtmlRenderer
             return ElementImageState.Missing;
         }
 
-        var task = image.LoadAsync(source, selection.Density);
+        var task = ImageLoads.Load(image, source, selection.Density);
         var state = image.Owner?.Context?.TryGetDomHarness(out var harness) == true ? harness as InteractiveHtmlRendererState : null;
         state?.WatchImageLoad(image);
 

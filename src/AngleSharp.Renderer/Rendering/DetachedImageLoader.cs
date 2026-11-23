@@ -40,7 +40,7 @@ internal sealed class DetachedImageLoader : IAttributeObserver
 
         if (!IsConnected(image) && image.GetImageSource() is { } source)
         {
-            _ = image.LoadAsync(source.Url, source.Density);
+            _ = ImageLoads.Load(image, source.Url, source.Density);
         }
     }
 

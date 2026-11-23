@@ -488,7 +488,7 @@ internal sealed partial class InteractiveHtmlRendererState : IDomHarness, AngleS
         foreach (var entry in layout.TakeNearImages(area))
         {
             WatchImageLoad(entry.Image);
-            _ = entry.Image.LoadAsync(entry.Source.Url, entry.Source.Density);
+            _ = ImageLoads.Load(entry.Image, entry.Source.Url, entry.Source.Density);
         }
     }
 

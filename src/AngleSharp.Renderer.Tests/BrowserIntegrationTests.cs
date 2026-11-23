@@ -644,6 +644,9 @@ public sealed class BrowserIntegrationTests
                 Content = new GatedStream(png, Gate, CopyStarted),
             });
 
+        // continues off the test's thread, as a stream of the network does: xunit runs what is
+        // posted to a test's thread on as many threads as there are cores, which other tests
+        // keep busy on a runner of 2 cores (the image's load sat there for more than 10 seconds)
         private sealed class GatedStream(byte[] data, ManualResetEventSlim gate, ManualResetEventSlim copyStarted) : MemoryStream(data)
         {
             public override void CopyTo(Stream destination, int bufferSize)
@@ -655,8 +658,8 @@ public sealed class BrowserIntegrationTests
             public override async Task CopyToAsync(Stream destination, int bufferSize, CancellationToken cancellationToken)
             {
                 copyStarted.Set();
-                await Task.Run(() => gate.Wait(cancellationToken), cancellationToken);
-                await base.CopyToAsync(destination, bufferSize, cancellationToken);
+                await Task.Run(() => gate.Wait(cancellationToken), cancellationToken).ConfigureAwait(false);
+                await base.CopyToAsync(destination, bufferSize, cancellationToken).ConfigureAwait(false);
             }
 
             public override int Read(byte[] buffer, int offset, int count)
@@ -673,14 +676,14 @@ public sealed class BrowserIntegrationTests
 
             public override async Task<int> ReadAsync(byte[] buffer, int offset, int count, CancellationToken cancellationToken)
             {
-                await Task.Run(() => gate.Wait(cancellationToken), cancellationToken);
-                return await base.ReadAsync(buffer, offset, count, cancellationToken);
+                await Task.Run(() => gate.Wait(cancellationToken), cancellationToken).ConfigureAwait(false);
+                return await base.ReadAsync(buffer, offset, count, cancellationToken).ConfigureAwait(false);
             }
 
             public override async ValueTask<int> ReadAsync(Memory<byte> buffer, CancellationToken cancellationToken = default)
             {
-                await Task.Run(() => gate.Wait(cancellationToken), cancellationToken);
-                return await base.ReadAsync(buffer, cancellationToken);
+                await Task.Run(() => gate.Wait(cancellationToken), cancellationToken).ConfigureAwait(false);
+                return await base.ReadAsync(buffer, cancellationToken).ConfigureAwait(false);
             }
         }
     }
@@ -704,16 +707,15 @@ public sealed class BrowserIntegrationTests
         var image = (IHtmlImageElement)document.CreateElement("img");
         image.Source = "http://localhost/red.png";
         document.Body!.AppendChild(image);
-        // what a layout of the image does (an image requests nothing by itself)
-        _ = image.LoadAsync(image.GetImageSource()!.Url);
-        var download = ((ILoadableElement)image).CurrentDownload!;
-        await download.Task.WaitAsync(TimeSpan.FromSeconds(10));
+        // a render loads the image (it requests nothing by itself) and waits for it
+        var first = Task.Run(() => Render(document));
         Assert.True(await Task.Run(() => requester.CopyStarted.Wait(TimeSpan.FromSeconds(10))));
 
-        // the image service waits for the body now; the render must not read it, but wait
+        // the image service waits for the body now; another render must not read it, but wait
         var render = Task.Run(() => Render(document));
         requester.Gate.Set();
-        await render.WaitAsync(TimeSpan.FromSeconds(10));
+        await render.WaitAsync(TimeSpan.FromSeconds(30));
+        await first.WaitAsync(TimeSpan.FromSeconds(30));
 
         Assert.Equal(40, image.OriginalWidth);
         using var rendered = SKBitmap.Decode(Render(document));
