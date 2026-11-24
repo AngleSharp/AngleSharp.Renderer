@@ -39,6 +39,7 @@ Released on Tuesday, November 24 2026.
 - Updated minimum version of AngleSharp to 1.11.0
 - Updated to use a minimum of AngleSharp.Css 1.6.0
 - Updated the document of an iframe to keep the render device of its browsing context, if it has one of its own
+- Updated `Element.animate` to take typed arguments instead of a plain object
 - Updated loading the image of an `img`: the renderer loads the source its render node picked (`srcset`, `sizes`, `picture`) once it lays the image out
 - Added color hints and color interpolation methods (e.g. `in oklch`, `in hsl longer hue`) of gradients
 - Added `loading=lazy` for images: a frame loads one once it is within 1250px of the viewport and of every scroll container around it

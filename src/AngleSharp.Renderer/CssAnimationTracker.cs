@@ -1,6 +1,7 @@
 using AngleSharp.Css.Dom;
 using AngleSharp.Dom;
 using System.Collections.Concurrent;
+using System.Diagnostics.CodeAnalysis;
 using System.Globalization;
 using System.Linq;
 using System.Reflection;
@@ -437,6 +438,13 @@ internal sealed class CssAnimationTracker
     /// so it is read by reflection; without it, the animations of pseudo-elements restart with
     /// every layout, as before.
     /// </summary>
+    /// <remarks>
+    /// Kept for trimming by the <see cref="DynamicDependencyAttribute"/>; when the property is
+    /// still gone (another AngleSharp.Css version), the lookup yields null, which is the fallback.
+    /// TODO: drop once AngleSharp.Css exposes the host publicly.
+    /// </remarks>
+    [DynamicDependency(DynamicallyAccessedMemberTypes.PublicProperties | DynamicallyAccessedMemberTypes.NonPublicProperties, "AngleSharp.Css.Dom.PseudoElement", "AngleSharp.Css")]
+    [UnconditionalSuppressMessage("Trimming", "IL2070", Justification = "The Host property of AngleSharp.Css's PseudoElement is preserved by DynamicDependency; other types fall back to null.")]
     internal static IElement? GetHost(IPseudoElement pseudo) =>
         s_hostGetters.GetOrAdd(pseudo.GetType(), static type =>
             type.GetProperty("Host", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic) is { CanRead: true } property &&
