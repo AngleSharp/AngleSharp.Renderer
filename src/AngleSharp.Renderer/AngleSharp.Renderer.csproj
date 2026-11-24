@@ -20,8 +20,8 @@
     <EmbedUntrackedSources>true</EmbedUntrackedSources>
     <IncludeSymbols>true</IncludeSymbols>
     <SymbolPackageFormat>snupkg</SymbolPackageFormat>
-    <AngleSharpVersion Condition=" '$(AngleSharpVersion)' == '' ">1.11.0-beta.982</AngleSharpVersion>
-    <AngleSharpCssVersion Condition=" '$(AngleSharpCssVersion)' == '' ">1.6.0-beta.466</AngleSharpCssVersion>
+    <AngleSharpVersion Condition=" '$(AngleSharpVersion)' == '' ">1.11.0</AngleSharpVersion>
+    <AngleSharpCssVersion Condition=" '$(AngleSharpCssVersion)' == '' ">1.6.0</AngleSharpCssVersion>
   </PropertyGroup>
 
   <ItemGroup>
@@ -29,8 +29,6 @@
   </ItemGroup>
 
   <ItemGroup>
-    <PackageReference Include="AngleSharp" Version="[$(AngleSharpVersion),2.0.0)" />
-    <PackageReference Include="AngleSharp.Css" Version="[$(AngleSharpCssVersion),2.0.0)" />
     <PackageReference Include="SkiaSharp" Version="4.156.1" />
     <PackageReference Include="SkiaSharp.NativeAssets.Linux.NoDependencies" Version="4.156.1" />
     <PackageReference Include="SkiaSharp.HarfBuzz" Version="4.156.1" />
@@ -42,6 +40,16 @@
     <None Include="Resources/Fonts/*-OFL.txt" Pack="true" PackagePath="licenses/" />
   </ItemGroup>
 
+  <!-- TEMPORARY while the DOM registration contract (AngleSharp.Scripting.DomRegistry) and its
+       generator are developed in AngleSharp.Core: build against the sibling checkout. Revert to the
+       package reference, with AngleSharpVersion raised to the release shipping them, before merging;
+       the package brings the generator as an analyzer by itself. -->
+  <ItemGroup>
+    <ProjectReference Include="..\..\..\AngleSharp.Core\src\AngleSharp\AngleSharp.Core.csproj" />
+    <ProjectReference Include="..\..\..\AngleSharp.Css\src\AngleSharp.Css\AngleSharp.Css.csproj" />
+    <ProjectReference Include="..\..\..\AngleSharp.Core\src\AngleSharp.Generators\AngleSharp.Generators.csproj" OutputItemType="Analyzer" ReferenceOutputAssembly="false" PrivateAssets="all" />
+  </ItemGroup>
+
   <ItemGroup>
     <None Include="$(MSBuildThisFileDirectory)..\..\logo.png" Pack="true" PackagePath="\" Visible="false" />
     <None Include="$(MSBuildThisFileDirectory)..\..\README.md" Pack="true" PackagePath="\" Visible="false" />
@@ -50,6 +58,10 @@
   <ItemGroup>
     <AssemblyAttribute Include="System.Runtime.InteropServices.ComVisibleAttribute">
       <_Parameter1>false</_Parameter1>
+    </AssemblyAttribute>
+    <!-- the DOM of this library for a scripting engine, without reflection: RendererDom.Register -->
+    <AssemblyAttribute Include="AngleSharp.Attributes.GenerateDomRegistrationAttribute">
+      <_Parameter1>AngleSharp.Renderer.RendererDom</_Parameter1>
     </AssemblyAttribute>
   </ItemGroup>
 

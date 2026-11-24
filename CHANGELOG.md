@@ -1,6 +1,6 @@
 # 0.13.0
 
-Released on Monday, November 23 2026.
+Released on Tuesday, November 24 2026.
 
 - Fixed images picked from a `srcset` being as large as their pixels; they are divided by their density
 - Fixed the caret of a focused text input or textarea always being painted at the end of its text instead of at its cursor (`selectionStart`/`selectionEnd`), and the selected text of one not being highlighted
@@ -44,6 +44,7 @@ Released on Monday, November 23 2026.
 - Added the `disclosure-open` and `disclosure-closed` list markers (e.g. of `summary`)
 - Added `drawFocusIfNeeded()` of the canvas
 - Added animations and transitions of registered custom properties (`@property`, `CSS.registerProperty`), which are part of the cascade, so what uses them follows, e.g. a `var()` in a gradient or the input properties of a paint worklet
+- Added `RendererDom.Register`, the DOM of this library declared for a scripting engine
 
 # 0.12.0
 
