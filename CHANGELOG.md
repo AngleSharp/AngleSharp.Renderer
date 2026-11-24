@@ -28,6 +28,7 @@ Released on Tuesday, November 24 2026.
 - Fixed a `paint()` image not being drawn anew when only the custom properties it uses changed, and not at all when its box was only painted again
 - Fixed opaque shadow colors (e.g. `box-shadow: 0 2px 3px #fff`) being painted black while AngleSharp.Css serializes colors as the spec says (`rgb(255, 255, 255)`)
 - Fixed an absolutely positioned `::before` of a positioned box painting above the positioned content after it in frames of the interactive harness
+- Updated minimum version of AngleSharp to 1.11.0
 - Updated to use a minimum of AngleSharp.Css 1.6.0
 - Updated the document of an iframe to keep the render device of its browsing context, if it has one of its own
 - Updated loading the image of an `img`: the renderer loads the source its render node picked (`srcset`, `sizes`, `picture`) once it lays the image out
