@@ -31,6 +31,11 @@ Released on Tuesday, November 24 2026.
 - Fixed a `paint()` image not being drawn anew when only the custom properties it uses changed, and not at all when its box was only painted again
 - Fixed opaque shadow colors (e.g. `box-shadow: 0 2px 3px #fff`) being painted black while AngleSharp.Css serializes colors as the spec says (`rgb(255, 255, 255)`)
 - Fixed an absolutely positioned `::before` of a positioned box painting above the positioned content after it in frames of the interactive harness
+- Fixed absolutely positioned boxes with a negative `z-index` sized by their containing block
+- Fixed percentage heights of the items of a flex container that got its height from its own flex container being treated as `auto`
+- Fixed a positioned pseudo-element covering its element being hit instead of the positioned boxes in that element
+- Fixed the bounding box of SVG `image` elements being unknown
+- Improved repainting an animated inline SVG
 - Updated minimum version of AngleSharp to 1.11.0
 - Updated to use a minimum of AngleSharp.Css 1.6.0
 - Updated the document of an iframe to keep the render device of its browsing context, if it has one of its own

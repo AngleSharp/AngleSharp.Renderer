@@ -422,6 +422,13 @@ public sealed partial class HtmlRenderer
         // the inline SVGs changed by the records of the current update
         private readonly HashSet<IElement> _svgRootsChanged = new(ReferenceEqualityComparer.Instance);
 
+        // per inline SVG of _svgRepaints, its elements whose page style may have changed since the
+        // frame, or null if all may have (see NoteSvgStyleChange)
+        private readonly Dictionary<IElement, HashSet<IElement>?> _svgStyleChanges = new(ReferenceEqualityComparer.Instance);
+
+        // tells the content of an inline SVG painted again from what it was before
+        private static long s_svgChangeCount;
+
         // the selectors of _relationalMatches, parsed once
         private readonly Dictionary<string, ISelector?> _parsedSelectors = new(StringComparer.Ordinal);
         // if a repaint changed a cursor or what can be hit (see TryRepaint)
@@ -609,6 +616,7 @@ public sealed partial class HtmlRenderer
             _removals.Clear();
             _repaints.Clear();
             _svgRepaints.Clear();
+            _svgStyleChanges.Clear();
             _recolors.Clear();
             _effects.Clear();
             _transformedSincePatch.Clear();
@@ -1591,6 +1599,7 @@ public sealed partial class HtmlRenderer
 
             // whether a `:has()` outside of it matches otherwise is looked at once for all changes
             _svgRootsChanged.Add(root);
+            NoteSvgStyleChange(root, record);
 
             if (!_svgRepaints.ContainsKey(root))
             {
@@ -1598,6 +1607,32 @@ public sealed partial class HtmlRenderer
             }
 
             return true;
+        }
+
+        /// <summary>
+        /// Notes which elements of an inline SVG the page may style otherwise after the change: only
+        /// the element of an attribute no rule selects by (e.g. the transforms and the `display` in
+        /// the `style` of the layers of a Lottie animation, in every frame), else any of them.
+        /// </summary>
+        private void NoteSvgStyleChange(IElement root, IMutationRecord record)
+        {
+            var hadChanges = _svgStyleChanges.TryGetValue(root, out var changed);
+
+            if (hadChanges && changed is null)
+            {
+                return;
+            }
+
+            if (record is { Type: "attributes", Target: IElement element, AttributeName: { } name } &&
+                name is not ("class" or "id") && !IsStyledByAttributeChange(element, name, record.PreviousValue, element.GetAttribute(name)))
+            {
+                (changed ??= new HashSet<IElement>(ReferenceEqualityComparer.Instance)).Add(element);
+                _svgStyleChanges[root] = changed;
+            }
+            else
+            {
+                _svgStyleChanges[root] = null;
+            }
         }
 
         /// <summary>
@@ -1620,8 +1655,18 @@ public sealed partial class HtmlRenderer
             {
                 foreach (var (root, previous) in _svgRepaints)
                 {
-                    // the page's styles of its elements are resolved anew, too
-                    _pass.Styles.Remove(root);
+                    // the page's styles of its elements are resolved anew, too: only those of the
+                    // elements that may have changed, if it is known which, and as it is known that
+                    // the content changed, without telling it from the one before by its markup
+                    if (_svgStyleChanges.TryGetValue(root, out var changed) && changed is not null &&
+                        _pass.Styles.TryGetValue(root, out var before) && before.PageStyle is { } pageStyle)
+                    {
+                        _pass.Styles[root] = (UpdateSvgPageStyle(root, pageStyle, changed), $"\u0001changed {System.Threading.Interlocked.Increment(ref s_svgChangeCount)}");
+                    }
+                    else
+                    {
+                        _pass.Styles.Remove(root);
+                    }
 
                     if (previous is null || !_document.Contains(root) || !TryGetOrLoadInlineSvgResource(root, out var resource) || resource?.VectorImage is null ||
                         resource.NaturalWidth != previous.NaturalWidth || resource.NaturalHeight != previous.NaturalHeight)
@@ -2548,7 +2593,7 @@ public sealed partial class HtmlRenderer
 
         // by attribute name, the keys of the compounds of the rules of the layout (with the user
         // agent's) selecting by it (null for one any element may match), and if any shows it by attr()
-        private readonly Dictionary<string, (List<CompoundKeys?> Compounds, bool IsShown)> _attributeRules = new(StringComparer.OrdinalIgnoreCase);
+        private readonly Dictionary<string, (List<(CompoundKeys? Keys, List<AttributeSelector> Tests)> Compounds, bool IsShown)> _attributeRules = new(StringComparer.OrdinalIgnoreCase);
 
         /// <summary>
         /// Gets if a rule may style the element differently by the attribute: a compound selecting
@@ -2557,13 +2602,34 @@ public sealed partial class HtmlRenderer
         /// </summary>
         private bool IsStyledByAttribute(IElement element, string name)
         {
+            var rules = GetAttributeRules(name);
+            return rules.IsShown || rules.Compounds.Any(compound => compound.Keys is null || compound.Keys.Matches(element));
+        }
+
+        /// <summary>
+        /// Gets if a rule may style the element differently after the attribute changed from one
+        /// value to another: as <see cref="IsStyledByAttribute"/>, but only by compounds whose
+        /// tests of the attribute tell the values apart (e.g. not <c>[style*="border-color"]</c>
+        /// for a `style` going from `display: none` to `display: block`).
+        /// </summary>
+        private bool IsStyledByAttributeChange(IElement element, string name, string? before, string? after)
+        {
+            var rules = GetAttributeRules(name);
+            return rules.IsShown || rules.Compounds.Any(compound => (compound.Keys is null || compound.Keys.Matches(element)) &&
+                (compound.Tests.Count == 0 || compound.Tests.Any(test =>
+                    test.Matches(before, test.IgnoresCase) != test.Matches(after, test.IgnoresCase) ||
+                    test.Matches(before, ignoreCase: true) != test.Matches(after, ignoreCase: true))));
+        }
+
+        private (List<(CompoundKeys? Keys, List<AttributeSelector> Tests)> Compounds, bool IsShown) GetAttributeRules(string name)
+        {
             if (!_attributeRules.TryGetValue(name, out var rules))
             {
                 rules = FindAttributeRules(name);
                 _attributeRules[name] = rules;
             }
 
-            return rules.IsShown || rules.Compounds.Any(keys => keys is null || keys.Matches(element));
+            return rules;
         }
 
         /// <summary>The tag, classes and ids a compound selector asks for (outside of any arguments).</summary>
@@ -2621,12 +2687,12 @@ public sealed partial class HtmlRenderer
             private static bool IsNameCharacter(char c) => char.IsLetterOrDigit(c) || c is '-' or '_' || c > 127;
         }
 
-        private (List<CompoundKeys?> Compounds, bool IsShown) FindAttributeRules(string name)
+        private (List<(CompoundKeys? Keys, List<AttributeSelector> Tests)> Compounds, bool IsShown) FindAttributeRules(string name)
         {
             var escaped = Regex.Escape(name);
             var selector = new Regex(@"\[\s*(?:[^\s\]|]*\|)?" + escaped + @"\s*(?:[~|^$*]?=\s*(?:""[^""]*""|'[^']*'|[^\s\]]*)\s*[is]?\s*)?\]", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
             var content = new Regex(@"attr\(\s*" + escaped + @"\b", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
-            var compounds = new List<CompoundKeys?>();
+            var compounds = new List<(CompoundKeys?, List<AttributeSelector>)>();
             var isShown = false;
 
             // the rules of the layout (with the user agent's), or the document's without them
@@ -2659,8 +2725,8 @@ public sealed partial class HtmlRenderer
 
                                     if (matches.Count > 0)
                                     {
-                                        // in an argument (e.g. `:not([title])`) it may style any element
-                                        compounds.Add(matches.Any(match => IsInArgument(compound, match.Index)) ? null : CompoundKeys.Parse(compound));
+                                        // one testing another element (e.g. `:has([title])` or `:not([title] *)`) may style any element
+                                        compounds.Add((matches.Any(match => !TestsCompoundElement(compound, match.Index)) ? null : CompoundKeys.Parse(compound), ParseAttributeTests(compound, name, matches.Count)));
                                     }
                                 }
                             }
@@ -2684,7 +2750,132 @@ public sealed partial class HtmlRenderer
             }
         }
 
-        private static bool IsInArgument(string compound, int index) => compound[..index].Count(c => c == '(') > compound[..index].Count(c => c == ')');
+        // the tests of the attribute in the compound, or none if not all of its tests can be told
+        // (e.g. with a namespace prefix)
+        private static List<AttributeSelector> ParseAttributeTests(string compound, string name, int count)
+        {
+            var tests = new List<AttributeSelector>();
+
+            foreach (Match match in s_attributeSelectors.Matches(compound))
+            {
+                if (string.Equals(match.Groups[1].Value, name, StringComparison.OrdinalIgnoreCase))
+                {
+                    var expected = match.Groups[3].Success ? match.Groups[3].Value : match.Groups[4].Success ? match.Groups[4].Value : match.Groups[5].Value;
+                    tests.Add(new AttributeSelector(match.Groups[2].Value, expected, match.Groups[6].Value is "i" or "I"));
+                }
+            }
+
+            return tests.Count == count ? tests : [];
+        }
+
+        /// <summary>
+        /// Gets if what is at the index of the compound tests the element the compound matches: it
+        /// is outside of any argument, or each argument around it is a compound selector of a
+        /// pseudo-class matching that element (e.g. <c>:where([dir])</c>, <c>:not(.a[title])</c>),
+        /// not one of <c>:has()</c> or with a combinator (e.g. <c>:not([title] *)</c>).
+        /// </summary>
+        private static bool TestsCompoundElement(string compound, int index)
+        {
+            // a string may hold parentheses: then only what is outside of any argument
+            if (compound.IndexOfAny(['"', '\'']) >= 0)
+            {
+                return compound[..index].Count(c => c == '(') <= compound[..index].Count(c => c == ')');
+            }
+
+            var depth = 0;
+
+            for (var start = index - 1; start >= 0; start--)
+            {
+                var c = compound[start];
+
+                if (c is ')' or ']')
+                {
+                    depth++;
+                }
+                else if (c == '[' && depth > 0)
+                {
+                    depth--;
+                }
+                else if (c == '(' && depth > 0)
+                {
+                    depth--;
+                }
+                else if (c == '(')
+                {
+                    // the argument around it, from this parenthesis to its closing one
+                    var name = compound[..start];
+                    var nameStart = name.LastIndexOf(':') + 1;
+
+                    if (name[nameStart..].Trim().ToLowerInvariant() is not ("is" or "where" or "not" or "matches" or "any" or "-webkit-any" or "-moz-any") ||
+                        !IsCompoundArgument(compound, start + 1, index))
+                    {
+                        return false;
+                    }
+                }
+            }
+
+            return true;
+
+            // whether the selector of the argument list holding the index has no combinator
+            static bool IsCompoundArgument(string text, int argumentStart, int index)
+            {
+                var from = argumentStart;
+                var nesting = 0;
+
+                for (var i = argumentStart; i < text.Length; i++)
+                {
+                    var c = text[i];
+
+                    if (c is '(' or '[')
+                    {
+                        nesting++;
+                    }
+                    else if (c is ')' or ']')
+                    {
+                        if (nesting == 0)
+                        {
+                            return IsCompound(text[from..i]);
+                        }
+
+                        nesting--;
+                    }
+                    else if (c == ',' && nesting == 0)
+                    {
+                        if (i > index)
+                        {
+                            return IsCompound(text[from..i]);
+                        }
+
+                        from = i + 1;
+                    }
+                }
+
+                return false;
+            }
+
+            static bool IsCompound(string selector)
+            {
+                var nesting = 0;
+
+                foreach (var c in selector.Trim())
+                {
+                    if (c is '(' or '[')
+                    {
+                        nesting++;
+                    }
+                    else if (c is ')' or ']')
+                    {
+                        nesting--;
+                    }
+                    else if (nesting == 0 && (char.IsWhiteSpace(c) || c is '>' or '+' or '~'))
+                    {
+                        return false;
+                    }
+                }
+
+                return true;
+            }
+        }
 
         private static bool ChangesStyleSheets(IMutationRecord record)
         {

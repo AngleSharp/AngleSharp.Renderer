@@ -85,7 +85,7 @@ internal static class SvgElementRenderer
         {
             // The filter region clips both what the filter sees and what it produces.
             canvas.ClipRect(filter.Region);
-            using var filterPaint = new SKPaint { ImageFilter = filter.ImageFilter };
+            using var filterPaint = new SKPaint { ImageFilter = filter.ImageFilter, ColorFilter = filter.ColorFilter };
             filterLayerCount = canvas.SaveLayer(filterPaint);
         }
 
@@ -111,9 +111,10 @@ internal static class SvgElementRenderer
 
     private static void RenderMasked(SKCanvas canvas, IElement element, IElement maskElement, string tagName, SvgPaintState state, SvgRenderContext context, SvgViewport viewport)
     {
-        var contentLayerCount = canvas.SaveLayer();
-
+        // the mask region clips the layers, too, so they are only as large as it is
+        var contentLayerCount = canvas.Save();
         ApplyMaskRegionClip(canvas, maskElement, element, viewport, context);
+        canvas.SaveLayer();
         RenderElementContent(canvas, element, tagName, state, context, viewport);
 
         // a mask's luminance is its coverage, unless it says its alpha is (mask-type: alpha)

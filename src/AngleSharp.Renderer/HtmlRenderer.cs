@@ -778,6 +778,7 @@ public sealed partial class HtmlRenderer
             var deferredPreviousBlockMarginBottom = MarginStrut.Zero;
             var deferredSuppressNextBlockTopMargin = false;
             var deferredTextIndentConsumed = true;
+            var rangeStart = displayList.Commands.Count;
 
             LayoutNode(
                 deferred.Node,
@@ -797,6 +798,50 @@ public sealed partial class HtmlRenderer
                 positionedContainingY: paddingBoxY,
                 positionedContainingWidth: deferred.PositionedContainingWidth,
                 positionedContainingHeight: paddingBoxHeight);
+
+            if (deferred.Placeholder is { } placeholder)
+            {
+                MoveToPlaceholder(displayList, placeholder, rangeStart);
+            }
+        }
+    }
+
+    /// <summary>
+    /// Moves the commands from <paramref name="rangeStart"/> on to <paramref name="index"/> (before
+    /// them), e.g. a box laid out last but painted below what came before it.
+    /// </summary>
+    /// <returns>The number of commands moved.</returns>
+    private static int MoveRangeTo(DisplayList displayList, int rangeStart, int index)
+    {
+        var range = displayList.Commands.Skip(rangeStart).ToList();
+
+        if (range.Count > 0 && index < rangeStart)
+        {
+            displayList.RemoveFrom(rangeStart);
+            displayList.InsertRange(index, range);
+        }
+
+        return range.Count;
+    }
+
+    /// <summary>
+    /// Moves the commands from <paramref name="rangeStart"/> on into the place of a placeholder
+    /// scope (an identity <see cref="PushTransformCommand"/> and its pop) emitted before them. One
+    /// that isn't there (e.g. emitted into a scratch list) leaves them where they are.
+    /// </summary>
+    private static void MoveToPlaceholder(DisplayList displayList, PushTransformCommand placeholder, int rangeStart)
+    {
+        var commands = displayList.Commands;
+
+        for (var index = rangeStart - 2; index >= 0; index--)
+        {
+            if (ReferenceEquals(commands[index], placeholder))
+            {
+                var range = commands.Skip(rangeStart).ToList();
+                displayList.RemoveFrom(rangeStart);
+                displayList.ReplaceRange(index, 2, range);
+                return;
+            }
         }
     }
 
@@ -810,7 +855,8 @@ public sealed partial class HtmlRenderer
         RenderTextStyle TextStyle,
         float MaxY,
         float PositionedContainingX,
-        float PositionedContainingWidth);
+        float PositionedContainingWidth,
+        PushTransformCommand? Placeholder = null);
 
     /// <summary>
     /// If percentages of `top`, `bottom` or `height`, or a `bottom` offset, need the height of the
@@ -1541,9 +1587,21 @@ public sealed partial class HtmlRenderer
             ((isAbsolute && float.IsNaN(positionedContainingHeight) && DependsOnContainingBlockHeight(styleMap)) || IsClippedBelowContainingBlock(node, isFixed, context)) &&
             (isFixed ? FindRootScope(context) : FindContainingBlockScope(positionedContainingX, positionedContainingY, context)) is { } positionedScope)
         {
+            // A box painted below the in-flow content (negative z-index) leaves a placeholder where
+            // it is met: its siblings below the content are laid out first, in paint order, and
+            // what follows it is painted above it. Its commands take that place once laid out.
+            PushTransformCommand? placeholder = null;
+
+            if (HasExplicitZIndex(styleMap) && ParseZIndex(styleMap) < 0)
+            {
+                placeholder = new PushTransformCommand(RenderTransform2D.Identity);
+                displayList.Add(placeholder);
+                displayList.Add(new PopTransformCommand());
+            }
+
             // a flex item may be laid out twice
             positionedScope.Boxes.RemoveAll(box => ReferenceEquals(box.Node, node));
-            positionedScope.Boxes.Add(new DeferredPositionedBox(node, containingX, containingY, containingWidth, cursorY, inheritedTextStyle, maxY, positionedContainingX, positionedContainingWidth));
+            positionedScope.Boxes.Add(new DeferredPositionedBox(node, containingX, containingY, containingWidth, cursorY, inheritedTextStyle, maxY, positionedContainingX, positionedContainingWidth, placeholder));
             return;
         }
 
@@ -2966,8 +3024,14 @@ public sealed partial class HtmlRenderer
         var ignoresWhitespaceFlexItems = string.Equals(flexWrap, "wrap", StringComparison.OrdinalIgnoreCase) ||
             string.Equals(justifyContent, "space-around", StringComparison.OrdinalIgnoreCase) ||
             string.Equals(justifyContent, "space-evenly", StringComparison.OrdinalIgnoreCase);
-        // percentage heights of the items refer to the container's height, if it is definite (else they are auto)
+        // percentage heights of the items refer to the container's height, if it is definite (else they
+        // are auto); one it got from its own flex container (e.g. stretched) counts, as for a block
         var definiteContentHeight = ResolveAuthoredDimension(styleMap, "height", containingHeight, float.NaN, borderTop + borderBottom + paddingTop + paddingBottom);
+
+        if (float.IsNaN(definiteContentHeight) && usedContentHeight.HasValue)
+        {
+            definiteContentHeight = usedContentHeight.Value;
+        }
         var children = OrderChildrenForLayout(FlattenDisplayContents(node.Children, context), context).ToList();
         CreateStyleMapsInParallel(children.OfType<ElementRenderNode>().ToList(), context);
         // absolutely positioned children do not take part in the flex layout
@@ -3714,6 +3778,8 @@ public sealed partial class HtmlRenderer
         {
             var contentY = borderBoxY + borderTop + paddingTop;
             var isContainingBlock = ActsAsContainingBlock(styleMap, positionedContainingX);
+            // the ones painted below the items (negative z-index, met first) go before them
+            var belowItemsIndex = itemsStart;
 
             foreach (var child in outOfFlowChildren)
             {
@@ -3748,6 +3814,13 @@ public sealed partial class HtmlRenderer
                     positionedContainingY: isContainingBlock ? borderBoxY + borderTop : positionedContainingY,
                     positionedContainingWidth: isContainingBlock ? paddingLeft + containingWidth + paddingRight : positionedContainingWidth,
                     positionedContainingHeight: isContainingBlock ? paddingTop + usedContentHeight + paddingBottom : positionedContainingHeight);
+
+                if (IsNegativeZIndexChild(child, context))
+                {
+                    belowItemsIndex += MoveRangeTo(displayList, childRangeStart, belowItemsIndex);
+                    continue;
+                }
+
                 paintOrder.Track(child, displayList, childRangeStart, context);
             }
         }
@@ -3876,9 +3949,12 @@ public sealed partial class HtmlRenderer
             .ToList();
         CreateStyleMapsInParallel(gridItems.OfType<ElementRenderNode>().ToList(), context);
         // absolutely positioned children take no cell; they are laid out once the grid's size is known
-        var outOfFlowChildren = gridItems
+        // (those painted below the items first, see LayoutOutOfFlowChildren)
+        var outOfFlowChildren = OrderChildrenForLayout(gridItems
             .OfType<ElementRenderNode>()
             .Where(child => IsOutOfFlowPositioned(GetOrCreateStyleMap(context, child.Ref, child.ComputedStyle)))
+            .ToList(), context)
+            .Cast<ElementRenderNode>()
             .ToList();
         gridItems.RemoveAll(child => child is ElementRenderNode element && outOfFlowChildren.Contains(element));
         var paintOrder = new PaintOrder();
@@ -4751,6 +4827,9 @@ public sealed partial class HtmlRenderer
                     paddingBoxX, paddingBoxY, paddingBoxWidth, paddingBoxHeight);
             }
 
+            // the ones painted below the items (negative z-index, met first) go before them
+            var belowItemsIndex = boxPaintInsertIndex;
+
             foreach (var child in outOfFlowChildren)
             {
                 var childStyleMap = GetOrCreateStyleMap(context, child.Ref, child.ComputedStyle);
@@ -4789,6 +4868,13 @@ public sealed partial class HtmlRenderer
                     positionedContainingY: isContainingBlock ? areaTop : positionedContainingY,
                     positionedContainingWidth: isContainingBlock ? Math.Max(0f, areaRight - areaLeft) : positionedContainingWidth,
                     positionedContainingHeight: isContainingBlock ? Math.Max(0f, areaBottom - areaTop) : positionedContainingHeight);
+
+                if (IsNegativeZIndexChild(child, context))
+                {
+                    belowItemsIndex += MoveRangeTo(displayList, childRangeStart, belowItemsIndex);
+                    continue;
+                }
+
                 paintOrder.Track(child, displayList, childRangeStart, context);
             }
         }
@@ -10770,34 +10856,68 @@ public sealed partial class HtmlRenderer
 
         foreach (var element in svgRoot.DescendantsAndSelf<IElement>())
         {
-            // Only what the page declares on the element itself: inherited values must not beat
-            // the element's own presentation attributes (GetDeclarations merges in the ancestors).
-            var cascaded = styleCollection.ComputeExplicitStyle(element);
-            Dictionary<string, string>? values = null;
-
-            foreach (var property in SvgPaintState.PresentationProperties)
-            {
-                var value = cascaded.GetPropertyValue(property);
-
-                // custom properties are only substituted in the computed value, e.g. fill: var(--text)
-                if (!UsesExplicitValue(value) && !string.IsNullOrWhiteSpace(value))
-                {
-                    value = ComputeStyle(styleCollection, element).GetPropertyValue(property);
-                }
-
-                if (!string.IsNullOrWhiteSpace(value))
-                {
-                    (values ??= new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase))[property] = value;
-                }
-            }
-
-            if (values is not null)
+            if (ResolveSvgElementDeclarations(styleCollection, element) is { } values)
             {
                 declarations[element] = values;
             }
         }
 
         return new SvgPageStyle(inherited, declarations);
+    }
+
+    /// <summary>
+    /// The page style of an inline SVG with the declarations of the given elements resolved anew,
+    /// the others (whose styles stay the same) kept.
+    /// </summary>
+    private static SvgPageStyle UpdateSvgPageStyle(IElement svgRoot, SvgPageStyle previous, IEnumerable<IElement> changed)
+    {
+        if (svgRoot.Owner?.DefaultView is not { } window)
+        {
+            return previous;
+        }
+
+        var styleCollection = GetSvgStyleCollection(window);
+        var declarations = new Dictionary<IElement, IReadOnlyDictionary<string, string>>(previous.Declarations, ReferenceEqualityComparer.Instance);
+
+        foreach (var element in changed)
+        {
+            if (ResolveSvgElementDeclarations(styleCollection, element) is { } values)
+            {
+                declarations[element] = values;
+            }
+            else
+            {
+                declarations.Remove(element);
+            }
+        }
+
+        return previous with { Declarations = declarations };
+    }
+
+    private static Dictionary<string, string>? ResolveSvgElementDeclarations(IStyleCollection styleCollection, IElement element)
+    {
+        // Only what the page declares on the element itself: inherited values must not beat
+        // the element's own presentation attributes (GetDeclarations merges in the ancestors).
+        var cascaded = styleCollection.ComputeExplicitStyle(element);
+        Dictionary<string, string>? values = null;
+
+        foreach (var property in SvgPaintState.PresentationProperties)
+        {
+            var value = cascaded.GetPropertyValue(property);
+
+            // custom properties are only substituted in the computed value, e.g. fill: var(--text)
+            if (!UsesExplicitValue(value) && !string.IsNullOrWhiteSpace(value))
+            {
+                value = ComputeStyle(styleCollection, element).GetPropertyValue(property);
+            }
+
+            if (!string.IsNullOrWhiteSpace(value))
+            {
+                (values ??= new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase))[property] = value;
+            }
+        }
+
+        return values;
     }
 
     private static IStyleCollection GetSvgStyleCollection(IWindow window)

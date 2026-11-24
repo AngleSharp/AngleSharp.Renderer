@@ -9,9 +9,10 @@ using SkiaSharp;
 
 /// <summary>
 /// The image filter a &lt;filter&gt; element applies to one element, and the filter region its
-/// result is clipped to.
+/// result is clipped to. A filter that only maps the colors of each pixel is a color filter
+/// instead, which the layer it applies to is composited through (no images in between).
 /// </summary>
-internal readonly record struct SvgFilter(SKImageFilter? ImageFilter, SKRect Region);
+internal readonly record struct SvgFilter(SKImageFilter? ImageFilter, SKRect Region, SKColorFilter? ColorFilter = null);
 
 /// <summary>
 /// Builds an <see cref="SKImageFilter"/> from a &lt;filter&gt; element's primitive chain, composed
@@ -35,6 +36,13 @@ internal static class SvgFilterBuilder
         var bounds = SvgGeometry.ComputeBounds(target, viewport, context);
         var region = ResolveFilterRegion(filterElement, bounds, viewport);
         var primitiveUnitsAreBoundingBox = string.Equals(filterElement.GetAttribute("primitiveUnits")?.Trim(), "objectBoundingBox", StringComparison.OrdinalIgnoreCase);
+
+        // e.g. the alpha inversion of each track matte of a Lottie animation
+        if (TryBuildColorFilter(filterElement) is { } colorFilter)
+        {
+            return new SvgFilter(null, region, colorFilter);
+        }
+
         var results = new Dictionary<string, FilterResult>(StringComparer.Ordinal);
         FilterResult? last = null;
         var source = new FilterResult(null, region, Linear: false);
@@ -77,6 +85,8 @@ internal static class SvgFilterBuilder
                 "feoffset" => input with { Filter = BuildOffset(primitive, input.Filter, crop), Subregion = subregion },
                 "fetile" => input with { Filter = SKImageFilter.CreateTile(input.Subregion, subregion, input.Filter), Subregion = subregion },
                 "fedisplacementmap" => input with { Filter = BuildDisplacementMap(primitive, input.Filter, SecondInput(), crop), Subregion = subregion },
+                // one leaving red, green and blue as they are maps alpha alike in either space
+                "fecomponenttransfer" when IsAlphaOnlyTransfer(primitive) => input with { Filter = BuildComponentTransfer(primitive, input.Filter, crop), Subregion = subregion },
                 "feimage" => new FilterResult(BuildImage(primitive, subregion, context, viewport), subregion, Linear: false),
                 _ => new FilterResult(tag switch
                 {
@@ -109,6 +119,70 @@ internal static class SvgFilterBuilder
         return last is { } final ? new SvgFilter(ConvertSpace(final, linear: false), region) : null;
     }
 
+    /// <summary>
+    /// The filter as one color filter, if it is a chain of primitives mapping the colors of each
+    /// pixel alone (<c>feColorMatrix</c>, <c>feComponentTransfer</c>) from the source graphic on,
+    /// each taking the result before it, over the whole filter region.
+    /// </summary>
+    private static SKColorFilter? TryBuildColorFilter(IElement filterElement)
+    {
+        SKColorFilter? composed = null;
+        var linear = false;
+        var previousResult = default(string);
+        var any = false;
+
+        foreach (var primitive in filterElement.Children)
+        {
+            var tag = primitive.LocalName.ToLowerInvariant();
+
+            if (!tag.StartsWith("fe", StringComparison.Ordinal))
+            {
+                continue;
+            }
+
+            var input = primitive.GetAttribute("in")?.Trim();
+            var takesPrevious = string.IsNullOrEmpty(input) || (any ? input == previousResult : input == "SourceGraphic");
+
+            if (tag is not ("fecolormatrix" or "fecomponenttransfer") || !takesPrevious ||
+                primitive.HasAttribute("x") || primitive.HasAttribute("y") || primitive.HasAttribute("width") || primitive.HasAttribute("height"))
+            {
+                composed?.Dispose();
+                return null;
+            }
+
+            if (!(tag == "fecomponenttransfer" && IsAlphaOnlyTransfer(primitive)))
+            {
+                var primitiveLinear = UsesLinearRgb(primitive, filterElement);
+
+                if (primitiveLinear != linear)
+                {
+                    composed = Compose(CreateSpaceConversion(primitiveLinear), composed);
+                    linear = primitiveLinear;
+                }
+            }
+
+            composed = Compose(tag == "fecolormatrix" ? CreateColorMatrixFilter(primitive) : CreateComponentTransferFilter(primitive), composed);
+            previousResult = primitive.GetAttribute("result")?.Trim();
+            any = true;
+        }
+
+        return linear ? Compose(CreateSpaceConversion(linear: false), composed) : composed;
+
+        // the outer one maps the colors the inner one gave
+        static SKColorFilter Compose(SKColorFilter outer, SKColorFilter? inner)
+        {
+            if (inner is null)
+            {
+                return outer;
+            }
+
+            var result = SKColorFilter.CreateCompose(outer, inner);
+            outer.Dispose();
+            inner.Dispose();
+            return result;
+        }
+    }
+
     /// <summary>A primitive's output: its filter, subregion, and the color space its colors are in.</summary>
     private readonly record struct FilterResult(SKImageFilter? Filter, SKRect Subregion, bool Linear);
 
@@ -136,10 +210,15 @@ internal static class SvgFilterBuilder
             return result.Filter;
         }
 
-        // Lookup tables act on unpremultiplied colors, as the transfer functions require; alpha is kept.
-        var table = linear ? SrgbToLinearTable : LinearToSrgbTable;
-        using var conversion = SKColorFilter.CreateTable(IdentityTable, table, table, table);
+        using var conversion = CreateSpaceConversion(linear);
         return SKImageFilter.CreateColorFilter(conversion, result.Filter);
+    }
+
+    // Lookup tables act on unpremultiplied colors, as the transfer functions require; alpha is kept.
+    private static SKColorFilter CreateSpaceConversion(bool linear)
+    {
+        var table = linear ? SrgbToLinearTable : LinearToSrgbTable;
+        return SKColorFilter.CreateTable(IdentityTable, table, table, table);
     }
 
     private static readonly byte[] IdentityTable = Enumerable.Range(0, 256).Select(i => (byte)i).ToArray();
@@ -245,6 +324,12 @@ internal static class SvgFilterBuilder
 
     private static SKImageFilter BuildColorMatrix(IElement primitive, SKImageFilter? input, SKRect crop)
     {
+        using var colorFilter = CreateColorMatrixFilter(primitive);
+        return SKImageFilter.CreateColorFilter(colorFilter, input, crop);
+    }
+
+    private static SKColorFilter CreateColorMatrixFilter(IElement primitive)
+    {
         var type = primitive.GetAttribute("type")?.Trim().ToLowerInvariant();
         var values = primitive.GetAttribute("values");
 
@@ -257,8 +342,7 @@ internal static class SvgFilterBuilder
             _ => IdentityMatrix,
         };
 
-        using var colorFilter = SKColorFilter.CreateColorMatrix(matrix);
-        return SKImageFilter.CreateColorFilter(colorFilter, input, crop);
+        return SKColorFilter.CreateColorMatrix(matrix);
     }
 
     private static SKImageFilter BuildDropShadow(IElement primitive, SKImageFilter? input, SKRect crop, bool linear)
@@ -376,6 +460,26 @@ internal static class SvgFilterBuilder
     /// </summary>
     private static SKImageFilter BuildComponentTransfer(IElement primitive, SKImageFilter? input, SKRect crop)
     {
+        using var colorFilter = CreateComponentTransferFilter(primitive);
+        return SKImageFilter.CreateColorFilter(colorFilter, input, crop);
+    }
+
+    private static SKColorFilter CreateComponentTransferFilter(IElement primitive)
+    {
+        var tables = CreateTransferTables(primitive);
+        return SKColorFilter.CreateTable(tables[3], tables[0], tables[1], tables[2]);
+    }
+
+    /// <summary>If an <c>feComponentTransfer</c> keeps red, green and blue (e.g. inverts alpha).</summary>
+    private static bool IsAlphaOnlyTransfer(IElement primitive)
+    {
+        var tables = CreateTransferTables(primitive);
+        return tables[0].AsSpan().SequenceEqual(IdentityTable) && tables[1].AsSpan().SequenceEqual(IdentityTable) && tables[2].AsSpan().SequenceEqual(IdentityTable);
+    }
+
+    // the tables of red, green, blue and alpha
+    private static byte[][] CreateTransferTables(IElement primitive)
+    {
         var tables = new byte[4][];
 
         for (var channel = 0; channel < 4; channel++)
@@ -400,8 +504,7 @@ internal static class SvgFilterBuilder
             }
         }
 
-        using var colorFilter = SKColorFilter.CreateTable(tables[3], tables[0], tables[1], tables[2]);
-        return SKImageFilter.CreateColorFilter(colorFilter, input, crop);
+        return tables;
     }
 
     private static byte[] CreateTransferTable(IElement? function)

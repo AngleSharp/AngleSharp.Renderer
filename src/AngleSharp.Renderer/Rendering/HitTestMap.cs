@@ -50,7 +50,7 @@ public sealed class HitTestMap
         var escapes = GetEscape(styleMaps, element);
         var isPage = container is null || container.ParentElement is null;
 
-        for (var ancestor = element.ParentElement; ancestor is not null; ancestor = ancestor.ParentElement)
+        for (var ancestor = HitTesting.GetParentBox(element); ancestor is not null; ancestor = HitTesting.GetParentBox(ancestor))
         {
             var isContainer = ReferenceEquals(ancestor, container);
 
@@ -97,7 +97,7 @@ public sealed class HitTestMap
     {
         var escapes = GetEscape(styleMaps, element);
 
-        for (var ancestor = element.ParentElement; ancestor is not null && !ReferenceEquals(ancestor, until); ancestor = ancestor.ParentElement)
+        for (var ancestor = HitTesting.GetParentBox(element); ancestor is not null && !ReferenceEquals(ancestor, until); ancestor = HitTesting.GetParentBox(ancestor))
         {
             if (!metrics.TryGetValue(ancestor, out var ancestorMetrics))
             {
@@ -359,7 +359,7 @@ public sealed class HitTestMap
             // what is out of the flow isn't clipped by what is below its containing block
             var escapes = GetEscape(styleMaps, element);
 
-            for (var ancestor = element.ParentElement; ancestor is not null; ancestor = ancestor.ParentElement)
+            for (var ancestor = HitTesting.GetParentBox(element); ancestor is not null; ancestor = HitTesting.GetParentBox(ancestor))
             {
                 if (GetAncestorInfo(ancestor) is not { } info)
                 {

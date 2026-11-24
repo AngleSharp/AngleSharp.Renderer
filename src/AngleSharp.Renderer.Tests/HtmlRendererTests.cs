@@ -767,6 +767,23 @@ public sealed class HtmlRendererTests
     }
 
     [Fact]
+    public async Task BuildDisplayList_PercentageMinHeightInStretchedColumnFlexContainerFillsIt()
+    {
+        // found on smapiot.com: cards stretched to the tallest one in their row, whose inner box
+        // has `min-height: 100%`, stopped at their own content (the stretched size is definite)
+        var displayList = await LayoutAsync("""
+            <html><body style="margin:0">
+                <div style="display:flex">
+                    <div style="display:flex; flex-direction:column; padding:2px; width:50px"><div style="min-height:100%; background-color:#112233"><div style="height:20px"></div></div></div>
+                    <div style="width:50px; height:100px"></div>
+                </div>
+            </body></html>
+            """);
+
+        Assert.Equal(96f, FillOf(displayList, new RenderColor(0x11, 0x22, 0x33)).Height);
+    }
+
+    [Fact]
     public async Task BuildDisplayList_GridItemSpanningAFlexibleRowDoesNotGrowTheOtherRows()
     {
         // found on MDN: a tall sidebar spanning both rows made the min-content header row as tall
@@ -4089,6 +4106,31 @@ public sealed class HtmlRendererTests
         Assert.True(greenIndex >= 0);
         Assert.True(redIndex >= 0);
         Assert.True(redIndex > greenIndex);
+    }
+
+    [Theory]
+    [InlineData("block")]
+    [InlineData("flex")]
+    [InlineData("grid")]
+    public async Task BuildDisplayList_PaintsNegativeZIndexBoxSizedByItsContainingBlockBelowInFlowContent(string display)
+    {
+        // found on smapiot.com: a card's glowing "border" is a `z-index: -2` pseudo-element with
+        // `inset: -2px`, which waits for the card's height, and so painted over the card's content
+        var displayList = await LayoutAsync($$"""
+            <html><head><style>
+                .card { display:{{display}}; position:relative; z-index:1; padding:2px; overflow:hidden; background-color:#00ff00 }
+                .card::after { content:""; position:absolute; inset:-2px; z-index:-2; background-color:#ff0000; transform:rotate(30deg) }
+            </style></head><body>
+                <div class="card"><div style="width:40px; height:40px; background-color:#0000ff"></div></div>
+            </body></html>
+            """);
+
+        var fills = displayList.Commands.OfType<FillRectCommand>().ToList();
+        var card = fills.FindIndex(fill => fill.Color.Equals(new RenderColor(0, 255, 0)));
+        var glow = fills.FindIndex(fill => fill.Color.Equals(new RenderColor(255, 0, 0)));
+        var content = fills.FindIndex(fill => fill.Color.Equals(new RenderColor(0, 0, 255)));
+
+        Assert.True(card < glow && glow < content, $"card {card}, glow {glow}, content {content}");
     }
 
     [Fact]
