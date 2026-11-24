@@ -10524,6 +10524,63 @@ public sealed class HtmlRendererTests
     }
 
     [Fact]
+    public async Task BuildDisplayList_BackgroundClipTextMasksTheBackgroundByTheGlyphsOfTheBlock()
+    {
+        var document = await ParseAsync("<html><body><div style=\"width:200px; background:linear-gradient(#ff0000, #0000ff); background-clip:text; color:transparent\">Gradient <b>text</b></div><p>Outside</p></body></html>");
+
+        var commands = BuildDisplayList(document).Commands.ToList();
+        var push = Assert.Single(commands.OfType<PushMaskCommand>());
+        var mask = Assert.IsType<RenderTextMaskPaint>(Assert.Single(push.Layers).Paint);
+
+        Assert.Equal("Gradient text", string.Join(" ", mask.Texts.Select(static text => text.Text.Trim())));
+
+        var pushIndex = commands.IndexOf(push);
+        var fillIndex = commands.FindIndex(c => c is FillRectCommand { Paint: RenderGradientPaint });
+        var popIndex = commands.FindIndex(c => c is PopMaskCommand);
+        Assert.True(pushIndex < fillIndex && fillIndex < popIndex);
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_BackgroundClipTextMasksTheBackgroundOfAnInlineBoxByItsGlyphs()
+    {
+        // anglesharp.github.io: `<h1>Parse the web.<br><span class="gradient-text">The .NET way.</span></h1>`
+        var document = await ParseAsync("<html><body><h1>Parse the web. <span style=\"background:linear-gradient(100deg, #ff0000, #0000ff); background-clip:text; color:transparent\">The <i>.NET</i> way.</span> Done</h1></body></html>");
+
+        var commands = BuildDisplayList(document, width: 800).Commands.ToList();
+        var push = Assert.Single(commands.OfType<PushMaskCommand>());
+        var layer = Assert.Single(push.Layers);
+        var mask = Assert.IsType<RenderTextMaskPaint>(layer.Paint);
+
+        // only the glyphs within the span, its nested box included
+        Assert.Equal("The .NET way.", string.Join(" ", mask.Texts.Select(static text => text.Text.Trim())));
+
+        var pushIndex = commands.IndexOf(push);
+        var fillIndex = commands.FindIndex(c => c is FillRectCommand { Paint: RenderGradientPaint });
+        var popIndex = commands.FindIndex(c => c is PopMaskCommand);
+        Assert.True(pushIndex < fillIndex && fillIndex < popIndex);
+
+        // painted below the glyphs, in the span's fragment
+        var spanText = commands.FindIndex(c => c is DrawTextCommand { Text: var text } && text.StartsWith("The", StringComparison.Ordinal));
+        Assert.True(popIndex < spanText);
+        var fill = (FillRectCommand)commands[fillIndex];
+        Assert.Equal(layer.Area, fill.Rect);
+        Assert.True(fill.Rect.X > 0f, "The background is painted in the span's fragment, not the line.");
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_BackgroundClipTextMasksEachLineFragmentOfAnInlineBox()
+    {
+        var document = await ParseAsync("<html><body><div style=\"width:120px\"><span style=\"background:linear-gradient(#ff0000, #0000ff); background-clip:text; color:transparent\">Gradient text that wraps</span></div></body></html>");
+
+        var masks = BuildDisplayList(document).Commands.OfType<PushMaskCommand>().ToList();
+
+        Assert.True(masks.Count > 1, "Every line fragment of the span gets a mask of its own.");
+        Assert.Equal(
+            "Gradient text that wraps",
+            string.Join(" ", masks.SelectMany(static mask => Assert.IsType<RenderTextMaskPaint>(Assert.Single(mask.Layers).Paint).Texts).Select(static text => text.Text.Trim())));
+    }
+
+    [Fact]
     public async Task BuildDisplayList_MaskSizeSizesTheMaskImage()
     {
         // Needs AngleSharp.Css to compute `mask-size` (reported upstream).

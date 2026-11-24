@@ -394,6 +394,9 @@ public sealed partial class HtmlRenderer
 
         public bool IsBrokenImage { get; init; }
 
+        /// <summary>`background-clip: text`: the background shows only through the glyphs of the box's content.</summary>
+        public bool ClipsBackgroundToText { get; init; }
+
         /// <summary>Positioned, itself or by a box around it: painted above what else is on the line.</summary>
         public bool IsPositioned { get; init; }
 
@@ -684,6 +687,7 @@ public sealed partial class HtmlRenderer
                 MarginLeft = float.IsNaN(marginLeft) ? 0f : marginLeft,
                 MarginRight = float.IsNaN(marginRight) ? 0f : marginRight,
                 IsDecorated = isDecorated,
+                ClipsBackgroundToText = HasTextBackgroundClip(box, styleMap),
                 BaselineShift = ResolveInlineBaselineShift(styleMap, style, parentStyle, _context, out var lineEdge),
                 LineEdge = lineEdge,
                 RelativeX = (parentBox?.RelativeX ?? 0f) + relativeX,
@@ -1904,7 +1908,9 @@ public sealed partial class HtmlRenderer
             }
         }
 
-        PaintInlineBoxFragments(visualOrder, baselineY, context, displayList, positioned: false);
+        var textClippedBackgrounds = new List<TextClippedInlineBackground>();
+        var paintedRuns = new List<(InlineBox? Box, int Start, int End)>();
+        PaintInlineBoxFragments(visualOrder, baselineY, context, displayList, positioned: false, textClippedBackgrounds);
 
         // what is positioned goes above the rest of the line; the pieces around it, which then
         // follow each other, are still painted where they are (not as one run)
@@ -1926,7 +1932,7 @@ public sealed partial class HtmlRenderer
 
             if (index == firstPositioned)
             {
-                PaintInlineBoxFragments(visualOrder, baselineY, context, displayList, positioned: true);
+                PaintInlineBoxFragments(visualOrder, baselineY, context, displayList, positioned: true, textClippedBackgrounds);
             }
 
             if (piece.Kind is InlinePieceKind.Text or InlinePieceKind.Space)
@@ -2006,7 +2012,9 @@ public sealed partial class HtmlRenderer
                     };
 
                     var fragment = CreateRunFragment(context, visualOrder, first, last, text, runX, lineTop + (piece.Box?.RelativeY ?? 0f), lineHeight, runStyle);
+                    var runStart = displayList.Commands.Count;
                     DrawTextFragment(context, displayList, text, runX, textBaseline, runStyle, fragment);
+                    paintedRuns.Add((piece.Box, runStart, displayList.Commands.Count));
                 }
 
                 for (var spaceIndex = Math.Max(last + 1, first); spaceIndex < runEnd; spaceIndex++)
@@ -2057,6 +2065,8 @@ public sealed partial class HtmlRenderer
                     forcedBorderBoxWidth: measurement.BorderBoxWidth,
                     isAtomicInline: true);
 
+                paintedRuns.Add((piece.Box, rangeStart, displayList.Commands.Count));
+
                 if (IsNegativeZIndexChild(piece.Element!, context))
                 {
                     negativeZIndexRanges.Add((rangeStart, displayList.Commands.Count - rangeStart));
@@ -2071,6 +2081,8 @@ public sealed partial class HtmlRenderer
 
             index++;
         }
+
+        PaintTextClippedInlineBackgrounds(displayList, textClippedBackgrounds, paintedRuns, negativeZIndexRanges);
 
         // Recorded after the atomic children so it is this line's baseline - not one they recorded
         // while being laid out - that an enclosing inline-block aligns with.
@@ -2508,7 +2520,14 @@ public sealed partial class HtmlRenderer
         }
     }
 
-    private static void PaintInlineBoxFragments(List<InlinePiece> linePieces, float baselineY, LayoutContext context, DisplayList displayList, bool positioned)
+    /// <summary>
+    /// The background of an inline box fragment with `background-clip: text`, which is masked by
+    /// the glyphs painted inside the box on the line: those are only known once the line's text
+    /// is painted, so it is inserted at <see cref="InsertIndex"/> (below the box's border) then.
+    /// </summary>
+    private sealed record TextClippedInlineBackground(InlineBox Box, RenderRect Rect, RenderCornerRadii Radii, int InsertIndex);
+
+    private static void PaintInlineBoxFragments(List<InlinePiece> linePieces, float baselineY, LayoutContext context, DisplayList displayList, bool positioned, List<TextClippedInlineBackground> textClippedBackgrounds)
     {
         var boxes = new List<InlineBox>();
 
@@ -2593,7 +2612,15 @@ public sealed partial class HtmlRenderer
                 box.Box.BorderWidth.Bottom,
                 (box.EdgesReversed ? box.EndsOnLine : box.StartsOnLine) ? box.Box.BorderWidth.Left : 0f);
 
-            PaintBackground(displayList, box.Box.BackgroundPaint, left, top, width, height, radii);
+            if (box.ClipsBackgroundToText)
+            {
+                textClippedBackgrounds.Add(new TextClippedInlineBackground(box, new RenderRect(left, top, width, height), radii, displayList.Commands.Count));
+            }
+            else
+            {
+                PaintBackground(displayList, box.Box.BackgroundPaint, left, top, width, height, radii);
+            }
+
             PaintBorder(displayList, box.Box.BorderColor, left, top, width, height, borderWidths, radii, box.Box.BorderStyle);
         }
 
@@ -2607,6 +2634,85 @@ public sealed partial class HtmlRenderer
             }
 
             return depth;
+        }
+    }
+
+    /// <summary>
+    /// Inserts the backgrounds of the line's `background-clip: text` fragments, each masked by the
+    /// glyphs painted on the line within its box (nested boxes and atomic inlines included), as
+    /// <see cref="PaintBoxBackground"/> does for block boxes.
+    /// </summary>
+    private static void PaintTextClippedInlineBackgrounds(DisplayList displayList, List<TextClippedInlineBackground> backgrounds, List<(InlineBox? Box, int Start, int End)> paintedRuns, List<(int StartIndex, int Count)> negativeZIndexRanges)
+    {
+        if (backgrounds.Count == 0)
+        {
+            return;
+        }
+
+        // the glyphs are collected before anything is inserted, which would move the ranges
+        var masked = new List<(int InsertIndex, DisplayList Commands)>(backgrounds.Count);
+
+        foreach (var background in backgrounds)
+        {
+            var texts = new List<DrawTextCommand>();
+
+            foreach (var (runBox, start, end) in paintedRuns)
+            {
+                if (!IsWithin(runBox, background.Box))
+                {
+                    continue;
+                }
+
+                for (var index = start; index < end; index++)
+                {
+                    if (displayList.Commands[index] is DrawTextCommand text)
+                    {
+                        texts.Add(text);
+                    }
+                }
+            }
+
+            var commands = new DisplayList();
+
+            if (texts.Count > 0)
+            {
+                commands.PushMask([new RenderMaskLayer(new RenderTextMaskPaint(texts), background.Rect, background.Rect, false)]);
+                PaintBackground(commands, background.Box.Box.BackgroundPaint, background.Rect.X, background.Rect.Y, background.Rect.Width, background.Rect.Height, background.Radii);
+                commands.PopMask();
+            }
+
+            masked.Add((background.InsertIndex, commands));
+        }
+
+        // from the back, so the earlier insertion points stay where they are
+        foreach (var (insertIndex, commands) in masked.OrderByDescending(static entry => entry.InsertIndex))
+        {
+            if (commands.Commands.Count > 0)
+            {
+                displayList.InsertRange(insertIndex, commands.Commands);
+
+                // ranges of the line recorded by index move along
+                for (var index = 0; index < negativeZIndexRanges.Count; index++)
+                {
+                    if (negativeZIndexRanges[index].StartIndex >= insertIndex)
+                    {
+                        negativeZIndexRanges[index] = (negativeZIndexRanges[index].StartIndex + commands.Commands.Count, negativeZIndexRanges[index].Count);
+                    }
+                }
+            }
+        }
+
+        static bool IsWithin(InlineBox? box, InlineBox ancestor)
+        {
+            for (var current = box; current is not null; current = current.Parent)
+            {
+                if (ReferenceEquals(current, ancestor))
+                {
+                    return true;
+                }
+            }
+
+            return false;
         }
     }
 

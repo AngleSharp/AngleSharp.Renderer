@@ -303,6 +303,41 @@ public sealed class FontFaceTests
     }
 
     [Fact]
+    public async Task VariableFace_SetsTheWeightAxisToTheRequestedWeight()
+    {
+        // anglesharp.github.io: a Latin subset of Inter (SIL OFL, see fonts/Inter-OFL.txt), whose
+        // `wght` axis runs from 100 to 900 with the default at 400. Its advances grow with the
+        // weight, which a synthesized bold of the default instance leaves as they are.
+        var css = $"@font-face {{ font-family: 'Inter'; font-weight: 100 900; src: url({FixtureDataUri("Inter-Variable-Latin.woff2", "woff2")}) format('woff2-variations'); }}";
+        var regular = await MeasureAsync(css, "Inter", 400f);
+        var medium = await MeasureAsync(css, "Inter", 500f);
+        var heavy = await MeasureAsync(css, "Inter", 800f);
+
+        Assert.True(medium > regular + 0.5f, $"500 measured {medium}, 400 {regular}: the weight axis was not set.");
+        Assert.True(heavy > medium + 0.5f, $"800 measured {heavy}, 500 {medium}: the weight axis was not set.");
+    }
+
+    [Fact]
+    public async Task VariableFace_ClampsTheWeightToTheDeclaredRange()
+    {
+        var css = $"@font-face {{ font-family: 'Inter'; font-weight: 300 600; src: url({FixtureDataUri("Inter-Variable-Latin.woff2", "woff2")}) format('woff2'); }}";
+
+        Assert.Equal(await MeasureAsync(css, "Inter", 600f), await MeasureAsync(css, "Inter", 900f), tolerance: 0.01f);
+        Assert.Equal(await MeasureAsync(css, "Inter", 300f), await MeasureAsync(css, "Inter", 100f), tolerance: 0.01f);
+    }
+
+    [Fact]
+    public void FontFaceSet_MatchesAWeightWithinTheRangeOfAFace()
+    {
+        var regular = new FontFace("F", 400f, false, [FontFaceSource.FromLocal("A")]);
+        var variable = new FontFace("F", 100f, false, [FontFaceSource.FromLocal("B")], weightDescriptor: "100 900");
+        var set = new FontFaceSet([regular, variable]);
+
+        Assert.True(set.TryMatch("F", 800f, isItalic: false, out var matched));
+        Assert.Same(variable, matched);
+    }
+
+    [Fact]
     public void FontFaceSet_Empty_MatchesNothing()
     {
         Assert.True(FontFaceSet.Empty.IsEmpty);

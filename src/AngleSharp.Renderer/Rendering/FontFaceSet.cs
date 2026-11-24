@@ -52,7 +52,7 @@ public sealed class FontFaceSet
     /// </summary>
     /// <remarks>
     /// This is a reduced form of the CSS font matching algorithm: a matching slant wins first,
-    /// then the nearest weight. Stretch is not considered; of faces splitting a family by
+    /// then the nearest weight (a weight range counts as all of its weights). Stretch is not considered; of faces splitting a family by
     /// unicode range, the one for Latin letters is taken.
     /// </remarks>
     public bool TryMatch(string family, float weight, bool isItalic, out FontFace face) =>
@@ -64,7 +64,7 @@ public sealed class FontFaceSet
     /// </summary>
     /// <remarks>
     /// This is a reduced form of the CSS font matching algorithm: a matching slant wins first,
-    /// then the nearest weight. Stretch is not considered. A family whose faces all leave out the
+    /// then the nearest weight (a weight range counts as all of its weights). Stretch is not considered. A family whose faces all leave out the
     /// code point still gives its best face, whose glyphs decide then.
     /// </remarks>
     public bool TryMatch(string family, float weight, bool isItalic, int codePoint, out FontFace face)
@@ -78,7 +78,7 @@ public sealed class FontFaceSet
         face = candidates
             .OrderBy(candidate => candidate.Covers(codePoint) ? 0 : 1)
             .ThenBy(candidate => candidate.IsItalic == isItalic ? 0 : 1)
-            .ThenBy(candidate => Math.Abs(candidate.Weight - weight))
+            .ThenBy(candidate => candidate.WeightDistance(weight))
             .First();
 
         return true;

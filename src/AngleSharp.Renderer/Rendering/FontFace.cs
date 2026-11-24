@@ -89,6 +89,51 @@ public sealed class FontFace
     public string WeightDescriptor { get; }
 
     /// <summary>
+    /// The range of weights the face provides: a variable font declares one (<c>100 900</c>),
+    /// a static one a single weight (CSS Fonts 4 §4.5).
+    /// </summary>
+    internal (float Min, float Max) WeightRange
+    {
+        get
+        {
+            var parts = WeightDescriptor.Split(' ', StringSplitOptions.RemoveEmptyEntries);
+
+            if (parts.Length == 2 &&
+                TryParseWeight(parts[0], out var first) &&
+                TryParseWeight(parts[1], out var second))
+            {
+                return (Math.Min(first, second), Math.Max(first, second));
+            }
+
+            return (Weight, Weight);
+        }
+    }
+
+    private static bool TryParseWeight(string value, out float weight)
+    {
+        switch (value.ToLowerInvariant())
+        {
+            case "normal":
+                weight = 400f;
+                return true;
+            case "bold":
+                weight = 700f;
+                return true;
+            default:
+                return float.TryParse(value, System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out weight);
+        }
+    }
+
+    /// <summary>
+    /// The distance between the requested weight and the weights the face provides.
+    /// </summary>
+    internal float WeightDistance(float weight)
+    {
+        var (min, max) = WeightRange;
+        return weight < min ? min - weight : weight > max ? weight - max : 0f;
+    }
+
+    /// <summary>
     /// Gets the authored style descriptor.
     /// </summary>
     public string Style { get; }

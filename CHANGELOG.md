@@ -2,6 +2,9 @@
 
 Released on Tuesday, November 24 2026.
 
+- Fixed variable web fonts always being drawn with their default instance, bolder weights synthesized
+- Fixed `@font-face` matching ignoring weight ranges
+- Fixed `background-clip: text` on inline boxes painting the whole box instead of only its glyphs
 - Fixed images picked from a `srcset` being as large as their pixels; they are divided by their density
 - Fixed the caret of a focused text input or textarea always being painted at the end of its text instead of at its cursor (`selectionStart`/`selectionEnd`), and the selected text of one not being highlighted
 - Fixed adjoining vertical margins collapsing pairwise instead of all together, e.g. those of an empty block with a negative margin inside (75px and -72px with 48px before them are 3px, not 48px)
