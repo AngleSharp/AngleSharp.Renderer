@@ -33,8 +33,25 @@ internal static class HitTesting
             }
         }
 
-        return best;
+        // generated content is hit as the element it belongs to (CSSOM View: pseudo-elements are
+        // never the result), e.g. a link's `::after` stretched over a whole card is the link
+        return best is null ? null : GetOriginatingElement(best);
     }
+
+    /// <summary>
+    /// The element itself, or the one a pseudo-element belongs to (its <c>ParentElement</c> is
+    /// the parent of that element).
+    /// </summary>
+    internal static IElement GetOriginatingElement(IElement element) =>
+        element is IPseudoElement pseudo && CssAnimationTracker.GetHost(pseudo) is { } host ? host : element;
+
+    /// <summary>
+    /// The element whose box the element's box is in: its parent, or for a pseudo-element the
+    /// element it belongs to (whose <c>ParentElement</c> it shares, so a walk up from it would
+    /// leave out that element's layer and clip).
+    /// </summary>
+    internal static IElement? GetParentBox(IElement element) =>
+        element is IPseudoElement pseudo && CssAnimationTracker.GetHost(pseudo) is { } host ? host : element.ParentElement;
 
     // an inline box on several lines is hit on them, not in the box around them
     private static bool Contains(HtmlRenderer.ElementLayoutMetrics metrics, double x, double y) =>
@@ -46,7 +63,7 @@ internal static class HitTesting
 
     private static bool IsClippedAway(IElement element, IReadOnlyDictionary<IElement, HtmlRenderer.ElementLayoutMetrics> metrics, double x, double y)
     {
-        for (var ancestor = element.ParentElement; ancestor is not null; ancestor = ancestor.ParentElement)
+        for (var ancestor = GetParentBox(element); ancestor is not null; ancestor = GetParentBox(ancestor))
         {
             if (metrics.TryGetValue(ancestor, out var clip) && clip.Layer.ClipsOverflow)
             {
@@ -72,7 +89,7 @@ internal static class HitTesting
         var path = new List<IElement> { element };
         var isInLayer = metrics.TryGetValue(element, out var elementMetrics) && elementMetrics.Layer.IsLayerRoot;
 
-        for (var ancestor = element.ParentElement; ancestor is not null; ancestor = ancestor.ParentElement)
+        for (var ancestor = GetParentBox(element); ancestor is not null; ancestor = GetParentBox(ancestor))
         {
             if (metrics.TryGetValue(ancestor, out var ancestorMetrics) && (ancestorMetrics.Layer.IsLayerRoot || (!isInLayer && ancestorMetrics.Layer.IsFloat)))
             {
@@ -107,24 +124,70 @@ internal static class HitTesting
                 return layerA.CompareTo(layerB);
             }
 
-            // b follows a in document order, so it paints above (or b contains a: a is above)
-            var position = a.CompareDocumentPosition(b);
-
-            if ((position & DocumentPositions.ContainedBy) != 0)
-            {
-                return -1;
-            }
-
-            if ((position & DocumentPositions.Contains) != 0)
-            {
-                return 1;
-            }
-
-            return (position & DocumentPositions.Following) != 0 ? -1 : 1;
+            // what comes later in tree order paints above (a box contains what is in it)
+            return CompareTreeOrder(a, b);
         }
 
         // an element paints above the layer roots it is in
         return first.Count.CompareTo(second.Count);
+    }
+
+    // -1 if a comes before b in tree order (an element before its descendants), else 1, with
+    // ::before right after the element it belongs to and ::after after all of its descendants
+    private static int CompareTreeOrder(IElement a, IElement b)
+    {
+        if (a is IPseudoElement pseudo && CssAnimationTracker.GetHost(pseudo) is { } host)
+        {
+            var isBefore = IsBefore(pseudo);
+
+            if (b is IPseudoElement otherPseudo && CssAnimationTracker.GetHost(otherPseudo) is { } otherHost)
+            {
+                if (ReferenceEquals(host, otherHost))
+                {
+                    return isBefore && !IsBefore(otherPseudo) ? -1 : 1;
+                }
+
+                // the other one is where its element is, unless this one is in that element
+                return CompareTreeOrder(a, otherHost) < 0 ? -1
+                    : otherHost.Contains(host) && IsBefore(otherPseudo) ? 1
+                    : otherHost.Contains(host) ? -1
+                    : 1;
+            }
+
+            if (ReferenceEquals(b, host))
+            {
+                return 1;
+            }
+
+            if (host.Contains(b))
+            {
+                return isBefore ? -1 : 1;
+            }
+
+            return b.Contains(host) ? 1 : CompareTreeOrder(host, b);
+        }
+
+        if (b is IPseudoElement && GetOriginatingElement(b) != b)
+        {
+            return -CompareTreeOrder(b, a);
+        }
+
+        var position = a.CompareDocumentPosition(b);
+
+        if ((position & DocumentPositions.ContainedBy) != 0)
+        {
+            return -1;
+        }
+
+        if ((position & DocumentPositions.Contains) != 0)
+        {
+            return 1;
+        }
+
+        return (position & DocumentPositions.Following) != 0 ? -1 : 1;
+
+        static bool IsBefore(IPseudoElement pseudo) =>
+            pseudo.PseudoName.Contains("before", StringComparison.OrdinalIgnoreCase) || pseudo.PseudoName.Contains("marker", StringComparison.OrdinalIgnoreCase);
     }
 
     // (step, z-index) within the stacking context: negative z, in flow (floats above blocks),

@@ -660,6 +660,13 @@ public static class ElementCssomViewExtensions
             bottomExtent = Math.Max(bottomExtent, own.Y + own.Height + elementMetrics.MarginBottom);
         }
 
+        // lines of text extending beyond the box (e.g. not wrapped)
+        if (!float.IsNaN(elementMetrics.TextRight))
+        {
+            rightExtent = Math.Max(rightExtent, elementMetrics.BorderBoxX + elementMetrics.TextRight + scrollLeft);
+            bottomExtent = Math.Max(bottomExtent, elementMetrics.BorderBoxY + elementMetrics.TextBottom + scrollTop);
+        }
+
         foreach (var (candidate, candidateMetrics) in metricsMap)
         {
             // content clipped by a scroll container (or any clipping box) inside is no overflow of
@@ -671,6 +678,13 @@ public static class ElementCssomViewExtensions
 
             rightExtent = Math.Max(rightExtent, candidateMetrics.BorderBoxX + candidateMetrics.BorderBoxWidth + scrollLeft);
             bottomExtent = Math.Max(bottomExtent, candidateMetrics.BorderBoxY + candidateMetrics.BorderBoxHeight + scrollTop);
+
+            // as well as text of it beyond its box (unless it clips that)
+            if (!float.IsNaN(candidateMetrics.TextRight) && !(styleMaps.TryGetValue(candidate, out var candidateStyle) && HtmlRenderer.ClipsOverflow(candidateStyle)))
+            {
+                rightExtent = Math.Max(rightExtent, candidateMetrics.BorderBoxX + candidateMetrics.TextRight + scrollLeft);
+                bottomExtent = Math.Max(bottomExtent, candidateMetrics.BorderBoxY + candidateMetrics.TextBottom + scrollTop);
+            }
         }
 
         var scrollWidth = (int)Math.Round(Math.Max(clientWidth, rightExtent - paddingBoxLeft));

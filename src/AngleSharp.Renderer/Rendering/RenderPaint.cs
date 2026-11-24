@@ -11,6 +11,12 @@ public abstract record RenderPaint;
 public sealed record RenderColorPaint(RenderColor Color) : RenderPaint;
 
 /// <summary>
+/// The glyphs of text runs as a mask (`background-clip: text`): what they cover is opaque.
+/// </summary>
+/// <param name="Texts">The text runs.</param>
+public sealed record RenderTextMaskPaint(IReadOnlyList<DrawTextCommand> Texts) : RenderPaint;
+
+/// <summary>
 /// Represents a gradient paint.
 /// </summary>
 /// <param name="Gradient">The gradient.</param>
@@ -180,7 +186,20 @@ public sealed record RenderGradient(
     bool Repeating = false,
     RenderGradientSizeKind SizeKind = RenderGradientSizeKind.FarthestCorner,
     float? ExplicitRadiusX = null,
-    float? ExplicitRadiusY = null);
+    float? ExplicitRadiusY = null)
+{
+    /// <summary>
+    /// The color space the colors are interpolated in (`in oklch`), e.g. "oklch"; sRGB when
+    /// <see langword="null"/>.
+    /// </summary>
+    public string? ColorSpace { get; init; }
+
+    /// <summary>
+    /// How hues are interpolated in a polar <see cref="ColorSpace"/> ("shorter", "longer",
+    /// "increasing" or "decreasing"); the shorter way when <see langword="null"/>.
+    /// </summary>
+    public string? HueInterpolation { get; init; }
+}
 
 /// <summary>
 /// Describes a single gradient stop.
@@ -206,7 +225,14 @@ public sealed record RenderGradient(
 /// Whether the stop has no position of its own: it is then placed halfway between its
 /// neighbours (CSS Images 3 §3.5.3), and <see cref="Position"/> only holds an estimate.
 /// </param>
-public sealed record RenderGradientStop(float Position, RenderColor Color, float? AbsolutePositionPixels = null, float OffsetPixels = 0f, bool IsAuto = false);
+public sealed record RenderGradientStop(float Position, RenderColor Color, float? AbsolutePositionPixels = null, float OffsetPixels = 0f, bool IsAuto = false)
+{
+    /// <summary>
+    /// Whether this is a color hint ("red, 20%, blue") rather than a color stop: the position
+    /// where the colors of the stops around it are mixed half and half. Its color is unused.
+    /// </summary>
+    public bool IsHint { get; init; }
+}
 
 /// <summary>
 /// Describes the available gradient kinds.

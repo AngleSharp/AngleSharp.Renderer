@@ -959,7 +959,7 @@ public sealed partial class HtmlRenderer
         float containingX,
         float containingWidth,
         ref float cursorY,
-        ref float previousBlockMarginBottom,
+        ref MarginStrut previousBlockMarginBottom,
         ref bool suppressNextBlockTopMargin,
         FloatArea floats,
         RenderTextStyle inheritedTextStyle,
@@ -1353,7 +1353,7 @@ public sealed partial class HtmlRenderer
         box = box with { BorderRadius = ResolveBorderRadii(styleMap, borderBoxWidth, borderBoxHeight) };
         var decorations = textStyle.IsHidden ? new DisplayList() : displayList;
         var effects = OpenElementEffectScopes(displayList, decorations, styleMap, tableNode.Ref, borderBoxX, borderBoxY, borderBoxWidth, borderBoxHeight, border, padding, box.BorderRadius, textStyle.FontSize);
-        PaintBoxBackground(decorations, styleMap, box, borderBoxX, borderBoxY, borderBoxWidth, borderBoxHeight, border, padding);
+        PaintBoxBackground(decorations, styleMap, box, borderBoxX, borderBoxY, borderBoxWidth, borderBoxHeight, border, padding, GetViewportArea(context));
         PaintBoxShadows(decorations, box.BoxShadows, borderBoxX, borderBoxY, borderBoxWidth, borderBoxHeight, box.BorderRadius);
         PaintBoxBorder(decorations, styleMap, tableNode.Ref, box, borderBoxX, borderBoxY, borderBoxWidth, borderBoxHeight);
         PaintOutline(decorations, styleMap, borderBoxX, borderBoxY, borderBoxWidth, borderBoxHeight);
@@ -1406,7 +1406,7 @@ public sealed partial class HtmlRenderer
             };
 
             var cellCursorY = cellY;
-            var cellPreviousMarginBottom = 0f;
+            var cellPreviousMarginBottom = MarginStrut.Zero;
             var cellSuppressTopMargin = false;
             var cellTextIndentConsumed = false;
 
@@ -1529,7 +1529,7 @@ public sealed partial class HtmlRenderer
             : !float.IsNaN(bottom) && !float.IsNaN(blockHeight) ? blockY + blockHeight - bottom - marginBottom - measured.BorderBoxHeight - marginTop
             : staticY;
         var cursorY = marginBoxY;
-        var previousMargin = 0f;
+        var previousMargin = MarginStrut.Zero;
         var suppressTopMargin = false;
 
         LayoutTable(node, marginBoxX, marginLeft + measured.BorderBoxWidth + marginRight, ref cursorY, ref previousMargin, ref suppressTopMargin, new FloatArea(), inheritedTextStyle, context, displayList, maxY, positionedContainingX, positionedContainingY, positionedContainingWidth, positionedContainingHeight, measured.BorderBoxWidth, containingHeight);
@@ -1551,7 +1551,7 @@ public sealed partial class HtmlRenderer
     {
         foreach (var caption in captions)
         {
-            var previousMarginBottom = 0f;
+            var previousMarginBottom = MarginStrut.Zero;
             var suppressTopMargin = false;
             var textIndentConsumed = false;
 

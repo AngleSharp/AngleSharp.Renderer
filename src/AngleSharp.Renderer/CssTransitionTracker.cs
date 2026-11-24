@@ -47,6 +47,11 @@ internal sealed class CssTransitionTracker
     private readonly Dictionary<(IElement Element, string Property), CssTransitionRun> _activeRuns = [];
     private readonly Dictionary<(IElement Element, string Property), string> _lastKnownValues = [];
     private readonly HashSet<IElement> _observedElements = new(ReferenceEqualityComparer.Instance);
+
+    // the declared values of the custom properties whose transitions the cascade got last (see
+    // AddTransitioningCustomValues), which is the value they go to, as their computed one is the
+    // transitioning value
+    private readonly Dictionary<(IElement Element, string Property), string> _declaredCustomValues = [];
     private List<CssTransitionEventRecord> _pendingEvents = [];
     private double _clockMs;
 
@@ -196,8 +201,50 @@ internal sealed class CssTransitionTracker
 
         var t = run.Spec.DurationMs > 0d ? elapsed / run.Spec.DurationMs : 1d;
         var eased = run.Spec.TimingFunction.Evaluate(t);
-        return CssValueInterpolation.Interpolate(property, run.From, run.To, eased);
+        return IsCustomProperty(property)
+            ? CssValueInterpolation.InterpolateCustom(GetRegistration(element, property), run.From, run.To, eased)
+            : CssValueInterpolation.Interpolate(property, run.From, run.To, eased);
     }
+
+    /// <summary>
+    /// Adds the values the transitions of the element give its custom properties now, which are
+    /// part of the cascade (see <see cref="AngleSharp.Css.IAnimatedValueProvider"/>), as what uses
+    /// them (a var(), a paint worklet) is computed from them. The declared style has the values
+    /// they go to.
+    /// </summary>
+    public void AddTransitioningCustomValues(IElement element, ICssStyleDeclaration declared, ref Dictionary<string, string>? values)
+    {
+        if (_activeRuns.Count == 0)
+        {
+            return;
+        }
+
+        element = GetStableElement(element);
+
+        foreach (var (key, run) in _activeRuns)
+        {
+            if (!ReferenceEquals(key.Element, element) || run.IsEventOnly || !IsCustomProperty(key.Property))
+            {
+                continue;
+            }
+
+            if (GetTransitioningValue(element, key.Property) is { } value)
+            {
+                var own = declared.GetPropertyValue(key.Property);
+                _declaredCustomValues[key] = string.IsNullOrWhiteSpace(own) ? GetRegistration(element, key.Property)?.InitialValue ?? string.Empty : own.Trim();
+                (values ??= new(StringComparer.Ordinal))[key.Property] = value;
+            }
+        }
+    }
+
+    private static bool IsCustomProperty(string property) => property.StartsWith("--", StringComparison.Ordinal);
+
+    private static ICssPropertyRegistration? GetRegistration(IElement element, string property) =>
+        (GetEventTarget(element) ?? element).Owner?.GetRegisteredProperty(property);
+
+    // a registered custom property of a type having values in between transitions as others do
+    private static bool IsInterpolatedCustomProperty(IElement element, string property) =>
+        IsCustomProperty(property) && GetRegistration(element, property) is { IsUniversal: false, IsList: false };
 
     /// <summary>
     /// Records each of the given elements' *current* natural value for every transitionable
@@ -336,7 +383,19 @@ internal sealed class CssTransitionTracker
         foreach (var (property, spec) in ParseTransitionSpecs(style, withEventOnlyProperties: true))
         {
             var isInterpolated = CssValueInterpolation.InterpolatableProperties.TryGetValue(property, out var kind);
-            var naturalValue = property.Equals("transform", StringComparison.OrdinalIgnoreCase)
+            var isCustom = IsInterpolatedCustomProperty(element, property);
+
+            // one that isn't registered is discrete (CSS Properties and Values API 1, 2.6)
+            if (!isCustom && IsCustomProperty(property))
+            {
+                continue;
+            }
+
+            var key = (element, property);
+            var hasRun = _activeRuns.TryGetValue(key, out var run) && !IsOver(run);
+            // the computed value of a transitioning custom property is the transitioning one
+            var naturalValue = isCustom && hasRun && !run!.IsEventOnly && _declaredCustomValues.TryGetValue(key, out var declared) ? declared
+                : property.Equals("transform", StringComparison.OrdinalIgnoreCase)
                 ? CssValueInterpolation.ReadNaturalTransform(authoredTransform)
                 : ReadValue(style, property, isInterpolated, kind, element);
 
@@ -345,11 +404,8 @@ internal sealed class CssTransitionTracker
                 continue;
             }
 
-            var key = (element, property);
-            var hasRun = _activeRuns.TryGetValue(key, out var run) && !IsOver(run);
-
             // e.g. started by :hover already
-            if (hasRun && AreEquivalent(isInterpolated, kind, run!.To, naturalValue))
+            if (hasRun && AreEquivalent(isInterpolated, isCustom, kind, run!.To, naturalValue))
             {
                 _lastKnownValues[key] = naturalValue;
                 continue;
@@ -364,13 +420,13 @@ internal sealed class CssTransitionTracker
                 : ReadValue(previousStyle, property, isInterpolated, kind, element);
             _lastKnownValues[key] = naturalValue;
 
-            if (before is null || AreEquivalent(isInterpolated, kind, before, naturalValue))
+            if (before is null || AreEquivalent(isInterpolated, isCustom, kind, before, naturalValue))
             {
                 continue;
             }
 
-            var from = (hasRun && isInterpolated ? GetTransitioningValue(element, property) : null) ?? before;
-            StartRun(key, from, naturalValue, spec, isEventOnly: !isInterpolated);
+            var from = (hasRun && (isInterpolated || isCustom) ? GetTransitioningValue(element, property) : null) ?? before;
+            StartRun(key, from, naturalValue, spec, isEventOnly: !isInterpolated && !isCustom);
         }
     }
 
@@ -388,6 +444,7 @@ internal sealed class CssTransitionTracker
                 if (!IsConnected(key.Element))
                 {
                     _activeRuns.Remove(key);
+                    _declaredCustomValues.Remove(key);
                     continue;
                 }
 
@@ -402,6 +459,7 @@ internal sealed class CssTransitionTracker
                 if (elapsed >= run.Spec.DurationMs)
                 {
                     _activeRuns.Remove(key);
+                    _declaredCustomValues.Remove(key);
                     _pendingEvents.Add(new(key.Element, "transitionend", key.Property, run.Spec.DurationMs / 1000d));
                 }
             }
@@ -459,6 +517,8 @@ internal sealed class CssTransitionTracker
     // a run replaced or removed before it is over is cancelled
     private void CancelRun((IElement Element, string Property) key)
     {
+        _declaredCustomValues.Remove(key);
+
         if (_activeRuns.Remove(key, out var run) && !IsOver(run))
         {
             var elapsed = Math.Max(0d, _clockMs - run.StartMs - run.Spec.DelayMs);
@@ -479,6 +539,9 @@ internal sealed class CssTransitionTracker
 
     private static bool AreEquivalent(bool isInterpolated, CssInterpolationValueKind kind, string a, string b) =>
         isInterpolated ? CssValueInterpolation.ValuesAreEquivalent(kind, a, b) : string.Equals(a, b, StringComparison.OrdinalIgnoreCase);
+
+    private static bool AreEquivalent(bool isInterpolated, bool isCustom, CssInterpolationValueKind kind, string a, string b) =>
+        isCustom ? CssValueInterpolation.CustomValuesAreEquivalent(a, b) : AreEquivalent(isInterpolated, kind, a, b);
 
     /// <summary>
     /// Gets if the style has a transition, i.e., a transition-duration of more than 0.
@@ -568,7 +631,8 @@ internal sealed class CssTransitionTracker
                     result[property] = spec;
                 }
             }
-            else if (withEventOnlyProperties && name.Length > 0 && !name.Equals("none", StringComparison.OrdinalIgnoreCase) && !name.StartsWith("--", StringComparison.Ordinal) && !DiscreteProperties.Contains(name))
+            // a custom property is followed if registered (see Observe), its values are of its own type
+            else if (withEventOnlyProperties && name.Length > 0 && !name.Equals("none", StringComparison.OrdinalIgnoreCase) && !DiscreteProperties.Contains(name))
             {
                 result[name] = spec;
             }

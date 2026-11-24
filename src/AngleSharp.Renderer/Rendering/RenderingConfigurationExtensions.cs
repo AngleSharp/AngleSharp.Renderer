@@ -28,8 +28,20 @@ public static class RenderingConfigurationExtensions
         ArgumentNullException.ThrowIfNull(factory);
         configuration = configuration.WithOnly(factory);
 
-        return configuration.Services.OfType<ImageResourceService>().Any()
+        configuration = configuration.Services.OfType<ImageResourceService>().Any()
             ? configuration
             : configuration.With(ImageResourceService.Instance);
+
+        // images not in a document load once they have a source (those in it once laid out)
+        configuration = configuration.Services.OfType<DetachedImageLoader>().Any()
+            ? configuration
+            : configuration.With(DetachedImageLoader.Instance);
+
+        // an object showing a document hides its fallback
+        configuration = configuration.Services.OfType<ObjectDocumentService>().Any()
+            ? configuration
+            : configuration.With(ObjectDocumentService.Instance);
+
+        return configuration;
     }
 }

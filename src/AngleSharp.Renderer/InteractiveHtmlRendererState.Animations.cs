@@ -83,6 +83,42 @@ internal sealed partial class InteractiveHtmlRendererState
         static bool IsNotRendered(ICssStyleDeclaration style) => style.GetPropertyValue("display") is "none";
     }
 
+    private bool _isGivingAnimatedValues;
+
+    /// <summary>
+    /// The values the animations and transitions of the element give its custom properties now,
+    /// which the cascade has (unlike the other animated properties, which are put into the style
+    /// of a box once computed), as everything using them is computed from them.
+    /// </summary>
+    IReadOnlyDictionary<string, string>? AngleSharp.Css.IAnimatedValueProvider.GetAnimatedValues(IElement element, ICssStyleDeclaration declared)
+    {
+        // what the trackers do here doesn't compute styles, but a style computed meanwhile has none
+        if (_isGivingAnimatedValues || element is IPseudoElement)
+        {
+            return null;
+        }
+
+        _isGivingAnimatedValues = true;
+
+        try
+        {
+            Dictionary<string, string>? values = null;
+            var names = declared.GetPropertyValue("animation-name");
+
+            if (!string.IsNullOrWhiteSpace(names) && !names.Trim().Equals("none", StringComparison.OrdinalIgnoreCase))
+            {
+                _animationTracker.AddAnimatedCustomValues(element, declared, _clockMs, ref values);
+            }
+
+            _transitionTracker.AddTransitioningCustomValues(element, declared, ref values);
+            return values;
+        }
+        finally
+        {
+            _isGivingAnimatedValues = false;
+        }
+    }
+
     // The events go to script once the frame that found them is done, as a task of the event
     // loop, not in the middle of laying out the page.
     private void DispatchAnimationEvents()

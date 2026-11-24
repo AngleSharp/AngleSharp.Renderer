@@ -74,7 +74,6 @@ public sealed partial class HtmlRenderer
             mute = default;
         }
 
-        // without a source there is nothing to play (AngleSharp before 1.10.4 is never paused)
         PaintPlayIcon(displayList, play, media.IsPaused || media.IsEnded || string.IsNullOrEmpty(media.CurrentSource));
 
         if (mute.Width > 0f)

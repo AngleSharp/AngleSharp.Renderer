@@ -83,6 +83,34 @@ public sealed class ScrolledGeometryTests
         Assert.Equal("item5", hit!.Value.Element.Id);
     }
 
+    [Theory]
+    [InlineData("before")]
+    [InlineData("after")]
+    public async Task PositionedPseudoElementCoveringItsElementIsBelowThePositionedBoxesInIt(string pseudo)
+    {
+        // found on smapiot.com: a section's background overlay (a `::before` filling it) took the
+        // pointer from the carousel buttons in it, as if it painted above the section's content
+        var document = await ParseAsync($$"""
+            <html>
+              <head><style>
+                html, body { margin: 0; padding: 0; }
+                #section { position: relative; height: 200px; }
+                #section::{{pseudo}} { content: ''; position: absolute; inset: 0; }
+                #button { position: absolute; left: 10px; top: 10px; width: 40px; height: 40px; z-index: 2; cursor: pointer; }
+              </style></head>
+              <body><div id="section"><div><div id="button"></div></div></div></body>
+            </html>
+            """);
+
+        Assert.Equal("button", document.ElementFromPoint(20, 20)?.Id);
+
+        var hit = document.Context.GetDomHarness().PrepareFrame().HitTestMap.HitTest(20, 20);
+        Assert.Equal("button", hit!.Value.Element.Id);
+        Assert.Equal("pointer", hit.Value.Cursor);
+        // elsewhere the generated box is hit, as its element
+        Assert.Equal("section", document.ElementFromPoint(100, 100)?.Id);
+    }
+
     [Fact]
     public async Task NestedScrollContainersOnlyAddTheirBoxToTheScrollableOverflow()
     {

@@ -767,6 +767,23 @@ public sealed class HtmlRendererTests
     }
 
     [Fact]
+    public async Task BuildDisplayList_PercentageMinHeightInStretchedColumnFlexContainerFillsIt()
+    {
+        // found on smapiot.com: cards stretched to the tallest one in their row, whose inner box
+        // has `min-height: 100%`, stopped at their own content (the stretched size is definite)
+        var displayList = await LayoutAsync("""
+            <html><body style="margin:0">
+                <div style="display:flex">
+                    <div style="display:flex; flex-direction:column; padding:2px; width:50px"><div style="min-height:100%; background-color:#112233"><div style="height:20px"></div></div></div>
+                    <div style="width:50px; height:100px"></div>
+                </div>
+            </body></html>
+            """);
+
+        Assert.Equal(96f, FillOf(displayList, new RenderColor(0x11, 0x22, 0x33)).Height);
+    }
+
+    [Fact]
     public async Task BuildDisplayList_GridItemSpanningAFlexibleRowDoesNotGrowTheOtherRows()
     {
         // found on MDN: a tall sidebar spanning both rows made the min-content header row as tall
@@ -2908,6 +2925,50 @@ public sealed class HtmlRendererTests
     }
 
     [Fact]
+    public async Task BuildDisplayList_DisclosureMarkersAreTrianglesNotNumbers()
+    {
+        var document = await ParseAsync("""
+            <html><body><div style="display: list-item; list-style: disclosure-closed inside">Closed</div><div style="display: list-item; list-style: disclosure-open inside">Open</div></body></html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, new DefaultRenderDevice
+        {
+            ViewPortWidth = 300,
+            ViewPortHeight = 120,
+            FontSize = 16f,
+        });
+
+        var texts = displayList.Commands.OfType<DrawTextCommand>().Select(t => t.Text).ToList();
+        Assert.Equal(new[] { "Closed", "Open" }, texts);
+        Assert.Equal(2, displayList.Commands.OfType<PushClipShapeCommand>().Count(c => c.Shape is RenderClipPolygon { Points.Count: 3 }));
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_TextAroundARelativelyPositionedInlineKeepsItsPlace()
+    {
+        var document = await ParseAsync("""
+            <html><body><p>HTML<span style="position: relative; top: 7px">5</span>test</p></body></html>
+            """);
+
+        var renderer = new HtmlRenderer();
+        var displayList = renderer.BuildDisplayList(document, new DefaultRenderDevice
+        {
+            ViewPortWidth = 300,
+            ViewPortHeight = 120,
+            FontSize = 16f,
+        });
+
+        // the text before and after the positioned box is painted before it, but not as one run
+        var texts = displayList.Commands.OfType<DrawTextCommand>().ToList();
+        var before = Assert.Single(texts.Where(t => t.Text == "HTML"));
+        var five = Assert.Single(texts.Where(t => t.Text == "5"));
+        var after = Assert.Single(texts.Where(t => t.Text == "test"));
+        Assert.True(five.X > before.X);
+        Assert.True(after.X > five.X);
+    }
+
+    [Fact]
     public async Task BuildDisplayList_PreHtmlElementDefaultsToPreservingWhitespace()
     {
         // <pre> gets `white-space: pre` from AngleSharp.Css's own UA stylesheet, the same way <ol>/
@@ -4045,6 +4106,31 @@ public sealed class HtmlRendererTests
         Assert.True(greenIndex >= 0);
         Assert.True(redIndex >= 0);
         Assert.True(redIndex > greenIndex);
+    }
+
+    [Theory]
+    [InlineData("block")]
+    [InlineData("flex")]
+    [InlineData("grid")]
+    public async Task BuildDisplayList_PaintsNegativeZIndexBoxSizedByItsContainingBlockBelowInFlowContent(string display)
+    {
+        // found on smapiot.com: a card's glowing "border" is a `z-index: -2` pseudo-element with
+        // `inset: -2px`, which waits for the card's height, and so painted over the card's content
+        var displayList = await LayoutAsync($$"""
+            <html><head><style>
+                .card { display:{{display}}; position:relative; z-index:1; padding:2px; overflow:hidden; background-color:#00ff00 }
+                .card::after { content:""; position:absolute; inset:-2px; z-index:-2; background-color:#ff0000; transform:rotate(30deg) }
+            </style></head><body>
+                <div class="card"><div style="width:40px; height:40px; background-color:#0000ff"></div></div>
+            </body></html>
+            """);
+
+        var fills = displayList.Commands.OfType<FillRectCommand>().ToList();
+        var card = fills.FindIndex(fill => fill.Color.Equals(new RenderColor(0, 255, 0)));
+        var glow = fills.FindIndex(fill => fill.Color.Equals(new RenderColor(255, 0, 0)));
+        var content = fills.FindIndex(fill => fill.Color.Equals(new RenderColor(0, 0, 255)));
+
+        Assert.True(card < glow && glow < content, $"card {card}, glow {glow}, content {content}");
     }
 
     [Fact]
@@ -5724,16 +5810,17 @@ public sealed class HtmlRendererTests
         Assert.Equal(1f, CurrentAlpha(), precision: 2);
     }
 
+    // a number input only keeps a number as its value (HTML 4.10.5.1.12)
     [Theory]
-    [InlineData("text")]
-    [InlineData("number")]
-    [InlineData("url")]
-    [InlineData("email")]
-    [InlineData("search")]
-    [InlineData("tel")]
-    public async Task BuildDisplayList_TextLikeInputGetsDefaultChromeAndShowsItsValue(string type)
+    [InlineData("text", "Hello")]
+    [InlineData("number", "42")]
+    [InlineData("url", "Hello")]
+    [InlineData("email", "Hello")]
+    [InlineData("search", "Hello")]
+    [InlineData("tel", "Hello")]
+    public async Task BuildDisplayList_TextLikeInputGetsDefaultChromeAndShowsItsValue(string type, string value)
     {
-        var document = await ParseAsync($"""<html><body><input type="{type}" value="Hello" /></body></html>""");
+        var document = await ParseAsync($"""<html><body><input type="{type}" value="{value}" /></body></html>""");
 
         var renderer = new HtmlRenderer();
         var displayList = renderer.BuildDisplayList(document, new DefaultRenderDevice
@@ -5753,7 +5840,7 @@ public sealed class HtmlRendererTests
         var borderEdges = displayList.Commands.OfType<FillRectCommand>().Where(f => f.Color.Equals(new RenderColor(118, 118, 118))).ToList();
         Assert.NotEmpty(borderEdges);
 
-        var valueText = Assert.Single(displayList.Commands.OfType<DrawTextCommand>().Where(t => t.Text == "Hello"));
+        var valueText = Assert.Single(displayList.Commands.OfType<DrawTextCommand>().Where(t => t.Text == value));
         // Left-aligned at the content box's own left edge (border + padding in from the box), not
         // centered - matching how a browser shows typed input text.
         Assert.Equal(background.Rect.X + 1f + 2f, valueText.X, precision: 3);
@@ -5899,6 +5986,61 @@ public sealed class HtmlRendererTests
         // sitting at the content edge.
         Assert.True(caret.Rect.X > valueText.X);
         Assert.True(caret.Rect.X < background.Rect.X + background.Rect.Width);
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_FocusedTextInputPaintsTheCaretAtItsCursor()
+    {
+        var document = await ParseAsync("""<html><body><input id="target" type="text" value="Hello" /></body></html>""");
+        var target = (IHtmlInputElement)document.GetElementById("target")!;
+        target.DoFocus();
+        var device = new DefaultRenderDevice { ViewPortWidth = 300, ViewPortHeight = 100, FontSize = 16f };
+        var renderer = new HtmlRenderer();
+
+        var atEnd = Assert.Single(renderer.BuildDisplayList(document, device).Commands.OfType<FillRectCommand>().Where(f => f.Rect.Width == 1.5f));
+        target.Select(0, 0);
+        var atStart = Assert.Single(renderer.BuildDisplayList(document, device).Commands.OfType<FillRectCommand>().Where(f => f.Rect.Width == 1.5f));
+        target.Select(2, 2);
+        var inBetween = Assert.Single(renderer.BuildDisplayList(document, device).Commands.OfType<FillRectCommand>().Where(f => f.Rect.Width == 1.5f));
+
+        Assert.True(atStart.Rect.X < inBetween.Rect.X);
+        Assert.True(inBetween.Rect.X < atEnd.Rect.X);
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_FocusedTextInputHighlightsItsSelectedText()
+    {
+        var document = await ParseAsync("""<html><body><input id="target" type="text" value="Hello" /></body></html>""");
+        var target = (IHtmlInputElement)document.GetElementById("target")!;
+        target.DoFocus();
+        target.Select(1, 4, "backward");
+
+        var displayList = new HtmlRenderer().BuildDisplayList(document, new DefaultRenderDevice { ViewPortWidth = 300, ViewPortHeight = 100, FontSize = 16f });
+        var commands = displayList.Commands.ToList();
+        var highlight = Assert.Single(commands.OfType<FillRectCommand>().Where(f => f.Color.Equals(new RenderColor(0xB4, 0xD5, 0xFE))));
+        var text = Assert.Single(commands.OfType<DrawTextCommand>().Where(t => t.Text == "Hello"));
+        var caret = Assert.Single(commands.OfType<FillRectCommand>().Where(f => f.Rect.Width == 1.5f));
+
+        // below the text, from the second to the fourth character, the caret at its start
+        Assert.True(commands.IndexOf(highlight) < commands.IndexOf(text));
+        Assert.True(highlight.Rect.X > text.X);
+        Assert.Equal(highlight.Rect.X, caret.Rect.X, precision: 3);
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_FocusedTextAreaPaintsTheCaretOnTheLineOfItsCursor()
+    {
+        var document = await ParseAsync("<html><body><textarea id=\"target\" style=\"width:200px;\">one\ntwo</textarea></body></html>");
+        var target = (IHtmlTextAreaElement)document.GetElementById("target")!;
+        target.DoFocus();
+        var device = new DefaultRenderDevice { ViewPortWidth = 300, ViewPortHeight = 100, FontSize = 16f };
+        var renderer = new HtmlRenderer();
+
+        var atEnd = Assert.Single(renderer.BuildDisplayList(document, device).Commands.OfType<FillRectCommand>().Where(f => f.Rect.Width == 1.5f));
+        target.Select(2, 2);
+        var onFirstLine = Assert.Single(renderer.BuildDisplayList(document, device).Commands.OfType<FillRectCommand>().Where(f => f.Rect.Width == 1.5f));
+
+        Assert.True(onFirstLine.Rect.Y < atEnd.Rect.Y);
     }
 
     [Fact]
@@ -10421,6 +10563,63 @@ public sealed class HtmlRendererTests
         var fillIndex = commands.FindIndex(c => c is FillRectCommand f && f.Color.Equals(Red));
         var popIndex = commands.FindIndex(c => c is PopMaskCommand);
         Assert.True(pushIndex < fillIndex && fillIndex < popIndex);
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_BackgroundClipTextMasksTheBackgroundByTheGlyphsOfTheBlock()
+    {
+        var document = await ParseAsync("<html><body><div style=\"width:200px; background:linear-gradient(#ff0000, #0000ff); background-clip:text; color:transparent\">Gradient <b>text</b></div><p>Outside</p></body></html>");
+
+        var commands = BuildDisplayList(document).Commands.ToList();
+        var push = Assert.Single(commands.OfType<PushMaskCommand>());
+        var mask = Assert.IsType<RenderTextMaskPaint>(Assert.Single(push.Layers).Paint);
+
+        Assert.Equal("Gradient text", string.Join(" ", mask.Texts.Select(static text => text.Text.Trim())));
+
+        var pushIndex = commands.IndexOf(push);
+        var fillIndex = commands.FindIndex(c => c is FillRectCommand { Paint: RenderGradientPaint });
+        var popIndex = commands.FindIndex(c => c is PopMaskCommand);
+        Assert.True(pushIndex < fillIndex && fillIndex < popIndex);
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_BackgroundClipTextMasksTheBackgroundOfAnInlineBoxByItsGlyphs()
+    {
+        // anglesharp.github.io: `<h1>Parse the web.<br><span class="gradient-text">The .NET way.</span></h1>`
+        var document = await ParseAsync("<html><body><h1>Parse the web. <span style=\"background:linear-gradient(100deg, #ff0000, #0000ff); background-clip:text; color:transparent\">The <i>.NET</i> way.</span> Done</h1></body></html>");
+
+        var commands = BuildDisplayList(document, width: 800).Commands.ToList();
+        var push = Assert.Single(commands.OfType<PushMaskCommand>());
+        var layer = Assert.Single(push.Layers);
+        var mask = Assert.IsType<RenderTextMaskPaint>(layer.Paint);
+
+        // only the glyphs within the span, its nested box included
+        Assert.Equal("The .NET way.", string.Join(" ", mask.Texts.Select(static text => text.Text.Trim())));
+
+        var pushIndex = commands.IndexOf(push);
+        var fillIndex = commands.FindIndex(c => c is FillRectCommand { Paint: RenderGradientPaint });
+        var popIndex = commands.FindIndex(c => c is PopMaskCommand);
+        Assert.True(pushIndex < fillIndex && fillIndex < popIndex);
+
+        // painted below the glyphs, in the span's fragment
+        var spanText = commands.FindIndex(c => c is DrawTextCommand { Text: var text } && text.StartsWith("The", StringComparison.Ordinal));
+        Assert.True(popIndex < spanText);
+        var fill = (FillRectCommand)commands[fillIndex];
+        Assert.Equal(layer.Area, fill.Rect);
+        Assert.True(fill.Rect.X > 0f, "The background is painted in the span's fragment, not the line.");
+    }
+
+    [Fact]
+    public async Task BuildDisplayList_BackgroundClipTextMasksEachLineFragmentOfAnInlineBox()
+    {
+        var document = await ParseAsync("<html><body><div style=\"width:120px\"><span style=\"background:linear-gradient(#ff0000, #0000ff); background-clip:text; color:transparent\">Gradient text that wraps</span></div></body></html>");
+
+        var masks = BuildDisplayList(document).Commands.OfType<PushMaskCommand>().ToList();
+
+        Assert.True(masks.Count > 1, "Every line fragment of the span gets a mask of its own.");
+        Assert.Equal(
+            "Gradient text that wraps",
+            string.Join(" ", masks.SelectMany(static mask => Assert.IsType<RenderTextMaskPaint>(Assert.Single(mask.Layers).Paint).Texts).Select(static text => text.Text.Trim())));
     }
 
     [Fact]

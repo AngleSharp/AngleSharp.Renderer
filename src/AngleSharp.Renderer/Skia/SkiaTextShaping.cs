@@ -157,7 +157,7 @@ internal static class SkiaTextShaping
 
     /// <summary>
     /// Bold is synthesized when the resolved face is lighter than asked for (CSS Fonts 4 §5.2,
-    /// font-synthesis: weight), e.g. a variable web font whose weight axis cannot be set here, or
+    /// font-synthesis: weight), e.g. a web font whose weight range ends below the requested weight, or
     /// a family that only comes in one weight.
     /// </summary>
     private static bool NeedsSyntheticBold(RenderFont font, SKTypeface typeface) =>
@@ -227,7 +227,7 @@ internal static class SkiaTextShaping
         // A declared face takes precedence over an installed font of the same name.
         if (!faces.IsEmpty &&
             faces.TryMatch(normalized, requestedWeight, isItalic, codePoint, out var face) &&
-            TryResolveFaceTypeface(face, fontStyle, out typeface))
+            TryResolveFaceTypeface(face, fontStyle, requestedWeight, out typeface))
         {
             return true;
         }
@@ -289,7 +289,7 @@ internal static class SkiaTextShaping
             foreach (var family in font.FontFamily.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
             {
                 if (faces.TryMatch(family.Trim('\'', '"', ' '), font.FontWeight, font.IsItalic, codepoint, out var face) &&
-                    TryResolveFaceTypeface(face, fontStyle, out var declared) && HasGlyph(declared, codepoint))
+                    TryResolveFaceTypeface(face, fontStyle, font.FontWeight, out var declared) && HasGlyph(declared, codepoint))
                 {
                     return declared;
                 }
@@ -503,7 +503,7 @@ internal static class SkiaTextShaping
     /// <summary>
     /// Walks the sources of a face in declaration order and returns the first usable one.
     /// </summary>
-    private static bool TryResolveFaceTypeface(FontFace face, SKFontStyle fontStyle, out SKTypeface typeface)
+    private static bool TryResolveFaceTypeface(FontFace face, SKFontStyle fontStyle, float requestedWeight, out SKTypeface typeface)
     {
         foreach (var source in face.Sources)
         {
@@ -511,6 +511,7 @@ internal static class SkiaTextShaping
             {
                 if (TryResolveSystemTypeface(source.LocalFamily, fontStyle, out typeface))
                 {
+                    typeface = InstantiateVariableTypeface(typeface, face, requestedWeight, fontStyle.Width);
                     return true;
                 }
 
@@ -519,13 +520,65 @@ internal static class SkiaTextShaping
 
             if (source.Data is not null && TryDecodeTypeface(source.Data) is { } decoded)
             {
-                typeface = decoded;
+                typeface = InstantiateVariableTypeface(decoded, face, requestedWeight, fontStyle.Width);
                 return true;
             }
         }
 
         typeface = null!;
         return false;
+    }
+
+    private static readonly SKFourByteTag WeightAxis = SKFourByteTag.Parse("wght");
+    private static readonly SKFourByteTag WidthAxis = SKFourByteTag.Parse("wdth");
+
+    private static readonly ConcurrentDictionary<(SKTypeface Typeface, float Weight, float Width), SKTypeface> VariableInstances = new();
+
+    /// <summary>
+    /// Sets the weight and width axes of a variable font to the requested <c>font-weight</c>
+    /// (clamped to the weight range the face declares) and <c>font-stretch</c>, as browsers do
+    /// (CSS Fonts 4 §5.2, §7.1); a font without these axes stays as it is. Without this, every
+    /// weight of a variable web font is drawn with its default instance (and bold synthesized).
+    /// </summary>
+    private static SKTypeface InstantiateVariableTypeface(SKTypeface typeface, FontFace face, float requestedWeight, int widthClass)
+    {
+        if (typeface.VariationDesignParameterCount == 0)
+        {
+            return typeface;
+        }
+
+        var (minWeight, maxWeight) = face.WeightRange;
+        var weight = Math.Clamp(requestedWeight, minWeight, maxWeight);
+        var width = FromFontStyleWidth(widthClass);
+        var coordinates = new List<SKFontVariationPositionCoordinate>(2);
+
+        foreach (var axis in typeface.VariationDesignParameters)
+        {
+            float? value = axis.Tag == WeightAxis ? weight : axis.Tag == WidthAxis ? width : null;
+
+            if (value is { } requested)
+            {
+                coordinates.Add(new SKFontVariationPositionCoordinate { Axis = axis.Tag, Value = Math.Clamp(requested, axis.Min, axis.Max) });
+            }
+        }
+
+        if (coordinates.Count == 0)
+        {
+            return typeface;
+        }
+
+        return VariableInstances.GetOrAdd((typeface, coordinates.Find(c => c.Axis == WeightAxis).Value, coordinates.Find(c => c.Axis == WidthAxis).Value), _ =>
+            typeface.Clone(new SKFontArguments { VariationDesignPosition = coordinates.ToArray() }) ?? typeface);
+    }
+
+    /// <summary>
+    /// The <c>font-stretch</c> percentage of an OpenType width class (the inverse of
+    /// <see cref="ToFontStyleWidth"/>).
+    /// </summary>
+    private static float FromFontStyleWidth(int widthClass)
+    {
+        ReadOnlySpan<float> classes = [50f, 62.5f, 75f, 87.5f, 100f, 112.5f, 125f, 150f, 200f];
+        return widthClass >= 1 && widthClass <= classes.Length ? classes[widthClass - 1] : 100f;
     }
 
     private static SKTypeface? TryDecodeTypeface(byte[] fontData) =>
@@ -870,6 +923,17 @@ internal static class SkiaTextShaping
             // positions in font units, scaled to the font size by the caller
             font.SetScale(unitsPerEm, unitsPerEm);
             font.SetFunctionsOpenType();
+
+            // the stream is the font file as is, so an instance of a variable font (see
+            // InstantiateVariableTypeface) hands its axis values on, or HarfBuzz would shape
+            // with the advances of the default instance
+            if (typeface.VariationDesignPositionCount > 0)
+            {
+                var variations = typeface.VariationDesignPosition
+                    .Select(static coordinate => new HarfBuzzSharp.Variation { Tag = (uint)coordinate.Axis, Value = coordinate.Value })
+                    .ToArray();
+                font.SetVariations(variations);
+            }
             return new HarfBuzzFont(blob, face, font, unitsPerEm);
         });
 

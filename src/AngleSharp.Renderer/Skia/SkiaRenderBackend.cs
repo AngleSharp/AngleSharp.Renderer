@@ -333,7 +333,7 @@ public sealed partial class SkiaRenderBackend : IPixelRenderBackend, ITextMeasur
                 state.Masks.Push(pushMask);
                 break;
             case PopMaskCommand:
-                ApplyMask(canvas, state.Masks.Pop());
+                ApplyMask(canvas, state.Masks.Pop(), fonts);
                 break;
             case FillRectCommand fill:
                 DrawFillRect(canvas, fill);
@@ -1001,7 +1001,7 @@ public sealed partial class SkiaRenderBackend : IPixelRenderBackend, ITextMeasur
             _ => 0f,
         };
 
-        var (colors, rawPositions) = ResolveGradientStops(gradient.Stops, referenceLength);
+        var (colors, rawPositions) = ResolveGradientStops(gradient.Stops, referenceLength, gradient.ColorSpace, gradient.HueInterpolation);
 
         var tileMode = gradient.Repeating ? SKShaderTileMode.Repeat : SKShaderTileMode.Clamp;
 
@@ -1055,7 +1055,7 @@ public sealed partial class SkiaRenderBackend : IPixelRenderBackend, ITextMeasur
     /// transparent stop takes the color of its neighbours on either side (fading `white` to
     /// `transparent` must not pass through grey, as `transparent` is transparent black).
     /// </summary>
-    private static (SKColor[] Colors, float[] Positions) ResolveGradientStops(IReadOnlyList<RenderGradientStop> stops, float referenceLength)
+    private static (SKColor[] Colors, float[] Positions) ResolveGradientStops(IReadOnlyList<RenderGradientStop> stops, float referenceLength, string? colorSpace = null, string? hueInterpolation = null)
     {
         var count = stops.Count;
         var positions = new float?[count];
@@ -1110,6 +1110,33 @@ public sealed partial class SkiaRenderBackend : IPixelRenderBackend, ITextMeasur
             {
                 positions[j] = from + ((to - from) * (j - i + 1) / (end - i + 1));
             }
+        }
+
+        // hints and other color spaces are sampled into stops (see GradientInterpolation)
+        if (colorSpace is not null || stops.Any(static stop => stop.IsHint))
+        {
+            var colorStops = new List<(RenderColor Color, float Position)>(count);
+            var hints = new List<float>(count);
+
+            for (var i = 0; i < count; i++)
+            {
+                var position = Math.Clamp(positions[i]!.Value, 0f, 1f);
+
+                if (stops[i].IsHint)
+                {
+                    if (hints.Count > 0)
+                    {
+                        hints[^1] = position;
+                    }
+
+                    continue;
+                }
+
+                colorStops.Add((stops[i].Color, position));
+                hints.Add(float.NaN);
+            }
+
+            return GradientInterpolation.Build(colorStops, hints, colorSpace, hueInterpolation);
         }
 
         var colors = new List<SKColor>(count + 2);

@@ -783,6 +783,27 @@ public sealed class Canvas2DRenderingContext : ICanvasRenderingContext2D
     }
 
     /// <summary>
+    /// Draws a focus ring along the current path if the given element, a fallback element of
+    /// the canvas, is focused.
+    /// </summary>
+    public void DrawFocusIfNeeded(IElement element)
+    {
+        if (element is null || element.Owner?.ActiveElement != element || !element.IsDescendantOf(Host))
+        {
+            return;
+        }
+
+        // the ring of the platform: a solid line, not affected by the shadow or the dashes of the state
+        Save();
+        SetLineDash(null);
+        StrokeStyle = "#005fcc";
+        LineWidth = 2;
+        ShadowColor = "transparent";
+        Stroke();
+        Restore();
+    }
+
+    /// <summary>
     /// Restricts what is drawn from now on to the current path (until the state is restored).
     /// </summary>
     public void Clip(string fillRule = "nonzero")
@@ -1022,6 +1043,89 @@ public sealed class Canvas2DRenderingContext : ICanvasRenderingContext2D
         }
 
         return TryGetImage(image, out var source, out _, out _) ? new CanvasPattern(source!, mode) : null;
+    }
+
+    /// <summary>
+    /// Reads the pixels of a rectangle of the bitmap (not premultiplied); outside of the
+    /// canvas they are transparent black.
+    /// </summary>
+    public ImageData GetImageData(int x, int y, int width, int height)
+    {
+        if (width == 0 || height == 0)
+        {
+            throw new DomException(DomError.IndexSizeError);
+        }
+
+        // a negative size takes the rectangle on the other side
+        if (width < 0)
+        {
+            x += width;
+            width = -width;
+        }
+
+        if (height < 0)
+        {
+            y += height;
+            height = -height;
+        }
+
+        var data = new byte[checked(width * height * 4)];
+        var info = new SKImageInfo(width, height, SKColorType.Rgba8888, SKAlphaType.Unpremul);
+
+        lock (_sync)
+        {
+            EnsureBitmapSizeLocked();
+            using var surface = SKSurface.Create(info);
+
+            if (surface is not null)
+            {
+                using var paint = new SKPaint { BlendMode = SKBlendMode.Src };
+                surface.Canvas.Clear(SKColors.Transparent);
+                using var source = SKImage.FromBitmap(_bitmap);
+                surface.Canvas.DrawImage(source, -x, -y, new SKSamplingOptions(SKFilterMode.Nearest), paint);
+                var handle = System.Runtime.InteropServices.GCHandle.Alloc(data, System.Runtime.InteropServices.GCHandleType.Pinned);
+
+                try
+                {
+                    surface.ReadPixels(info, handle.AddrOfPinnedObject(), info.RowBytes, 0, 0);
+                }
+                finally
+                {
+                    handle.Free();
+                }
+            }
+        }
+
+        return new ImageData(width, height, data);
+    }
+
+    /// <summary>
+    /// Writes the pixels of image data to the bitmap at the given position, replacing what is
+    /// there (no compositing, transformation or clipping).
+    /// </summary>
+    public void PutImageData(ImageData imageData, int x, int y)
+    {
+        ArgumentNullException.ThrowIfNull(imageData);
+        var info = new SKImageInfo(imageData.Width, imageData.Height, SKColorType.Rgba8888, SKAlphaType.Unpremul);
+        using var image = SKImage.FromPixelCopy(info, imageData.Data, info.RowBytes);
+
+        if (image is null)
+        {
+            return;
+        }
+
+        lock (_sync)
+        {
+            EnsureBitmapSizeLocked();
+            using var paint = new SKPaint { BlendMode = SKBlendMode.Src };
+            _canvas.Save();
+            _canvas.ResetMatrix();
+            _canvas.DrawImage(image, x, y, new SKSamplingOptions(SKFilterMode.Nearest), paint);
+            _canvas.Restore();
+            Changed();
+        }
+
+        Invalidate();
     }
 
     /// <summary>

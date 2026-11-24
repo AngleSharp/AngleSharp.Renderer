@@ -1,6 +1,8 @@
 namespace AngleSharp.Media.Dom;
 
+using System;
 using AngleSharp.Attributes;
+using AngleSharp.Dom;
 using AngleSharp.Renderer;
 
 /// <summary>
@@ -390,6 +392,34 @@ public static class CanvasRenderingContext2DExtensions
     }
 
     /// <summary>
+    /// Reads the pixels of a rectangle of the canvas.
+    /// </summary>
+    [DomName("getImageData")]
+    public static ImageData GetImageData(this ICanvasRenderingContext2D context, int sx, int sy, int sw, int sh) =>
+        context is Canvas2DRenderingContext canvas
+            ? canvas.GetImageData(sx, sy, sw, sh)
+            : new ImageData(Math.Abs(sw), Math.Abs(sh));
+
+    /// <summary>
+    /// Creates transparent black image data of the given size.
+    /// </summary>
+    [DomName("createImageData")]
+    public static ImageData CreateImageData(this ICanvasRenderingContext2D context, int sw, int sh) =>
+        new(Math.Abs(sw), Math.Abs(sh));
+
+    /// <summary>
+    /// Writes the pixels of image data to the canvas at the given position.
+    /// </summary>
+    [DomName("putImageData")]
+    public static void PutImageData(this ICanvasRenderingContext2D context, ImageData imageData, int dx, int dy)
+    {
+        if (context is Canvas2DRenderingContext canvas)
+        {
+            canvas.PutImageData(imageData, dx, dy);
+        }
+    }
+
+    /// <summary>
     /// Fills a rectangle with the fill style.
     /// </summary>
     [DomName("fillRect")]
@@ -578,6 +608,19 @@ public static class CanvasRenderingContext2DExtensions
         if (context is Canvas2DRenderingContext canvas)
         {
             canvas.Stroke();
+        }
+    }
+
+    /// <summary>
+    /// Draws a focus ring along the current path if the given element (a fallback element of
+    /// the canvas) is focused.
+    /// </summary>
+    [DomName("drawFocusIfNeeded")]
+    public static void DrawFocusIfNeeded(this ICanvasRenderingContext2D context, IElement element)
+    {
+        if (context is Canvas2DRenderingContext canvas)
+        {
+            canvas.DrawFocusIfNeeded(element);
         }
     }
 

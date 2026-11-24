@@ -68,6 +68,17 @@ internal static class SvgGeometry
                 return referencedBounds is { } rb ? SKRect.Create(rb.Left + x, rb.Top + y, rb.Width, rb.Height) : null;
             }
 
+            case "image":
+            {
+                // its viewport (e.g. a bitmap of a Lottie animation, whose mask region is around it)
+                var width = SvgLength.Parse(element.GetAttribute("width"), viewport.Width, 0f);
+                var height = SvgLength.Parse(element.GetAttribute("height"), viewport.Height, 0f);
+
+                return width > 0f && height > 0f
+                    ? SKRect.Create(SvgShapeBuilder.ReadX(element, "x", viewport), SvgShapeBuilder.ReadY(element, "y", viewport), width, height)
+                    : null;
+            }
+
             default:
                 using (var path = SvgShapeBuilder.Build(element, viewport))
                 {

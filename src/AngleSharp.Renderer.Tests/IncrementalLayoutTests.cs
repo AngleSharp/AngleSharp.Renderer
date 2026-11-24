@@ -277,6 +277,35 @@ public sealed class IncrementalLayoutTests
         Assert.Equal((0, 128, 0), GetPixel(patchedPixels, 50, 70));
     }
 
+    [Theory]
+    [InlineData("style", "opacity: 1; stroke: lit", 0, 0, 255)]
+    [InlineData("style", "opacity: 1", 255, 0, 0)]
+    [InlineData("class", "on", 0, 128, 0)]
+    public async Task PageStylesOfAnInlineSvgFollowItsChanges(string name, string value, int r, int g, int b)
+    {
+        // the page's styles of the SVG's elements are kept from frame to frame while its changes
+        // can't make other rules match (e.g. a Lottie animation showing its layers by their `style`)
+        var (document, harness) = await ParseAsync(SvgPage.Replace(
+            "html, body { margin: 0; padding: 0; }",
+            "html, body { margin: 0; padding: 0; } :where([style*=\"lit\"]) { fill: rgb(0, 0, 255) } #svg rect.on { fill: rgb(0, 128, 0) }"));
+        var shape = document.GetElementById("shape")!;
+        harness.PrepareFrame();
+
+        // a change no rule tells apart first, then the one looked at
+        shape.SetAttribute("style", "opacity: 0.5");
+        Assert.NotNull(harness.UpdateFrame());
+        shape.RemoveAttribute("style");
+        shape.SetAttribute(name, value);
+
+        var patched = harness.UpdateFrame();
+        Assert.NotNull(patched);
+        Assert.True(patched!.Metrics.IsIncremental);
+        var expected = harness.PrepareFrame();
+
+        Assert.Equal((r, g, b), GetPixel(expected.Rasterize(), 50, 70));
+        Assert.Equal((r, g, b), GetPixel(patched.Rasterize(), 50, 70));
+    }
+
     [Fact]
     public async Task AChangedSizeOfAnInlineSvgNeedsALayout()
     {

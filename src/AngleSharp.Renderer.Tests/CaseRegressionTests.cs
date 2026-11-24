@@ -333,9 +333,14 @@ public sealed class CaseRegressionTests
 
         // the region of the top edge: its sides run through the outer and inner corners
         var top = regions[0].Points;
+        var innerTopLeft = top.Single(point => point.X > 0f && point.X < 50f && point.Y > 0f);
         Assert.Equal(4f / 6f, (0f - top[0].Y) / (0f - top[0].X), precision: 3);
-        Assert.Equal(4f / 6f, top[3].Y / top[3].X, precision: 3);
-        Assert.True(top[0].X < 0f && top[0].Y < 0f && top[3].X > 6f && top[3].Y > 4f);
+        Assert.Equal(4f / 6f, innerTopLeft.Y / innerTopLeft.X, precision: 3);
+        Assert.True(top[0].X < 0f && top[0].Y < 0f && innerTopLeft.X > 6f && innerTopLeft.Y > 4f);
+        // and it reaches under the corners of the sides painted after it, so that their diagonals
+        // are anti-aliased against its color rather than what is behind the border
+        Assert.Contains(top, point => point.X < 0f && point.Y > 4f);
+        Assert.Contains(top, point => point.X > 112f && point.Y > 4f);
     }
 
     [Theory]

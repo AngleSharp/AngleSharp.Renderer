@@ -351,6 +351,88 @@ switch (audio.GetMediaControlAt(x, y))
 }
 ```
 
+## Input Pickers
+
+The `color`, `date`, `datetime-local`, `month`, `time` and `week` inputs open a picker as in a
+browser: a color picker (saturation and brightness area, hue slider, the suggestions of the input's
+`list` or a few common colors), a calendar (of days, weeks with their ISO numbers, or months; with
+columns of hours, minutes and AM/PM for `datetime-local`), or the columns of a time. Like the list of
+a dropdown (`SelectPopup`), a picker is not part of the layout: a host opens it, shows it on top of a
+frame and forwards the pointer and the keyboard to it, in viewport coordinates:
+
+```cs
+var picker = input.OpenInputPicker();          // null if the input has none, or is disabled or read-only
+frame = frame.WithOverlay(picker.Render());
+
+// a press on the picker; a press anywhere else closes it with picker.Close()
+var result = picker.PointerDown(x, y);
+// also PointerMove, PointerUp, Wheel(x, y, deltaY) and KeyDown("ArrowLeft", "Enter", "Escape", ...)
+
+switch (result)
+{
+    case InputPickerResult.Repaint:
+        frame = frame.WithOverlay(picker.Render());
+        break;
+    case InputPickerResult.Close:
+        // hide the picker
+        break;
+}
+```
+
+Choosing sets the input's value and fires `input`; `change` is fired when the picker closes with a
+value other than the one it opened with. `picker.Close(cancel: true)` (and Escape) brings that value
+back. `min`, `max` and `step` disable what they don't allow: days, weeks or months off the step
+(counted from `min`, else the `value` attribute) are greyed out, and the time columns only list
+the hours, minutes and seconds the step allows (a seconds column appears when the step isn't a
+whole number of minutes); a chosen time moves to the nearest allowed one. `step="any"` allows
+everything. `InputValueConstraints.For(input)` gives custom pickers the same rules. The picker follows the color scheme of the
+input (as the list of a dropdown does) and its `accent-color`. `InputPickerOptions` sets where the
+viewport of the input's document is (for an input in an iframe), the page's device and the current
+time, which marks today and is shown when the input has no value.
+
+### Custom Controls
+
+How an input is shown is up to its `IInputControl`: `GetIntrinsicSize` gives its size when `width`
+or `height` is `auto`, `Paint` paints the content of the input (its border, padding and background
+come from the style sheets) and `CreatePicker` creates its picker. A size is of the content box
+(padding and border are added, as for a text field) or of the border box
+(`InputControlSizeBox.BorderBox`, as for the swatch of a color input); a side left null, or a null
+size, is the built-in one of the type. The built-in ones are
+`ColorInputControl` and `DateTimeInputControl` with the pickers `ColorPicker`, `CalendarPicker` and
+`TimePicker`; all of them can be derived from. Another control is registered with the configuration,
+for any input type:
+
+```cs
+var config = Configuration.Default
+    .WithCss()
+    .WithRenderDevice(device)
+    .WithInputControl("color", new MyColorControl());   // the other types keep the built-in controls
+
+sealed class MyColorControl : ColorInputControl
+{
+    public override InputControlSize? GetIntrinsicSize(InputControlSizeContext context) =>
+        new(context.MeasureText("#000000") + 40f, context.LineHeight);
+
+    public override void Paint(InputControlPaintContext context)
+    {
+        // what to paint, in the coordinates of context.DisplayList
+        context.DisplayList.FillRect(context.ContentBox, MyColors.Parse(context.Value));
+        context.DrawText(context.Value, context.ContentBox.X + 4f, context.TextBaseline);
+    }
+
+    public override IInputPicker? CreatePicker(InputPickerContext context) => new MyColorPicker(context);
+}
+```
+
+`InputControlPaintContext` measures and paints text as the input's text is painted (`MeasureText`,
+`DrawText`). `InputPickerContext` gives the input's place in the viewport (`Anchor`, and `Place` for
+putting a picker below or above it), its font, the colors of its scheme (`Palette`) and a text
+measurer. Deriving from `InputPicker` brings setting the value with its events (`SetValue`,
+`Choose`), closing, and painting text in the input's font. `WithInputControls(provider)` replaces
+the registry with any `IInputControlProvider`; returning null for an input leaves it to the
+built-in control of its type, if any. The painting happens during layout, so it must only depend on
+the state of the input.
+
 ## Scrolling
 
 The same harness also tracks per-element scroll position, read and set through the standard

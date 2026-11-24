@@ -122,7 +122,7 @@ public sealed partial class HtmlRenderer
         float containingY,
         float containingWidth,
         ref float cursorY,
-        ref float previousBlockMarginBottom,
+        ref MarginStrut previousBlockMarginBottom,
         ref bool suppressNextBlockTopMargin,
         FloatArea floats,
         ref bool textIndentConsumed,

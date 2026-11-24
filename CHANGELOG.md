@@ -1,3 +1,61 @@
+# 0.13.0
+
+Released on Tuesday, November 24 2026.
+
+- Fixed variable web fonts always being drawn with their default instance, bolder weights synthesized
+- Fixed `@font-face` matching ignoring weight ranges
+- Fixed `background-clip: text` on inline boxes painting the whole box instead of only its glyphs
+- Fixed images picked from a `srcset` being as large as their pixels; they are divided by their density
+- Fixed the caret of a focused text input or textarea always being painted at the end of its text instead of at its cursor (`selectionStart`/`selectionEnd`), and the selected text of one not being highlighted
+- Fixed adjoining vertical margins collapsing pairwise instead of all together, e.g. those of an empty block with a negative margin inside (75px and -72px with 48px before them are 3px, not 48px)
+- Fixed the bottom margin of a block being left out before inline content following it, and before a float or an absolutely positioned box placed after it
+- Fixed `min-height` not winning over `max-height`
+- Fixed `position: relative` with only `bottom` or `right` not moving the box
+- Fixed `background-attachment: fixed` being ignored: such a background is positioned in the viewport, where it stays while the page scrolls
+- Fixed atomic inlines (e.g. an image overflowing a block of no height) being painted below the floats they overlap, as all inline content paints above the floats
+- Fixed the background showing through where two border sides of different colors meet on a diagonal
+- Fixed `data:` images whose base64 is percent-encoded (e.g. `%2F` for `/`) not being shown
+- Fixed an `object` with data that failed to load (e.g. a 404) showing it instead of its fallback content
+- Fixed an `object` showing a page (e.g. `text/html`) showing its fallback content; it is an empty box of the size of an iframe
+- Fixed the document of an empty iframe (e.g. 0 by 0) keeping the viewport of 300 by 150
+- Fixed generated content being hit as the pseudo-element (in the hit-test map, `elementFromPoint` and for `:hover`) instead of its element, e.g. a link's `::after` stretched over a whole card did not act as the link
+- Fixed grid items with a percentage `height` (e.g. `height: 100%` cards) in an auto row being as tall as the grid is wide; such a height contributes as `auto` to the row and then fills it
+- Fixed text right in a grid container (e.g. the label of an icon with `display: grid; place-items: center`) not being an anonymous grid item: it stayed at the top left instead of being placed in a cell and aligned
+- Fixed `row-reverse` and `column-reverse` packing the items at the end without reversing their order
+- Fixed `grid-auto-columns` being ignored for implicit columns
+- Fixed the edges of a gradient `border-image` of a box with a fractional size being drawn with seams and a washed out side
+- Fixed `::marker` and `::first-line` colors being ignored
+- Fixed an absolutely positioned box with `height: fit-content` (e.g. a popover) being stretched between `top` and `bottom`, and centering one of an automatic height with `margin: auto`
+- Fixed `scrollWidth` and `scrollHeight` leaving out text extending beyond its box (e.g. cut off by an ellipsis)
+- Fixed text before and after a relatively positioned inline box (e.g. a `strong` with `position: relative`) being painted as one, where the box was
+- Fixed a `paint()` image not being drawn anew when only the custom properties it uses changed, and not at all when its box was only painted again
+- Fixed opaque shadow colors (e.g. `box-shadow: 0 2px 3px #fff`) being painted black while AngleSharp.Css serializes colors as the spec says (`rgb(255, 255, 255)`)
+- Fixed an absolutely positioned `::before` of a positioned box painting above the positioned content after it in frames of the interactive harness
+- Fixed absolutely positioned boxes with a negative `z-index` sized by their containing block
+- Fixed percentage heights of the items of a flex container that got its height from its own flex container being treated as `auto`
+- Fixed a positioned pseudo-element covering its element being hit instead of the positioned boxes in that element
+- Fixed the bounding box of SVG `image` elements being unknown
+- Improved repainting an animated inline SVG
+- Updated minimum version of AngleSharp to 1.11.0
+- Updated to use a minimum of AngleSharp.Css 1.6.0
+- Updated the document of an iframe to keep the render device of its browsing context, if it has one of its own
+- Updated `Element.animate` to take typed arguments instead of a plain object
+- Updated loading the image of an `img`: the renderer loads the source its render node picked (`srcset`, `sizes`, `picture`) once it lays the image out
+- Added color hints and color interpolation methods (e.g. `in oklch`, `in hsl longer hue`) of gradients
+- Added `loading=lazy` for images: a frame loads one once it is within 1250px of the viewport and of every scroll container around it
+- Added `subgrid` for `grid-template-columns` and `grid-template-rows` (tracks, gaps and line names of the parent grid, row sizes from the subgrid's items)
+- Added `background-clip: text`
+- Added `object` elements showing an image instead of their fallback content
+- Added `align-items: baseline` (and `align-self`) for flex items in a row: an item without text sits on the baseline with the bottom of its border box (e.g. a rule after a heading's text), where it was at the top of the line
+- Added `getImageData()`, `putImageData()` and `createImageData()` of the canvas (`ImageData`)
+- Added `paint()` background images of the CSS Painting API
+- Added pickers of `color`, `date`, `datetime-local`, `month`, `time` and `week` inputs (`OpenInputPicker`): a color picker, a calendar of days, weeks or months, and columns of hours and minutes, which a host shows on top of a frame like the list of a dropdown, setting the value with `input` and `change` events; `min`, `max` and `step` disable the days, weeks, months and times they don't allow (`InputValueConstraints`)
+- Added `IInputControl` for showing inputs in other ways: a control sizes an input whose `width` or `height` is `auto`, paints its content and creates its picker, and is registered per input type with `WithInputControl` (the built-in ones are `ColorInputControl` and `DateTimeInputControl`)
+- Added the `disclosure-open` and `disclosure-closed` list markers (e.g. of `summary`)
+- Added `drawFocusIfNeeded()` of the canvas
+- Added animations and transitions of registered custom properties (`@property`, `CSS.registerProperty`), which are part of the cascade, so what uses them follows, e.g. a `var()` in a gradient or the input properties of a paint worklet
+- Added `RendererDom.Register`, the DOM of this library declared for a scripting engine
+
 # 0.12.0
 
 Released on Wednesday, November 18 2026.

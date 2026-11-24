@@ -30,7 +30,7 @@ public sealed partial class HtmlRenderer
     /// </summary>
     private static bool HidesChildren(IElement element) =>
         element is not IPseudoElement &&
-        (string.Equals(element.LocalName, "svg", StringComparison.OrdinalIgnoreCase) || IsCanvas(element));
+        (string.Equals(element.LocalName, "svg", StringComparison.OrdinalIgnoreCase) || IsCanvas(element) || IsImageObject(element));
 
     private static bool TryResolveCanvas(ElementRenderNode node, Dictionary<string, string> styleMap, float containingWidth, float x, float y, out RenderedImage? image, out RenderRect rect, out RenderRect? clipRect, (float Width, float Height)? usedSize = null)
     {
@@ -58,7 +58,11 @@ public sealed partial class HtmlRenderer
             return null;
         }
 
-        if (!TryGetOrLoadImageResource(element, element.GetAttribute("src"), out var resource) || resource is null)
+        // what it loaded (e.g. a sprite a game preloaded), else the data of a data URL
+        var source = (element as ILoadableElement)?.CurrentDownload?.Target ?? element.GetImageSource()?.Url;
+
+        if (source is null || ((element as ILoadableElement)?.CurrentDownload is null && !source.Href.StartsWith("data:", StringComparison.OrdinalIgnoreCase)) ||
+            !TryGetOrLoadImageResource(element, source.Href, out var resource) || resource is null)
         {
             return null;
         }

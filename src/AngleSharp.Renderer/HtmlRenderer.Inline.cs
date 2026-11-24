@@ -34,7 +34,7 @@ public sealed partial class HtmlRenderer
         float contentY,
         float contentWidth,
         ref float cursorY,
-        ref float previousBlockMarginBottom,
+        ref MarginStrut previousBlockMarginBottom,
         ref bool suppressNextBlockTopMargin,
         FloatArea floats,
         ref bool textIndentConsumed,
@@ -53,7 +53,7 @@ public sealed partial class HtmlRenderer
         var runHasInlineContent = false;
         var paintOrder = new PaintOrder();
 
-        void FlushRun(ref float cursorY, ref float previousBlockMarginBottom, ref bool suppressNextBlockTopMargin, FloatArea floats, ref bool textIndentConsumed)
+        void FlushRun(ref float cursorY, ref MarginStrut previousBlockMarginBottom, ref bool suppressNextBlockTopMargin, FloatArea floats, ref bool textIndentConsumed)
         {
             if (run.Count == 0)
             {
@@ -394,6 +394,9 @@ public sealed partial class HtmlRenderer
 
         public bool IsBrokenImage { get; init; }
 
+        /// <summary>`background-clip: text`: the background shows only through the glyphs of the box's content.</summary>
+        public bool ClipsBackgroundToText { get; init; }
+
         /// <summary>Positioned, itself or by a box around it: painted above what else is on the line.</summary>
         public bool IsPositioned { get; init; }
 
@@ -412,7 +415,8 @@ public sealed partial class HtmlRenderer
 
         public string Text { get; init; } = string.Empty;
 
-        public RenderTextStyle Style { get; init; }
+        // set again for the first line, which ::first-line styles
+        public RenderTextStyle Style { get; set; }
 
         /// <summary>Identifies pieces that share one resolved text style, so they can be painted as one run.</summary>
         public int StyleId { get; init; }
@@ -683,6 +687,7 @@ public sealed partial class HtmlRenderer
                 MarginLeft = float.IsNaN(marginLeft) ? 0f : marginLeft,
                 MarginRight = float.IsNaN(marginRight) ? 0f : marginRight,
                 IsDecorated = isDecorated,
+                ClipsBackgroundToText = HasTextBackgroundClip(box, styleMap),
                 BaselineShift = ResolveInlineBaselineShift(styleMap, style, parentStyle, _context, out var lineEdge),
                 LineEdge = lineEdge,
                 RelativeX = (parentBox?.RelativeX ?? 0f) + relativeX,
@@ -903,7 +908,7 @@ public sealed partial class HtmlRenderer
         float contentX,
         float contentWidth,
         ref float cursorY,
-        ref float previousBlockMarginBottom,
+        ref MarginStrut previousBlockMarginBottom,
         ref bool suppressNextBlockTopMargin,
         FloatArea floats,
         ref bool textIndentConsumed,
@@ -929,7 +934,9 @@ public sealed partial class HtmlRenderer
         }
 
         var pieces = collector.Pieces;
-        var pendingBlockMargin = 0f;
+        // the bottom margin of the block before is still to come: the first line box (or a float
+        // or a block before it) is below it
+        var pendingBlockMargin = previousBlockMarginBottom;
 
         if (pieces.Count == 0)
         {
@@ -991,7 +998,7 @@ public sealed partial class HtmlRenderer
         void PlaceFloat(InlinePiece piece)
         {
             var floatCursorY = lineTop + pendingBlockMargin;
-            var floatPreviousMarginBottom = 0f;
+            var floatPreviousMarginBottom = MarginStrut.Zero;
             var floatSuppressTopMargin = false;
             var floatTextIndentConsumed = false;
             var rangeStart = displayList.Commands.Count;
@@ -1122,17 +1129,24 @@ public sealed partial class HtmlRenderer
 
             if (clamped || (hasLineBox && textStyle.TextOverflow == TextOverflowMode.Ellipsis && MeasureLinePieces(linePieces) > available + 0.01f))
             {
+                // what the ellipsis cuts off still overflows the box (scrollWidth)
+                NoteTextExtent(lineLeft + indent + MeasureLinePieces(linePieces), lineTop + pendingBlockMargin);
                 TruncateLineWithEllipsis(linePieces, available, textStyle, context, forceEllipsis: clamped);
             }
 
             if (!hasLineBox)
             {
-                LayoutOutOfFlowPieces(linePieces, false, 0f, contentX, lineTop, contentWidth, context, displayList, maxY, containingHeight, positionedContainingX, positionedContainingY, positionedContainingWidth, positionedContainingHeight, paintOrder);
+                LayoutOutOfFlowPieces(linePieces, false, 0f, contentX, lineTop + pendingBlockMargin, contentWidth, context, displayList, maxY, containingHeight, positionedContainingX, positionedContainingY, positionedContainingWidth, positionedContainingHeight, paintOrder);
                 continue;
             }
 
             lineTop += pendingBlockMargin;
-            pendingBlockMargin = 0f;
+            pendingBlockMargin = MarginStrut.Zero;
+
+            if (lineCount == 0 && textStyle.FirstLineColor is { } firstLineColor)
+            {
+                ApplyFirstLineColor(linePieces, textStyle.Color, firstLineColor);
+            }
 
             var lineHeight = EmitLine(
                 linePieces,
@@ -1499,6 +1513,12 @@ public sealed partial class HtmlRenderer
     /// separators (the untrimmed space pieces), widening them in place. Returns false when the
     /// line has no separator or no free space, in which case it stays start-aligned.
     /// </summary>
+    private static bool AreAdjacent(List<InlinePiece> lineOrder, InlinePiece previous, InlinePiece next)
+    {
+        var index = lineOrder.IndexOf(previous);
+        return index >= 0 && index + 1 < lineOrder.Count && ReferenceEquals(lineOrder[index + 1], next);
+    }
+
     private static bool JustifySpaces(List<InlinePiece> visualOrder, float freeSpace)
     {
         if (freeSpace <= 0f)
@@ -1720,6 +1740,25 @@ public sealed partial class HtmlRenderer
     /// <summary>
     /// Positions and paints one line box and returns its height.
     /// </summary>
+    /// <summary>
+    /// The color of `::first-line` for the text of the first line, which inherits it (CSS
+    /// Pseudo-Elements 4 §2.1); what has a color of its own keeps it.
+    /// </summary>
+    private static void ApplyFirstLineColor(List<InlinePiece> linePieces, RenderColor blockColor, RenderColor color)
+    {
+        foreach (var piece in linePieces)
+        {
+            if (piece.Style.Color == blockColor)
+            {
+                piece.Style = piece.Style with
+                {
+                    Color = color,
+                    DecorationColor = piece.Style.DecorationColor == blockColor ? color : piece.Style.DecorationColor,
+                };
+            }
+        }
+    }
+
     private static float EmitLine(
         List<InlinePiece> linePieces,
         float lineLeft,
@@ -1764,6 +1803,8 @@ public sealed partial class HtmlRenderer
                 x += piece.Width;
             }
         }
+
+        var lineRight = x;
 
         // Vertical metrics: the block's own strut, the line-height box of every inline box and of
         // its text, and every atomic inline's margin box, all aligned on one baseline, each shifted
@@ -1867,13 +1908,20 @@ public sealed partial class HtmlRenderer
             }
         }
 
-        PaintInlineBoxFragments(visualOrder, baselineY, context, displayList, positioned: false);
+        var textClippedBackgrounds = new List<TextClippedInlineBackground>();
+        var paintedRuns = new List<(InlineBox? Box, int Start, int End)>();
+        PaintInlineBoxFragments(visualOrder, baselineY, context, displayList, positioned: false, textClippedBackgrounds);
 
-        // what is positioned goes above the rest of the line
+        // what is positioned goes above the rest of the line; the pieces around it, which then
+        // follow each other, are still painted where they are (not as one run)
+        var lineOrder = visualOrder;
+
         if (boxesOnLine.Exists(static box => box.IsPositioned))
         {
             visualOrder = visualOrder.OrderBy(static piece => piece.Box?.IsPositioned == true ? 1 : 0).ToList();
         }
+
+        var isReordered = !ReferenceEquals(lineOrder, visualOrder);
 
         var firstPositioned = visualOrder.FindIndex(static piece => piece.Box?.IsPositioned == true);
         var index = 0;
@@ -1884,7 +1932,7 @@ public sealed partial class HtmlRenderer
 
             if (index == firstPositioned)
             {
-                PaintInlineBoxFragments(visualOrder, baselineY, context, displayList, positioned: true);
+                PaintInlineBoxFragments(visualOrder, baselineY, context, displayList, positioned: true, textClippedBackgrounds);
             }
 
             if (piece.Kind is InlinePieceKind.Text or InlinePieceKind.Space)
@@ -1896,6 +1944,7 @@ public sealed partial class HtmlRenderer
                 var splitAtSpaces = justified || piece.Style.WordSpacing != 0f;
 
                 while (runEnd < visualOrder.Count &&
+                       (!isReordered || AreAdjacent(lineOrder, visualOrder[runEnd - 1], visualOrder[runEnd])) &&
                        visualOrder[runEnd].Kind is InlinePieceKind.Text or InlinePieceKind.Space &&
                        visualOrder[runEnd].StyleId == piece.StyleId &&
                        visualOrder[runEnd].Style.IsRightToLeftRun == piece.Style.IsRightToLeftRun &&
@@ -1963,7 +2012,9 @@ public sealed partial class HtmlRenderer
                     };
 
                     var fragment = CreateRunFragment(context, visualOrder, first, last, text, runX, lineTop + (piece.Box?.RelativeY ?? 0f), lineHeight, runStyle);
+                    var runStart = displayList.Commands.Count;
                     DrawTextFragment(context, displayList, text, runX, textBaseline, runStyle, fragment);
+                    paintedRuns.Add((piece.Box, runStart, displayList.Commands.Count));
                 }
 
                 for (var spaceIndex = Math.Max(last + 1, first); spaceIndex < runEnd; spaceIndex++)
@@ -1986,7 +2037,7 @@ public sealed partial class HtmlRenderer
                 } + (piece.Box?.RelativeY ?? 0f);
 
                 var atomicCursorY = marginBoxTop;
-                var atomicPreviousMarginBottom = 0f;
+                var atomicPreviousMarginBottom = MarginStrut.Zero;
                 var atomicSuppressTopMargin = false;
                 var atomicFloats = new FloatArea();
                 var atomicTextIndentConsumed = false;
@@ -2014,18 +2065,29 @@ public sealed partial class HtmlRenderer
                     forcedBorderBoxWidth: measurement.BorderBoxWidth,
                     isAtomicInline: true);
 
+                paintedRuns.Add((piece.Box, rangeStart, displayList.Commands.Count));
+
                 if (IsNegativeZIndexChild(piece.Element!, context))
                 {
                     negativeZIndexRanges.Add((rangeStart, displayList.Commands.Count - rangeStart));
+                }
+                else if (displayList.Commands.Count > rangeStart)
+                {
+                    // painted above the floats of the flow it is in, where it overlaps one of them
+                    context.HoistCandidates.Add(new HoistCandidate(displayList, InlineContentLayer, displayList.Commands[rangeStart], displayList.Commands.Count - rangeStart, piece.Element!.Ref,
+                        new RenderRect(piece.X, marginBoxTop, measurement.BorderBoxWidth, measurement.OuterHeight)));
                 }
             }
 
             index++;
         }
 
+        PaintTextClippedInlineBackgrounds(displayList, textClippedBackgrounds, paintedRuns, negativeZIndexRanges);
+
         // Recorded after the atomic children so it is this line's baseline - not one they recorded
         // while being laid out - that an enclosing inline-block aligns with.
         RecordTextBaseline(baselineY);
+        NoteTextExtent(lineRight, lineTop + lineHeight);
         return lineHeight;
     }
 
@@ -2280,9 +2342,12 @@ public sealed partial class HtmlRenderer
         return string.IsNullOrWhiteSpace(styleMap.GetValueOrDefault("width")) || styleMap.GetValueOrDefault("width")!.Trim() == "auto" ? string.Empty : null;
     }
 
+    // one without a source, or whose image could not be loaded (not one still loading, nor a
+    // lazy one that is to load later)
     private static bool IsBrokenImage(IElement element) =>
         element is IHtmlImageElement image && element is not IPseudoElement &&
-        (string.IsNullOrEmpty(element.GetAttribute("src")) || image.IsCompleted) && !HasLoadableImageSource(element);
+        image.GetImageSource() is var source && !DefersLazyImage(image, source) &&
+        GetElementImage(image, source, out _) == ElementImageState.Missing;
 
     // a plain outline where browsers show their icon of a broken image
     private static void PaintBrokenImageMark(DisplayList displayList, float x, float y, float width, float height)
@@ -2455,7 +2520,14 @@ public sealed partial class HtmlRenderer
         }
     }
 
-    private static void PaintInlineBoxFragments(List<InlinePiece> linePieces, float baselineY, LayoutContext context, DisplayList displayList, bool positioned)
+    /// <summary>
+    /// The background of an inline box fragment with `background-clip: text`, which is masked by
+    /// the glyphs painted inside the box on the line: those are only known once the line's text
+    /// is painted, so it is inserted at <see cref="InsertIndex"/> (below the box's border) then.
+    /// </summary>
+    private sealed record TextClippedInlineBackground(InlineBox Box, RenderRect Rect, RenderCornerRadii Radii, int InsertIndex);
+
+    private static void PaintInlineBoxFragments(List<InlinePiece> linePieces, float baselineY, LayoutContext context, DisplayList displayList, bool positioned, List<TextClippedInlineBackground> textClippedBackgrounds)
     {
         var boxes = new List<InlineBox>();
 
@@ -2540,7 +2612,15 @@ public sealed partial class HtmlRenderer
                 box.Box.BorderWidth.Bottom,
                 (box.EdgesReversed ? box.EndsOnLine : box.StartsOnLine) ? box.Box.BorderWidth.Left : 0f);
 
-            PaintBackground(displayList, box.Box.BackgroundPaint, left, top, width, height, radii);
+            if (box.ClipsBackgroundToText)
+            {
+                textClippedBackgrounds.Add(new TextClippedInlineBackground(box, new RenderRect(left, top, width, height), radii, displayList.Commands.Count));
+            }
+            else
+            {
+                PaintBackground(displayList, box.Box.BackgroundPaint, left, top, width, height, radii);
+            }
+
             PaintBorder(displayList, box.Box.BorderColor, left, top, width, height, borderWidths, radii, box.Box.BorderStyle);
         }
 
@@ -2554,6 +2634,85 @@ public sealed partial class HtmlRenderer
             }
 
             return depth;
+        }
+    }
+
+    /// <summary>
+    /// Inserts the backgrounds of the line's `background-clip: text` fragments, each masked by the
+    /// glyphs painted on the line within its box (nested boxes and atomic inlines included), as
+    /// <see cref="PaintBoxBackground"/> does for block boxes.
+    /// </summary>
+    private static void PaintTextClippedInlineBackgrounds(DisplayList displayList, List<TextClippedInlineBackground> backgrounds, List<(InlineBox? Box, int Start, int End)> paintedRuns, List<(int StartIndex, int Count)> negativeZIndexRanges)
+    {
+        if (backgrounds.Count == 0)
+        {
+            return;
+        }
+
+        // the glyphs are collected before anything is inserted, which would move the ranges
+        var masked = new List<(int InsertIndex, DisplayList Commands)>(backgrounds.Count);
+
+        foreach (var background in backgrounds)
+        {
+            var texts = new List<DrawTextCommand>();
+
+            foreach (var (runBox, start, end) in paintedRuns)
+            {
+                if (!IsWithin(runBox, background.Box))
+                {
+                    continue;
+                }
+
+                for (var index = start; index < end; index++)
+                {
+                    if (displayList.Commands[index] is DrawTextCommand text)
+                    {
+                        texts.Add(text);
+                    }
+                }
+            }
+
+            var commands = new DisplayList();
+
+            if (texts.Count > 0)
+            {
+                commands.PushMask([new RenderMaskLayer(new RenderTextMaskPaint(texts), background.Rect, background.Rect, false)]);
+                PaintBackground(commands, background.Box.Box.BackgroundPaint, background.Rect.X, background.Rect.Y, background.Rect.Width, background.Rect.Height, background.Radii);
+                commands.PopMask();
+            }
+
+            masked.Add((background.InsertIndex, commands));
+        }
+
+        // from the back, so the earlier insertion points stay where they are
+        foreach (var (insertIndex, commands) in masked.OrderByDescending(static entry => entry.InsertIndex))
+        {
+            if (commands.Commands.Count > 0)
+            {
+                displayList.InsertRange(insertIndex, commands.Commands);
+
+                // ranges of the line recorded by index move along
+                for (var index = 0; index < negativeZIndexRanges.Count; index++)
+                {
+                    if (negativeZIndexRanges[index].StartIndex >= insertIndex)
+                    {
+                        negativeZIndexRanges[index] = (negativeZIndexRanges[index].StartIndex + commands.Commands.Count, negativeZIndexRanges[index].Count);
+                    }
+                }
+            }
+        }
+
+        static bool IsWithin(InlineBox? box, InlineBox ancestor)
+        {
+            for (var current = box; current is not null; current = current.Parent)
+            {
+                if (ReferenceEquals(current, ancestor))
+                {
+                    return true;
+                }
+            }
+
+            return false;
         }
     }
 
@@ -2590,7 +2749,7 @@ public sealed partial class HtmlRenderer
 
             var rangeStart = displayList.Commands.Count;
             var staticCursorY = lineTop;
-            var previousMarginBottom = 0f;
+            var previousMarginBottom = MarginStrut.Zero;
             var suppressTopMargin = false;
             var localFloats = new FloatArea();
             var textIndentConsumed = false;
@@ -2922,7 +3081,7 @@ public sealed partial class HtmlRenderer
         try
         {
             var cursorY = 0f;
-            var previousMarginBottom = 0f;
+            var previousMarginBottom = MarginStrut.Zero;
             var suppressTopMargin = false;
             var localFloats = new FloatArea();
             var textIndentConsumed = false;
@@ -3120,7 +3279,7 @@ public sealed partial class HtmlRenderer
         width = 0f;
 
         if (!IsReplacedElement(element.Ref) ||
-            !TryResolveReplacedElementImage(element, styleMap, containingWidth, 0f, 0f, out _, out var imageRect, out var objectFitClip))
+            !TryResolveReplacedElementImage(element, styleMap, containingWidth, 0f, 0f, out _, out var imageRect, out var objectFitClip, isPlaced: false))
         {
             return false;
         }
@@ -3135,9 +3294,10 @@ public sealed partial class HtmlRenderer
     /// </summary>
     private static float ClampToMinMaxHeight(Dictionary<string, string> styleMap, float contentHeight, float heightReference, float verticalExtras)
     {
-        contentHeight = Math.Max(contentHeight, ResolveAuthoredDimension(styleMap, "min-height", heightReference, 0f, verticalExtras));
+        // max-height first, then min-height, which wins over it (CSS 2.1, 10.7)
         var maxHeight = ResolveAuthoredDimension(styleMap, "max-height", heightReference, float.NaN, verticalExtras);
-        return float.IsNaN(maxHeight) ? contentHeight : Math.Min(contentHeight, maxHeight);
+        contentHeight = float.IsNaN(maxHeight) ? contentHeight : Math.Min(contentHeight, maxHeight);
+        return Math.Max(contentHeight, ResolveAuthoredDimension(styleMap, "min-height", heightReference, 0f, verticalExtras));
     }
 
     private static float ClampToMinMaxWidth(Dictionary<string, string> styleMap, float contentWidth, float containingWidth, float horizontalExtras)

@@ -1517,6 +1517,28 @@ public sealed class SiteRegressionTests
     }
 
     [Fact]
+    public async Task RelativeBox_PaintsAboveEarlierAbsoluteSiblingInAFrame()
+    {
+        // the tractor store's buttons in the browser: the frame of a harness found the ::before
+        // outside of its host (the parent of a pseudo-element is the parent of its host), so it
+        // was left to paint with the flow around the button, above the button's content
+        var document = await OpenAsync("""
+            <style>
+              body { margin: 0 }
+              .button { position: relative; width: 60px; height: 60px }
+              .button::before { content: ""; position: absolute; inset: 0; background: #ffffff }
+              .inner { position: relative; height: 40px; background: #ff0000 }
+            </style>
+            <div class="button"><div class="inner"></div></div>
+            """);
+
+        var pixels = document.Context.GetDomHarness().PrepareFrame().Rasterize();
+        var index = (20 * pixels.Width + 30) * 4;
+
+        Assert.Equal((0xff, 0x00, 0x00), (pixels.Data[index], pixels.Data[index + 1], pixels.Data[index + 2]));
+    }
+
+    [Fact]
     public async Task Image_WithPercentageWidth_DoesNotWidenGridTrack()
     {
         // the tractor store's home page: an image with width: 100% in a 1fr track can shrink
@@ -1602,10 +1624,73 @@ public sealed class SiteRegressionTests
         Assert.Equal(300d, dialog.Height, 1);
     }
 
-    private static async Task<IDocument> OpenAsync(string body)
+    [Fact]
+    public async Task GridItem_WithPercentageHeight_FillsItsRow()
+    {
+        // anglesharp-tests renderer index: `height: 100%` cards in an auto row are as tall as the
+        // row, not as tall as the grid is wide
+        var document = await OpenAsync("""
+            <ul style="display: grid; grid-template-columns: repeat(auto-fill, minmax(min(100%, 200px), 1fr)); margin: 0; padding: 0; width: 600px">
+              <li id="short" style="display: flex; height: 100%">one line</li>
+              <li id="tall" style="display: block; height: 100%"><div style="height: 80px"></div></li>
+              <li id="third" style="display: block">x</li>
+            </ul>
+            """, isStandardsMode: true);
+
+        var tall = document.GetElementById("tall")!.GetBoundingClientRect();
+        var shorter = document.GetElementById("short")!.GetBoundingClientRect();
+        var third = document.GetElementById("third")!.GetBoundingClientRect();
+
+        Assert.Equal(200d, tall.Width, 1);
+        Assert.Equal(400d, third.Left, 1);
+        Assert.Equal(80d, tall.Height, 1);
+        Assert.Equal(80d, shorter.Height, 1);
+        Assert.Equal(0d, shorter.Top, 1);
+    }
+
+    [Fact]
+    public async Task GridText_IsAnAnonymousItemAlignedByTheContainer()
+    {
+        // an icon badge: text right in a grid container is centered in its cell
+        var document = await OpenAsync("""
+            <span id="icon" style="display: grid; justify-items: center; align-items: center; width: 40px; height: 40px; font: 10px/1 sans-serif">A1</span>
+            """, isStandardsMode: true);
+
+        var range = document.CreateRange();
+        range.SelectContent(document.GetElementById("icon")!);
+        var text = range.GetBoundingClientRect();
+
+        Assert.True(text.Width is > 0 and < 30, $"width {text.Width}");
+        Assert.Equal(20d, text.Left + (text.Width / 2), 1);
+        Assert.Equal(20d, text.Top + (text.Height / 2), 1);
+    }
+
+    [Fact]
+    public async Task FlexItem_WithoutText_SitsOnTheBaselineWithItsBottomEdge()
+    {
+        // a heading with a rule after its text: `align-items: baseline` and an empty `::after`
+        var document = await OpenAsync("""
+            <div id="heading" style="display: flex; align-items: baseline; font: 20px/30px sans-serif">
+              <span id="label" style="font-size: 10px; line-height: 10px">Acid</span>Tests<span id="rule" style="flex: 1; border-bottom: 1px solid"></span>
+            </div>
+            """, isStandardsMode: true);
+
+        var heading = document.GetElementById("heading")!.GetBoundingClientRect();
+        var label = document.GetElementById("label")!.GetBoundingClientRect();
+        var rule = document.GetElementById("rule")!.GetBoundingClientRect();
+
+        // the larger text's baseline is well below the top of the line and the smaller one's
+        Assert.Equal(30d, heading.Height, 1);
+        Assert.True(label.Top > 5, $"label at {label.Top}");
+        Assert.True(rule.Bottom > 15 && rule.Bottom < 30, $"rule ends at {rule.Bottom}");
+        // the label's baseline (its text's bottom minus its descent) is where the rule ends
+        Assert.True(Math.Abs(label.Bottom - rule.Bottom) < 4, $"label {label.Bottom} rule {rule.Bottom}");
+    }
+
+    private static async Task<IDocument> OpenAsync(string body, bool isStandardsMode = false)
     {
         var context = BrowsingContext.New(Configuration.Default.WithCss().WithRenderDevice(Device));
-        var document = await context.OpenAsync(request => request.Content($$"""
+        var document = await context.OpenAsync(request => request.Content((isStandardsMode ? "<!DOCTYPE html>" : "") + $$"""
             <html><head><style>html, body { margin: 0; padding: 0; font-family: sans-serif }</style></head>
             <body>{{body}}</body></html>
             """));

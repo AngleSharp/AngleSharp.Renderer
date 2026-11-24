@@ -7,7 +7,6 @@ using AngleSharp.Renderer;
 using System.Collections;
 using System.Globalization;
 using System.Linq;
-using System.Reflection;
 using System.Threading.Tasks;
 
 /// <summary>Options for a script-created animation.</summary>
@@ -45,6 +44,63 @@ public sealed class KeyframeAnimationOptions
     /// <summary>Gets or sets the animation id.</summary>
     [DomName("id")]
     public string Id { get; set; } = string.Empty;
+
+    /// <summary>Creates options with only a duration, as <c>animate(keyframes, 100)</c> gives.</summary>
+    /// <param name="duration">The active duration in milliseconds.</param>
+    public static implicit operator KeyframeAnimationOptions(double duration) => new() { Duration = duration };
+}
+
+/// <summary>
+/// Represents the keyframes given to <c>animate()</c>: either a list of keyframes (each a map of
+/// property values plus <c>offset</c>/<c>easing</c>/<c>composite</c>), or one map whose values are
+/// lists, the i-th entries forming the i-th keyframe (a value that is no list counts for all).
+/// </summary>
+public sealed class AnimationKeyframes
+{
+    private AnimationKeyframes(IReadOnlyList<IReadOnlyDictionary<string, object?>> rows)
+    {
+        Rows = rows;
+    }
+
+    internal IReadOnlyList<IReadOnlyDictionary<string, object?>> Rows { get; }
+
+    /// <summary>Creates the keyframes from a list of keyframes.</summary>
+    /// <param name="keyframes">The keyframes, in order.</param>
+    public static implicit operator AnimationKeyframes(Dictionary<string, object?>[] keyframes) =>
+        new((keyframes ?? [])
+            .Where(frame => frame is not null)
+            .Select(frame => (IReadOnlyDictionary<string, object?>)new Dictionary<string, object?>(frame, StringComparer.OrdinalIgnoreCase))
+            .ToArray());
+
+    /// <summary>Creates the keyframes from a map of property value lists.</summary>
+    /// <param name="keyframes">The values of every property, one per keyframe.</param>
+    public static implicit operator AnimationKeyframes(Dictionary<string, object?> keyframes)
+    {
+        if (keyframes is null || keyframes.Count == 0)
+        {
+            return new([]);
+        }
+
+        var lists = keyframes.ToDictionary(
+            pair => pair.Key,
+            pair => pair.Value is IEnumerable sequence && pair.Value is not string ? sequence.Cast<object?>().ToArray() : null,
+            StringComparer.OrdinalIgnoreCase);
+        var count = lists.Values.Where(values => values is not null).Select(values => values!.Length).DefaultIfEmpty(1).Max();
+        var rows = new IReadOnlyDictionary<string, object?>[count];
+
+        for (var index = 0; index < count; index++)
+        {
+            var row = new Dictionary<string, object?>(StringComparer.OrdinalIgnoreCase);
+            foreach (var (name, value) in keyframes)
+            {
+                var values = lists[name];
+                row[name] = values is null ? value : values.Length == 0 ? null : values[Math.Min(index, values.Length - 1)];
+            }
+            rows[index] = row;
+        }
+
+        return new(rows);
+    }
 }
 
 /// <summary>The document timeline used by script-created animations.</summary>
@@ -533,7 +589,7 @@ public static class ElementWebAnimationsExtensions
 {
     /// <summary>Creates and starts a keyframe animation.</summary>
     [DomName("animate")]
-    public static Animation Animate(this IElement element, object keyframes, object? options = null)
+    public static Animation Animate(this IElement element, AnimationKeyframes keyframes, KeyframeAnimationOptions? options = null)
     {
         ArgumentNullException.ThrowIfNull(element);
         ArgumentNullException.ThrowIfNull(keyframes);
@@ -560,64 +616,24 @@ public static class ElementWebAnimationsExtensions
         document.Context.GetDomHarness() as InteractiveHtmlRendererState
             ?? throw new InvalidOperationException("The browsing context is not connected to the interactive renderer.");
 
-    private static KeyframeAnimationOptions ParseOptions(object? options)
-    {
-        if (options is null || options is double or float or int or long or decimal)
-        {
-            return new KeyframeAnimationOptions
+    private static KeyframeAnimationOptions ParseOptions(KeyframeAnimationOptions? options) =>
+        options is null
+            ? new KeyframeAnimationOptions()
+            : new KeyframeAnimationOptions
             {
-                Duration = options is null ? 0d : Convert.ToDouble(options, CultureInfo.InvariantCulture),
+                Duration = options.Duration,
+                Delay = options.Delay,
+                EndDelay = options.EndDelay,
+                Iterations = options.Iterations,
+                Direction = (options.Direction ?? "normal").ToLowerInvariant(),
+                Easing = options.Easing ?? "linear",
+                Fill = (options.Fill ?? "none").ToLowerInvariant(),
+                Id = options.Id ?? string.Empty,
             };
-        }
 
-        return new KeyframeAnimationOptions
-        {
-            Duration = ReadNumber(options, "duration", 0d),
-            Delay = ReadNumber(options, "delay", 0d),
-            EndDelay = ReadNumber(options, "endDelay", 0d),
-            Iterations = ReadNumber(options, "iterations", 1d),
-            Direction = ReadString(options, "direction", "normal").ToLowerInvariant(),
-            Easing = ReadString(options, "easing", "linear"),
-            Fill = ReadString(options, "fill", "none").ToLowerInvariant(),
-            Id = ReadString(options, "id", string.Empty),
-        };
-    }
-
-    private static AnimationKeyframe[] ParseKeyframes(object input)
+    private static AnimationKeyframe[] ParseKeyframes(AnimationKeyframes input)
     {
-        var rows = new List<Dictionary<string, object?>>();
-
-        if (TryReadDictionary(input, out var objectForm))
-        {
-            var count = objectForm.Values.OfType<IEnumerable>().Where(value => value is not string).Select(value => value.Cast<object?>().Count()).DefaultIfEmpty(1).Max();
-            for (var index = 0; index < count; index++)
-            {
-                var row = new Dictionary<string, object?>(StringComparer.OrdinalIgnoreCase);
-                foreach (var (name, value) in objectForm)
-                {
-                    if (value is IEnumerable sequence && value is not string)
-                    {
-                        var values = sequence.Cast<object?>().ToArray();
-                        row[name] = values.Length == 0 ? null : values[Math.Min(index, values.Length - 1)];
-                    }
-                    else
-                    {
-                        row[name] = value;
-                    }
-                }
-                rows.Add(row);
-            }
-        }
-        else if (input is IEnumerable sequence && input is not string)
-        {
-            foreach (var item in sequence)
-            {
-                if (item is not null && TryReadDictionary(item, out var row))
-                {
-                    rows.Add(row);
-                }
-            }
-        }
+        var rows = input.Rows;
 
         if (rows.Count == 0)
         {
@@ -724,69 +740,8 @@ public static class ElementWebAnimationsExtensions
         return result.ToString();
     }
 
-    private static double ReadNumber(object source, string name, double fallback)
-    {
-        var value = ReadValue(source, name);
-        if (value is null)
-        {
-            return fallback;
-        }
-        if (value is string text && text.Equals("infinite", StringComparison.OrdinalIgnoreCase))
-        {
-            return double.PositiveInfinity;
-        }
-        return double.TryParse(Convert.ToString(value, CultureInfo.InvariantCulture), NumberStyles.Float, CultureInfo.InvariantCulture, out var number)
-            ? number
-            : fallback;
-    }
-
-    private static string ReadString(object source, string name, string fallback) =>
-        Convert.ToString(ReadValue(source, name), CultureInfo.InvariantCulture) ?? fallback;
-
     private static double? ToNullableDouble(object value) =>
         double.TryParse(Convert.ToString(value, CultureInfo.InvariantCulture), NumberStyles.Float, CultureInfo.InvariantCulture, out var result) ? result : null;
-
-    private static object? ReadValue(object source, string name)
-    {
-        if (TryReadDictionary(source, out var dictionary))
-        {
-            return dictionary.FirstOrDefault(pair => pair.Key.Equals(name, StringComparison.OrdinalIgnoreCase)).Value;
-        }
-
-        var property = source.GetType().GetProperty(name, BindingFlags.Instance | BindingFlags.Public | BindingFlags.IgnoreCase);
-        return property?.GetValue(source);
-    }
-
-    private static bool TryReadDictionary(object source, out Dictionary<string, object?> result)
-    {
-        result = new Dictionary<string, object?>(StringComparer.OrdinalIgnoreCase);
-        if (source is IDictionary dictionary)
-        {
-            foreach (DictionaryEntry item in dictionary)
-            {
-                if (item.Key is string key)
-                {
-                    result[key] = item.Value;
-                }
-            }
-            return result.Count > 0;
-        }
-
-        var type = source.GetType();
-        if (type.IsPrimitive || source is string || source is IEnumerable)
-        {
-            return false;
-        }
-
-        foreach (var property in type.GetProperties(BindingFlags.Instance | BindingFlags.Public))
-        {
-            if (property.CanRead && property.GetIndexParameters().Length == 0)
-            {
-                result[property.Name] = property.GetValue(source);
-            }
-        }
-        return result.Count > 0;
-    }
 }
 
 /// <summary>Provides the Web Animations timeline and document animation query.</summary>

@@ -15,16 +15,16 @@ public sealed class WebAnimationsTests
         var (document, harness) = await OpenAsync();
         var element = document.GetElementById("target")!;
         var animation = element.Animate(
-            new object[]
+            new Dictionary<string, object?>[]
             {
                 new Dictionary<string, object?> { ["opacity"] = 0d },
                 new Dictionary<string, object?> { ["opacity"] = 1d },
             },
-            new Dictionary<string, object?>
+            new KeyframeAnimationOptions
             {
-                ["duration"] = 100d,
-                ["fill"] = "forwards",
-                ["easing"] = "linear",
+                Duration = 100d,
+                Fill = "forwards",
+                Easing = "linear",
             });
 
         Assert.Equal("running", animation.PlayState);
@@ -78,7 +78,7 @@ public sealed class WebAnimationsTests
         var element = document.GetElementById("target")!;
         var animation = element.Animate(
             new Dictionary<string, object?> { ["opacity"] = new[] { 0d, 1d } },
-            new Dictionary<string, object?> { ["duration"] = 100d, ["fill"] = "both" });
+            new KeyframeAnimationOptions { Duration = 100d, Fill = "both" });
         var finished = false;
         animation.OnFinish = (_, _) => finished = true;
 
@@ -100,12 +100,12 @@ public sealed class WebAnimationsTests
         var (document, harness) = await OpenAsync();
         document.GetElementById("target")!.Animate(
             new Dictionary<string, object?> { ["opacity"] = new[] { 0d, 1d } },
-            new Dictionary<string, object?>
+            new KeyframeAnimationOptions
             {
-                ["duration"] = 100d,
-                ["iterations"] = 2d,
-                ["direction"] = "alternate",
-                ["fill"] = "both",
+                Duration = 100d,
+                Iterations = 2d,
+                Direction = "alternate",
+                Fill = "both",
             });
 
         harness.AdvanceTime(TimeSpan.FromMilliseconds(125));
@@ -123,7 +123,7 @@ public sealed class WebAnimationsTests
         var element = document.GetElementById("target")!;
         element.Animate(
             new Dictionary<string, object?> { ["opacity"] = new[] { 0d, 1d } },
-            new Dictionary<string, object?> { ["duration"] = 100d, ["fill"] = "both" });
+            new KeyframeAnimationOptions { Duration = 100d, Fill = "both" });
 
         harness.PrepareFrame();
         harness.AdvanceTime(TimeSpan.FromMilliseconds(50));

@@ -250,6 +250,29 @@ public sealed class Canvas2DRenderingContextTests
         Assert.Equal(0, bitmap.GetPixel(10, 10).Alpha);
     }
 
+    [Fact]
+    public async Task DrawFocusIfNeeded_DrawsTheRingOfAFocusedFallbackElementOnly()
+    {
+        var document = await ParseAsync("<html><body><canvas width='100' height='100'><button id='inside'>A</button></canvas><button id='outside'>B</button></body></html>");
+        var canvas = (IHtmlCanvasElement)document.QuerySelector("canvas")!;
+        var inside = (IHtmlElement)document.GetElementById("inside")!;
+        var outside = (IHtmlElement)document.GetElementById("outside")!;
+        var context = new Canvas2DRenderingContext(canvas);
+        context.BeginPath();
+        context.Rect(20f, 20f, 60f, 60f);
+
+        context.DrawFocusIfNeeded(inside);
+        Assert.Equal(0, CountNonTransparentPixels(context.ToImage("image/png")));
+
+        outside.DoFocus();
+        context.DrawFocusIfNeeded(outside);
+        Assert.Equal(0, CountNonTransparentPixels(context.ToImage("image/png")));
+
+        inside.DoFocus();
+        context.DrawFocusIfNeeded(inside);
+        Assert.True(CountNonTransparentPixels(context.ToImage("image/png")) > 100);
+    }
+
     private static async Task<Canvas2DRenderingContext> CreateContextAsync()
     {
         var document = await ParseAsync("<html><body><canvas width='100' height='100'></canvas></body></html>");
